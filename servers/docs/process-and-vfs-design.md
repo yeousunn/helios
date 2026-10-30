@@ -207,7 +207,7 @@ land in the result window. `STAT` returns a packed stat: `w1 = kind(8)|mode(24)|
 
 | label | name | words (w0..w3) | reply |
 |---|---|---|---|
-| 0x0201 | CONNECT | w0 = version, w1..w3 as PS CONNECT | w0 = status, w1 = connection id; out: connection endpoint |
+| 0x0201 | CONNECT | w0 = version(16)\|flags(16) — same generic handshake as PS | session notification, arg frame (`READ`), result frame (`WRITE\|MAP`) | w0 = status, w1 = connection id, **w2 = root directory handle** (VFS extension: the connection's whole visible tree); out: connection endpoint |
 | 0x0210 | WALK | w0 = dir handle, w1 = `(name off,len)`, w2 = flags | w0 = status, w1 = new handle, w2..w3 = stat |
 | 0x0211 | OPEN | w0 = dir handle, w1 = `(name off,len)`, w2 = flags | w0 = status, w1 = file handle, w2..w3 = stat |
 | 0x0212 | READ | w0 = file handle, w1 = offset, w2 = len, w3 = result-window off | w0 = status, w1 = bytes read |
@@ -226,7 +226,16 @@ land in the result window. `STAT` returns a packed stat: `w1 = kind(8)|mode(24)|
 
 `READ_BULK` exists because the 64 KiB window is the wrong shape for ELF loading and
 future mmap population (sdk schema §8.2 shows the wire example). Smaller reads use the
-window to avoid a frame transfer per call.
+window to avoid a frame transfer per call. **v0 status:** `READ_BULK` returns `ENOSYS`
+in `servers/vfs` slice 1 — the server must first be able to map the transferred frame
+into its own address space (runtime `map_into_self`); PS ELF loading uses chunked
+window reads until that lands.
+
+**Stat words:** WALK/OPEN/CREATE/MKDIR replies carry `w2 = kind(8)|mode(24)`,
+`w3 = size`; only STAT carries the full triple including mtime. Status codes come from
+the shared table (`sdk/docs/ipc-schema.md` §7): the VFS set ENOENT/EEXIST/ENOTEMPTY/
+ENOTDIR/EISDIR/EINVAL/EACCES (-15..-21) was appended there while building
+`servers/vfs`; `ipc::status` mirrors it (requested from GLM).
 
 ### 3.4 Page cache and pager role (Phase 2 interface, sketched)
 
