@@ -522,6 +522,32 @@ pub fn switch_to(next: ThreadId) {
     }
 }
 
+/// Are there live (non-Exited) threads for this process? (ADR-026 reaper.)
+pub fn process_has_live_threads(process: ObjRef) -> bool {
+    let guard = SCHED.lock();
+    let Some(s) = guard.as_ref() else {
+        return false;
+    };
+    s.slots
+        .threads
+        .iter()
+        .flatten()
+        .any(|t| t.process == process && !matches!(t.state, State::Exited(_)))
+}
+
+/// Enter the first thread: switch the arch state to `next` and update the
+/// scheduler's current pointer. Called once at boot to enter init.
+pub fn start_first(next: ThreadId) {
+    let guard = CTX.lock();
+    if let Some(b) = guard.as_ref() {
+        b.start_first(next);
+    }
+    let mut g = SCHED.lock();
+    if let Some(s) = g.as_mut() {
+        s.current = next;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

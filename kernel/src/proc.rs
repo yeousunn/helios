@@ -29,6 +29,11 @@ pub type ProcResult<T> = Result<T, ProcError>;
 /// Kernel-side process id == registry index + 1 (0 = none).
 pub type ProcessId = ObjId;
 
+/// Wrap a scheduler process reference (same numeric space).
+pub fn from_ref(r: crate::sched::ObjRef) -> ProcessId {
+    ObjId(r.0)
+}
+
 /// Preallocated registry state (const-initialized in the static).
 struct RegistryInner {
     used: [bool; MAX_PROCESSES],

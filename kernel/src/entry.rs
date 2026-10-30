@@ -451,37 +451,46 @@ fn factory_invoke(
     let msg = args.message();
     match msg.tag.label() {
         NEW_ENDPOINT => match crate::endpoint::create_endpoint() {
-            Ok(ep) => install_ret(
-                pid,
-                ep.0,
-                ObjType::Endpoint,
-                Rights::SEND.union(Rights::RECV).union(Rights::GRANT),
-                msg.tag,
-            ),
+            Ok(ep) => {
+                crate::objreg::register(ObjId(ep.0), ObjType::Endpoint, pid);
+                install_ret(
+                    pid,
+                    ep.0,
+                    ObjType::Endpoint,
+                    Rights::SEND.union(Rights::RECV).union(Rights::GRANT),
+                    msg.tag,
+                )
+            }
             Err(_) => SyscallReturn::err(ipc::status::ENOMEM),
         },
         NEW_NOTIFICATION => match crate::notification::create() {
-            Ok(n) => install_ret(
-                pid,
-                n.0,
-                ObjType::Notification,
-                // GRANT: session/death notifications must be transferable to
-                // children (ADR-023 §5b).
-                Rights::SIGNAL.union(Rights::RECV).union(Rights::GRANT),
-                msg.tag,
-            ),
+            Ok(n) => {
+                crate::objreg::register(ObjId(n.0), ObjType::Notification, pid);
+                install_ret(
+                    pid,
+                    n.0,
+                    ObjType::Notification,
+                    // GRANT: session/death notifications must be transferable to
+                    // children (ADR-023 §5b).
+                    Rights::SIGNAL.union(Rights::RECV).union(Rights::GRANT),
+                    msg.tag,
+                )
+            }
             Err(_) => SyscallReturn::err(ipc::status::ENOMEM),
         },
         NEW_ADDRESS_SPACE => {
-            // Per-process AS object (ADR-022 §1).
+            // Per-process AS object (ADR-022 §1); owner-registered (ADR-026).
             match crate::aspace::create() {
-                Ok(as_id) => install_ret(
-                    pid,
-                    as_id.0,
-                    ObjType::AddressSpace,
-                    Rights::MAP.union(Rights::GRANT),
-                    msg.tag,
-                ),
+                Ok(as_id) => {
+                    crate::objreg::register(as_id, ObjType::AddressSpace, pid);
+                    install_ret(
+                        pid,
+                        as_id.0,
+                        ObjType::AddressSpace,
+                        Rights::MAP.union(Rights::GRANT),
+                        msg.tag,
+                    )
+                }
                 Err(_) => SyscallReturn::err(ipc::status::ENOMEM),
             }
         }

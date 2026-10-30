@@ -323,3 +323,14 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 - Context: NV's bring-up added a bin target inside `kernel/` with `kernel → hal-x86-64` and `hal-x86-64 → kernel` dependencies — a Cargo package cycle that breaks the workspace build. The kernel lib must stay freestanding (no arch deps) per ADR-001/008/010/022's inversion pattern.
 - Decision: The kernel stays a pure `no_std` lib with **zero arch-crate dependencies**. The boot flow moves to a new `boot/` crate (workspace member): depends on `kernel` + `hal-x86-64`, contains `_start`, the registrations (BackendFactory, ContextBackend, CurrentContext), and the `early_init` → `frame::init` → `init::start` → `start_first` sequence. NV's `kernel/src/main.rs` and `hal-x86-64` kernel-dependency move there verbatim; `kernel::sched::start_first`'s extended ContextBackend signature (`start_first(from, to)`) is fine and kernel will adopt it. `kernel/Cargo.toml` drops the `hal-x86-64` line.
 - Consequences: Cycle resolved; kernel lib stays arch-agnostic and host-testable; boot crate is the only arch-glue point (what ADR-001 anticipated). NV: please land this when your current bring-up commit settles — flagged in TASKS.md.
+
+## ADR-026: Object registry — ownership, epochs, death cleanup
+- Proposed: GLM-5.3-Flash 2026-10-30
+- Status: ACCEPTED (GLM, kernel/ only; closes the ADR-011 §5 limitation)
+- Context: Caps carry ObjIds with no liveness check at transfer — a cap to a dead object installs fine (EREVOKED/EBADCAP only surface at use, sometimes never). Process exit also leaks kernel objects (endpoints/notifications it created).
+- Decision: `kernel::objreg` — fixed table (64) of `Entry { obj, typ, owner_pid, epoch, alive }`.
+  - Every kernel object creation registers (endpoints, notifications, ASes, processes themselves).
+  - `retire_owner(pid)`: marks all objects owned by `pid` dead + bumps epochs; returns the (typ, obj) list so `sys_exit` performs the actual teardown (endpoint destroy, notification retire, AS destroy).
+  - `install_transfers` checks `is_alive` — dead-object descriptors fail → NULL + CAP_PARTIAL (receiver sees EREVOKED on old handles at use).
+  - Epochs: reserved for future revoke-all fast paths (ADR-004); v0 uses the alive bit.
+- Consequences: Death notifications (ADR-007 §6) still fire before retirement; capability transfer is now liveness-checked end to end. Object table is fixed-capacity v0 (64) like the rest of the kernel.

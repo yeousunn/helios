@@ -98,7 +98,8 @@ fn resolve_transfers(pid: ProcessId, msg: &Message, sender: ThreadId) -> (Envelo
         }
         match proc::get_cap(pid, handle) {
             Ok(cap) => {
-                if cap.rights.contains(Rights::GRANT) {
+                // ADR-026: dead objects never transfer (NULL + CAP_PARTIAL).
+                if cap.rights.contains(Rights::GRANT) && crate::objreg::is_alive(cap.obj) {
                     env.caps[i] = Some(cap);
                 } else {
                     failed += 1;
@@ -446,16 +447,41 @@ pub fn sys_cap_revoke(pid: ProcessId, handle: u32, mode: u64) -> SysResult<usize
     proc::revoke(pid, handle, mode).map_err(|e| err(map_proc(e)))
 }
 
-/// SYS 8: `exit`. Fires the bound death notification (ADR-007 §6).
+/// SYS 8: `exit`. Fires the bound death notification (ADR-007 §6) and, when
+/// the last thread of the process is gone, retires the process's kernel
+/// objects and its capability table (ADR-026).
 pub fn sys_exit(tid: ThreadId, status: i32) -> SysResult<bool> {
-    // Clear any pending reply state so late replies are discarded.
+    // Clear any pending reply/park state so late replies are discarded.
     clear_reply(tid);
+    clear_park(tid);
+    let proc_ref = sched::get(tid)
+        .map_err(|_| err(ipc::status::EBADCAP))?
+        .process;
     let fired = sched::exit(tid, status).map_err(|_| err(ipc::status::EBADCAP))?;
     if fired {
         // Read the bound notification from the (now Exited) record and signal.
         if let Some(n) = sched::get(tid).ok().and_then(|t| t.bound_notification) {
             let _ = notification::signal(n, 1);
         }
+    }
+    // ADR-026: last thread out retires the process.
+    if !sched::process_has_live_threads(proc_ref) {
+        let pid = proc::from_ref(proc_ref);
+        for (typ, obj) in crate::objreg::retire_owner(pid) {
+            if obj.0 == 0 {
+                continue;
+            }
+            match typ {
+                ObjType::Endpoint => {
+                    let _ = endpoint::destroy_endpoint(ObjRef(obj.0));
+                }
+                ObjType::AddressSpace => {
+                    let _ = crate::aspace::destroy(obj);
+                }
+                _ => {}
+            }
+        }
+        let _ = proc::destroy(pid);
     }
     Ok(fired)
 }
@@ -811,5 +837,58 @@ mod tests {
         // here we call the kernel path directly for simplicity.
         let cap = proc::get_cap(pid, thread_cap).unwrap();
         crate::entry::thread_invoke_for_test(pid, ThreadId(1), &cap, m)
+    }
+    #[test]
+    fn process_death_retires_objects_and_blocks_transfer() {
+        // ADR-026 end-to-end: the last thread of a process exits → its
+        // kernel objects retire → caps to them can no longer transfer.
+        let (pid, server, _client, _ep) = setup();
+        // Give the server its own process identity: spawn a dedicated child
+        // process via Factory::NEW_THREAD semantics — simpler: register an
+        // endpoint owned by a standalone process id and exit its only thread.
+        let owner_pid = proc::create().unwrap();
+        let owner_thread = sched::spawn(ObjRef(owner_pid.0), 100).unwrap();
+        let ep = endpoint::create_endpoint().unwrap();
+        crate::objreg::register(ObjId(ep.0), ObjType::Endpoint, owner_pid);
+        assert!(crate::objreg::is_alive(ObjId(ep.0)));
+
+        // Install a cap to it in the server's table (simulating a prior
+        // transfer), then kill the owner.
+        let ep_h = proc::install_cap(
+            pid,
+            caps::Capability {
+                obj: ObjId(ep.0),
+                typ: ObjType::Endpoint,
+                rights: ipc::Rights::SEND.union(ipc::Rights::GRANT),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            sys_exit(owner_thread, 0),
+            Ok(false),
+            "no death notification bound"
+        );
+
+        assert!(
+            !crate::objreg::is_alive(ObjId(ep.0)),
+            "endpoint retired with owner"
+        );
+        // The server still holds the handle, but transfer now fails: the
+        // descriptor becomes NULL + CAP_PARTIAL.
+        let mut m = msg(0x0111, 1);
+        m.tag = m.tag.with_caps(1);
+        m.set_descriptor(0, ipc::CapSlot::pack(ep_h, ipc::Rights::SEND))
+            .unwrap();
+        assert_eq!(sys_send(pid, server, _ep, m, false), Ok(0));
+        let got = sys_recv(pid, server, _ep).unwrap().unwrap();
+        assert!(got.tag.flags() & ipc::flags::CAP_PARTIAL != 0);
+        assert_eq!(got.descriptor(0).unwrap().0, 0, "dead cap -> NULL");
+        // Old handles in OTHER processes surface EREVOKED at use (send on
+        // the retired endpoint fails as dead).
+        assert_eq!(
+            sys_send(pid, server, ep_h, msg(1, 1), false),
+            Err(ipc::status::EBADCAP),
+            "dead endpoint cap refuses send"
+        );
     }
 }

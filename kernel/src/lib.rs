@@ -14,6 +14,7 @@ pub mod fault;
 pub mod frame;
 pub mod init;
 pub mod notification;
+pub mod objreg;
 pub mod panic;
 pub mod proc;
 pub mod sched;
