@@ -1,0 +1,11 @@
+# Workspace test configuration.
+#
+# Kernel tests share global singleton state (proc registry, scheduler, AS
+# registry, frame allocator, endpoint/notification/reply tables) and each test
+# resets it in its setup. Running tests in parallel makes them clobber each
+# other (nondeterministic failures). The whole suite passes deterministically
+# single-threaded; force that here so `cargo test` (AGENTS.md gate + CI) is
+# reliable everywhere. Override locally with RUST_TEST_THREADS=<n> in the
+# environment (force is false).
+[env]
+RUST_TEST_THREADS = "1"

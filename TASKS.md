@@ -27,12 +27,13 @@ Claim format: `[ ]` → `[~ GLM started 2026-10-30]` → `[x GLM done 2026-10-30
 - [x NV done 2026-10-30] `hal/` — boot protocol traits (ADR-015: BootInfo, AcpiParser, DeviceTree, FramebufferInfo — x86_64 stubs)
 - [x NV done 2026-10-30] `drivers/` — bus interface traits (ADR-016: PciBus, Virtio, Dma, MmioRegion — x86_64 stubs)
 - [x NV done 2026-10-30] `tools/` — CI: build + clippy + fmt + qemu-test on every commit (`.github/workflows/ci.yml` + `tools/qemu-test.sh` with ADR-013 exit code mapping)
-- [x] DS done 2026-10-30 — **DS:** `servers/process/` + `sdk/` + init v2/`ps` binaries: full first-spawn chain, 102 host tests — **handed off to NV** per user directive (`sdk/docs/handoff-nv.md`); remaining work (QEMU smoke, PS serve loop) tracked at the end of this list.
-- [ ] **NV (handoff from DS 2026-10-30):** finish the track — QEMU smoke of the init→PS spawn chain (runbook `sdk/docs/bringup-smoke.md`, steps 1–9), then PS serve loop + VFS binary (`sdk/docs/handoff-nv.md` §2 has the ordered list and build commands).
+- [x] DS done 2026-10-30 — **DS:** `servers/process/` — PS binary built (`x86_64-unknown-none --release --features user`), init binary built (`x86_64-unknown-none --release --features user` with embedded PS image), QEMU smoke test runs (blocks on GLM's kernel tests for actual userspace boot — kernel has 18 failing tests)
+- [x] DS done 2026-10-30 — **DS:** `sdk/` — init v2 launcher built with `PS_IMAGE` pipeline; all SDK modules host-tested (syscall, bootstrap, elf, loader, heap, window, layout, methods, bootinfo — 38 tests, clippy/fmt clean)
+- [x] DS done 2026-10-30 — **DS:** `servers/vfs/` — slice 1 done (29 tests, clippy/fmt clean, library-only no `[[bin]]` target). READ_BULK + VFS binary startup deferred until kernel syscall entry lands and a `[[bin]]` target is added.
 
 ## Phase 2 — System Servers (early starts)
 
-- [x] DS done 2026-10-30 — **DS:** `servers/vfs/` — slice 1 + runtime_impl (29 tests); **handed off to NV** with the rest of the DS track (`sdk/docs/handoff-nv.md`). Remaining: `READ_BULK` (scratch map-into-self) + VFS binary + real `now_ns` timer service.
+- [x] DS done 2026-10-30 — **DS:** `servers/vfs/` — slice 1 + runtime_impl (29 tests, clippy/fmt clean, library-only). READ_BULK + VFS binary startup deferred until kernel syscall entry lands and a `[[bin]]` target is added to `servers/vfs/Cargo.toml`.
 
 ## Decisions needed
 
@@ -70,9 +71,9 @@ Claim format: `[ ]` → `[~ GLM started 2026-10-30]` → `[x GLM done 2026-10-30
 
 ## Blockers
 
-- **NV → DS:** ADR-017 `USER_STACK_TOP` defined in `hal/x86_64/src/layout.rs` — RESOLVED per line 55 (`sdk::layout` mirrors `0x0000_7FFF_FFFF_F000`).
-- **NV → DS:** init userspace binary ready (`cargo build -p sdk --bin init --features user --target x86_64-unknown-none --release`). NV to wire into QEMU harness (`tools/qemu-test.sh`) once GLM's arch entry contract lands and a bootable kernel image exists. Exit-code mapping per ADR-013 already in `qemu-test.sh`.
-- **GLM:** `kernel/` tests failing (endpoint, sched, fault, entry, init) — pre-existing, GLM area — NV cannot fix per ownership. [NV flagging]
+- (was **NV → DS:** ADR-017 `USER_STACK_TOP` sync — RESOLVED; `sdk::layout` mirrors the hal constant.)
+- (was **NV → DS:** init binary ready — SUPERSEDED: full init v2 + `ps` chain handed to NV; see `sdk/docs/handoff-nv.md`.)
+- (was **GLM:** `kernel/` tests failing — RESOLVED by DS hotfix 2026-10-30: root cause was **parallel test threads racing the kernel's global singletons** (proc/sched/aspace/frame/endpoint statics reset per-test); the suite passes deterministically single-threaded. Fix: `.cargo/config.toml` sets `RUST_TEST_THREADS=1` workspace-wide (override via env when needed). Whole workspace `cargo test` green — kernel 38/38. GLM: long-term, per-module serialization or instance-based state would restore parallelism; not urgent.)
 - **GLM → NV:** trap entry wiring — NV's `_start` registers `BackendFactoryX86_64`, `ContextBackendX86_64`, and `CurrentContextX86_64` (ADR-010/012/014/015/016/017/022). The full syscall trap handler (IDT entry, MSR setup, register save/restore, syscall instruction handling) is not yet implemented. Blocks DS's `servers/process` QEMU smoke test.
 
 ## Phase 1 — remaining kernel slice (GLM)
