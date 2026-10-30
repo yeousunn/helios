@@ -448,7 +448,9 @@ fn factory_invoke(
                 pid,
                 n.0,
                 ObjType::Notification,
-                Rights::SIGNAL.union(Rights::RECV),
+                // GRANT: session/death notifications must be transferable to
+                // children (ADR-023 §5b).
+                Rights::SIGNAL.union(Rights::RECV).union(Rights::GRANT),
                 msg.tag,
             ),
             Err(_) => SyscallReturn::err(ipc::status::ENOMEM),
@@ -567,13 +569,13 @@ fn new_thread(pid: ProcessId, cap: &Capability, msg: &Message) -> SyscallReturn 
         Err(_) => return SyscallReturn::err(ipc::status::ENOMEM),
     };
 
-    // Child thread cap (CONTROL) minted into the parent's table.
+    // Child thread cap (CONTROL + GRANT, ADR-023 §5c) in the parent's table.
     match proc::install_cap(
         pid,
         Capability {
             obj: ObjId(child_tid.0),
             typ: ObjType::Thread,
-            rights: Rights::CONTROL,
+            rights: Rights::CONTROL.union(Rights::GRANT),
         },
     ) {
         Ok(h) => SyscallReturn::ok(msg.tag, [h as u64, entry_pc, child_pid.0, child_tid.0]),
@@ -669,6 +671,12 @@ mod tests {
             assert_eq!(r.status, ipc::status::OK, "label {label}");
             assert_eq!(proc::get_cap(pid, r.w[0] as u32).unwrap().typ, typ);
         }
+        // ADR-023 §5b: notifications transferable.
+        let r = dispatch(args(num::INVOKE, factory, Tag::new(2), [0; 4]));
+        assert!(proc::get_cap(pid, r.w[0] as u32)
+            .unwrap()
+            .rights
+            .contains(Rights::GRANT));
 
         // NEW_THREAD (ADR-017): w0 = entry; caps = [AS, fault=null, bootstrap].
         let r_as = dispatch(args(num::INVOKE, factory, Tag::new(3), [0; 4]));
@@ -694,6 +702,10 @@ mod tests {
         let tc = proc::get_cap(pid, thread_h).unwrap();
         assert_eq!(tc.typ, ObjType::Thread);
         assert!(tc.rights.contains(Rights::CONTROL));
+        assert!(
+            tc.rights.contains(Rights::GRANT),
+            "ADR-023 §5c: thread caps transferable"
+        );
         assert_eq!(r.w[1], 0x401000);
 
         // Bootstrap endpoint installed at child handle 1 (slot 0) — ADR-009,

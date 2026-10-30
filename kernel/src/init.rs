@@ -131,7 +131,9 @@ pub fn start(regions: &[BootRegion]) -> Result<InitLaunch, &'static str> {
             Capability {
                 obj: ObjId(region_id),
                 typ: ObjType::Region,
-                rights: Rights::default(), // carve-only; rights via Region methods
+                // GRANT: init must be able to pass regions to spawned servers
+                // (ADR-023 §5a; transfers require GRANT on the sender's cap).
+                rights: Rights::GRANT,
             },
         )
         .map_err(|_| "cannot grant Region")?;
@@ -411,6 +413,10 @@ mod tests {
         let (h, base, len) = launch.bootinfo.regions[0];
         let rc = proc::get_cap(launch.pid, h).unwrap();
         assert_eq!(rc.typ, ObjType::Region);
+        assert!(
+            rc.rights.contains(Rights::GRANT),
+            "ADR-023 §5a: regions transferable"
+        );
         assert_eq!(base, 0x10_0000);
         assert_eq!(len, 0x40000);
         // Thread spawned.
