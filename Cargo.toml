@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "kernel",
+    "hal",
+    "hal/x86_64",
+    "hal/aarch64",
+    "hal/riscv64",
+    "caps",
+    "ipc",
+    "servers/process",
+    "servers/vfs",
+    "servers/auth",
+    "servers/net",
+    "personality",
+    "sdk",
+    "drivers",
+    "graphics",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://example.com/micro-kernel-rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+panic = "abort"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"

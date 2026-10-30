@@ -1,0 +1,8 @@
+[package]
+name = "hal-riscv64"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hal = { path = ".." }
