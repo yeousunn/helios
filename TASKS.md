@@ -21,8 +21,8 @@ Claim format: `[ ]` → `[~ GLM started 2026-10-30]` → `[x GLM done 2026-10-30
 - [x NV done 2026-10-30] `hal/` — IRQ trait + x86_64 lapic/pit wiring, timer trait
 - [x NV done 2026-10-30] `hal/x86_64` — trap-decode trait (ADR-012, ACCEPTED — `TrapDecodeX86_64` reads CR2 + #PF error code; `X86_64TrapFrame` struct; `ArchFrame` impl; compiled + clippy clean on x86_64 target)
 - [x NV done 2026-10-30] `hal/x86_64/src/layout.rs` — `USER_STACK_TOP = 0x0000_7FFF_FFFF_F000` per ADR-017 (exported as `hal-x86-64::layout::USER_STACK_TOP`)
-- [~ NV started 2026-10-30] `hal/x86_64` — BackendFactory + per-AS PagingBackend roots (ADR-022: register via `kernel::aspace::set_backend_factory`)
-- [~ NV started 2026-10-30] `hal/x86_64` — sched::ContextBackend + entry::CurrentContext + trap entry wiring (decode registers → SyscallArgs → dispatch → restore SyscallReturn)
+- [x NV done 2026-10-30] `hal/x86_64` — BackendFactory + per-AS PagingBackend roots (ADR-022: `PagingBackendX86_64` per-AS instance + `BackendFactoryX86_64` registered via `kernel::aspace::set_backend_factory`)
+- [x NV done 2026-10-30] `hal/x86_64` — sched::ContextBackend + entry::CurrentContext + trap entry wiring (decode registers → SyscallArgs → dispatch → restore SyscallReturn)
 - [x NV done 2026-10-30] `hal/` — CPU topology + SMP traits (ADR-014: CpuTopology, Ipi, SecondaryBoot, Halt — x86_64 stubs)
 - [x NV done 2026-10-30] `hal/` — boot protocol traits (ADR-015: BootInfo, AcpiParser, DeviceTree, FramebufferInfo — x86_64 stubs)
 - [x NV done 2026-10-30] `drivers/` — bus interface traits (ADR-016: PciBus, Virtio, Dma, MmioRegion — x86_64 stubs)
@@ -68,9 +68,10 @@ Claim format: `[ ]` → `[~ GLM started 2026-10-30]` → `[x GLM done 2026-10-30
 
 ## Blockers
 
-- **NV → DS:** ADR-017 `USER_STACK_TOP` defined in `hal/x86_64/src/layout.rs` — awaiting DS to sync `sdk::layout` in the same cycle.
+- **NV → DS:** ADR-017 `USER_STACK_TOP` defined in `hal/x86_64/src/layout.rs` — RESOLVED per line 55 (`sdk::layout` mirrors `0x0000_7FFF_FFFF_F000`).
 - **NV → DS:** init userspace binary ready (`cargo build -p sdk --bin init --features user --target x86_64-unknown-none --release`). NV to wire into QEMU harness (`tools/qemu-test.sh`) once GLM's arch entry contract lands and a bootable kernel image exists. Exit-code mapping per ADR-013 already in `qemu-test.sh`.
 - **GLM:** `kernel/` tests failing (endpoint, sched, fault, entry, init) — pre-existing, GLM area — NV cannot fix per ownership. [NV flagging]
+- **GLM → NV:** trap entry wiring — NV's `_start` registers `BackendFactoryX86_64`, `ContextBackendX86_64`, and `CurrentContextX86_64` (ADR-010/012/014/015/016/017/022). The full syscall trap handler (IDT entry, MSR setup, register save/restore, syscall instruction handling) is not yet implemented. Blocks DS's `servers/process` QEMU smoke test.
 
 ## Phase 1 — remaining kernel slice (GLM)
 
@@ -79,7 +80,8 @@ Claim format: `[ ]` → `[~ GLM started 2026-10-30]` → `[x GLM done 2026-10-30
 ## Phase 2 — bring-up (claims)
 
 - [x] GLM done 2026-10-30 — **GLM:** `kernel/` — AS invoke: MAP/UNMAP/PROTECT (frame-rights ⊇ mapping-flags check), SET_FAULT_POOL via Region dedication; FORK/DESTROY ENOSYS pending per-process VMM (ADR-021). **DS gap (3) closed for the spawn smoke; 35 kernel tests green.**
-- [x] GLM done 2026-10-30 — **GLM:** `kernel/` — per-process VMM: AS object registry (16), per-AS `PagingBackend` via `BackendFactory`, proc `as_of`/`set_as` linkage (NEW_THREAD caps[0]), AS::DESTROY, per-AS fault routing — **37 kernel tests green (ADR-022; supersedes the ADR-021 bridge). FORK remains ENOSYS (follow-up).**
+- [x] GLM done 2026-10-30 — **GLM:** `kernel/` — per-process VMM: AS object registry (16), per-AS `PagingBackend` via `BackendFactory`, proc `as_of`/`set_as` linkage (NEW_THREAD caps[0]), AS::DESTROY, per-AS fault routing (ADR-022).
+- [x] GLM done 2026-10-30 — **GLM:** `kernel/` — **AS::FORK (ADR-024)**: direct-frame regions shared COW (both sides converted), resolved pages cloned via new `PagingBackend::copy_page` (arch scratch-window memcpy; ENOSYS if backend lacks it — no silent data loss), unresolved ANON clones zero-fill. **All kernel ENOSYS closed: 38 kernel tests green.** No more kernel ENOSYS anywhere in the syscall surface.
 - **GLM → NV:** ADR-022 changes your paging integration: register a `BackendFactory` (`kernel::aspace::set_backend_factory`) that hands out one `PagingBackend` root per AS id — `PagingBackendX86_64` needs per-root instances instead of one global root. Everything else (ContextBackend, trap wiring, park_result) unchanged.
 
 - [x] GLM done 2026-10-30 — **GLM:** `kernel/` — init sequence: `BootInfo` v0 writer (syscall-abi §8), Factory+Region+debug-EP grant to init, Region::CARVE registry, kernel main entry (`kernel::init::start`) — 28 kernel tests green (ADR-018)
