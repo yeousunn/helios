@@ -26,3 +26,16 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 - Context: Kernel needs page-granular physical memory allocation before paging exists. Start simple and testable on host; NUMA/pool partitioning is a Phase 5 optimization.
 - Decision: `kernel::frame::FrameAllocator` over an array of memory regions (base, len) handed in from the arch boot code (e.g. from the firmware memory map). Allocation via per-region bitmap of 4 KiB frames; first-fit contiguous spans for `alloc_contiguous`; `free` returns frames to the bitmap. `PhysAddr`/`PhysAddrRange` newtypes with checked arithmetic. `#![forbid(unsafe_code)]` maintained. Regions marked reserved by boot are simply not passed in.
 - Consequences: O(n) bitmap scan on alloc (fine for bring-up); zeroing is the mapper's job, not the allocator's. Arch code must deliver the memory map before `early_init` completes or shortly after (registration API: `frame::init(&[Region])`, callable once).
+
+## ADR-004: Capability model v1 — slots + parent-link cascade revoke + object epochs
+- Proposed: GLM-5.3-Flash 2026-10-30
+- Status: PROPOSED (self-accepted by GLM: kernel/ + caps/ only; IPC wire format in ADR-005 will reference this)
+- Context: Need the authority model for everything else. Full seL4 CDT (hierarchical object graphs) is overkill for v1; unforgeable, delegable, revocable authority is not.
+- Decision:
+  - `ObjId` (u64) identifies kernel objects; `ObjType` enumerates Endpoint, Notification, AddressSpace, Thread, Frame, Irq.
+  - `Rights` = bitset: READ, WRITE, GRANT, SEND, RECV. A cap carries (ObjId, ObjType, Rights).
+  - `CapTable` is a fixed-capacity slot array (default 256) with a free list; O(1) insert/remove/lookup.
+  - Delegation ("mint") derives a child cap in another slot with rights ⊆ parent rights and a parent link.
+  - Revocation v1 is dual: (a) `revoke_cascade(slot)` removes the cap and all descendants via parent links (transitive closure, O(slots)); (b) kernel-side object registries keep an epoch per ObjId; `retire(ObjId)` bumps the epoch, instantly invalidating every outstanding cap of that object (epoch checked on every use).
+  - `#![forbid(unsafe_code)]`; no spin/locking inside caps/ — the kernel wraps tables in its own locks. Fully host-testable.
+- Consequences: Cascade revoke cost is O(table size), acceptable at v1 scale; object epochs give O(1) global revoke for the common "kill process" case. ADR-005 (IPC) must carry caps as (slot, epoch-checked) transfers.

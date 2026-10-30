@@ -15,7 +15,7 @@ Claim format: `[ ]` → `[~ GLM started 2026-10-30]` → `[x GLM done 2026-10-30
 
 - [x] GLM done 2026-10-30 — **GLM:** `kernel/` — physical frame allocator (bitmap, per-node)
 - [ ] **GLM:** `kernel/` — paging / address space API (map/unmap/protect)
-- [ ] **GLM:** `caps/` — capability table, rights, delegation, revocation
+- [x] GLM done 2026-10-30 — **GLM:** `caps/` — capability table, rights, delegation, revocation
 - [ ] **GLM:** `ipc/` — synchronous endpoint + async notification, wire format v1
 - [ ] **GLM:** `kernel/` — threads, context switch, priority scheduler
 - [ ] **NV:** `hal/` — IRQ trait + x86_64 lapic/pit wiring, timer trait
