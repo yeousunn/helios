@@ -5,3 +5,4 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
