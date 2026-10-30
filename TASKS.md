@@ -39,7 +39,7 @@ Claim format: `[ ]` → `[~ GLM started 2026-10-30]` → `[x GLM done 2026-10-30
 
 - (none — all PROPOSED ADRs through ADR-017 reviewed by GLM 2026-10-30. ADR-006 noted/deferred per NV; **ADR-012 ACCEPTED** (identical to GLM's proposed shape); **ADR-017 ACCEPTED** with amendment: `USER_STACK_TOP` canonical definition lives in the hal arch crate (NV), `sdk::layout` mirrors it userspace-side; both must stay identical.)
 - **ADR-007/009/010/011** — all ACCEPTED and implemented in `kernel/` (syscall engine `kernel/src/syscall.rs` covers the 9 syscalls incl. Factory-side semantics for a later arch entry).
-- **ADR-023** (DS, NEW): init bootstrap v0.1 — BootInfo reserved u32 @20 → `self_as` (v0-compatible); embedded-image loading (launcher `include_bytes!` + `sdk::elf` + carve/map/copy dance); package extensions ride the optional tail (`tail[0] = Factory` for PS). PROPOSED — needs GLM (writer sets `self_as`) + NV (pipeline embeds PS image). Without it, post-ADR-022 no process can be spawned (launchers can't map).
+- **ADR-023** — **ACCEPTED + kernel-side DONE** (self_as grant + BootInfo offset 20 + §5 rights adjustments; see Requests). Userspace/NV pipeline side per DS's handoff kit.
 
 ## Requests
 
