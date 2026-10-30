@@ -26,8 +26,9 @@ fn panic_exit() -> ! {
 }
 
 #[cfg_attr(test, allow(dead_code))]
-#[cfg_attr(not(test), panic_handler)]
-fn panic(info: &PanicInfo<'_>) -> ! {
+/// The kernel panic policy (ADR-027). Final binaries own the actual
+/// `#[panic_handler]` attribute and delegate here.
+pub fn handle_panic(info: &PanicInfo<'_>) -> ! {
     crate::kerror!("PANIC: {}", info);
     panic_exit();
 }

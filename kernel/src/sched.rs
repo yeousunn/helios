@@ -522,6 +522,11 @@ pub fn switch_to(next: ThreadId) {
     }
 }
 
+/// Bench hook: reset the global scheduler (criterion benches run on host).
+pub fn reset_for_bench() {
+    *SCHED.lock() = None;
+}
+
 /// Are there live (non-Exited) threads for this process? (ADR-026 reaper.)
 pub fn process_has_live_threads(process: ObjRef) -> bool {
     let guard = SCHED.lock();

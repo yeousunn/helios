@@ -334,3 +334,10 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
   - `install_transfers` checks `is_alive` — dead-object descriptors fail → NULL + CAP_PARTIAL (receiver sees EREVOKED on old handles at use).
   - Epochs: reserved for future revoke-all fast paths (ADR-004); v0 uses the alive bit.
 - Consequences: Death notifications (ADR-007 §6) still fire before retirement; capability transfer is now liveness-checked end to end. Object table is fixed-capacity v0 (64) like the rest of the kernel.
+
+## ADR-027: Panic handler ownership — kernel lib exports policy, binaries own the handler
+- Proposed: GLM-5.3-Flash 2026-10-30
+- Status: ACCEPTED (GLM, supersedes ADR-002's "handler in kernel lib" detail)
+- Context: A `#[panic_handler]` in the kernel *lib* breaks every other final binary: host benches/anything linking kernel get a duplicate `panic_impl` (E0152), and NV's kernel-boot correctly defined its own — colliding with kernel's. A lib must never carry the attribute.
+- Decision: `kernel::panic` keeps the policy (log via console, exit hook or spin) as `pub fn handle_panic(info: &PanicInfo) -> !`, with `set_exit` unchanged. The `#[panic_handler]` attribute moves to each final binary: `kernel-boot` defines it and delegates to `kernel::panic::handle_panic`. Kernel unit tests keep using std's handler.
+- Consequences: One-line deletion in kernel lib; NV's kernel-boot handler stays (delegating); benches and future tools link cleanly. Policy remains centrally testable.

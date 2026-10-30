@@ -166,7 +166,7 @@ struct Endpoint {
     receivers: ReceiverQueue,
 }
 
-pub(crate) struct Engine {
+struct Engine {
     endpoints: [Option<Endpoint>; MAX_ENDPOINTS],
 }
 
@@ -257,6 +257,11 @@ impl Delivered {
 /// Read the envelope handed off to `id` by a sender rendezvous.
 pub fn take_delivered(id: ThreadId) -> Option<Envelope> {
     DELIVERED_FOR_REPLY.lock().take(id)
+}
+
+/// Bench hook: clear the engine table (criterion benches run on host).
+pub fn reset_for_bench() {
+    *ENGINE.lock() = None;
 }
 
 /// Test hook: clear the engine + rendezvous table.
