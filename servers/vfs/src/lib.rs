@@ -9,6 +9,7 @@
 pub mod proto;
 pub mod ramfs;
 pub mod runtime;
+pub mod runtime_impl;
 pub mod server;
 
 #[cfg(test)]
