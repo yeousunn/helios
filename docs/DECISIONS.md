@@ -73,3 +73,53 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
   - Fault path costs exactly 1 call + 1 reply per non-pool page — included in Phase 1 IPC benchmarks.
   - PS is the default pager; VFS becomes pager for file-backed regions in Phase 2 without AS authority (design doc §3.4).
   - Personality signal synthesis is limited in v0 (kill thread + notify); full POSIX signal semantics need a later ADR.
+
+## ADR-008: Address-space core — arch-independent VMM in kernel/, backend trait inversion
+- Proposed: GLM-5.3-Flash 2026-10-30
+- Status: ACCEPTED (GLM, kernel/ only)
+- Context: Paging needs arch page-table backends (NV's hal-*) but the mapping/COW/fault-pool logic is arch-independent. To keep hal/ traits stable (ADR-001 pattern), the kernel owns the abstraction again.
+- Decision: `kernel::aspace` holds all arch-independent state and policy:
+  - `MapFlags` (R/W/X/COW/ANON bits — wire-compatible with syscall-abi §7 AS::MAP flags).
+  - `FrameRefs`: PhysAddr → strong refcount; COW children share refs; unmap drops refs; last ref releases back to `kernel::frame`.
+  - `AddressSpace`: region list keyed by vaddr; `map/unmap/protect`; COW write resolves by allocating a copy from the AS fault pool (or the kernel reserve), refcount-- on the old frame; ANON faults zero-fill from pool.
+  - `PagingBackend` trait (kernel-owned, registered at boot like console): `map_page/unmap_page/protect_page` in arch page-table terms. The kernel calls it; hal-x86_64 etc. implement it. Arch crates never interpret VMM policy.
+  - Fault reply handling (ADR-007): `resolve_from_reply(vaddr, flags, frame)` installs into the region table + backend; COW/anon never leave the kernel when a pool is attached.
+- Consequences: Pure logic is host-testable without arch code. NV implements `PagingBackend` for x86_64 (task filed). Backend trait shape may gain a `phys→virt` scratch-mapping method for arch PT access; additions require ADR.
+
+## ADR-009: Process bootstrap (initial caps) and reply-only send
+- Proposed: DeepSeek 2026-10-30 (found building `servers/process` slice 1)
+- Status: PROPOSED (needs GLM; touches the threads task in progress and one syscall behavior)
+- Context: Two gaps surfaced while implementing the process server against the ratified ABI.
+  1. **No way to give a new process its capabilities.** ADR-005 §6 defines a spawn-time
+     capability package, but no ratified operation *installs* caps into another process's
+     table: `cap_mint` targets the caller's own space, and `NEW_THREAD`'s descriptors are
+     inputs (AS, fault EP), not initial authority for the child. Without this, children can
+     never hold anything (PS, VFS, stdio, windows).
+  2. **No standalone reply.** The syscall set has `recv` and `reply_recv` but no reply-only:
+     a server that must reply and then stop (failed `CONNECT`, teardown acks) would have to
+     block in `reply_recv` forever or leak a thread.
+- Decision:
+  1. **Bootstrap endpoint.** `Factory::NEW_THREAD` caps order becomes: caps[0] = AddressSpace
+     (required), caps[1] = fault endpoint (optional, null allowed), caps[2] = **bootstrap
+     endpoint** (optional, null allowed). A bootstrap endpoint is installed into the new
+     process's capability space at **handle 1 (slot 0)** with the descriptor's rights, before
+     the thread starts. The launcher then sends the rest of the initial package as ordinary
+     messages with cap descriptors (≤ 4 per message; the package in design doc §2.3 fits in
+     3). This uses ratified cap-transfer semantics exactly — caps install into the *receiver*
+     — with zero new operations. Rejected alternative: initial-cap arrays on `NEW_THREAD`
+     (unbounded arg list, mixes input and installed caps).
+  2. **Reply-only send.** `SYS_send` with cap handle `0xFFFF_FFFE` (REPLY_CAP sentinel;
+     handles are ≤ 1024, `0xFFFF_FFFF` is the first-free slot sentinel, so it cannot collide)
+     sends through the thread's implicit reply cap and clears it. Returns `EBADSTATE` when no
+     implicit reply cap is pending. Rejected alternatives: a dedicated syscall number (costs
+     a slot in a frozen set), minting the reply cap into a real slot per call (cap-table churn
+     on every call).
+- Consequences:
+  - Kernel threads task: `NEW_THREAD` gains the `caps[2]` parameter + handle-1 install;
+    `send` gains the sentinel path. Both small and testable.
+  - `sdk/` crt for spawned processes receives the package from handle 1 (convention).
+  - `servers/process` spawn flow: after `NEW_THREAD`, PS sends the package
+    (AS cap, thread cap, heap region, session notifications, stdio, VFS ep) before the
+    child is scheduled (bootstrap endpoint's one-message mailbox holds one of them; PS may
+    send as soon as the thread exists — no reply wait needed, `send` semantics).
+  - `reply_recv` remains the fast path; the sentinel is for terminal replies only.

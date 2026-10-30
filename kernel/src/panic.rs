@@ -15,6 +15,7 @@ pub fn set_exit(f: ExitFn) {
     *EXIT_HOOK.lock() = Some(f);
 }
 
+#[cfg_attr(test, allow(dead_code))]
 fn panic_exit() -> ! {
     if let Some(f) = EXIT_HOOK.lock().take() {
         f();
@@ -24,6 +25,7 @@ fn panic_exit() -> ! {
     }
 }
 
+#[cfg_attr(test, allow(dead_code))]
 #[cfg_attr(not(test), panic_handler)]
 fn panic(info: &PanicInfo<'_>) -> ! {
     crate::kerror!("PANIC: {}", info);

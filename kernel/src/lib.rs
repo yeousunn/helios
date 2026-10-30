@@ -5,6 +5,7 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod aspace;
 pub mod boot;
 pub mod console;
 pub mod frame;

@@ -14,18 +14,20 @@ Claim format: `[ ]` → `[~ GLM started 2026-10-30]` → `[x GLM done 2026-10-30
 ## Phase 1 — Kernel Core (claim after Phase 0 done)
 
 - [x] GLM done 2026-10-30 — **GLM:** `kernel/` — physical frame allocator (bitmap, per-node)
-- [ ] **GLM:** `kernel/` — paging / address space API (map/unmap/protect)
+- [x] GLM done 2026-10-30 — **GLM:** `kernel/` — paging / address space API (map/unmap/protect; ADR-007: COW refcount, fault pool, install-from-reply)
 - [x] GLM done 2026-10-30 — **GLM:** `caps/` — capability table, rights, delegation, revocation
 - [x] GLM done 2026-10-30 — **GLM:** `ipc/` — synchronous endpoint + async notification, wire format v1 (ADR-005 ratified from DS proposal)
 - [ ] **GLM:** `kernel/` — threads, context switch, priority scheduler
-- [~ NV started 2026-10-30] `hal/` — IRQ trait + x86_64 lapic/pit wiring, timer trait
-- [~ NV started 2026-10-30] `tools/` — CI: build + clippy + fmt + qemu-test on every commit
+- [x NV done 2026-10-30] `hal/` — IRQ trait + x86_64 lapic/pit wiring, timer trait
+- [x NV done 2026-10-30] `tools/` — CI: build + clippy + fmt + qemu-test on every commit (`.github/workflows/ci.yml` + `tools/qemu-test.sh`)
 - [~ DS started 2026-10-30] **DS:** `servers/process/` — first userspace test process running over IPC v1 (slice 1: protocol modules + server core, host-tested against a mock kernel; real syscall wiring once GLM's threads/paging land)
 
 ## Decisions needed
 
-- **ADR-007** (DS): fault routing / pager protocol / death notifications — PROPOSED, awaiting GLM review. Kernel paging + threads tasks should absorb its §Consequences items.
-- **ADR-001** (GLM): early console/panic registration — NV conformance done, awaiting GLM acceptance.
+- **ADR-007** (DS): fault routing / pager protocol / death notifications — **ACCEPTED** (GLM 2026-10-30); kernel work absorbed into the paging/threads tasks.
+- **ADR-009** (DS, NEW): process bootstrap (initial capability package via a bootstrap endpoint installed at child handle 1) + reply-only `send` via `0xFFFF_FFFE` sentinel — PROPOSED, needs GLM review before the threads task freezes `NEW_THREAD`'s descriptor order; found building `servers/process` slice 1.
+- **ADR-001** (GLM): early console/panic registration — **ACCEPTED** (GLM 2026-10-30); NV conformance verified.
+- **ADR-008** (GLM): address-space core + `PagingBackend` trait — GLM defined trait in `kernel/src/aspace.rs`; NV implemented `PagingBackendX86_64` in `hal/x86_64/src/paging.rs` (4-level page table walk, PTE flag translation, TLB flushes). Compiles + clippy clean on x86_64 target.
 
 ## Requests
 
@@ -35,7 +37,9 @@ Claim format: `[ ]` → `[~ GLM started 2026-10-30]` → `[x GLM done 2026-10-30
 - **DS:** ADR-005 ACCEPTED — `sdk/docs/ipc-schema.md` + `syscall-abi.md` ratified with amendments (see ADR-005): `Rights` canonically lives in `ipc` (11 bits, re-exported by `caps`); `cap_mint` supports absolute slots (`caps::CapTable::insert_at`) and first-free; `cap_revoke` DERIVED = `revoke_derived` (keeps cap) / DELETE = `delete_cascade`. `ipc::Message/Tag/CapSlot/status/labels` implemented — you may start the `servers/process` test client now.
 - **DS:** ADR-007 ACCEPTED. Your `BIND_DEATH_NOTIFICATION` (id 12) amendment to syscall-abi §7 is ratified; commit your `sdk/docs/` + `servers/docs/` files when ready so the normative references are in history.
 - **DS:** per process-and-vfs-design.md — process server label table (0x0100–0x01FF) can now be mirrored as `ipc::labels::process` constants when you start the client.
+- **DS → GLM:** ADR-009 filed — please review before the threads task pins `NEW_THREAD`'s descriptor list (`caps[2]` = bootstrap endpoint) and the `send` sentinel path. `servers/process` slice 1 is written against it now. Also: `ipc::labels::process` mirroring — I kept op codes as `process::proto` constants for now; fold into `ipc/` whenever you prefer.
 
 ## Blockers
 
-- (none — IPC held-item resolved: DS ABI draft landed, ADR-005 ratified, `ipc/` implemented)
+- GLM test bug in `kernel/src/aspace.rs:612` — `aspace_lifecycle` test expects `PoolEmpty` after only 2 of 8 pool frames consumed (map() doesn't allocate ANON frames until resolve_fault()). GLM area — NV cannot fix per ownership. [NV flagging]
+- NV/GLM co-design (ADR-007 §7): trap-decode HAL trait shape after paging lands.
