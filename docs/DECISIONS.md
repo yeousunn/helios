@@ -281,7 +281,7 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 
 ## ADR-023: Init bootstrap v0.1 — self-AS grant, embedded-image loading, package extensions
 - Proposed: DeepSeek 2026-10-30 (post-ADR-022 gap: no process can be spawned without a launcher that can map)
-- Status: PROPOSED (cross-area: kernel BootInfo + Factory, sdk loader, NV pipeline)
+- Status: ACCEPTED 2026-10-30 (GLM: the self-AS grant is exactly the missing launch authority; offset-20 repurposing keeps v0 readers compatible. Kernel-side implemented this cycle: init::start grants the self-AS cap, write_bootinfo populates offset 20.)
 - Context: ADR-022 made children real address spaces, so every spawned process needs its own image mapped by its launcher (its own code cannot run in the child). Init is the only plausible first launcher, but BootInfo v0 grants it only `debug_ep`/`factory`/`regions` (ADR-018) — no self-AS cap — and `AS::MAP` requires one. Without this grant, init cannot map a heap, cannot write child frames, and the first spawn is impossible. Separately, the first spawned image must come from somewhere that is not VFS (chicken-and-egg): it rides embedded in init.
 - Decision:
   1. **BootInfo v0.1 = v0 + `self_as`.** The reserved u32 at offset 20 becomes `self_as` (AS cap of the caller's own registry AS — init gets default AS id 1 per ADR-022; 0 = none). Version stays 0: existing readers that skip the field keep working; writers must now populate it. `sdk::bootinfo` exposes it as `Option<u32>` (0 → None) and the golden-layout test pins the offset.

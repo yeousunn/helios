@@ -29,6 +29,9 @@ pub struct BootRegion {
 pub struct BootInfoV0 {
     pub debug_ep: u32,
     pub factory: u32,
+    /// ADR-023 §1: the caller's own AS cap handle (0 = none). Occupies the
+    /// formerly-reserved u32 at offset 20.
+    pub self_as: u32,
     /// (handle, base, len) triples, in grant order.
     pub regions: [(u32, u64, u64); MAX_BOOT_REGIONS],
     pub region_count: u32,
@@ -60,7 +63,7 @@ pub fn write_bootinfo(buf: &mut [u8], info: &BootInfoV0) -> usize {
     w(8, info.debug_ep as u64, 4);
     w(12, info.factory as u64, 4);
     w(16, count as u64, 4);
-    w(20, 0, 4);
+    w(20, info.self_as as u64, 4);
     for (i, &(handle, base, len)) in info.regions[..count].iter().enumerate() {
         let off = 24 + i * 24;
         w(off, handle as u64, 4);
@@ -117,6 +120,7 @@ pub fn start(regions: &[BootRegion]) -> Result<InitLaunch, &'static str> {
     let mut info = BootInfoV0 {
         debug_ep,
         factory,
+        self_as: 0,
         regions: [(0, 0, 0); MAX_BOOT_REGIONS],
         region_count: regions.len() as u32,
     };
@@ -134,6 +138,21 @@ pub fn start(regions: &[BootRegion]) -> Result<InitLaunch, &'static str> {
         info.regions[i] = (handle, r.base.as_u64(), r.len);
         REGIONS.lock().add(region_id, r.base.as_u64(), r.len);
     }
+
+    // ADR-023 §1: grant init its own AS (the default AS) so it can map
+    // heaps/stacks/child images. Ensure the default AS exists.
+    let _ = crate::aspace::init_default();
+    let self_as = proc::install_cap(
+        pid,
+        Capability {
+            obj: crate::aspace::DEFAULT_AS,
+            typ: ObjType::AddressSpace,
+            rights: Rights::MAP.union(Rights::GRANT),
+        },
+    )
+    .map_err(|_| "cannot grant self-AS")?;
+    proc::set_as(pid, crate::aspace::DEFAULT_AS).map_err(|_| "cannot link init AS")?;
+    info.self_as = self_as;
 
     let thread = sched::spawn(ObjRef(pid.0), sched::DEFAULT_PRIORITY)
         .map_err(|_| "cannot spawn init thread")?;
@@ -289,7 +308,22 @@ mod tests {
         fn start_first(&self, _t: ThreadId) {}
     }
 
+    struct BootFactory;
+    impl crate::aspace::BackendFactory for BootFactory {
+        fn create(&self, _id: u64) -> Option<&'static dyn crate::aspace::PagingBackend> {
+            Some(&BootBackend)
+        }
+    }
+
+    struct BootBackend;
+    impl crate::aspace::PagingBackend for BootBackend {
+        fn map_page(&self, _v: crate::aspace::Vaddr, _p: PhysAddr, _f: crate::aspace::MapFlags) {}
+        fn unmap_page(&self, _v: crate::aspace::Vaddr) {}
+        fn protect_page(&self, _v: crate::aspace::Vaddr, _f: crate::aspace::MapFlags) {}
+    }
+
     fn setup() {
+        crate::aspace::set_backend_factory(&BootFactory);
         proc::reset_for_test();
         crate::endpoint::reset_engine_for_test();
         crate::notification::reset_for_test();
@@ -315,6 +349,7 @@ mod tests {
         let info = BootInfoV0 {
             debug_ep: 2,
             factory: 3,
+            self_as: 9,
             regions,
             region_count: 2,
         };
@@ -331,6 +366,7 @@ mod tests {
         assert_eq!(rd32(8), 2);
         assert_eq!(rd32(12), 3);
         assert_eq!(rd32(16), 2);
+        assert_eq!(rd32(20), 9, "self_as at offset 20 (ADR-023)");
         assert_eq!(rd32(24), 4);
         // base/len are u64 fields.
         let base0 = u64::from_le_bytes(buf[32..40].try_into().unwrap());
@@ -346,6 +382,7 @@ mod tests {
         let info = BootInfoV0 {
             debug_ep: 0,
             factory: 0,
+            self_as: 0,
             regions: [(0, 0, 0); MAX_BOOT_REGIONS],
             region_count: 0,
         };
