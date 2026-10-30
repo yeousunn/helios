@@ -483,6 +483,11 @@ pub fn sys_exit(tid: ThreadId, status: i32) -> SysResult<bool> {
         }
         let _ = proc::destroy(pid);
     }
+    // ADR-028: the last live user thread is gone → deterministic clean halt
+    // (QEMU exit code 0) so harnesses observe a fixed success state.
+    if sched::thread_count() == 0 && crate::panic::has_exit_hook() {
+        crate::panic::clean_exit();
+    }
     Ok(fired)
 }
 
@@ -890,5 +895,31 @@ mod tests {
             Err(ipc::status::EBADCAP),
             "dead endpoint cap refuses send"
         );
+    }
+    #[test]
+    fn last_thread_exit_clean_halts() {
+        use std::string::{String, ToString};
+        // ADR-028: when the final user thread exits, the kernel clean-halts
+        // via the registered code hook (QEMU exit code 0, ADR-013).
+        let (_pid, _server, client, _ep) = setup();
+        // Register a code hook that panics so the test can observe the call.
+        crate::panic::set_exit_code(|code| {
+            std::panic::panic_any(format_args!("CLEAN_EXIT_{}", code).to_string());
+        });
+        // Exit both threads of the only live process; the last one halts.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = sys_exit(_server, 0);
+            let _ = sys_exit(client, 0);
+        }));
+        match result {
+            Err(payload) => {
+                let msg = payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .unwrap_or_default();
+                assert_eq!(msg, "CLEAN_EXIT_0", "clean halt must use code 0");
+            }
+            Ok(_) => panic!("expected clean halt"),
+        }
     }
 }

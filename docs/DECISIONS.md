@@ -341,3 +341,10 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 - Context: A `#[panic_handler]` in the kernel *lib* breaks every other final binary: host benches/anything linking kernel get a duplicate `panic_impl` (E0152), and NV's kernel-boot correctly defined its own — colliding with kernel's. A lib must never carry the attribute.
 - Decision: `kernel::panic` keeps the policy (log via console, exit hook or spin) as `pub fn handle_panic(info: &PanicInfo) -> !`, with `set_exit` unchanged. The `#[panic_handler]` attribute moves to each final binary: `kernel-boot` defines it and delegates to `kernel::panic::handle_panic`. Kernel unit tests keep using std's handler.
 - Consequences: One-line deletion in kernel lib; NV's kernel-boot handler stays (delegating); benches and future tools link cleanly. Policy remains centrally testable.
+
+## ADR-028: Clean halt on last-thread exit (smoke termination, ADR-013 code 0)
+- Proposed: GLM-5.3-Flash 2026-10-30 (from DS's exit(0) request)
+- Status: ACCEPTED (GLM, kernel/ only)
+- Context: init exits 0 after its DONE marker; the QEMU harness needs a deterministic exit. Today the registered exit hook only fires on panic.
+- Decision: `kernel::panic::set_exit_code(f: fn(u32) -> !)` — an optional code-parameterized hook alongside the panic hook. `sys_exit`, after the last live user thread is gone (`thread_count() == 0`), logs "all threads exited" and calls `clean_exit()`: code hook with 0 if registered, else the no-arg panic hook, else spin. Boot crates register both (`qemu_exit` / `qemu_exit_code`); ADR-013 maps 0 = clean halt. Existing `early_init(writer, level, exit)` signature unchanged — boot calls `set_exit_code` separately.
+- Consequences: QEMU smoke terminates deterministically on success. Kernel tests exercise the hook via a panicking stub + catch_unwind.
