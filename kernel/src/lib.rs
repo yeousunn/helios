@@ -10,6 +10,7 @@ pub mod boot;
 pub mod console;
 pub mod endpoint;
 pub mod entry;
+pub mod fault;
 pub mod frame;
 pub mod init;
 pub mod notification;

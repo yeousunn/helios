@@ -439,12 +439,61 @@ pub fn translate(vaddr: Vaddr) -> Result<(PhysAddr, MapFlags), VmmError> {
     vmm_err(VmmError::NotFound)
 }
 
+/// Install a mapping from a pager's FAULT_RESOLVE reply (ADR-007 §2): the
+/// kernel installs from the reply — the resolver needs no AS authority.
+/// If a region already covers `vaddr`, this sets a per-page frame override;
+/// otherwise it creates a one-page region. Returns previous coverage.
+pub fn install_from_reply(
+    vaddr: Vaddr,
+    frame_addr: PhysAddr,
+    flags: MapFlags,
+) -> Result<bool, VmmError> {
+    if !vaddr.is_page_aligned() || !frame_addr.is_frame_aligned() {
+        return vmm_err(VmmError::BadVaddr);
+    }
+    let mut guard = VMM.lock();
+    let as_state = guard.as_mut().ok_or(VmmError::NoBackend)?;
+    let idx = vaddr.page_index();
+    FRAME_REFS.lock().acquire(frame_addr);
+    let covered = as_state.regions.iter().flatten().any(|m| m.contains(vaddr));
+    if covered {
+        // Per-page override (same mechanism as resolved ANON/COW pages).
+        let slot_pf = as_state
+            .page_frames
+            .iter()
+            .position(|(p, _)| *p == 0 || *p == idx)
+            .ok_or(VmmError::Overlap)?;
+        as_state.page_frames[slot_pf] = (idx, frame_addr);
+    } else {
+        let slot = as_state
+            .regions
+            .iter_mut()
+            .position(|r| r.is_none())
+            .ok_or(VmmError::Overlap)?;
+        as_state.regions[slot] = Some(Mapping {
+            vaddr,
+            pages: 1,
+            base: None,
+            flags,
+        });
+        let slot_pf = as_state
+            .page_frames
+            .iter()
+            .position(|(p, _)| *p == 0)
+            .ok_or(VmmError::Overlap)?;
+        as_state.page_frames[slot_pf] = (idx, frame_addr);
+    }
+    with_backend(|be| be.map_page(vaddr, frame_addr, flags), ());
+    Ok(covered)
+}
+
 /// Handle a page fault (ADR-007 §4, §9):
 /// - ANON region → zero-frame from pool (pool required);
 /// - COW write → copy page from pool, remap writable, old ref dropped;
 /// - otherwise → `NoPool`/`NoWritePerm` meaning "raise FAULT_PAGE to the
 ///   fault endpoint" (the caller decides; kernel syscall layer routes).
-///   Returns the frame now backing the page.
+///
+/// Returns the frame now backing the page.
 pub fn resolve_fault(vaddr: Vaddr, write: bool) -> Result<PhysAddr, VmmError> {
     if !vaddr.is_page_aligned() {
         return vmm_err(VmmError::BadVaddr);
@@ -523,6 +572,12 @@ pub fn resolve_fault(vaddr: Vaddr, write: bool) -> Result<PhysAddr, VmmError> {
         return vmm_err(VmmError::NoWritePerm);
     }
     m.base.ok_or(VmmError::NotMapped)
+}
+
+#[cfg(test)]
+pub(crate) fn vmm_for_test() -> spin::MutexGuard<'static, Option<AddressSpace>> {
+    *VMM.lock() = None;
+    VMM.lock()
 }
 
 #[cfg(test)]

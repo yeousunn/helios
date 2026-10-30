@@ -244,6 +244,7 @@ pub fn debug_ep_send(msg: &Message) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frame;
     use crate::syscall;
 
     struct TestCtx;
@@ -376,12 +377,19 @@ mod tests {
             Err(ipc::status::EBADARG)
         );
         // Exhaustion → ENOMEM (region is 0x40000 = 64 frames; 3 carved).
+        let mut carved: std::vec::Vec<u64> = std::vec::Vec::new();
         loop {
             match region_carve(launch.pid, ObjId(0x100), frame::FRAME_SIZE as u64, 0) {
-                Ok(_) => {}
+                Ok(h) => carved.push(proc::get_cap(launch.pid, h).unwrap().obj.0),
                 Err(ipc::status::ENOMEM) => break,
                 Err(e) => panic!("unexpected {e}"),
             }
+        }
+        // Leave the allocator fully free for subsequent tests.
+        carved.push(a1);
+        carved.push(a2);
+        for addr in carved {
+            let _ = frame::free(PhysAddr::new(addr));
         }
     }
 }
