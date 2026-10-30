@@ -9,8 +9,9 @@
 //!   through scratch [`MappedWindow`]s. Invoke shapes are mock-tested; only
 //!   the byte copies touch real memory.
 //!
-//! v0 constraints: `ET_EXEC`, page-aligned segment vaddrs (linker scripts do
-//! this), 4 KiB pages.
+//! v0 constraints: `ET_EXEC`, 4 KiB pages, and segments obeying the ELF ABI's
+//! `p_vaddr ≡ p_offset (mod PAGE)` congruence (linkers guarantee this; the
+//! loader page-splits segments, so unaligned segment vaddrs are fine).
 
 use alloc::vec::Vec;
 
@@ -63,10 +64,6 @@ pub enum LoadOp {
     AnonMap { vaddr: u64, pages: u64, flags: u32 },
 }
 
-fn pages_of(bytes: u64) -> u64 {
-    bytes.div_ceil(PAGE)
-}
-
 /// Build the op list for `image`, mapping into a child AS and using scratch
 /// VAs from `scratch_base` upward.
 pub fn plan(image: &ElfImage, scratch_base: u64) -> Result<Vec<LoadOp>, Status> {
@@ -74,9 +71,6 @@ pub fn plan(image: &ElfImage, scratch_base: u64) -> Result<Vec<LoadOp>, Status> 
     let mut scratch = scratch_base;
     for i in 0..image.segment_count {
         let seg = image.segment(i).ok_or(status::EBADARG)?;
-        if !seg.vaddr.is_multiple_of(PAGE) {
-            return Err(status::EBADARG);
-        }
         plan_segment(&seg, &mut scratch, &mut ops)?;
     }
     if ops.is_empty() {
@@ -85,15 +79,36 @@ pub fn plan(image: &ElfImage, scratch_base: u64) -> Result<Vec<LoadOp>, Status> 
     Ok(ops)
 }
 
+/// Plan one PT_LOAD segment, page-splitting like a real loader. Segment
+/// vaddrs are not required to be page-aligned; the ELF ABI only requires
+/// `vaddr ≡ offset (mod PAGE)` so aligned pages can be backed by file bytes.
 fn plan_segment(seg: &ElfSegment, scratch: &mut u64, ops: &mut Vec<LoadOp>) -> Result<(), Status> {
-    let file_pages = pages_of(seg.filesz);
-    let mem_pages = pages_of(seg.memsz);
+    if (seg.vaddr & (PAGE - 1)) != (seg.offset & (PAGE - 1)) {
+        return Err(status::EBADARG);
+    }
+    let first_page = seg.vaddr & !(PAGE - 1);
+    let intra = seg.vaddr - first_page;
+    let file_pages = if seg.filesz == 0 {
+        0
+    } else {
+        (intra + seg.filesz).div_ceil(PAGE)
+    };
+    let total_pages = (intra + seg.memsz).div_ceil(PAGE);
 
-    for page in 0..file_pages {
-        let src_off = seg.offset + page * PAGE;
-        let page_vaddr = seg.vaddr + page * PAGE;
-        let remaining = seg.filesz - page * PAGE;
-        let copy_len = remaining.min(PAGE) as u32;
+    let mut copied = 0u64;
+    let mut page = 0u64;
+    while page < total_pages {
+        if page >= file_pages {
+            ops.push(LoadOp::AnonMap {
+                vaddr: first_page + page * PAGE,
+                pages: total_pages - page,
+                flags: seg.flags,
+            });
+            break;
+        }
+        let page_vaddr = first_page + page * PAGE;
+        let copy_start = if page == 0 { intra } else { 0 };
+        let want = (PAGE - copy_start).min(seg.filesz - copied);
 
         ops.push(LoadOp::CarvePage);
         ops.push(LoadOp::MapFrame {
@@ -106,30 +121,34 @@ fn plan_segment(seg: &ElfSegment, scratch: &mut u64, ops: &mut Vec<LoadOp>) -> R
             vaddr: *scratch,
             flags: SCRATCH_FLAGS,
         });
-        if copy_len > 0 {
-            ops.push(LoadOp::Copy {
-                scratch_vaddr: *scratch,
-                src_off,
-                len: copy_len,
-            });
-        }
-        if copy_len < PAGE as u32 {
+        if copy_start > 0 {
+            // Bytes before the segment start in its first page (only when the
+            // link script left the page partly unused) must be zero.
             ops.push(LoadOp::ZeroFill {
                 scratch_vaddr: *scratch,
-                offset: copy_len,
-                len: PAGE as u32 - copy_len,
+                offset: 0,
+                len: copy_start as u32,
+            });
+        }
+        if want > 0 {
+            ops.push(LoadOp::Copy {
+                scratch_vaddr: *scratch,
+                src_off: seg.offset + copied,
+                len: want as u32,
+            });
+            copied += want;
+        }
+        let used = copy_start + want;
+        if used < PAGE {
+            ops.push(LoadOp::ZeroFill {
+                scratch_vaddr: *scratch,
+                offset: used as u32,
+                len: (PAGE - used) as u32,
             });
         }
         ops.push(LoadOp::UnmapScratch { vaddr: *scratch });
         *scratch += PAGE;
-    }
-
-    if mem_pages > file_pages {
-        ops.push(LoadOp::AnonMap {
-            vaddr: seg.vaddr + file_pages * PAGE,
-            pages: mem_pages - file_pages,
-            flags: seg.flags,
-        });
+        page += 1;
     }
     Ok(())
 }
@@ -399,10 +418,67 @@ mod tests {
     }
 
     #[test]
-    fn plan_rejects_unaligned_vaddr() {
+    fn plan_rejects_incongruent_segment() {
+        // vaddr 0x10_0800 with file offset 0 violates vaddr ≡ offset (mod 4096).
         let img = build_elf(&[(5, 0, 0x10_0800, 0x100, 0x100)], 0x10_0800);
         let elf = ElfImage::parse(&img).unwrap();
         assert_eq!(plan(&elf, 0x7000), Err(status::EBADARG));
+    }
+
+    #[test]
+    fn plan_handles_congruent_unaligned_segments() {
+        // Typical rust-lld layout: vaddr 0x201540, offset 0x540.
+        let img = build_elf(&[(5, 0x540, 0x201_540, 0x116f, 0x1200)], 0x201_540);
+        let elf = ElfImage::parse(&img).unwrap();
+        let ops = plan(&elf, 0x7000).unwrap();
+
+        // First page maps at 0x201000; zero-fill before the segment start,
+        // then copy the leading chunk from file offset 0x540.
+        assert_eq!(
+            ops[0..3],
+            [
+                LoadOp::CarvePage,
+                LoadOp::MapFrame {
+                    target: AsChoice::Child,
+                    vaddr: 0x201_000,
+                    flags: 5
+                },
+                LoadOp::MapFrame {
+                    target: AsChoice::SelfScratch,
+                    vaddr: 0x7000,
+                    flags: SCRATCH_FLAGS
+                },
+            ]
+        );
+        assert!(ops.contains(&LoadOp::ZeroFill {
+            scratch_vaddr: 0x7000,
+            offset: 0,
+            len: 0x540
+        }));
+        assert!(ops.contains(&LoadOp::Copy {
+            scratch_vaddr: 0x7000,
+            src_off: 0x540,
+            len: 0x1000 - 0x540
+        }));
+        // The segment's bytes are contiguous in the image: page 1 copies from
+        // file offset 0x1000 (= 0x540 + 0xAC0 copied on page 0), 0x6AF bytes,
+        // and zero-fills the rest of the page.
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            LoadOp::Copy {
+                src_off: 0x1000,
+                len: 0x6AF,
+                scratch_vaddr: 0x8000
+            }
+        )));
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            LoadOp::ZeroFill {
+                scratch_vaddr: 0x8000,
+                offset: 0x6AF,
+                len: 0x951
+            }
+        )));
     }
 
     #[test]
