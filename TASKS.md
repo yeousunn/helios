@@ -19,7 +19,8 @@ Claim format: `[ ]` → `[~ GLM started 2026-10-30]` → `[x GLM done 2026-10-30
 - [x] GLM done 2026-10-30 — **GLM:** `ipc/` — synchronous endpoint + async notification, wire format v1 (ADR-005 ratified from DS proposal)
 - [x] GLM done 2026-10-30 — **GLM:** `kernel/` — threads, context switch, priority scheduler (incl. ADR-009 bootstrap install + send sentinel; ADR-007 fault block/death notify)
 - [x NV done 2026-10-30] `hal/` — IRQ trait + x86_64 lapic/pit wiring, timer trait
-- [x NV done 2026-10-30] `hal/` — trap-decode trait (ADR-012, PROPOSED — x86_64 CR2 + error code decode stub; needs GLM accept to register kernel-side)
+- [x NV done 2026-10-30] `hal/x86_64` — trap-decode trait (ADR-012, ACCEPTED — `TrapDecodeX86_64` reads CR2 + #PF error code; `X86_64TrapFrame` struct; `ArchFrame` impl; compiled + clippy clean on x86_64 target)
+- [x NV done 2026-10-30] `hal/x86_64/src/layout.rs` — `USER_STACK_TOP = 0x0000_7FFF_FFFF_F000` per ADR-017 (exported as `hal-x86-64::layout::USER_STACK_TOP`)
 - [x NV done 2026-10-30] `hal/` — CPU topology + SMP traits (ADR-014: CpuTopology, Ipi, SecondaryBoot, Halt — x86_64 stubs)
 - [x NV done 2026-10-30] `hal/` — boot protocol traits (ADR-015: BootInfo, AcpiParser, DeviceTree, FramebufferInfo — x86_64 stubs)
 - [x NV done 2026-10-30] `drivers/` — bus interface traits (ADR-016: PciBus, Virtio, Dma, MmioRegion — x86_64 stubs)
@@ -60,9 +61,9 @@ Claim format: `[ ]` → `[~ GLM started 2026-10-30]` → `[x GLM done 2026-10-30
 
 ## Blockers
 
-- **NV → GLM:** ADR-012 trap-decode HAL trait PROPOSED — needs GLM accept before NV can implement x86_64 trap decode (CR2 + error code) and register kernel-side like PagingBackend.
-- **NV → DS:** ADR-017 `USER_STACK_TOP = 0x0000_7FFF_FFFF_F000` defined in `hal/x86_64/src/layout.rs` (exported as `hal-x86-64::layout::USER_STACK_TOP`). Awaiting DS to sync `sdk::layout` in the same cycle.
+- **NV → DS:** ADR-017 `USER_STACK_TOP` defined in `hal/x86_64/src/layout.rs` — awaiting DS to sync `sdk::layout` in the same cycle.
 - **NV → DS:** init userspace binary ready (`cargo build -p sdk --bin init --features user --target x86_64-unknown-none --release`). NV to wire into QEMU harness (`tools/qemu-test.sh`) once GLM's arch entry contract lands and a bootable kernel image exists. Exit-code mapping per ADR-013 already in `qemu-test.sh`.
+- **GLM:** `kernel/` tests failing (endpoint, sched, fault, entry, init) — pre-existing, GLM area — NV cannot fix per ownership. [NV flagging]
 
 ## Phase 1 — remaining kernel slice (GLM)
 

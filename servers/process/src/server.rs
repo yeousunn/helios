@@ -891,6 +891,47 @@ mod tests {
     }
 
     #[test]
+    fn hostile_messages_never_panic_and_always_reply() {
+        // PLAN §6 spirit: arbitrary bytes over IPC must never take a server
+        // down. Random labels, cap counts, descriptors, and words — every
+        // request must produce a reply (or a legitimate park), never a panic.
+        let mut s = server();
+        let mut w = MockWindows::default();
+        let (_, ep) = s.connect(&connect_req()).unwrap();
+
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        for i in 0..1000usize {
+            let cap = if i % 5 == 0 { next() as u32 } else { ep };
+            let mut m = Message::new(next() as u16);
+            if i % 2 == 0 {
+                m.tag = m.tag.with_caps((next() % 6) as u8);
+            } else {
+                m.tag = ipc::Tag(next());
+            }
+            m.words = [next(), next(), next(), next()];
+            s.transport.incoming.push_back((cap, m));
+
+            let before = s.transport.replies.len();
+            let outcome = s
+                .serve_one(cap, &mut w)
+                .unwrap_or_else(|e| panic!("iteration {i} returned Err({e})"));
+            if outcome == Next::Continue {
+                assert!(
+                    s.transport.replies.len() > before,
+                    "iteration {i}: Continue without a reply"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn mock_incoming_is_fifo_per_cap() {
         let mut t = MockTransport {
             incoming: VecDeque::from(vec![

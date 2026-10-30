@@ -982,6 +982,48 @@ mod tests {
     }
 
     #[test]
+    fn hostile_messages_never_panic_and_always_reply() {
+        // PLAN §6 spirit: arbitrary bytes over IPC must never take the server
+        // down. Random labels, cap counts, descriptors, and words on both the
+        // service endpoint and a live connection.
+        let mut s = server();
+        let mut w = MockWindows::default();
+        let (ep, _root) = connect(&mut s, &mut w);
+
+        let mut seed = 0xD1B5_4A32_D192_ED03u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        for i in 0..1000usize {
+            let cap = match i % 4 {
+                0 => 8,             // service endpoint
+                1 => ep,            // live connection
+                _ => next() as u32, // never-seen caps
+            };
+            let mut m = Message::new(next() as u16);
+            if i % 2 == 0 {
+                m.tag = m.tag.with_caps((next() % 6) as u8);
+            } else {
+                m.tag = ipc::Tag(next());
+            }
+            m.words = [next(), next(), next(), next()];
+            s.transport.incoming.push_back((cap, m));
+
+            let before = s.transport.replies.len();
+            s.serve_one(cap, &mut w)
+                .unwrap_or_else(|e| panic!("iteration {i} returned Err({e})"));
+            assert!(
+                s.transport.replies.len() > before,
+                "iteration {i}: no reply"
+            );
+        }
+    }
+
+    #[test]
     fn rename_via_protocol_and_disconnect_closes_handles() {
         let mut s = server();
         let mut w = MockWindows::default();
