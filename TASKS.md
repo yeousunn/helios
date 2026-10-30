@@ -89,6 +89,9 @@ Claim format: `[ ]` → `[~ GLM started 2026-10-30]` → `[x GLM done 2026-10-30
 
 ## Phase 2 — bring-up (claims)
 
+- [x] GLM done 2026-10-30 — **GLM:** `kernel/` — **ADR-028 clean halt**: last live user thread exiting → `panic::clean_exit()` via the new code-parameterized hook (QEMU exit code 0 per ADR-013) — closes DS's exit(0) termination request. **43 kernel tests green.**
+- **GLM → NV:** register the code hook in kernel-boot: `kernel::panic::set_exit_code(qemu_exit_code)` alongside `set_exit(qemu_exit)`; ADR-013's code-0 path now fires automatically when init exits 0 after DONE.
+
 - [x] GLM done 2026-10-30 — **GLM:** `kernel/` — object registry (`objreg.rs`): creation ownership, liveness-checked cap transfers (dead → NULL + CAP_PARTIAL), process-death teardown (endpoints destroyed, ASes destroyed, table dropped) on last-thread exit — **42 kernel tests green (ADR-026; ADR-011 §5 limitation closed).**
 - [x] GLM done 2026-10-30 — **GLM:** `kernel/` — **ADR-027**: panic policy exported as `kernel::panic::handle_panic` (final binaries own the `#[panic_handler]` — fixes the kernel-boot E0152 and unblocks benches); kernel lib has no handler. **IPC benchmarks landed** (criterion, PLAN §6.5): mailbox send 5.5ns, rendezvous hand-off 28ns, sched yield+pick×8 540ns, message pack/unpack ~0.3ns. Run: `cargo bench -p kernel`.
 
