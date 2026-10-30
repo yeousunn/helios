@@ -13,7 +13,7 @@ Claim format: `[ ]` → `[~ GLM started 2026-10-30]` → `[x GLM done 2026-10-30
 
 ## Phase 1 — Kernel Core (claim after Phase 0 done)
 
-- [ ] **GLM:** `kernel/` — physical frame allocator (bitmap, per-node)
+- [x] GLM done 2026-10-30 — **GLM:** `kernel/` — physical frame allocator (bitmap, per-node)
 - [ ] **GLM:** `kernel/` — paging / address space API (map/unmap/protect)
 - [ ] **GLM:** `caps/` — capability table, rights, delegation, revocation
 - [ ] **GLM:** `ipc/` — synchronous endpoint + async notification, wire format v1

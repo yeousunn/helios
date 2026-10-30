@@ -7,6 +7,7 @@
 
 pub mod boot;
 pub mod console;
+pub mod frame;
 pub mod panic;
 
 #[cfg(test)]

@@ -127,22 +127,19 @@ mod tests {
     }
 
     #[test]
-    fn logs_respect_level_filter() {
+    fn console_behaviour() {
         super::init(capture, Level::Warn);
         crate::kinfo!("hidden");
         assert_eq!(*LAST.lock(), "");
         crate::kwarn!("shown");
         assert_eq!(*LAST.lock(), "W: shown\n");
-    }
 
-    #[test]
-    fn long_output_is_truncated_at_char_boundary() {
+        // Truncation at buffer end stays valid UTF-8.
         super::init(capture, Level::Info);
         crate::kinfo!("{}", "é".repeat(600));
         let out = *LAST.lock();
         assert!(out.len() <= 512);
         assert!(out.starts_with("I: "));
-        // Must be valid UTF-8 (as_str walks back to a char boundary).
         assert!(std::str::from_utf8(out.as_bytes()).is_ok());
     }
 }
