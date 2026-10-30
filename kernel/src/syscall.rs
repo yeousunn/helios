@@ -73,6 +73,14 @@ fn clear_reply(callee: ThreadId) {
     }
 }
 
+/// Test hook: clear all implicit reply state.
+#[cfg(test)]
+pub(crate) fn reset_reply_for_test() {
+    *REPLY.lock() = ReplyState {
+        who: [const { None }; 64],
+    };
+}
+
 /// Resolve outgoing descriptors against the sender's table (ADR-011 §1).
 /// Returns the envelope with pending installs, or the count of failed
 /// descriptors (those become FLAG_CAP_PARTIAL and null words on delivery).

@@ -18,6 +18,7 @@ pub struct ObjId(pub u64);
 /// The kind of object a capability grants authority over.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ObjType {
+    Factory,
     Endpoint,
     Notification,
     AddressSpace,

@@ -9,6 +9,7 @@ pub mod aspace;
 pub mod boot;
 pub mod console;
 pub mod endpoint;
+pub mod entry;
 pub mod frame;
 pub mod notification;
 pub mod panic;

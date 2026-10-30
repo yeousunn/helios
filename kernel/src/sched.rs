@@ -138,6 +138,9 @@ pub(crate) static SCHED: Mutex<Option<Sched>> = Mutex::new(None);
 
 pub const IDLE: ThreadId = ThreadId(0);
 
+/// Scheduler default priority (ADR-010/ADR-017 §3).
+pub const DEFAULT_PRIORITY: u8 = 100;
+
 /// Initialize the scheduler. Call once from boot.
 pub fn init() -> SchedResult<()> {
     let mut guard = SCHED.lock();
