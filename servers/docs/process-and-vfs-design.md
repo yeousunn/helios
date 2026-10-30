@@ -90,8 +90,8 @@ concretized:
 | stdio endpoints x3 | in: `RECV`; out: `SEND` | console or pipes (caller-supplied) |
 | VFS service endpoint | `SEND|GRANT` | filesystem access |
 | session notifications (4) | `SIGNAL|RECV|GRANT` | grant one per server connection (§1.5) |
+| PS service endpoint | `SEND|GRANT` | its own `CONNECT` for thread/IPC services (windows are granted then, not at spawn) |
 | fault endpoint (held by PS) | — | demand paging, COW fallback |
-| argument/result window frames (2) | `READ` / `WRITE|MAP` | shared with PS connection |
 
 The `SPAWN` call's capability descriptors install caller-supplied stdio and VFS caps;
 slots the caller omits are filled by PS defaults (`/dev/null` endpoints, PS's own VFS
@@ -122,7 +122,12 @@ caller                PS                      VFS                 kernel
 2. PS resolves the program through its VFS connection; reads it into frames it maps
    into the new AS. (v0: eager load; Phase 2+: lazy segments via the pager protocol.)
 3. PS creates AS, maps segments, sets fault pool, builds stack/auxv from windows.
-4. PS creates main thread with `fault_ep` set; mints the §2.3 package; binds `N_dead`.
+4. PS creates main thread with `fault_ep` + a bootstrap endpoint set; binds `N_dead`;
+   then sends the §2.3 package over the bootstrap endpoint (ADR-009): first a header
+   (label 0x0102, `w0` = number of caps that follow), then messages of ≤ 4 cap
+   descriptors each. The child's crt drains until the header count is satisfied, so the
+   full package is installed before it proceeds. PS's sends block on the one-message
+   mailbox while the child drains — expect the child to be scheduled during spawn.
 5. Reply: `w0 = status`, `w1 = pid`; out-caps: `thread_control` (parent may kill),
    `exit_notif` (signalled by PS's reaper when the child dies).
 6. PS registers the process in its table (pid → AS/threads/N_dead/session notifs).
@@ -144,7 +149,8 @@ caller                PS                      VFS                 kernel
 | label | name | words (w0..w3) | caps in | reply |
 |---|---|---|---|---|
 | 0x0101 | CONNECT | w0 = version, w1 = arg window size, w2 = result window size, w3 = flags | session notification, arg frame (`READ`), result frame (`WRITE|MAP`) | w0 = status, w1 = connection id; out: connection endpoint |
-| 0x0110 | SPAWN | w0 = flags, w1 = `(argv off,len)`, w2 = `(env off,len)`, w3 = `(cwd off,len)` | up to 4: vfs_ep, stdin, stdout, stderr (order fixed, nulls allowed) | w0 = status, w1 = pid; out: thread_control, exit_notif |
+| 0x0102 | PACKAGE | w0 = number of caps that follow, w1 = flags (PS → child at bootstrap only; ADR-009) | package caps over following messages | none |
+| 0x0110 | SPAWN | w0 = flags, w1 = `(program off,len)`, w2 = `(argv off,len)`, w3 = `(env off,len)` | up to 4: vfs_ep, stdin, stdout, stderr (order fixed, nulls allowed) | w0 = status, w1 = pid; out: thread_control, exit_notif |
 | 0x0111 | WAIT | w0 = pid, w1 = flags (NONBLOCK) | — | w0 = status (of the wait), w1 = child's exit status; pending-call semantics: blocks until death unless NONBLOCK |
 | 0x0112 | KILL | w0 = pid, w1 = raw status | — | w0 = status |
 | 0x0113 | EXEC | w0 = `(argv off,len)`, w1 = `(env off,len)`, w2 = `(program off,len)`, w3 = flags | — | (on success: never returns — image replaced; on failure: w0 = status) |
@@ -154,6 +160,11 @@ caller                PS                      VFS                 kernel
 | 0x0117 | GETPID | — | — | w0 = status, w1 = pid |
 
 Notes:
+- **Blocking `WAIT` parks the connection** in v0: the reply capability for a deferred
+  reply cannot be saved across requests (no SaveCaller-style op in the ABI), so the
+  serving context stays parked until the reaper answers. A client that wants to wait
+  and keep working concurrently uses a second connection; the SDK does this
+  transparently. A reply-cap-save op is a candidate for a future ABI ADR (§6).
 - `EXEC` and `FORK` apply to the **calling process** (POSIX semantics): PS holds or is
   granted the caller's AS/thread caps; EXEC builds a new AS and swaps the caller's
   threads onto it, then destroys the old one. v0 simplification: EXEC kills all
@@ -275,3 +286,9 @@ window to avoid a frame transfer per call.
    one thread serves many connections; requires an ADR-005 amendment to carry the
    sender capability along with a message). Decide with Phase 2 measurements; the
    protocol above is badge-compatible (same ops, shared endpoint).
+7. **Deferred replies / SaveCaller**: a reply capability cannot currently be saved
+   into an explicit slot, so a deferred reply (blocking WAIT, async I/O completion)
+   parks its whole connection thread. A `recv` option or Thread op to *save* the
+   implicit reply cap into a slot (seL4 `CNode_SaveCaller`-style) would let one
+   connection thread juggle many outstanding requests. Needs an ADR with GLM when
+   VFS async I/O lands (Phase 2).

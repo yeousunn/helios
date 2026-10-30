@@ -62,7 +62,7 @@ Return tag/words registers are only meaningful when status is OK. `yield`,
 | # | name | semantics |
 |---|---|---|
 | 0 | `yield` | voluntarily deschedule the calling thread; no arguments beyond the number. Returns OK. |
-| 1 | `send` | Dispatch on destination cap type — Endpoint: enqueue the message. Notification: atomically OR `w0` into the notification word; never blocks; other words ignored. IRQ: `EBADARG`. Blocking unless `FLAG_NONBLOCK`; returns when the message is accepted (delivered to a waiting receiver or stored in the endpoint's one-message mailbox), not when received. |
+| 1 | `send` | Dispatch on destination cap type — Endpoint: enqueue the message. Notification: atomically OR `w0` into the notification word; never blocks; other words ignored. IRQ: `EBADARG`. Blocking unless `FLAG_NONBLOCK`; returns when the message is accepted (delivered to a waiting receiver or stored in the endpoint's one-message mailbox), not when received. **Special cap handle `0xFFFF_FFFE` (REPLY_CAP): send through the thread's implicit reply cap and clear it — the reply-only escape hatch for terminal replies (ADR-009); `EBADSTATE` if none is pending.** |
 | 2 | `call` | `send` **and** atomically wait for the reply. The kernel mints a temporary *reply capability* for the callee, delivered as the callee's implicit reply cap. Returns the reply's tag and words. |
 | 3 | `recv` | Block on the destination cap (dispatch on cap type) — Endpoint: next message; sets the thread's implicit reply cap **iff** the message was produced by `call`. Notification: return pending mask in `w0` (immediately if nonzero, else block until signalled); tag label 0x0003 (NOTIFY), mask cleared on return. IRQ: block until the IRQ count increments; tag label 0x0004 (IRQ), `w0` = irq vector; the hardware line stays masked until `invoke(ACK)` (see §7). |
 | 4 | `reply_recv` | Send a reply through the thread's implicit reply cap (from the last `recv`/`reply_recv`), then `recv` on the destination cap. The server fast path: one syscall per request/reply cycle. Returns `EBADSTATE` if no implicit reply cap is pending. |
@@ -155,7 +155,7 @@ Method ids are per object type; `invoke` returns `ENOSYS` for unknown ids.
 | 1 | NEW_ENDPOINT | returns new handle in w0 |
 | 2 | NEW_NOTIFICATION | returns new handle in w0 |
 | 3 | NEW_ADDRESS_SPACE | returns new handle in w0 |
-| 4 | NEW_THREAD | w0 = entry PC, w1 = stack top, w2 = priority; caps[0] = AddressSpace (GRANT), caps[1] = fault endpoint (optional) — returns thread handle in w0 |
+| 4 | NEW_THREAD | w0 = entry PC, w1 = stack top, w2 = priority; caps[0] = AddressSpace (GRANT), caps[1] = fault endpoint (optional), caps[2] = bootstrap endpoint (optional) — a bootstrap endpoint is installed into the new process at handle 1 before it starts (ADR-009); returns thread handle in w0 |
 
 ### Region (physical memory grant; boot carves these for init, the process server carves for children)
 
