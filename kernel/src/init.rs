@@ -299,6 +299,11 @@ pub(crate) fn register_region_for_test(id: u64, base: u64, len: u64) {
 }
 
 #[cfg(test)]
+pub(crate) fn reset_regions_for_test() {
+    *REGIONS.lock() = RegionRegistry::new();
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::frame;

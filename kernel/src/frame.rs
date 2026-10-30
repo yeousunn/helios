@@ -224,7 +224,13 @@ mod tests {
     #[test]
     fn full_lifecycle() {
         let region = Region::new(PhysAddr::new(0x1000), 64 * FRAME_SIZE as u64).unwrap();
-        init(&[region]).expect("init once");
+        // entry-module tests may have seeded the identical region first.
+        let _ = init(&[region]);
+        assert_eq!(
+            free_count(),
+            64,
+            "allocator must be fully free at test start"
+        );
         assert!(init(&[region]).is_err(), "re-init must be rejected");
 
         assert_eq!(free_count(), 64);

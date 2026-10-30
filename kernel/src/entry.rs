@@ -309,7 +309,24 @@ fn as_invoke(pid: ProcessId, cap: &Capability, args: &SyscallArgs) -> SyscallRet
                 Err(e) => SyscallReturn::err(e),
             }
         }
-        FORK | DESTROY => SyscallReturn::err(ipc::status::ENOSYS),
+        FORK => {
+            // ADR-024: COW clone; returns child AS cap (MAP|GRANT) in w0.
+            match crate::aspace::fork(as_id) {
+                Ok(child_id) => install_ret(
+                    pid,
+                    child_id.0,
+                    ObjType::AddressSpace,
+                    Rights::MAP.union(Rights::GRANT),
+                    msg.tag,
+                ),
+                Err(crate::aspace::VmmError::NoBackend) => SyscallReturn::err(ipc::status::ENOSYS),
+                Err(_) => SyscallReturn::err(ipc::status::ENOMEM),
+            }
+        }
+        DESTROY => match crate::aspace::destroy(as_id) {
+            Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
+            Err(_) => SyscallReturn::err(ipc::status::EBADARG),
+        },
         _ => SyscallReturn::err(ipc::status::ENOSYS),
     }
 }
@@ -618,11 +635,22 @@ mod tests {
         fn map_page(&self, _v: crate::aspace::Vaddr, _p: crate::frame::PhysAddr, _f: MapFlags) {}
         fn unmap_page(&self, _v: crate::aspace::Vaddr) {}
         fn protect_page(&self, _v: crate::aspace::Vaddr, _f: MapFlags) {}
+        fn copy_page(&self, _dst: crate::frame::PhysAddr, _src: crate::frame::PhysAddr) -> bool {
+            true
+        }
     }
 
     fn setup() -> (ProcessId, ThreadId, u32) {
         crate::aspace::set_backend_factory(&MockFactory);
         let _ = crate::aspace::init_default();
+        // Frame allocator: entry tests run before frame tests; seed the same
+        // region frame::full_lifecycle expects so both suites coexist.
+        let _ = crate::frame::init(&[crate::frame::Region::new(
+            crate::frame::PhysAddr::new(0x1000),
+            64 * crate::frame::FRAME_SIZE as u64,
+        )
+        .unwrap()]);
+        crate::init::reset_regions_for_test();
         crate::proc::reset_for_test();
         crate::endpoint::reset_engine_for_test();
         crate::notification::reset_for_test();
@@ -824,11 +852,101 @@ mod tests {
             Ok(crate::frame::PhysAddr::new(region_addr))
         );
 
-        // FORK/DESTROY are ENOSYS in v0 (per-process VMM pending).
+        // FORK clones this AS (ADR-024); DESTROY then cleans up the fork.
         let m7 = Message::new(5);
+        let r = dispatch(args(num::INVOKE, as_h, m7.tag, m7.words));
+        assert_eq!(r.status, ipc::status::OK, "FORK (ADR-024)");
+        let forked = proc::get_cap(pid, r.w[0] as u32).unwrap().obj;
+        let m8 = Message::new(6);
         assert_eq!(
-            dispatch(args(num::INVOKE, as_h, m7.tag, m7.words)).status,
-            ipc::status::ENOSYS
+            dispatch(args(num::INVOKE, r.w[0] as u32, m8.tag, m8.words)).status,
+            ipc::status::OK,
+            "AS::DESTROY of the fork"
         );
+        assert!(crate::aspace::translate(forked, Vaddr(0xB0_0000)).is_err());
+    }
+    #[test]
+    fn as_fork_cow_shares_and_copies_resolved_pages() {
+        let (pid, _tid, factory) = setup();
+        let r_as = dispatch(args(num::INVOKE, factory, Tag::new(3), [0; 4]));
+        let as_h = r_as.w[0] as u32;
+        let as_id = proc::get_cap(pid, as_h).unwrap().obj;
+
+        // Direct-frame region (writable) + a resolved ANON page.
+        let base = crate::frame::PhysAddr::new(0xF0_0000);
+        crate::aspace::track_frame(base);
+        crate::aspace::map(
+            as_id,
+            Vaddr(0xC0_0000),
+            1,
+            Some(base),
+            MapFlags::READ.union(MapFlags::WRITE),
+        )
+        .unwrap();
+
+        // Attach a pool, then resolve one ANON page (per-page override).
+        crate::aspace::set_pool(
+            as_id,
+            crate::frame::PhysAddr::new(0xC8_0000),
+            2 * crate::aspace::PAGE_SIZE as u64,
+        )
+        .unwrap();
+        crate::aspace::map(
+            as_id,
+            Vaddr(0xC1_0000),
+            1,
+            None,
+            MapFlags::ANON.union(MapFlags::READ),
+        )
+        .unwrap();
+        let resolved = crate::aspace::resolve_fault(as_id, Vaddr(0xC1_0000), false).unwrap();
+
+        // FORK via invoke.
+        let m = Message::new(5);
+        let r = dispatch(args(num::INVOKE, as_h, m.tag, m.words));
+        assert_eq!(r.status, ipc::status::OK, "FORK must succeed");
+        let child_as = proc::get_cap(pid, r.w[0] as u32).unwrap();
+        assert_eq!(child_as.typ, ObjType::AddressSpace);
+        assert!(child_as.rights.contains(Rights::MAP));
+        let child_id = child_as.obj;
+
+        // Child sees the shared direct region, converted to COW on both sides.
+        let (pa_child, fl_child) = crate::aspace::translate(child_id, Vaddr(0xC0_0000)).unwrap();
+        assert_eq!(pa_child, base, "same frame shared");
+        assert!(fl_child.contains(MapFlags::COW), "child side COW");
+        let (_, fl_parent) = crate::aspace::translate(as_id, Vaddr(0xC0_0000)).unwrap();
+        assert!(fl_parent.contains(MapFlags::COW), "parent side COW");
+        assert_eq!(crate::aspace::frame_refs(base), 3, "owner + 2 mapping refs");
+
+        // Child's resolved ANON page is a COPY (fresh frame), not shared.
+        let (pa_copy, _) = crate::aspace::translate(child_id, Vaddr(0xC1_0000)).unwrap();
+        assert_ne!(pa_copy, resolved, "resolved page copied, not shared");
+
+        // COW write on the shared region: both sides still share with the
+        // other's mapping ref outstanding → both copy from their own pools.
+        let w1 = crate::aspace::resolve_fault(as_id, Vaddr(0xC0_0000), true).unwrap();
+        crate::aspace::set_pool(
+            child_id,
+            crate::frame::PhysAddr::new(0xD0_0000),
+            2 * crate::aspace::PAGE_SIZE as u64,
+        )
+        .unwrap();
+        let w2 = crate::aspace::resolve_fault(child_id, Vaddr(0xC0_0000), true).unwrap();
+        // Pool frame 0 went to the earlier ANON resolve; COW copy gets frame 1.
+        assert_eq!(
+            w1,
+            crate::frame::PhysAddr::new(0xC8_1000),
+            "parent copies from its pool"
+        );
+        assert_eq!(
+            w2,
+            crate::frame::PhysAddr::new(0xD0_0000),
+            "child copies from its pool"
+        );
+
+        // Tear down both ASes so the shared frame allocator returns to full
+        // for the frame-test module that runs after this one.
+        let _ = crate::aspace::destroy(as_id);
+        let _ = crate::aspace::destroy(child_id);
     }
 }

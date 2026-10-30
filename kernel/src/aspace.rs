@@ -124,6 +124,11 @@ pub trait PagingBackend: Sync + Send {
     fn unmap_page(&self, vaddr: Vaddr);
     /// Change permissions of an existing mapping.
     fn protect_page(&self, vaddr: Vaddr, flags: MapFlags);
+    /// Copy one page's contents (FORK resolved-page cloning, ADR-024 §2).
+    /// Arch scratch-window memcpy. Default: unsupported (FORK → ENOSYS).
+    fn copy_page(&self, _dst: PhysAddr, _src: PhysAddr) -> bool {
+        false
+    }
 }
 
 /// Arch-provided backend factory (ADR-022 §2). Registered at boot; hands
@@ -464,6 +469,78 @@ impl AddressSpace {
         m.base.ok_or(VmmError::NotMapped)
     }
 
+    /// COW clone into a fresh child space (ADR-024): direct-frame regions
+    /// shared with COW conversion, resolved pages copied via `copy_page`.
+    fn fork_into(
+        &mut self,
+        be: &dyn PagingBackend,
+        child: &mut AddressSpace,
+        child_be: &dyn PagingBackend,
+    ) -> Result<(), VmmError> {
+        // 1. Direct-frame regions: share + COW-convert writable ones.
+        for m in self.regions.iter().flatten() {
+            if m.base.is_none() {
+                // Unresolved ANON region: clone shape only (zero-fill faults).
+                child
+                    .map(m.vaddr, m.pages, None, m.flags)
+                    .map_err(|_| VmmError::Overlap)?;
+                continue;
+            }
+            let child_flags = if m.flags.contains(MapFlags::WRITE) {
+                MapFlags(m.flags.0 | MapFlags::COW.0)
+            } else {
+                m.flags
+            };
+            child
+                .map(m.vaddr, m.pages, m.base, child_flags)
+                .map_err(|_| VmmError::Overlap)?;
+            // child.map() already acquired the mapping ref on the base.
+            if let Some(b) = m.base {
+                child.map_backend(child_be, m.vaddr, m.pages, b, child_flags);
+            }
+            // Convert the source's writable region to COW (backend re-protect).
+            if m.flags.contains(MapFlags::WRITE) && !m.flags.contains(MapFlags::COW) {
+                for i in 0..m.pages {
+                    let va = Vaddr(m.vaddr.as_u64() + i * PAGE_SIZE as u64);
+                    be.protect_page(va, MapFlags(m.flags.0 | MapFlags::COW.0));
+                }
+            }
+        }
+        // Mark source regions COW in the region table too (single pass over
+        // mutable self after the child is built).
+        for m in self.regions.iter_mut().flatten() {
+            if m.base.is_some() && m.flags.contains(MapFlags::WRITE) {
+                m.flags.0 |= MapFlags::COW.0;
+            }
+        }
+        // 2. Resolved per-page overrides: fresh frame + copy contents.
+        for i in 0..self.page_frames.len() {
+            let (idx, frame) = self.page_frames[i];
+            if idx == 0 {
+                continue;
+            }
+            let Some(fresh) = frame::alloc() else {
+                return vmm_err(VmmError::PoolEmpty);
+            };
+            if !child_be.copy_page(fresh, frame) {
+                let _ = frame::free(fresh);
+                return vmm_err(VmmError::NoBackend);
+            }
+            FRAME_REFS.lock().acquire(fresh);
+            let va = Vaddr(idx * PAGE_SIZE as u64);
+            // Use the CHILD's own free slot (bug if parent's position were
+            // reused — the two tables fill differently).
+            let slot_pf = child
+                .page_frames
+                .iter()
+                .position(|(p, _)| *p == 0)
+                .ok_or(VmmError::Overlap)?;
+            child.page_frames[slot_pf] = (idx, fresh);
+            child_be.map_page(va, fresh, MapFlags::READ.union(MapFlags::WRITE));
+        }
+        Ok(())
+    }
+
     /// Drop all mappings and per-page frames (AS::DESTROY).
     fn destroy(&mut self, be: &dyn PagingBackend) {
         for i in 0..self.regions.len() {
@@ -692,6 +769,46 @@ pub fn install_from_reply(
     with_as(as_id, |space, be| {
         space.install_from_reply(be, vaddr, frame_addr, flags)
     })
+}
+
+/// COW-clone `parent` into a fresh AS; returns the child id (ADR-024).
+pub fn fork(parent: ObjId) -> Result<ObjId, VmmError> {
+    let child_id = create()?;
+    let mut table = AS_TABLE.lock();
+    let pslot = (parent.0 as usize)
+        .checked_sub(1)
+        .ok_or(VmmError::BadVaddr)?;
+    let cslot = (child_id.0 as usize)
+        .checked_sub(1)
+        .ok_or(VmmError::BadVaddr)?;
+
+    // Take both options out to avoid double mutable borrow of the table.
+    let p_opt = table[pslot].take();
+    let c_opt = table[cslot].take();
+
+    match (p_opt, c_opt) {
+        (Some(mut p), Some(mut c)) => match p.space.fork_into(p.backend, &mut c.space, c.backend) {
+            Ok(_) => {
+                table[pslot] = Some(p);
+                table[cslot] = Some(c);
+                Ok(child_id)
+            }
+            Err(e) => {
+                table[pslot] = Some(p);
+                table[cslot] = Some(c);
+                vmm_err(e)
+            }
+        },
+        (Some(p), None) => {
+            table[pslot] = Some(p);
+            vmm_err(VmmError::NotFound)
+        }
+        (None, Some(c)) => {
+            table[cslot] = Some(c);
+            vmm_err(VmmError::NotFound)
+        }
+        (None, None) => vmm_err(VmmError::NotFound),
+    }
 }
 
 /// Attach or replace the fault pool of `as_id`.

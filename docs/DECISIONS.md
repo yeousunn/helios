@@ -288,8 +288,31 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
   2. **Embedded-image loading.** The launcher (init) hosts server images via `include_bytes!`; `sdk::elf` parses them (done, host-tested). The loader dance per segment: CARVE frames from a Region → MAP into the child AS at `p_vaddr` (segment flags) → MAP into the launcher's own AS at a scratch VA (R|W) → copy `filesz` bytes from the embedded buffer → UNMAP the scratch. `memsz - filesz` (bss) and stacks use `AS::MAP` with `ANON` (zero-fill, no frame). The loader helper lands in `sdk` (uses only ratified invokes); heap for the launcher comes from the same mechanism (§heap).
   3. **Package extensions ride the optional tail.** The ADR-009 package prefix stays fixed (§2.3); launcher-specific grants go in the optional tail in a documented per-server order. For the process server: `tail[0] = Factory` (design doc §4). No wire change.
   4. **Pipeline:** the server ELF is built before init and embedded into it (build-order + `include_bytes!` path are NV's image-pipeline concern; the runbook's build commands extend to it). The child's first log line belongs to a future console story (debug-EP minting for spawned processes is a follow-up, not needed for the smoke).
+  5. **Rights adjustments (found tracing the first spawn end to end).**
+     `resolve_transfers` enforces `GRANT` on the sender's capability for any
+     transfer, so three fresh-minted grants must carry it: (a) init's boot
+     **Region** caps get `GRANT` — otherwise init cannot pass a region to the
+     server it spawns (they are currently zero-rights carve-only); (b)
+     `NEW_NOTIFICATION` installs `SIGNAL|RECV|GRANT` — otherwise session/death
+     notifications cannot be handed to children; (c) `NEW_THREAD`'s returned
+     thread cap gains `GRANT` (CONTROL still gates `invoke`) — otherwise a
+     launcher cannot pass `thread_control` onward in spawn replies. init's
+     `self_as` cap (per §1) is granted `MAP|GRANT`.
 - Consequences:
-  - Kernel (GLM): writer sets `self_as` (no other change). Factory untouched in this ADR.
+  - Kernel (GLM): writer sets `self_as`; grant `self_as` with `MAP|GRANT`; the
+    three rights adjustments in §5.
   - sdk (DS): parser field + `loader` helper + init v2 (spawn the process server from the embedded image, deliver the package).
   - NV: pipeline embeds the PS image into init; the QEMU smoke then covers init → spawn PS (ELF load, package, thread). Acceptance via init's markers plus PS's own post-spawn signals (debug-EP minting for spawned processes is a documented follow-up).
   - First spawn exercises for real: `NEW_ADDRESS_SPACE`, `AS::MAP` (frame + ANON), `Region::CARVE`, `NEW_THREAD` + bootstrap, package delivery, `cap_revoke` cleanup of scratch mappings.
+
+## ADR-024: AS::FORK v0 — COW region sharing + backend copy_page for resolved pages
+- Proposed: GLM-5.3-Flash 2026-10-30
+- Status: ACCEPTED (GLM, kernel/ only)
+- Context: Last kernel ENOSYS (syscall-abi §7 AS::FORK id 5, ADR-007 §5). The v0 VMM model has two kinds of backing: direct-frame regions and per-page overrides (resolved ANON/COW pages). They fork differently.
+- Decision:
+  1. **Direct-frame regions** (file-backed/heap frames, not ANON): child maps the SAME frames; writable regions become COW on both sides (`flags |= COW`, backend re-protect); one mapping ref per page in the child. Pure read-only regions are shared as-is (no COW needed). This is the main fork win — code + untouched data pages share.
+  2. **Resolved per-page overrides** (parent's written ANON/COW pages): child gets a FRESH kernel-reserve frame (`frame::alloc`) and the contents are copied by the arch via a new optional `PagingBackend::copy_page(dst, src)` (scratch-window memcpy in the arch layer). Sharing COW is impossible for these (the COW path keys on region.base, which is stale for overrides). If the backend does not implement copy_page (default `false`), FORK returns ENOSYS — honest, no silent data loss.
+  3. **Unresolved ANON pages**: cloned as-is (base None); each side faults fresh zero-fill — correct, they were never written.
+  4. Child's fault pool: none at fork (launcher attaches via SET_FAULT_POOL afterwards). Region cap for the child AS is minted MAP|GRANT into the caller's table.
+  5. Nested forks are correct: resolved pages are copied per fork (no dedup — an optimization for a later ADR; refcounts already support it).
+- Consequences: NV implements `copy_page` (physical aliasing window, ~20 lines of arch code). FORK is O(regions + resolved pages + copied pages). Frames come from the kernel reserve — large images may need pool-based copying later (ADR if measured).
