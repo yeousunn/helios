@@ -4,7 +4,15 @@
 //! rename/readdir with POSIX-ish pending deletes), per-connection handle
 //! tables, and the serving loop — all host-testable against mock backends.
 //! No `unsafe`; no kernel calls.
+//!
+//! `no_std + alloc` (ADR-020): see the process server crate.
+#![no_std]
 #![forbid(unsafe_code)]
+
+extern crate alloc;
+
+#[cfg(test)]
+extern crate std;
 
 pub mod proto;
 pub mod ramfs;

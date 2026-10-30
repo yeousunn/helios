@@ -7,8 +7,9 @@
 //! v0 has no reply-cap save, so the parked request occupies its connection
 //! (clients that wait and work concurrently use separate connections).
 
-use std::collections::BTreeMap;
+use alloc::collections::BTreeMap;
 
+use alloc::vec::Vec;
 use ipc::{status, CapSlot, Message, Rights};
 
 use crate::proto::{
@@ -571,6 +572,7 @@ fn spawn_err(status: Status) -> SpawnReply {
 mod tests {
     use super::*;
     use crate::test_support::{spawn_window, MockKernel, MockLoader, MockTransport, MockWindows};
+    use alloc::vec;
     use std::collections::VecDeque;
 
     fn connect_req() -> ConnectRequest {

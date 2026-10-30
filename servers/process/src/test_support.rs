@@ -1,5 +1,7 @@
 //! Test doubles shared by the unit tests of this crate.
 
+use alloc::vec;
+use alloc::vec::Vec;
 use std::collections::{BTreeMap, VecDeque};
 
 use ipc::{status, Message, Rights};

@@ -2,6 +2,8 @@
 //! testing (mirrors `servers/process::runtime`). The real implementation will
 //! wrap the SDK syscalls once the process/server binaries are brought up.
 
+use alloc::vec::Vec;
+
 use crate::proto::{Span, Status};
 
 pub type Handle = u32;

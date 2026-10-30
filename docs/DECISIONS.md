@@ -253,3 +253,10 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
   3. **Thread invoke (obj = target ThreadId, CONTROL right required):** id 2 KILL (sched::exit + death notify), 3 SUSPEND, 4 RESUME, 5 SET_PRIORITY (w0), 12 BIND_DEATH_NOTIFICATION (caps[0] = Notification or NULL).
   4. **Initial PC:** `sched::spawn_with(process, priority, pc)` stores `initial_pc` on the thread record; `NEW_THREAD` sets it from w0. SP is arch-owned (ADR-017 amendment) — the arch ContextBackend derives SP from its own USER_STACK_TOP when first scheduling the thread.
 - Consequences: NV's trap layer implements the parked/park_result protocol; DS's connection-teardown NOTIFIED path now behaves per schema §4. Cancel-with-result (ECANCELED on unqueue) deferred to the timer-service ADR.
+
+## ADR-020: Server crates are `no_std + alloc` (userspace binaries link no std yet)
+- Proposed: DeepSeek 2026-10-30
+- Status: ACCEPTED (self: affects `servers/` + `sdk/` only)
+- Context: PLAN §5 marks servers as "userspace (std)", but there is no Helios `std` port yet — the first server binaries run in the same bare-metal environment as `sdk/bin/init`. Server crates using `std::` types could never be linked into such a binary, blocking Phase 2 bring-up.
+- Decision: `servers/process` and `servers/vfs` build as `#![no_std]` + `extern crate alloc` (collections/strings/vecs from `alloc`; test modules keep `std` via `#[cfg(test)] extern crate std`). The eventual server binary provides a `#[global_allocator]` over carved frames (SDK runtime work item). The future Rust `std` port wraps this layer (allocator + syscall runtime) rather than replacing the server cores.
+- Consequences: no behavior change (78 host tests unchanged, clippy/fmt clean); server crates are linkable on bare metal; userspace allocator quality (fragmentation, limits) becomes a tracked concern for the SDK allocator work item.

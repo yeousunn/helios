@@ -1,7 +1,7 @@
 //! Test doubles shared by the VFS unit tests.
 
+use alloc::vec::Vec;
 use std::collections::{BTreeMap, VecDeque};
-use std::vec::Vec;
 
 use ipc::{status, Message};
 

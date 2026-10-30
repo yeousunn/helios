@@ -5,7 +5,16 @@
 //! mock backends. The real syscall runtime (`sdk/`) implements
 //! [`runtime::Transport`] and [`runtime::KernelOps`] once the kernel's
 //! threads/paging land; this crate contains no `unsafe` and no syscalls.
+//!
+//! `no_std + alloc` (ADR-020): the eventual server binary links no `std` —
+//! a userspace global allocator over carved frames comes with the SDK runtime.
+#![no_std]
 #![forbid(unsafe_code)]
+
+extern crate alloc;
+
+#[cfg(test)]
+extern crate std;
 
 pub mod proto;
 pub mod runtime;

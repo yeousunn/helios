@@ -2,9 +2,9 @@
 //! interface concerns: node arena, component walk, POSIX-ish open/close
 //! refcounting for pending deletes, and stable readdir cookies.
 
-use std::collections::BTreeMap;
-use std::string::String;
-use std::vec::Vec;
+use alloc::collections::BTreeMap;
+use alloc::string::String;
+use alloc::vec::Vec;
 
 use ipc::status;
 
@@ -391,6 +391,7 @@ impl Default for RamFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     fn fs() -> RamFs {
         RamFs::new()

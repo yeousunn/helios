@@ -2,6 +2,8 @@
 //! testing. The real implementation (in `sdk/`, once the kernel is ready)
 //! wraps the syscalls from `sdk/docs/syscall-abi.md`; mocks live in tests.
 
+use alloc::vec::Vec;
+
 use ipc::{Message, Rights};
 
 use crate::proto::Status;

@@ -53,6 +53,10 @@
 7. **Server loop.** `recv(svc)` once, then `reply_recv(svc, ...)` per request
    (syscall-abi §4). Heavy operations (ELF loading, disk I/O) run on worker threads;
    the loop stays responsive.
+8. **Crate profile: `no_std + alloc`** (ADR-020). There is no `std` port yet, so
+   server crates avoid `std::` (collections/strings come from `alloc`); the server
+   binary supplies a global allocator over carved frames, and each blocking WAIT
+   parks only its own connection thread (v0, §2.6).
 
 ## 2. Process server (`servers/process`)
 

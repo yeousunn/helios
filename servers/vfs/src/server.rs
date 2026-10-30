@@ -5,9 +5,9 @@
 //! another connection presenting a borrowed handle fails the table lookup.
 //! Every connection starts with exactly one handle — its root directory.
 
-use std::collections::BTreeMap;
-use std::string::String;
-use std::vec::Vec;
+use alloc::collections::BTreeMap;
+use alloc::string::String;
+use alloc::vec::Vec;
 
 use ipc::{status, CapSlot, Message, Rights};
 
@@ -366,7 +366,7 @@ impl<K: VfsKernel, T: Transport> VfsServer<K, T> {
             if end > proto::WIN_SIZE as u64 {
                 return Err(status::ETOOBIG);
             }
-            let mut buf = std::vec![0u8; req.len as usize];
+            let mut buf = alloc::vec![0u8; req.len as usize];
             let n = self.fs.read(entry.node, req.offset, &mut buf)?;
             let out = self.conns.get(&conn).ok_or(status::EBADCAP)?;
             windows.write(
