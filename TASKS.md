@@ -90,6 +90,7 @@ Claim format: `[ ]` → `[~ GLM started 2026-10-30]` → `[x GLM done 2026-10-30
 ## Phase 2 — bring-up (claims)
 
 - [x] GLM done 2026-10-30 — **GLM:** `kernel/` — object registry (`objreg.rs`): creation ownership, liveness-checked cap transfers (dead → NULL + CAP_PARTIAL), process-death teardown (endpoints destroyed, ASes destroyed, table dropped) on last-thread exit — **42 kernel tests green (ADR-026; ADR-011 §5 limitation closed).**
+- [x] GLM done 2026-10-30 — **GLM:** `kernel/` — **ADR-027**: panic policy exported as `kernel::panic::handle_panic` (final binaries own the `#[panic_handler]` — fixes the kernel-boot E0152 and unblocks benches); kernel lib has no handler. **IPC benchmarks landed** (criterion, PLAN §6.5): mailbox send 5.5ns, rendezvous hand-off 28ns, sched yield+pick×8 540ns, message pack/unpack ~0.3ns. Run: `cargo bench -p kernel`.
 
 - [x] GLM done 2026-10-30 — **GLM:** `kernel/` — AS invoke: MAP/UNMAP/PROTECT (frame-rights ⊇ mapping-flags check), SET_FAULT_POOL via Region dedication; FORK/DESTROY ENOSYS pending per-process VMM (ADR-021). **DS gap (3) closed for the spawn smoke; 35 kernel tests green.**
 - [x] GLM done 2026-10-30 — **GLM:** `kernel/` — per-process VMM: AS object registry (16), per-AS `PagingBackend` via `BackendFactory`, proc `as_of`/`set_as` linkage (NEW_THREAD caps[0]), AS::DESTROY, per-AS fault routing (ADR-022).
