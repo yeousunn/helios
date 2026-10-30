@@ -9,7 +9,7 @@
 //! o  8: u32 debug_ep handle
 //! o 12: u32 factory handle
 //! o 16: u32 region_count
-//! o 20: u32 reserved
+//! o 20: u32 self_as handle (v0.1, ADR-023; formerly reserved — 0 = none)
 //! o 24: region_count × { u32 handle; u32 reserved; u64 base; u64 len }
 //! ```
 
@@ -37,6 +37,9 @@ pub struct BootRegion {
 pub struct BootInfo {
     pub debug_ep: u32,
     pub factory: u32,
+    /// Capability to the caller's own address space (ADR-023; v0 images that
+    /// predate the grant read as `None`).
+    pub self_as: Option<u32>,
     pub regions: [Option<BootRegion>; MAX_REGIONS],
     pub region_count: u32,
 }
@@ -80,9 +83,11 @@ impl BootInfo {
                 len: rd64(bytes, off + 16),
             });
         }
+        let self_as = rd32(bytes, 20);
         Ok(Self {
             debug_ep: rd32(bytes, 8),
             factory: rd32(bytes, 12),
+            self_as: (self_as != 0).then_some(self_as),
             regions,
             region_count,
         })
@@ -108,7 +113,7 @@ mod tests {
         out.extend_from_slice(&info.debug_ep.to_le_bytes());
         out.extend_from_slice(&info.factory.to_le_bytes());
         out.extend_from_slice(&info.region_count.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&info.self_as.unwrap_or(0).to_le_bytes());
         for r in info.regions.iter().flatten() {
             out.extend_from_slice(&r.handle.to_le_bytes());
             out.extend_from_slice(&0u32.to_le_bytes());
@@ -133,6 +138,7 @@ mod tests {
         BootInfo {
             debug_ep: 2,
             factory: 3,
+            self_as: Some(9),
             regions,
             region_count: 2,
         }
@@ -156,9 +162,19 @@ mod tests {
         assert_eq!(rd32(&bytes, 0), MAGIC);
         assert_eq!(rd32(&bytes, 8), 2, "debug_ep at o8");
         assert_eq!(rd32(&bytes, 12), 3, "factory at o12");
+        assert_eq!(rd32(&bytes, 20), 9, "self_as at o20 (ADR-023)");
         assert_eq!(rd32(&bytes, 24), 4, "first region handle at o24");
         assert_eq!(rd64(&bytes, 32), 0x10_0000, "first region base at o32");
         assert_eq!(rd64(&bytes, 40), 0x40_0000, "first region len at o40");
+    }
+
+    #[test]
+    fn zero_self_as_reads_as_none_for_v0_images() {
+        let mut info = sample();
+        info.self_as = None;
+        let parsed = BootInfo::parse(&encode(&info)).unwrap();
+        assert_eq!(parsed.self_as, None);
+        assert_eq!(parsed, info);
     }
 
     #[test]

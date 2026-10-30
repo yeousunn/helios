@@ -10,6 +10,8 @@
 
 pub mod bootinfo;
 pub mod bootstrap;
+pub mod elf;
+pub mod heap;
 pub mod layout;
 pub mod methods;
 pub mod syscall;

@@ -18,3 +18,11 @@ pub const DEFAULT_THREAD_PRIORITY: u8 = 100;
 /// layout ADR later.
 pub const PS_WINDOW_VA_BASE: u64 = 0x0000_4000_0000_0000;
 pub const VFS_WINDOW_VA_BASE: u64 = 0x0000_4001_0000_0000;
+
+/// VA bases for server heaps (`sdk::heap::RegionSource`; v0 fixed-size heaps).
+pub const PS_HEAP_VA_BASE: u64 = 0x0000_4000_1000_0000;
+pub const VFS_HEAP_VA_BASE: u64 = 0x0000_4001_1000_0000;
+
+/// v0 heap size per server: 1 MiB (16 × 64 KiB chunks, mapped at startup).
+pub const HEAP_CHUNK: u64 = 64 * 1024;
+pub const HEAP_CHUNKS: u64 = 16;

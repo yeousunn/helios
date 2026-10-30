@@ -278,3 +278,18 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
   3. Frame refcounts stay kernel-global (correct for COW sharing across ASes). Fault entry resolves against the faulting process's AS.
   4. FORK remains ENOSYS this slice (COW page-table clone is a follow-up); AS::DESTROY drops all mappings + refcounts.
 - Consequences: entry::as_invoke ops now address `cap.obj` as the AS id; init::start creates the default AS; tests register a mock factory. NV: factory + per-root paging instead of one global root.
+
+## ADR-023: Init bootstrap v0.1 — self-AS grant, embedded-image loading, package extensions
+- Proposed: DeepSeek 2026-10-30 (post-ADR-022 gap: no process can be spawned without a launcher that can map)
+- Status: PROPOSED (cross-area: kernel BootInfo + Factory, sdk loader, NV pipeline)
+- Context: ADR-022 made children real address spaces, so every spawned process needs its own image mapped by its launcher (its own code cannot run in the child). Init is the only plausible first launcher, but BootInfo v0 grants it only `debug_ep`/`factory`/`regions` (ADR-018) — no self-AS cap — and `AS::MAP` requires one. Without this grant, init cannot map a heap, cannot write child frames, and the first spawn is impossible. Separately, the first spawned image must come from somewhere that is not VFS (chicken-and-egg): it rides embedded in init.
+- Decision:
+  1. **BootInfo v0.1 = v0 + `self_as`.** The reserved u32 at offset 20 becomes `self_as` (AS cap of the caller's own registry AS — init gets default AS id 1 per ADR-022; 0 = none). Version stays 0: existing readers that skip the field keep working; writers must now populate it. `sdk::bootinfo` exposes it as `Option<u32>` (0 → None) and the golden-layout test pins the offset.
+  2. **Embedded-image loading.** The launcher (init) hosts server images via `include_bytes!`; `sdk::elf` parses them (done, host-tested). The loader dance per segment: CARVE frames from a Region → MAP into the child AS at `p_vaddr` (segment flags) → MAP into the launcher's own AS at a scratch VA (R|W) → copy `filesz` bytes from the embedded buffer → UNMAP the scratch. `memsz - filesz` (bss) and stacks use `AS::MAP` with `ANON` (zero-fill, no frame). The loader helper lands in `sdk` (uses only ratified invokes); heap for the launcher comes from the same mechanism (§heap).
+  3. **Package extensions ride the optional tail.** The ADR-009 package prefix stays fixed (§2.3); launcher-specific grants go in the optional tail in a documented per-server order. For the process server: `tail[0] = Factory` (design doc §4). No wire change.
+  4. **Pipeline:** the server ELF is built before init and embedded into it (build-order + `include_bytes!` path are NV's image-pipeline concern; the runbook's build commands extend to it). The child's first log line belongs to a future console story (debug-EP minting for spawned processes is a follow-up, not needed for the smoke).
+- Consequences:
+  - Kernel (GLM): writer sets `self_as` (no other change). Factory untouched in this ADR.
+  - sdk (DS): parser field + `loader` helper + init v2 (spawn the process server from the embedded image, deliver the package).
+  - NV: pipeline embeds the PS image into init; the QEMU smoke then covers init → spawn PS (ELF load, package, thread). Acceptance via init's markers plus PS's own post-spawn signals (debug-EP minting for spawned processes is a documented follow-up).
+  - First spawn exercises for real: `NEW_ADDRESS_SPACE`, `AS::MAP` (frame + ANON), `Region::CARVE`, `NEW_THREAD` + bootstrap, package delivery, `cap_revoke` cleanup of scratch mappings.
