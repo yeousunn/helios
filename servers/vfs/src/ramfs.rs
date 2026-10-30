@@ -132,7 +132,7 @@ impl RamFs {
                 }
                 return Ok(n.parent);
             }
-            "" => return Err(vstatus::EINVAL),
+            "" => return Err(status::EBADARG),
             _ => {}
         }
         let entries = self.dir_entries(dir)?;
@@ -166,7 +166,7 @@ impl RamFs {
         now_ns: u64,
     ) -> Result<NodeId, Status> {
         if name.is_empty() || name == "." || name == ".." || name.contains('/') {
-            return Err(vstatus::EINVAL);
+            return Err(status::EBADARG);
         }
         if self.dir_entries(dir)?.contains_key(name) {
             return Err(vstatus::EEXIST);
@@ -187,7 +187,7 @@ impl RamFs {
         now_ns: u64,
     ) -> Result<NodeId, Status> {
         if name.is_empty() || name == "." || name == ".." || name.contains('/') {
-            return Err(vstatus::EINVAL);
+            return Err(status::EBADARG);
         }
         if self.dir_entries(dir)?.contains_key(name) {
             return Err(vstatus::EEXIST);
@@ -204,7 +204,7 @@ impl RamFs {
     /// If the node is open, it is marked deleted and freed on last close.
     pub fn unlink(&mut self, dir: NodeId, name: &str) -> Result<(), Status> {
         if name.is_empty() || name == "." || name == ".." {
-            return Err(vstatus::EINVAL);
+            return Err(status::EBADARG);
         }
         let id = {
             let entries = self.dir_entries(dir)?;
@@ -241,7 +241,7 @@ impl RamFs {
             .iter()
             .any(|n| n.is_empty() || *n == "." || *n == ".." || n.contains('/'))
         {
-            return Err(vstatus::EINVAL);
+            return Err(status::EBADARG);
         }
         let src = {
             let entries = self.dir_entries(src_dir)?;
@@ -250,10 +250,10 @@ impl RamFs {
         let src_is_dir = matches!(self.get(src)?.data, NodeData::Dir(_));
 
         if dst_dir == src && src_name == dst_name {
-            return Err(vstatus::EINVAL);
+            return Err(status::EBADARG);
         }
         if src_is_dir && self.is_ancestor_of(src, dst_dir)? {
-            return Err(vstatus::EINVAL);
+            return Err(status::EBADARG);
         }
 
         let existing = self.dir_entries(dst_dir)?.get(dst_name).copied();
@@ -323,7 +323,7 @@ impl RamFs {
     ) -> Result<usize, Status> {
         let end = offset
             .checked_add(bytes.len() as u64)
-            .ok_or(vstatus::EINVAL)?;
+            .ok_or(status::EBADARG)?;
         if end > MAX_FILE_SIZE {
             return Err(status::ETOOBIG);
         }
@@ -407,7 +407,7 @@ mod tests {
         assert_eq!(fs.walk(root, "..").unwrap(), root, "root clamps at itself");
         assert_eq!(fs.walk(etc, ".").unwrap(), etc);
         assert_eq!(fs.walk(root, "nope"), Err(vstatus::ENOENT));
-        assert_eq!(fs.walk(root, ""), Err(vstatus::EINVAL));
+        assert_eq!(fs.walk(root, ""), Err(status::EBADARG));
     }
 
     #[test]
@@ -519,7 +519,7 @@ mod tests {
         let root = fs.root();
         fs.mkdir(root, "d", MODE_DIR_DEFAULT, 0).unwrap();
         assert_eq!(fs.unlink(root, "d"), Err(vstatus::EISDIR));
-        assert_eq!(fs.unlink(root, "."), Err(vstatus::EINVAL));
+        assert_eq!(fs.unlink(root, "."), Err(status::EBADARG));
         assert_eq!(fs.unlink(root, "nope"), Err(vstatus::ENOENT));
     }
 
@@ -556,7 +556,7 @@ mod tests {
         let inner = fs.mkdir(a, "inner", MODE_DIR_DEFAULT, 0).unwrap();
         assert_eq!(
             fs.rename(root, "a", inner, "a", 4),
-            Err(vstatus::EINVAL),
+            Err(status::EBADARG),
             "cannot move a directory into its own subtree"
         );
     }

@@ -242,11 +242,11 @@ impl<K: VfsKernel, T: Transport> VfsServer<K, T> {
         windows: &mut impl Windows,
     ) -> Result<String, Status> {
         if !span.fits(proto::WIN_SIZE) {
-            return Err(vstatus::EINVAL);
+            return Err(status::EBADARG);
         }
         let conn = self.conns.get(&conn_id).ok_or(status::EBADCAP)?;
         let bytes = windows.read(conn.arg_window, span)?;
-        String::from_utf8(bytes).map_err(|_| vstatus::EINVAL)
+        String::from_utf8(bytes).map_err(|_| status::EBADARG)
     }
 
     // -----------------------------------------------------------------------
@@ -300,7 +300,7 @@ impl<K: VfsKernel, T: Transport> VfsServer<K, T> {
 
             let flags = req.flags;
             if flags & (OPEN_READ | OPEN_WRITE) == 0 {
-                return Err(vstatus::EINVAL);
+                return Err(status::EBADARG);
             }
             if flags & OPEN_TRUNC != 0 && flags & OPEN_WRITE == 0 {
                 return Err(vstatus::EACCES);
@@ -409,7 +409,7 @@ impl<K: VfsKernel, T: Transport> VfsServer<K, T> {
                 return Err(vstatus::EACCES);
             }
             if !req.data.fits(proto::WIN_SIZE) {
-                return Err(vstatus::EINVAL);
+                return Err(status::EBADARG);
             }
             let data = self.read_window(conn, req.data, windows)?;
             let offset = if entry.flags & OPEN_APPEND != 0 {
@@ -906,7 +906,7 @@ mod tests {
             HandleReply::decode(&reply(&mut s), label::OPEN)
                 .unwrap()
                 .status,
-            vstatus::EINVAL
+            status::EBADARG
         );
 
         // CREATE then WRITE without WRITE right on the handle: use a WALK

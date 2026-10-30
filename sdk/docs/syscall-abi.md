@@ -86,6 +86,14 @@ server protocol.
   notification's own endpoint — this is the server "select" primitive.
 - No timeouts in v0: a timer service (later) signals notifications; a client can
   use `reply_recv`/`recv` with a notification bound and treat timeout as cancel.
+- Parked-syscall contract (ADR-019, GLM): a `recv`/`reply_recv` that parks returns a
+  kernel-internal sentinel from `dispatch` (`i32::MIN`); the arch entry must switch
+  contexts instead of returning to userspace, and re-enter through `park_result`
+  on resume. Userspace only ever observes real results: the delivered message, or
+  `OK + FLAG_NOTIFIED` with `w0` = consumed notification mask when a bound
+  notification woke the park. The sentinel never reaches user space — SDK wrappers
+  treat any non-OK status as an error, and `i32::MIN` appearing there would be a
+  kernel bug.
 
 ## 4. Endpoint / call protocol recap
 

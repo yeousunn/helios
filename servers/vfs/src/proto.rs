@@ -40,15 +40,10 @@ pub mod label {
 
 pub type Status = i32;
 
-/// VFS status codes pending the `ipc::status` mirror (schema §7, -15..-21).
+/// VFS status codes, canonical in `ipc::status` (schema §7). Note: `EINVAL`
+/// was dropped in the ipc mirror — malformed values use `EBADARG` (same meaning).
 pub mod vstatus {
-    pub const ENOENT: i32 = -15;
-    pub const EEXIST: i32 = -16;
-    pub const ENOTEMPTY: i32 = -17;
-    pub const ENOTDIR: i32 = -18;
-    pub const EISDIR: i32 = -19;
-    pub const EINVAL: i32 = -20;
-    pub const EACCES: i32 = -21;
+    pub use ipc::status::{EACCES, EEXIST, EISDIR, EMFILE, ENOENT, ENOTDIR, ENOTEMPTY};
 }
 
 /// `(offset, len)` span into a connection window, packed into one word.
@@ -649,13 +644,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vfs_status_values_match_schema() {
+    fn vfs_status_values_match_ipc_mirror() {
         assert_eq!(vstatus::ENOENT, -15);
         assert_eq!(vstatus::EEXIST, -16);
-        assert_eq!(vstatus::ENOTEMPTY, -17);
+        assert_eq!(vstatus::EISDIR, -17);
         assert_eq!(vstatus::ENOTDIR, -18);
-        assert_eq!(vstatus::EISDIR, -19);
-        assert_eq!(vstatus::EINVAL, -20);
+        assert_eq!(vstatus::ENOTEMPTY, -19);
+        assert_eq!(vstatus::EMFILE, -20);
         assert_eq!(vstatus::EACCES, -21);
     }
 

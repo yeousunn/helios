@@ -213,17 +213,17 @@ migrate into `ipc/` (or per-server `protocol` modules) when code lands.
 | -14 | ENOSYS | label or version not implemented |
 | -15 | ENOENT | no such node/name (VFS) |
 | -16 | EEXIST | name already exists (VFS) |
-| -17 | ENOTEMPTY | directory not empty (VFS unlink) |
+| -17 | EISDIR | directory used as a file (VFS) |
 | -18 | ENOTDIR | path component is not a directory (VFS) |
-| -19 | EISDIR | directory used as a file (VFS) |
-| -20 | EINVAL | invalid argument for the operation |
+| -19 | ENOTEMPTY | directory not empty (VFS unlink) |
+| -20 | EMFILE | too many open handles (VFS) |
 | -21 | EACCES | operation refused by pseudo-mode checks or rights |
 
-New codes are appended here first (DS appended the VFS set -15..-21 while building
-`servers/vfs`); `ipc/` mirrors the table exactly, and `servers/` must not invent
-codes outside it (VFS may *translate* to POSIX errno in the personality layer,
-not on the wire). These remain a shared, server-agnostic vocabulary: ENOENT is
-as meaningful to a device or net server as to VFS.
+New codes are appended here first; `ipc/` mirrors the table exactly (`ipc/status.rs`
+is canonical), and `servers/` must not invent codes outside it (VFS may *translate*
+to POSIX errno in the personality layer, not on the wire). These remain a shared,
+server-agnostic vocabulary: ENOENT is as meaningful to a device or net server as to
+VFS. Malformed values/arguments use `EBADARG` — there is no EINVAL.
 
 ## 8. Examples
 
