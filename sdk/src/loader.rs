@@ -152,6 +152,21 @@ fn invoke_map(
     Ok(())
 }
 
+/// Map `pages` zero-fill (ANON) pages into `as_cap` starting at `vaddr` —
+/// used by the loader for bss remainders and by launchers for initial stacks.
+pub fn map_anon(
+    sys: &mut impl Invoke,
+    as_cap: Handle,
+    vaddr: u64,
+    pages: u64,
+    flags: u32,
+) -> Result<(), Status> {
+    for p in 0..pages {
+        invoke_map(sys, as_cap, vaddr + p * PAGE, flags | FLAG_ANON, None)?;
+    }
+    Ok(())
+}
+
 /// The invoke surface the executor needs (implemented for `Syscalls`, mocked
 /// in tests).
 pub trait Invoke {
@@ -249,9 +264,7 @@ pub fn execute(
                 pages,
                 flags,
             } => {
-                for p in 0..pages {
-                    invoke_map(sys, child_as, vaddr + p * PAGE, flags | FLAG_ANON, None)?;
-                }
+                map_anon(sys, child_as, vaddr, pages, flags)?;
             }
         }
     }

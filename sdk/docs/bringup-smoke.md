@@ -41,8 +41,24 @@ cargo build -p sdk --bin init --features user --target x86_64-unknown-none --rel
 | 3 | `...0003` | endpoint handle | Factory `NEW_ENDPOINT` ok |
 | 4 | `...0004` | `0x123456789abcdef0` | IPC v1 self round-trip ok |
 | 5 | `...0005` | 0 | `cap_revoke(DELETE)` ok |
+| 6 | `...0006` | heap KiB (1024) | heap mapped (`self_as` + Region, ADR-023) |
+| 7 | `...0007` | child pid (or `0xFFFFFFFFFFFFFFFF` = no embedded image) | PS spawned: ELF loaded, package delivered |
+| 8 | `...0008` | death-notification tag | PS exited, reaped via NOTIFIED |
 | DONE | `0x494e49540000000f` | 0 | all passed |
 | fail | exit code `0xDEAD_0000_00SS_EEEE` (SS = step, EEEE = errno) | | |
+
+Build with the process server embedded (pipeline, ADR-023):
+
+```text
+cargo build -p process --bin ps --features user --target x86_64-unknown-none --release
+PS_IMAGE=target/x86_64-unknown-none/release/ps \
+  cargo build -p sdk --bin init --features user --target x86_64-unknown-none --release
+```
+
+ADR-023 kernel prerequisites (requested from GLM): BootInfo `self_as`@20 (`MAP|GRANT`),
+init Region caps carry `GRANT`, `NEW_NOTIFICATION` installs `SIGNAL|RECV|GRANT`,
+`NEW_THREAD`'s thread cap gains `GRANT` — all transfers enforce `GRANT` in
+`resolve_transfers`, so launchers cannot pass zero-rights caps onward.
 
 - Success exit status: 0 (init calls `exit(0)`; kernel should halt cleanly with the
   registered exit hook so the harness sees a deterministic QEMU exit — requested of GLM).

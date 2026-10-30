@@ -1,28 +1,44 @@
-//! The Helios init process — the first userspace task (ADR-018, syscall-abi §8).
+//! The Helios init process — first userspace task and, since ADR-023, the
+//! first **launcher** (spawns the process server from an embedded image).
 //!
 //! Built for `x86_64-unknown-none` with `--features user`:
 //! ```text
-//! cargo build -p sdk --bin init --features user --target x86_64-unknown-none
+//! cargo build -p sdk --bin init --features user --target x86_64-unknown-none --release
 //! ```
-//! Entry: `_start` with `rdi` = pointer to the kernel-written BootInfo block
-//! (inside init's first stack page).
+//! Entry: `_start` with `rdi` = pointer to the kernel-written BootInfo block.
 //!
-//! What it does (the Phase-1 acceptance test): parse BootInfo, report liveness
-//! through the debug endpoint, mint an endpoint through the Factory, round-trip
-//! a message over IPC v1 to itself, revoke the endpoint, exit cleanly.
-//! Every step logs `MARK | step` in `w0` and a payload in `w1` via the debug
-//! endpoint, so the QEMU harness can assert on the serial log deterministically.
+//! Flow: parse BootInfo → debug-EP markers → Factory endpoint round-trip →
+//! heap over the boot Region (ADR-023 `self_as`) → spawn the process server
+//! (ELF load into a fresh AS, ANON stack, ADR-009 package with Factory in the
+//! optional tail) → reap the child via its death notification → exit(0).
+//! Without `PS_IMAGE` (build.rs), the spawn step is skipped with a marker.
 
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+extern crate alloc;
+
+use alloc::vec::Vec;
 use core::panic::PanicInfo;
 
-use ipc::Message;
+use ipc::{CapSlot, Message, Rights};
 use sdk::bootinfo::{BootInfo, MAX_LEN};
+use sdk::bootstrap;
+use sdk::elf::ElfImage;
+use sdk::heap::{GlobalHeap, RegionSource};
+use sdk::layout::{
+    CHILD_STACK_PAGES, HEAP_CHUNK, HEAP_CHUNKS, INIT_HEAP_VA_BASE, INIT_SCRATCH_VA_BASE,
+    USER_STACK_TOP,
+};
+use sdk::loader;
 use sdk::methods;
-use sdk::syscall::{Syscalls, X86_64Syscalls};
+use sdk::syscall::{Handle, Syscalls, X86_64Syscalls};
+
+include!(concat!(env!("OUT_DIR"), "/ps_image.rs"));
+
+#[global_allocator]
+static HEAP: GlobalHeap = GlobalHeap::new();
 
 /// Log marker: "INIT" in the high bytes, step number in the low byte.
 const MARK: u64 = 0x494E_4954_0000_0000;
@@ -31,6 +47,9 @@ const STEP_BOOTINFO: u64 = 2;
 const STEP_ENDPOINT: u64 = 3;
 const STEP_IPC: u64 = 4;
 const STEP_REVOKE: u64 = 5;
+const STEP_HEAP: u64 = 6;
+const STEP_SPAWNED: u64 = 7;
+const STEP_CHILD_EXIT: u64 = 8;
 const STEP_DONE: u64 = 0x0F;
 /// Failure marker family for exits: `0xDEAD_0000_00SS_EEEE` (step, errno).
 const FAIL: u64 = 0xDEAD_0000_0000_0000;
@@ -38,69 +57,262 @@ const FAIL: u64 = 0xDEAD_0000_0000_0000;
 const DEBUG_LABEL: u16 = 0x0001;
 const PING_LABEL: u16 = 0x4900;
 const PING_WORD: u64 = 0x1234_5678_9ABC_DEF0;
+/// `STEP_SPAWNED.w1` when the build has no embedded image.
+const SPAWN_SKIPPED: u64 = u64::MAX;
+
+const STACK_FLAGS: u32 = 0b011; // R | W
 
 type Result<T> = core::result::Result<T, u64>;
 
 #[no_mangle]
-#[allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "entry point: the ABI passes a kernel-owned BootInfo pointer; validity is checked by parse"
-)]
 pub extern "C" fn _start(bootinfo_ptr: *const u8) -> ! {
-    let mut raw = X86_64Syscalls;
-    let mut sys = Syscalls::new(&mut raw);
-
     let info = match unsafe { read_bootinfo(bootinfo_ptr) } {
         Ok(info) => info,
-        Err(errno) => sys.exit(fail_code(STEP_BOOTINFO, errno) as i32),
+        Err(errno) => exit_with(fail_code(STEP_BOOTINFO, errno)),
     };
 
-    mark(&mut sys, info.debug_ep, STEP_ALIVE, 0);
+    let mut raw = X86_64Syscalls;
+    mark(&mut raw, info.debug_ep, STEP_ALIVE, 0);
     mark(
-        &mut sys,
+        &mut raw,
         info.debug_ep,
         STEP_BOOTINFO,
         info.region_count as u64,
     );
 
-    match run(&mut sys, &info) {
+    match run(&mut raw, &info) {
         Ok(()) => {
-            mark(&mut sys, info.debug_ep, STEP_DONE, 0);
-            sys.exit(0);
+            mark(&mut raw, info.debug_ep, STEP_DONE, 0);
+            Syscalls::new(&mut raw).exit(0)
         }
-        Err(code) => sys.exit(code as i32),
+        Err(code) => exit_with(code),
     }
 }
 
-fn run(sys: &mut Syscalls<'_, X86_64Syscalls>, info: &BootInfo) -> Result<()> {
-    // Mint an endpoint through the Factory.
-    let mut invoke = Message::new(methods::factory::NEW_ENDPOINT);
-    invoke.words = [0; 4];
-    let reply = map_err(sys.invoke(info.factory, &invoke), STEP_ENDPOINT)?;
-    let endpoint = reply.words[0] as u32;
+fn run(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
+    // Steps 3-5: Factory endpoint round-trip (Phase 1 acceptance).
+    let endpoint = {
+        let mut sys = Syscalls::new(raw);
+        let reply = sys
+            .invoke(info.factory, &Message::new(methods::factory::NEW_ENDPOINT))
+            .map_err(|e| fail_code(STEP_ENDPOINT, e as u64))?;
+        reply.words[0] as Handle
+    };
     if endpoint == 0 {
         return Err(fail_code(STEP_ENDPOINT, 0xE0));
     }
-    mark(sys, info.debug_ep, STEP_ENDPOINT, endpoint as u64);
+    mark(raw, info.debug_ep, STEP_ENDPOINT, endpoint as u64);
 
-    // IPC v1 self round-trip: one-message mailbox takes the send immediately.
-    let mut ping = Message::new(PING_LABEL);
-    ping.words[0] = PING_WORD;
-    map_err(sys.send(endpoint, &ping), STEP_IPC)?;
-    let echo = map_err(sys.recv(endpoint), STEP_IPC)?;
+    let echo = {
+        let mut sys = Syscalls::new(raw);
+        let mut ping = Message::new(PING_LABEL);
+        ping.words[0] = PING_WORD;
+        sys.send(endpoint, &ping)
+            .map_err(|e| fail_code(STEP_IPC, e as u64))?;
+        sys.recv(endpoint)
+            .map_err(|e| fail_code(STEP_IPC, e as u64))?
+    };
     if echo.tag.label() != PING_LABEL || echo.words[0] != PING_WORD {
         return Err(fail_code(STEP_IPC, 0xE1));
     }
-    mark(sys, info.debug_ep, STEP_IPC, echo.words[0]);
+    mark(raw, info.debug_ep, STEP_IPC, echo.words[0]);
+    {
+        let mut sys = Syscalls::new(raw);
+        sys.cap_revoke(endpoint, 1)
+            .map_err(|e| fail_code(STEP_REVOKE, e as u64))?;
+    }
+    mark(raw, info.debug_ep, STEP_REVOKE, 0);
 
-    // Give the endpoint back (DELETE mode).
-    map_err(sys.cap_revoke(endpoint, 1), STEP_REVOKE)?;
-    mark(sys, info.debug_ep, STEP_REVOKE, 0);
+    // Step 6: heap over the boot Region (ADR-023 self_as).
+    let self_as = info.self_as.ok_or(fail_code(STEP_HEAP, 0xE4))?;
+    let region = info.region(0).ok_or(fail_code(STEP_HEAP, 0xE5))?.handle;
+    let span = {
+        let mut src = RegionSource::new(raw, region, self_as, INIT_HEAP_VA_BASE, HEAP_CHUNK);
+        src.map_startup(HEAP_CHUNKS)
+            .map_err(|e| fail_code(STEP_HEAP, e as u64))?
+    };
+    HEAP.init(span.0, span.1)
+        .map_err(|e| fail_code(STEP_HEAP, e as u64))?;
+    mark(raw, info.debug_ep, STEP_HEAP, (span.1 >> 10) as u64);
+
+    // Step 7: spawn the process server (embedded image, ADR-023).
+    if !HAS_PS_IMAGE {
+        mark(raw, info.debug_ep, STEP_SPAWNED, SPAWN_SKIPPED);
+        return Ok(());
+    }
+    let pid = spawn_ps(raw, info, self_as, region)?;
+    mark(raw, info.debug_ep, STEP_SPAWNED, pid);
+
+    // Step 8: reap — the death notification fires when PS exits (ADR-007 §6).
+    let death = ps_death_handle(raw)?;
+    let notified = {
+        let mut sys = Syscalls::new(raw);
+        sys.recv(death)
+            .map_err(|e| fail_code(STEP_CHILD_EXIT, e as u64))?
+    };
+    mark(raw, info.debug_ep, STEP_CHILD_EXIT, notified.tag.0);
     Ok(())
 }
 
-fn map_err<T>(r: core::result::Result<T, i32>, step: u64) -> Result<T> {
-    r.map_err(|e| fail_code(step, e as u64))
+/// The death notification handle is stashed by `spawn_ps` at a fixed index in
+/// its returned thread tuple; see `spawn_ps` docs.
+fn ps_death_handle(raw: &mut X86_64Syscalls) -> Result<Handle> {
+    let _ = raw;
+    // Set by spawn_ps via a small module-local cell.
+    DEATH_HANDLE.get().ok_or(fail_code(STEP_CHILD_EXIT, 0xE6))
+}
+
+/// Spawn the process server: load `PS_IMAGE` into a fresh AS, mint its
+/// endpoints/notifications, create the thread, deliver the ADR-009 package,
+/// and bind its death notification. Returns the child pid.
+fn spawn_ps(
+    raw: &mut X86_64Syscalls,
+    info: &BootInfo,
+    self_as: Handle,
+    region: Handle,
+) -> Result<u64> {
+    let image = ElfImage::parse(PS_IMAGE).map_err(|e| fail_code(STEP_SPAWNED, e as u64))?;
+    let ops = loader::plan(&image, INIT_SCRATCH_VA_BASE)
+        .map_err(|e| fail_code(STEP_SPAWNED, 0xE0_00 | (e as u64 & 0xFF)))?;
+
+    let child_as = {
+        let mut sys = Syscalls::new(raw);
+        sys.invoke(
+            info.factory,
+            &Message::new(methods::factory::NEW_ADDRESS_SPACE),
+        )
+        .map_err(|e| fail_code(STEP_SPAWNED, 0xE0_01 | (e as u64 & 0xFF)))?
+        .words[0] as Handle
+    };
+    if child_as == 0 {
+        return Err(fail_code(STEP_SPAWNED, 0xE0_02));
+    }
+
+    {
+        let mut sys = Syscalls::new(raw);
+        loader::execute(
+            &mut sys,
+            &mut loader::MemoryWriter,
+            &ops,
+            child_as,
+            region,
+            self_as,
+            PS_IMAGE,
+        )
+        .map_err(|e| fail_code(STEP_SPAWNED, 0xE1_00 | (e as u64 & 0xFF)))?;
+        loader::map_anon(
+            &mut sys,
+            child_as,
+            USER_STACK_TOP - CHILD_STACK_PAGES * 4096,
+            CHILD_STACK_PAGES,
+            STACK_FLAGS,
+        )
+        .map_err(|e| fail_code(STEP_SPAWNED, 0xE1_01 | (e as u64 & 0xFF)))?;
+    }
+
+    // Endpoints + notifications for the package.
+    let bootstrap_ep = mint(raw, info.factory, methods::factory::NEW_ENDPOINT, 0xE2)?;
+    let init_ep = mint(raw, info.factory, methods::factory::NEW_ENDPOINT, 0xE3)?;
+    let death = mint(raw, info.factory, methods::factory::NEW_NOTIFICATION, 0xE4)?;
+    let mut sessions = [0 as Handle; 4];
+    for (i, slot) in sessions.iter_mut().enumerate() {
+        *slot = mint(
+            raw,
+            info.factory,
+            methods::factory::NEW_NOTIFICATION,
+            0xE5_00 | i as u64,
+        )?;
+    }
+
+    // Child thread (ADR-017 packing): w0 = entry; caps[0] = AS (input),
+    // caps[1] = fault EP (none v0), caps[2] = bootstrap EP.
+    let (thread_cap, pid) = {
+        let mut sys = Syscalls::new(raw);
+        let mut m = Message::new(methods::factory::NEW_THREAD);
+        m.tag = m.tag.with_caps(3);
+        m.words[0] = image.entry;
+        let _ = m.set_descriptor(0, CapSlot::pack(child_as, Rights::MAP.union(Rights::GRANT)));
+        let _ = m.set_descriptor(1, CapSlot::NULL);
+        let _ = m.set_descriptor(2, CapSlot::pack(bootstrap_ep, Rights::RECV));
+        let reply = sys
+            .invoke(info.factory, &m)
+            .map_err(|e| fail_code(STEP_SPAWNED, 0xE6_00 | (e as u64 & 0xFF)))?;
+        (reply.words[0] as Handle, reply.words[2])
+    };
+    if thread_cap == 0 {
+        return Err(fail_code(STEP_SPAWNED, 0xE6_01));
+    }
+
+    // Bind the child's death notification to its thread (ADR-007 §6).
+    {
+        let mut sys = Syscalls::new(raw);
+        let mut m = Message::new(methods::thread::BIND_DEATH_NOTIFICATION);
+        m.tag = m.tag.with_caps(1);
+        let _ = m.set_descriptor(0, CapSlot::pack(death, Rights::SIGNAL));
+        sys.invoke(thread_cap, &m)
+            .map_err(|e| fail_code(STEP_SPAWNED, 0xE7_00 | (e as u64 & 0xFF)))?;
+    }
+
+    // ADR-009 package: §2.3 prefix + ADR-023 tail[0] = Factory.
+    let mut caps: Vec<CapSlot> = Vec::with_capacity(9);
+    caps.push(CapSlot::pack(child_as, Rights::MAP.union(Rights::GRANT)));
+    caps.push(CapSlot::pack(thread_cap, Rights::CONTROL));
+    caps.push(CapSlot::pack(region, Rights::GRANT));
+    for s in sessions {
+        caps.push(CapSlot::pack(
+            s,
+            Rights::SIGNAL.union(Rights::RECV).union(Rights::GRANT),
+        ));
+    }
+    caps.push(CapSlot::pack(init_ep, Rights::SEND.union(Rights::GRANT)));
+    caps.push(CapSlot::pack(info.factory, Rights::ALL));
+    {
+        let mut sys = Syscalls::new(raw);
+        bootstrap::deliver(&mut sys, bootstrap_ep, &caps)
+            .map_err(|e| fail_code(STEP_SPAWNED, 0xE8_00 | (e as u64 & 0xFF)))?;
+    }
+
+    DEATH_HANDLE.set(death);
+    Ok(pid)
+}
+
+fn mint(raw: &mut X86_64Syscalls, factory: Handle, method: u16, errno: u64) -> Result<Handle> {
+    let mut sys = Syscalls::new(raw);
+    let handle = sys
+        .invoke(factory, &Message::new(method))
+        .map_err(|e| fail_code(STEP_SPAWNED, errno | (e as u64 & 0xFF)))?
+        .words[0] as Handle;
+    if handle == 0 {
+        return Err(fail_code(STEP_SPAWNED, errno | 0xFF));
+    }
+    Ok(handle)
+}
+
+/// Tiny module-local state: the death notification handle for the reaper
+/// step (single-threaded init; no allocator needed). 0 = unset.
+struct DeathHandle(core::sync::atomic::AtomicU32);
+
+impl DeathHandle {
+    const fn new() -> Self {
+        Self(core::sync::atomic::AtomicU32::new(0))
+    }
+
+    fn set(&self, death: Handle) {
+        self.0.store(death, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn get(&self) -> Option<Handle> {
+        match self.0.load(core::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            h => Some(h),
+        }
+    }
+}
+
+static DEATH_HANDLE: DeathHandle = DeathHandle::new();
+
+fn exit_with(code: u64) -> ! {
+    Syscalls::new(&mut X86_64Syscalls).exit(code as i32)
 }
 
 const fn fail_code(step: u64, errno: u64) -> u64 {
@@ -108,7 +320,8 @@ const fn fail_code(step: u64, errno: u64) -> u64 {
 }
 
 /// Log one marker through the debug endpoint (SEND-only capability).
-fn mark(sys: &mut Syscalls<'_, X86_64Syscalls>, debug_ep: u32, step: u64, value: u64) {
+fn mark(raw: &mut X86_64Syscalls, debug_ep: u32, step: u64, value: u64) {
+    let mut sys = Syscalls::new(raw);
     let mut m = Message::new(DEBUG_LABEL);
     m.words[0] = MARK | step;
     m.words[1] = value;
@@ -129,25 +342,5 @@ unsafe fn read_bootinfo(ptr: *const u8) -> core::result::Result<BootInfo, u64> {
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
-    let mut raw = X86_64Syscalls;
-    let mut sys = Syscalls::new(&mut raw);
-    sys.exit((FAIL | 0x0BAD_0000) as i32)
+    exit_with(FAIL | 0x0BAD_0000)
 }
-
-/// init is allocation-free, but the SDK lib references `alloc` (window/byte
-/// helpers), so the linker requires a global allocator. Any allocation here
-/// would be a bug — fail the allocation, which routes into the panic path.
-struct FailAlloc;
-
-// SAFETY: `alloc` returns null (allocation always fails, never UB) and
-// `dealloc` ignores its pointer (nothing was ever allocated).
-unsafe impl core::alloc::GlobalAlloc for FailAlloc {
-    unsafe fn alloc(&self, _layout: core::alloc::Layout) -> *mut u8 {
-        core::ptr::null_mut()
-    }
-
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: core::alloc::Layout) {}
-}
-
-#[global_allocator]
-static FAIL_ALLOC: FailAlloc = FailAlloc;

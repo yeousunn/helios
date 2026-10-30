@@ -43,6 +43,31 @@ pub struct BootstrapPackage {
     pub optional: [Option<CapSlot>; 4],
 }
 
+/// Send a bootstrap package (header + chunks of <= 4 caps) to the child's
+/// bootstrap endpoint — the launcher side of [`receive`]. `caps` is the full
+/// package in the child's expected order (§2.3 prefix + optional tail).
+pub fn deliver<R: RawSyscalls>(
+    sys: &mut Syscalls<R>,
+    bootstrap_ep: Handle,
+    caps: &[ipc::CapSlot],
+) -> Result<(), Status> {
+    if caps.len() > MAX_PACKAGE_CAPS || caps.len() < FIXED_CAPS {
+        return Err(status::ETOOBIG);
+    }
+    let mut header = ipc::Message::new(PACKAGE_LABEL);
+    header.words[0] = caps.len() as u64;
+    sys.send(bootstrap_ep, &header)?;
+    for chunk in caps.chunks(ipc::MAX_WORDS) {
+        let mut m = ipc::Message::new(PACKAGE_LABEL);
+        m.tag = m.tag.with_caps(chunk.len() as u8);
+        for (i, slot) in chunk.iter().enumerate() {
+            let _ = m.set_descriptor(i, *slot);
+        }
+        sys.send(bootstrap_ep, &m)?;
+    }
+    Ok(())
+}
+
 /// Receive and unpack the bootstrap package; then `cap_revoke(DELETE)` the
 /// bootstrap endpoint (handle 1). Returns the package or the first error.
 pub fn receive<R: RawSyscalls>(sys: &mut Syscalls<R>) -> Result<BootstrapPackage, Status> {
@@ -276,6 +301,96 @@ mod tests {
         let package = result.unwrap();
         assert_eq!(package.optional[0], None);
         assert_eq!(package.optional[1].unwrap().handle(), 19);
+    }
+
+    #[test]
+    fn deliver_then_receive_roundtrips_a_full_package() {
+        use crate::syscall::number;
+
+        #[derive(Default)]
+        struct LoopbackRaw {
+            queue: VecDeque<ipc::Message>,
+            sends: usize,
+        }
+        impl RawSyscalls for LoopbackRaw {
+            fn raw(&mut self, number: u32, args: [u64; 6]) -> SysReply {
+                match number {
+                    number::SEND => {
+                        let mut m = ipc::Message::new(0);
+                        m.tag = Tag(args[1]);
+                        m.words = [args[2], args[3], args[4], args[5]];
+                        self.queue.push_back(m);
+                        self.sends += 1;
+                        SysReply::default()
+                    }
+                    number::RECV => {
+                        let m = self.queue.pop_front().unwrap_or(ipc::Message {
+                            tag: Tag(0),
+                            words: [0; 4],
+                        });
+                        SysReply {
+                            status: status::OK,
+                            tag: m.tag.0,
+                            words: m.words,
+                        }
+                    }
+                    _ => SysReply::default(),
+                }
+            }
+        }
+
+        let mut caps = Vec::new();
+        caps.push(CapSlot::pack(
+            10,
+            ipc::Rights::MAP.union(ipc::Rights::GRANT),
+        ));
+        caps.push(CapSlot::pack(11, ipc::Rights::CONTROL));
+        caps.push(CapSlot::pack(12, ipc::Rights::GRANT));
+        for h in 13..17 {
+            caps.push(CapSlot::pack(
+                h,
+                ipc::Rights::SIGNAL.union(ipc::Rights::RECV),
+            ));
+        }
+        caps.push(CapSlot::pack(17, ipc::Rights::SEND));
+        caps.push(CapSlot::pack(18, ipc::Rights::ALL)); // tail[0] = Factory
+
+        let mut raw = LoopbackRaw::default();
+        let package;
+        {
+            let mut sys = Syscalls::new(&mut raw);
+            deliver(&mut sys, BOOTSTRAP_HANDLE, &caps).unwrap();
+            package = receive(&mut sys).unwrap();
+        }
+        assert_eq!(raw.sends, 4, "header + 3 chunks for 10 caps");
+        assert_eq!(package.aspace, 10);
+        assert_eq!(package.thread, 11);
+        assert_eq!(package.region, 12);
+        assert_eq!(package.session_notifications, [13, 14, 15, 16]);
+        assert_eq!(package.process_server_ep, 17);
+        assert_eq!(package.optional[0].unwrap().handle(), 18);
+        assert_eq!(package.optional[0].unwrap().rights(), ipc::Rights::ALL);
+    }
+
+    #[test]
+    fn deliver_rejects_bad_lengths() {
+        #[derive(Default)]
+        struct NoopRaw;
+        impl RawSyscalls for NoopRaw {
+            fn raw(&mut self, _n: u32, _a: [u64; 6]) -> SysReply {
+                SysReply::default()
+            }
+        }
+        let mut raw = NoopRaw;
+        let mut sys = Syscalls::new(&mut raw);
+        assert_eq!(
+            deliver(&mut sys, 1, &[CapSlot::NULL; FIXED_CAPS - 1]),
+            Err(status::ETOOBIG)
+        );
+        assert_eq!(
+            deliver(&mut sys, 1, &[CapSlot::NULL; MAX_PACKAGE_CAPS + 1]),
+            Err(status::ETOOBIG)
+        );
     }
 
     #[test]

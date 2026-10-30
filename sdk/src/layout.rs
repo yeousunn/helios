@@ -26,3 +26,11 @@ pub const VFS_HEAP_VA_BASE: u64 = 0x0000_4001_1000_0000;
 /// v0 heap size per server: 1 MiB (16 × 64 KiB chunks, mapped at startup).
 pub const HEAP_CHUNK: u64 = 64 * 1024;
 pub const HEAP_CHUNKS: u64 = 16;
+
+/// init (launcher) VA reservations: its own heap and loader scratch mappings.
+pub const INIT_HEAP_VA_BASE: u64 = 0x0000_3F00_1000_0000;
+pub const INIT_SCRATCH_VA_BASE: u64 = 0x0000_3F00_2000_0000;
+
+/// Initial stack for spawned processes: 64 KiB of ANON pages below
+/// `USER_STACK_TOP`.
+pub const CHILD_STACK_PAGES: u64 = 16;
