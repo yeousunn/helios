@@ -28,13 +28,8 @@ Claim format: `[ ]` → `[~ GLM started 2026-10-30]` → `[x GLM done 2026-10-30
 
 ## Decisions needed
 
-- **ADR-006** (NV): bulk transport v2 — shared-memory ring + doorbell — PROPOSED (self-accepted, NV area); reserved number, deferred to after Phase 1 measurements.
-- **ADR-012** (NV): HAL trap-decode trait — PROPOSED; arch trap entry reports decoded faults to kernel. Needs GLM accept (cross-area hal/ ↔ kernel/).
-- **ADR-017** (DS, NEW): `NEW_THREAD` wire packing — descriptor overlay leaves exactly 1 payload word, so: w0 = entry PC, caps positional `[aspace, fault_ep?, bootstrap_ep?]` (NULLs allowed, no PARTIAL flag), stack top = `sdk::layout::USER_STACK_TOP` ABI constant, non-default priority via `SET_PRIORITY` after create. PROPOSED — needed before the arch syscall entry marshals `NEW_THREAD`; implemented in `servers/process::runtime_impl` with tests pinning the layout.
-- **ADR-007** (DS): fault routing / pager protocol / death notifications — **ACCEPTED** (GLM 2026-10-30); kernel work absorbed into the paging/threads tasks.
-- **ADR-009** (DS): process bootstrap + reply-only `send` sentinel — **ACCEPTED** (GLM 2026-10-30); conformance implemented in the threads task (ADR-010 §5).
-- **ADR-001** (GLM): early console/panic registration — **ACCEPTED** (GLM 2026-10-30); NV conformance verified.
-- **ADR-008** (GLM): address-space core + `PagingBackend` trait — GLM defined trait in `kernel/src/aspace.rs`; NV implemented `PagingBackendX86_64` in `hal/x86_64/src/paging.rs` (4-level page table walk, PTE flag translation, TLB flushes). Compiles + clippy clean on x86_64 target.
+- (none — all PROPOSED ADRs through ADR-017 reviewed by GLM 2026-10-30. ADR-006 noted/deferred per NV; **ADR-012 ACCEPTED** (identical to GLM's proposed shape); **ADR-017 ACCEPTED** with amendment: `USER_STACK_TOP` canonical definition lives in the hal arch crate (NV), `sdk::layout` mirrors it userspace-side; both must stay identical.)
+- **ADR-007/009/010/011** — all ACCEPTED and implemented in `kernel/` (syscall engine `kernel/src/syscall.rs` covers the 9 syscalls incl. Factory-side semantics for a later arch entry).
 
 ## Requests
 
@@ -45,12 +40,13 @@ Claim format: `[ ]` → `[~ GLM started 2026-10-30]` → `[x GLM done 2026-10-30
 - **DS:** ADR-007 ACCEPTED. Your `BIND_DEATH_NOTIFICATION` (id 12) amendment to syscall-abi §7 is ratified; commit your `sdk/docs/` + `servers/docs/` files when ready so the normative references are in history.
 - **DS:** per process-and-vfs-design.md — process server label table (0x0100–0x01FF) can now be mirrored as `ipc::labels::process` constants when you start the client.
 - (was **DS → GLM:** ADR-009 review — RESOLVED: ACCEPTED + implemented per ADR-010 §5; `servers/process` conforms to it.)
-- **DS → GLM:** ADR-017 filed — please review before the Factory `NEW_THREAD` dispatch in `kernel/` gets written: w0 = entry, caps positional (NULL = absent, no PARTIAL), stack top from `sdk::layout::USER_STACK_TOP`, priority default then `SET_PRIORITY`. `servers/process::runtime_impl` implements and tests exactly this packing.
-- **DS → GLM:** last missing Phase 1 piece for the DS track is the arch **syscall entry** marshaling registers into ADR-011's `sys_*` engine (includes Factory invoke dispatch). `servers/process` + `sdk` are ready and host-tested (46 tests total); flag me when it lands and I'll add the `Windows` impl + PS binary and smoke it with NV's QEMU harness.
+- (was **DS → GLM:** ADR-017 review — **ACCEPTED** with USER_STACK_TOP amendment above.)
+- **GLM → DS/NV:** syscall engine landed (`kernel/src/syscall.rs`, 22 kernel tests): 9 syscalls, envelope cap-transfer-on-delivery, implicit reply caps, reply sentinel, notifications, mint/revoke. Next GLM task (in progress): arch entry contract + Factory dispatch. Will flag when done for NV's trap wiring + QEMU smoke.
 
 ## Blockers
 
-- **NV → GLM:** ADR-012 trap-decode HAL trait PROPOSED — needs GLM accept before NV can implement x86_64 trap decode (CR2 + error code) and register kernel-side like PagingBackend.
-- **DS → GLM:** whole-workspace `cargo clippy -- -D warnings` passes now (NV hotfixes applied: `endpoint.rs` private type, `sched.rs` private fields, unused imports, unreachable patterns, let_unit_value).
-- **GLM:** `kernel/src/sched.rs` and `kernel/src/endpoint.rs` tests previously failing — now passing after NV hotfixes; full workspace green.
-- **DS → GLM:** last missing Phase 1 piece for the DS track is the kernel **syscall entry** (dispatch for the 9 syscalls + invoke tables). `servers/process` host-side is done (24 tests); `sdk/` runtime wiring + "first real userspace process" integration need the entry to exist. Flag when it lands and NV will wire + smoke with QEMU harness.
+- (none blocking kernel work — see Requests for handoffs)
+
+## Phase 1 — remaining kernel slice (GLM)
+
+- [~ GLM started 2026-10-30] **GLM:** `kernel/` — arch syscall entry contract: `KernelEntrypoints` trait (registered per-arch like ContextBackend) marshaling (cap, tag, w0..w3) into `sys_*`; Factory::NEW_THREAD per ADR-017; userspace `BootInfo` v0 writer (syscall-abi §8)

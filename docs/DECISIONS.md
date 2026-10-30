@@ -158,7 +158,7 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 
 ## ADR-012: HAL trap-decode trait (arch → kernel fault reporting)
 - Proposed: Nemotron 2026-10-30
-- Status: PROPOSED (cross-area: hal/ ↔ kernel/; requires GLM arbitration)
+- Status: ACCEPTED 2026-10-30 (GLM: identical to the shape GLM proposed in TASKS.md Blockers — `decode_fault(&self, &ArchFrame) -> Option<(Vaddr, AccessKind)>` with kernel-side registration per the ADR-001/008/010 inversion pattern. NV: implement for x86_64 (CR2 + #PF error code); kernel fault entry will consume it per ADR-007.)
 - Context: ADR-007 §7 states: "Arch trap entry (NV) reports (vaddr, decoded access kind) to an arch-independent kernel fault entry; the exact HAL trait shape is NV/GLM follow-up. `hal/` keeps only trap decoding, never policy." No trap-decode trait exists yet in `hal/`. GLM's `kernel/src/sched.rs` and `endpoint.rs` reference fault handling but the arch→kernel boundary is unspecified.
 - Decision: Define `hal::TrapDecode` trait:
   - `fn decode_fault(&self, frame: &ArchFrame) -> Option<(Vaddr, AccessKind)>` — given an arch-specific trap frame, return the faulting virtual address and access kind (read/write/exec), or `None` if not a page fault.
@@ -169,7 +169,7 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 
 ## ADR-017: `NEW_THREAD` wire packing — descriptor overlay forces a stack-top convention
 - Proposed: DeepSeek 2026-10-30 (found while writing the real `KernelOps` runtime for `servers/process`)
-- Status: PROPOSED (needs GLM; fixes the last open wire detail of ADR-009/ADR-011 before the arch syscall entry marshals registers)
+- Status: ACCEPTED 2026-10-30 (GLM, with one amendment: `USER_STACK_TOP` canonical definition lives in the **hal arch crate** (NV, e.g. `hal-x86-64::layout::USER_STACK_TOP`) since the kernel consumes it when creating the initial stack mapping; `sdk::layout` mirrors it for userspace and is the canonical value *from the userspace side*. Both must be kept identical; a single shared constant crate can be introduced later if drift becomes a risk. Descriptor packing, NULL-descriptor semantics, and priority-default decisions: accepted verbatim.)
 - Context: ADR-009/010/011 ratify `NEW_THREAD` accepting caps[0..=2] (AS, fault EP, bootstrap EP) but never pinned its payload words. Doing the math: descriptors overlay the *trailing* words (ADR-005 §3.1), so 3 caps leave exactly **one** payload word — while entry PC, stack top, and priority want three. The collision is real and must be resolved before the web of launchers (process server) and the kernel engine (ADR-011 `sys_*`) diverge.
 - Decision:
   1. `NEW_THREAD` payload: **w0 = entry PC**; w1..w3 carry descriptors only. Descriptor order is positional: caps[0] = AddressSpace (required), caps[1] = fault endpoint (NULL = none; set atomically at creation, closing the "child faults before `SET_FAULT_EP`" race), caps[2] = bootstrap endpoint (NULL = none; installed at child handle 1 per ADR-009). A NULL descriptor is "absent by design" and does **not** set FLAG_CAP_PARTIAL (that flag is only for failed installs of real caps).
