@@ -13,8 +13,10 @@ use ipc::{status, CapSlot, Message, Rights};
 /// Logical protocol version, carried in CONNECT `w0`.
 pub const PROTO_VERSION: u16 = 1;
 
-/// v0 window size for CONNECT maps (both directions).
-pub const WIN_SIZE: u32 = 64 * 1024;
+/// v0 window size: one 4 KiB frame — the kernel's `AS::MAP` is page-granular
+/// (ADR-021), and CONNECT has 3 cap descriptors (one payload word) so one
+/// frame per window keeps the handshake exact.
+pub const WIN_SIZE: u32 = 4096;
 
 /// Operation labels inside `ipc::labels::process` (0x0100–0x01FF).
 pub mod label {

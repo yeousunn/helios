@@ -11,3 +11,10 @@ pub const USER_STACK_TOP: u64 = 0x0000_7FFF_FFFF_F000;
 /// ADR-010; higher = more urgent). Launchers re-prioritize via
 /// `Thread::SET_PRIORITY` when they want something else.
 pub const DEFAULT_THREAD_PRIORITY: u8 = 100;
+
+/// VA bases for server connection windows (design doc §1.3; v0 constants).
+/// Distinct per server so the kernel-wide v0 VMM never collides; a window is
+/// one 4 KiB frame, mapped on first access. Subject to the per-process VMM
+/// layout ADR later.
+pub const PS_WINDOW_VA_BASE: u64 = 0x0000_4000_0000_0000;
+pub const VFS_WINDOW_VA_BASE: u64 = 0x0000_4001_0000_0000;

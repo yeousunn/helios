@@ -15,8 +15,9 @@ use ipc::{status, CapSlot, Message, Rights};
 /// Logical protocol version carried in CONNECT `w0`.
 pub const PROTO_VERSION: u16 = 1;
 
-/// v0 window size (CONNECT has 3 cap descriptors — one payload word).
-pub const WIN_SIZE: u32 = 64 * 1024;
+/// v0 window size: one 4 KiB frame — `AS::MAP` is page-granular (ADR-021),
+/// and CONNECT has 3 cap descriptors (one payload word).
+pub const WIN_SIZE: u32 = 4096;
 
 /// Operation labels inside `ipc::labels::vfs` (0x0200–0x02FF).
 pub mod label {

@@ -24,12 +24,16 @@
    - Rationale: endpoint-per-connection needs zero kernel features (a sender-badge
      mechanism would be an ADR-005 amendment); cost is one endpoint object + one
      server thread per connection, acceptable at v0 scale (see §6).
-3. **Argument/result windows.** Two frames (default 64 KiB) are transferred at
-   connect and mapped into the server (arg = server reads, result = server writes).
-   Strings and small structs travel in the windows; register words carry
-   `(offset, len)` pairs packed as `u32(u32)`. Client-side, a per-connection lock
-   serializes window use (SDK responsibility); server-side, the connection thread
-   serializes it naturally.
+3. **Argument/result windows.** Two frames are transferred at connect (arg =
+   server reads, result = server writes). **v0: one 4 KiB frame per window** —
+   `AddressSpace::MAP` is page-granular (ADR-021); larger windows land with
+   multi-page maps. The server maps each window lazily at a server-specific VA
+   base (`sdk::layout::{PS,VFS}_WINDOW_VA_BASE`, distinct per server so the
+   kernel-wide v0 VMM never collides; `sdk::window::WindowMapper` encapsulates
+   the mapping + safe byte access). Strings and small structs travel in the
+   windows; register words carry `(offset, len)` pairs packed as `u32(u32)`.
+   Client-side, a per-connection lock serializes window use (SDK responsibility);
+   server-side, the connection thread serializes it naturally.
 4. **Handles.** Servers mint server-private `u64` handles
    (`{generation: u16, kind: u8, index: u48}`) bound to a client record. A handle from
    another connection is rejected by the `(client, handle)` check — unforgeable

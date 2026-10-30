@@ -205,6 +205,20 @@ impl Windows for MockWindows {
             .map(|s| s.to_vec())
             .ok_or(status::EBADARG)
     }
+
+    fn write(&mut self, window: Handle, span: Span, data: &[u8]) -> Result<(), Status> {
+        if span.len as usize != data.len() {
+            return Err(status::EBADARG);
+        }
+        let window_data = self.data.entry(window).or_default();
+        let start = span.offset as usize;
+        let end = start + data.len();
+        if window_data.len() < end {
+            window_data.resize(end, 0);
+        }
+        window_data[start..end].copy_from_slice(data);
+        Ok(())
+    }
 }
 
 /// Window contents for a SPAWN: header + program name at `program.offset`.

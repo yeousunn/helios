@@ -12,12 +12,18 @@
 //! server's mapped window addresses, which arrive with the first real address
 //! space layout (integration milestone).
 
+use alloc::vec::Vec;
+
 use ipc::{CapSlot, Message, Rights};
 use sdk::methods;
 use sdk::syscall::{RawSyscalls, Syscalls};
+use sdk::window::WindowMapper;
 
-use crate::proto::Status;
-use crate::runtime::{Handle, KernelOps, MapFlags, Transport};
+use crate::proto::{Span, Status};
+use crate::runtime::{Handle, KernelOps, MapFlags, Transport, Windows};
+
+/// Window VA reservations per server (one 4 KiB frame per window, ADR-021).
+const MAX_WINDOWS: usize = 64;
 
 /// Builds an `invoke` message for `method` with payload words and capability
 /// descriptors. Descriptors overlay the *trailing* words, so `cap_count` is
@@ -39,18 +45,27 @@ fn first_word(msg: &Message) -> Result<Handle, Status> {
 pub struct Runtime<'a, R: RawSyscalls> {
     sys: Syscalls<'a, R>,
     factory: Handle,
+    windows: WindowMapper,
 }
 
 impl<'a, R: RawSyscalls> Runtime<'a, R> {
-    pub fn new(raw: &'a mut R, factory: Handle) -> Self {
+    /// `as_cap` = the server's self-AS cap (spawn package); `window_va_base` =
+    /// `sdk::layout::PS_WINDOW_VA_BASE`.
+    pub fn new(raw: &'a mut R, factory: Handle, as_cap: Handle, window_va_base: u64) -> Self {
         Self {
             sys: Syscalls::new(raw),
             factory,
+            windows: WindowMapper::new(as_cap, window_va_base, MAX_WINDOWS),
         }
     }
 
     fn invoke(&mut self, cap: Handle, msg: &Message) -> Result<Message, Status> {
         self.sys.invoke(cap, msg)
+    }
+
+    /// Map a window frame on first use; returns its VA (ADR-021).
+    pub fn map_window(&mut self, frame: Handle, flags: u32) -> Result<u64, Status> {
+        Ok(self.windows.window_of(&mut self.sys, frame, flags)?.va())
     }
 
     fn factory_op(&mut self, method: u16) -> Result<Handle, Status> {
@@ -179,6 +194,25 @@ impl<R: RawSyscalls> KernelOps for Runtime<'_, R> {
     }
 }
 
+impl<R: RawSyscalls> Windows for Runtime<'_, R> {
+    fn read(&mut self, window: Handle, span: Span) -> Result<Vec<u8>, Status> {
+        let w = self
+            .windows
+            .window_of(&mut self.sys, window, sdk::window::FLAG_READ)?;
+        w.read(span.offset, span.len)
+    }
+
+    fn write(&mut self, window: Handle, span: Span, data: &[u8]) -> Result<(), Status> {
+        if span.len as usize != data.len() {
+            return Err(ipc::status::EBADARG);
+        }
+        let w = self
+            .windows
+            .window_of(&mut self.sys, window, sdk::window::FLAG_WRITE)?;
+        w.write(span.offset, data)
+    }
+}
+
 impl<R: RawSyscalls> Transport for Runtime<'_, R> {
     fn recv(&mut self, on: Handle) -> Result<Message, Status> {
         self.sys.recv(on)
@@ -229,7 +263,24 @@ mod tests {
     }
 
     fn runtime(raw: &mut MockRaw) -> Runtime<'_, MockRaw> {
-        Runtime::new(raw, 8)
+        Runtime::new(raw, 8, 9, sdk::layout::PS_WINDOW_VA_BASE)
+    }
+
+    #[test]
+    fn map_window_invokes_as_map_at_the_reserved_base() {
+        let mut raw = MockRaw::default();
+        let va = {
+            let mut rt = runtime(&mut raw);
+            rt.map_window(30, sdk::window::FLAG_READ).unwrap()
+        };
+        assert_eq!(va, sdk::layout::PS_WINDOW_VA_BASE);
+        let (number, args) = raw.calls[0];
+        assert_eq!(number, number::INVOKE);
+        assert_eq!(args[0], 9, "invoke on the self-AS cap");
+        assert_eq!(args[1] as u16, sdk::methods::aspace::MAP);
+        assert_eq!(args[2], va, "w0 = vaddr");
+        assert_eq!(args[3], sdk::window::FLAG_READ as u64, "w1 = flags");
+        assert_eq!(args[5] as u32, 30, "caps[0] = window frame");
     }
 
     #[test]

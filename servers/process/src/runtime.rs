@@ -113,9 +113,15 @@ pub trait ProgramLoader {
     fn load(&mut self, program: &[u8]) -> Result<LoadedImage, Status>;
 }
 
-/// Reads bytes out of a connection window. Windows are frames mapped into the
-/// server's address space — this is a memory read, not a kernel operation; the
-/// trait exists so the serving logic stays host-testable.
+/// Reads/writes connection windows. Windows are frames mapped into the
+/// server's address space (ADR-021) — memory access, not a kernel operation;
+/// the trait exists so the serving logic stays host-testable.
 pub trait Windows {
     fn read(&mut self, window: Handle, span: crate::proto::Span) -> Result<Vec<u8>, Status>;
+    fn write(
+        &mut self,
+        window: Handle,
+        span: crate::proto::Span,
+        data: &[u8],
+    ) -> Result<(), Status>;
 }

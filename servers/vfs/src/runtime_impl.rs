@@ -6,24 +6,57 @@
 //! `now_ns` is a v0 stub: there is no time syscall yet (timer service lands in
 //! Phase 2); mtime stamps stay 0 until then.
 
+use alloc::vec::Vec;
+
 use ipc::Message;
 use sdk::methods;
 use sdk::syscall::{RawSyscalls, Syscalls};
+use sdk::window::WindowMapper;
 
-use crate::proto::Status;
-use crate::runtime::{Handle, Transport, VfsKernel};
+use crate::proto::{Span, Status};
+use crate::runtime::{Handle, Transport, VfsKernel, Windows};
+
+const MAX_WINDOWS: usize = 128;
 
 pub struct Runtime<'a, R: RawSyscalls> {
     sys: Syscalls<'a, R>,
     factory: Handle,
+    windows: WindowMapper,
 }
 
 impl<'a, R: RawSyscalls> Runtime<'a, R> {
-    pub fn new(raw: &'a mut R, factory: Handle) -> Self {
+    /// `as_cap` = the server's self-AS cap (spawn package); `window_va_base` =
+    /// `sdk::layout::VFS_WINDOW_VA_BASE`.
+    pub fn new(raw: &'a mut R, factory: Handle, as_cap: Handle, window_va_base: u64) -> Self {
         Self {
             sys: Syscalls::new(raw),
             factory,
+            windows: WindowMapper::new(as_cap, window_va_base, MAX_WINDOWS),
         }
+    }
+
+    /// Map a window frame on first use; returns its VA (ADR-021).
+    pub fn map_window(&mut self, frame: Handle, flags: u32) -> Result<u64, Status> {
+        Ok(self.windows.window_of(&mut self.sys, frame, flags)?.va())
+    }
+}
+
+impl<R: RawSyscalls> Windows for Runtime<'_, R> {
+    fn read(&mut self, window: Handle, span: Span) -> Result<Vec<u8>, Status> {
+        let w = self
+            .windows
+            .window_of(&mut self.sys, window, sdk::window::FLAG_READ)?;
+        w.read(span.offset, span.len)
+    }
+
+    fn write(&mut self, window: Handle, span: Span, data: &[u8]) -> Result<(), Status> {
+        if span.len as usize != data.len() {
+            return Err(ipc::status::EBADARG);
+        }
+        let w = self
+            .windows
+            .window_of(&mut self.sys, window, sdk::window::FLAG_WRITE)?;
+        w.write(span.offset, data)
     }
 }
 
@@ -92,7 +125,7 @@ mod tests {
     fn new_endpoint_is_a_factory_invoke_returning_w0() {
         let mut raw = MockRaw::default();
         let handle = {
-            let mut rt = Runtime::new(&mut raw, 8);
+            let mut rt = Runtime::new(&mut raw, 8, 9, sdk::layout::VFS_WINDOW_VA_BASE);
             rt.new_endpoint().unwrap()
         };
         assert_eq!(handle, 1);
@@ -109,7 +142,7 @@ mod tests {
             ..Default::default()
         };
         {
-            let mut rt = Runtime::new(&mut failing, 8);
+            let mut rt = Runtime::new(&mut failing, 8, 9, sdk::layout::VFS_WINDOW_VA_BASE);
             assert_eq!(rt.new_endpoint(), Err(ipc::status::EBADCAP));
         }
 
@@ -120,7 +153,7 @@ mod tests {
         };
         let mut nullish = nullish;
         {
-            let mut rt = Runtime::new(&mut nullish, 8);
+            let mut rt = Runtime::new(&mut nullish, 8, 9, sdk::layout::VFS_WINDOW_VA_BASE);
             assert_eq!(rt.new_endpoint(), Err(ipc::status::ENOMEM));
         }
     }
@@ -128,7 +161,7 @@ mod tests {
     #[test]
     fn now_ns_is_a_zero_stub() {
         let mut raw = MockRaw::default();
-        let mut rt = Runtime::new(&mut raw, 8);
+        let mut rt = Runtime::new(&mut raw, 8, 9, sdk::layout::VFS_WINDOW_VA_BASE);
         assert_eq!(rt.now_ns(), 0);
     }
 
@@ -137,7 +170,7 @@ mod tests {
         let mut raw = MockRaw::default();
         let msg = Message::new(0x0201);
         {
-            let mut rt = Runtime::new(&mut raw, 8);
+            let mut rt = Runtime::new(&mut raw, 8, 9, sdk::layout::VFS_WINDOW_VA_BASE);
             let _ = rt.recv(4);
             rt.reply(&msg).unwrap();
             rt.send(5, &msg).unwrap();
@@ -147,5 +180,22 @@ mod tests {
         assert_eq!(raw.calls[1].0, number::SEND);
         assert_eq!(raw.calls[1].1[0], sdk::syscall::REPLY_CAP as u64);
         assert_eq!(raw.calls[2].1[0], 5);
+    }
+
+    #[test]
+    fn map_window_invokes_as_map_at_the_reserved_base() {
+        let mut raw = MockRaw::default();
+        let va = {
+            let mut rt = Runtime::new(&mut raw, 8, 9, sdk::layout::VFS_WINDOW_VA_BASE);
+            rt.map_window(30, sdk::window::FLAG_WRITE).unwrap()
+        };
+        assert_eq!(va, sdk::layout::VFS_WINDOW_VA_BASE);
+        let (number, args) = raw.calls[0];
+        assert_eq!(number, sdk::syscall::number::INVOKE);
+        assert_eq!(args[0], 9, "invoke on the self-AS cap");
+        assert_eq!(args[1] as u16, methods::aspace::MAP);
+        assert_eq!(args[2], va, "w0 = vaddr");
+        assert_eq!(args[3], sdk::window::FLAG_WRITE as u64, "w1 = flags");
+        assert_eq!(args[5] as u32, 30, "caps[0] = window frame");
     }
 }

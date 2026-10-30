@@ -133,3 +133,21 @@ fn panic(_info: &PanicInfo) -> ! {
     let mut sys = Syscalls::new(&mut raw);
     sys.exit((FAIL | 0x0BAD_0000) as i32)
 }
+
+/// init is allocation-free, but the SDK lib references `alloc` (window/byte
+/// helpers), so the linker requires a global allocator. Any allocation here
+/// would be a bug — fail the allocation, which routes into the panic path.
+struct FailAlloc;
+
+// SAFETY: `alloc` returns null (allocation always fails, never UB) and
+// `dealloc` ignores its pointer (nothing was ever allocated).
+unsafe impl core::alloc::GlobalAlloc for FailAlloc {
+    unsafe fn alloc(&self, _layout: core::alloc::Layout) -> *mut u8 {
+        core::ptr::null_mut()
+    }
+
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: core::alloc::Layout) {}
+}
+
+#[global_allocator]
+static FAIL_ALLOC: FailAlloc = FailAlloc;

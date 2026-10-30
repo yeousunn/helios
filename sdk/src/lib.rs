@@ -13,6 +13,9 @@ pub mod bootstrap;
 pub mod layout;
 pub mod methods;
 pub mod syscall;
+pub mod window;
+
+extern crate alloc;
 
 #[cfg(test)]
 extern crate std;

@@ -25,11 +25,11 @@ Claim format: `[ ]` → `[~ GLM started 2026-10-30]` → `[x GLM done 2026-10-30
 - [x NV done 2026-10-30] `hal/` — boot protocol traits (ADR-015: BootInfo, AcpiParser, DeviceTree, FramebufferInfo — x86_64 stubs)
 - [x NV done 2026-10-30] `drivers/` — bus interface traits (ADR-016: PciBus, Virtio, Dma, MmioRegion — x86_64 stubs)
 - [x NV done 2026-10-30] `tools/` — CI: build + clippy + fmt + qemu-test on every commit (`.github/workflows/ci.yml` + `tools/qemu-test.sh` with ADR-013 exit code mapping)
-- [~ DS started 2026-10-30] **DS:** `servers/process/` — first userspace test process running over IPC v1. Done: proto codecs (CONNECT/PACKAGE/SPAWN/WAIT/KILL), spawn pipeline with ADR-009 bootstrap package, serving loop (endpoint-per-connection), reaper/wait bookkeeping; `sdk/`: typed syscall layer (x86_64 asm + mock-tested wrappers + reply sentinel), ADR-009 bootstrap receiver, invoke method tables, ABI layout constants; `runtime_impl`: real `KernelOps`/`Transport` over syscalls with ADR-017 `NEW_THREAD` packing (33 process tests + 13 sdk tests, all host). Remaining: `Windows` impl + PS binary + QEMU smoke once the arch syscall entry (kernel+NV) lands.
+- [~ DS started 2026-10-30] **DS:** `servers/process/` — first userspace test process running over IPC v1. Done: proto codecs, spawn pipeline (ADR-009), serving loop, reaper/wait; `sdk/` syscall layer + bootstrap receiver + method tables; `runtime_impl` (KernelOps/Transport **+ Windows**: window frames lazily mapped via ADR-021 `AS::MAP`, safe byte access in `sdk::window`); v0 windows are 1×4 KiB frame (page-granular MAP). 85 host tests across the three crates. Remaining: PS binary startup + QEMU smoke (gated on NV's context backend/syscall entry).
 
 ## Phase 2 — System Servers (early starts)
 
-- [~ DS started 2026-10-30] **DS:** `servers/vfs/` — slice 1 done (protocol codecs, ramfs core, handle tables, serving loop — 23 tests) + `runtime_impl` (VfsKernel/Transport over syscalls, `now_ns` = 0 stub until the timer service — 27 tests total, clippy/fmt clean). CONNECT reply carries the connection's root handle. Next: `READ_BULK` (needs map-into-self) + VFS binary startup once PS integration lands.
+- [~ DS started 2026-10-30] **DS:** `servers/vfs/` — slice 1 done + `runtime_impl` (VfsKernel/Transport/**Windows** over syscalls; `now_ns` = 0 stub until the timer service). CONNECT reply carries the connection's root handle. 29 tests. Next: `READ_BULK` (needs scratch map-into-self — deferred to the allocator/loader slice) + VFS binary startup once PS integration lands.
 
 ## Decisions needed
 
