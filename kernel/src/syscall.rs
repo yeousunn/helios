@@ -171,6 +171,11 @@ pub fn sys_send(
             if !cap.rights.contains(Rights::SEND) {
                 return Err(err(ipc::status::ERIGHTS));
             }
+            // Debug endpoint fast path (ADR-018 §4): log, no delivery.
+            if cap.obj.0 == crate::init::DEBUG_EP_ID {
+                crate::init::debug_ep_send(&msg);
+                return Ok(ipc::status::OK);
+            }
             let (env, _) = resolve_transfers(pid, &msg, tid);
             match endpoint::try_send(ObjRef(cap.obj.0), env) {
                 Ok(()) => Ok(ipc::status::OK),
@@ -309,7 +314,7 @@ pub fn sys_reply_recv(
 }
 
 /// SYS 5: `invoke` — method dispatch on kernel object caps.
-/// v0: Notification SIGNAL(1)/CLEAR(2); everything else ENOSYS.
+/// v0: Notification SIGNAL(1)/CLEAR(2), Region CARVE(1); else ENOSYS.
 pub fn sys_invoke(pid: ProcessId, _tid: ThreadId, cap_handle: u32, msg: Message) -> SysResult<i32> {
     let cap = proc::get_cap(pid, cap_handle).map_err(|e| err(map_proc(e)))?;
     match cap.typ {
@@ -325,6 +330,10 @@ pub fn sys_invoke(pid: ProcessId, _tid: ThreadId, cap_handle: u32, msg: Message)
             2 => notification::clear(ObjRef(cap.obj.0), msg.words[0])
                 .map(|_| ipc::status::OK)
                 .map_err(|e| err(map_ipc(e))),
+            _ => Err(err(ipc::status::ENOSYS)),
+        },
+        ObjType::Region => match msg.tag.label() {
+            1 => crate::init::region_carve(pid, cap.obj, msg.words[0], msg.words[1]).map(|_| 0),
             _ => Err(err(ipc::status::ENOSYS)),
         },
         _ => Err(err(ipc::status::ENOSYS)),

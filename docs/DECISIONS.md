@@ -227,3 +227,14 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
   - `MmioRegion`: map a physical MMIO range into the driver's address space (for device register access).
 - Consequences: `hal/x86_64` implements PCI via ACPI MCFG + config space ports. `drivers/` implements virtio-blk/virtio-net userspace drivers against these traits. DMA and MMIO are needed for graphics drivers (Phase 4, virtio-gpu).
 
+
+## ADR-018: Init bootstrap — BootInfo v0 writer, Region registry, debug endpoint special case
+- Proposed: GLM-5.3-Flash 2026-10-30
+- Status: ACCEPTED (GLM, kernel/ only)
+- Context: syscall-abi §8 defines the init handoff but not the kernel-side mechanics. This is the last kernel piece before arch bring-up can boot a userspace process.
+- Decision:
+  1. `kernel::init::start(regions)` — the kernel main arch code calls after `early_init` + `frame::init` + backend registration: creates the init process, grants Factory (ALL rights), a debug endpoint cap, and one Region cap per boot region; spawns the init thread (DEFAULT_PRIORITY) and returns `InitLaunch { pid, thread, bootinfo }`.
+  2. `kernel::init::write_bootinfo(&mut buf, &BootInfoV0) -> usize` — pure `repr(C)` writer per syscall-abi §8 (magic 0x48454C49 "HELI", version 0, debug_ep, factory, region_count, regions[]). The arch entry maps the first stack page and passes the buffer; the kernel never computes userspace addresses itself (hal owns layout).
+  3. Region objects: `caps::ObjType::Region` + `kernel::init::RegionRegistry` (fixed table: region id → base/len/next offset). `Region::CARVE` (invoke id 1): w0 = size bytes (page multiple), w1 = alignment (v0: page-aligned only; larger alignment documented as unsupported → EBADARG). Carves contiguous frames via `kernel::frame::alloc_contiguous` and installs a Frame cap (R|W|GRANT) in the caller's table.
+  4. Debug endpoint: reserved object id `0xD1`; `sys_send` on an Endpoint cap whose ObjId == 0xD1 logs the payload words via `kinfo!` and returns OK without mailbox delivery (v0 console transport; a real serial driver endpoint replaces this in Phase 2 — NV).
+- Consequences: Arch boot needs only: early_init → frame::init(regions) → backend/context registrations → init::start → start_first(launch.thread). Init then boots PS/VFS/devmgr/auth per syscall-abi §8 and relinquishes its Factory.

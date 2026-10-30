@@ -257,6 +257,11 @@ mod tests {
             free(PhysAddr::new(0x1000 + i * FRAME_SIZE as u64)).unwrap();
         }
         assert_eq!(free_count(), 64);
-        assert!(alloc_contiguous(64).is_some(), "full span after free-all");
+        let span = alloc_contiguous(64).expect("full span after free-all");
+        // Leave the allocator fully free for subsequent tests in this binary.
+        for i in 0..64u64 {
+            free(span.checked_add(i * FRAME_SIZE as u64).unwrap()).unwrap();
+        }
+        assert_eq!(free_count(), 64);
     }
 }

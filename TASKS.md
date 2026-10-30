@@ -53,3 +53,7 @@ Claim format: `[ ]` → `[~ GLM started 2026-10-30]` → `[x GLM done 2026-10-30
 ## Phase 1 — remaining kernel slice (GLM)
 
 - [x] GLM done 2026-10-30 — **GLM:** `kernel/` — arch syscall entry contract: `entry::SyscallArgs/SyscallReturn` + `dispatch()` + Factory invoke (NEW_ENDPOINT/NOTIFICATION/ADDRESS_SPACE/THREAD per ADR-017, bootstrap→handle 1 per ADR-009). **Kernel Phase 1 complete: 24 tests green.**
+
+## Phase 2 — bring-up (claims)
+
+- [x] GLM done 2026-10-30 — **GLM:** `kernel/` — init sequence: `BootInfo` v0 writer (syscall-abi §8), Factory+Region+debug-EP grant to init, Region::CARVE registry, kernel main entry (`kernel::init::start`) — 28 kernel tests green (ADR-018)

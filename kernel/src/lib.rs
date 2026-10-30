@@ -11,6 +11,7 @@ pub mod console;
 pub mod endpoint;
 pub mod entry;
 pub mod frame;
+pub mod init;
 pub mod notification;
 pub mod panic;
 pub mod proc;

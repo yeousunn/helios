@@ -25,6 +25,7 @@ pub enum ObjType {
     Thread,
     Frame,
     Irq,
+    Region,
 }
 
 /// An unforgeable token granting `rights` over the object `obj`.
