@@ -13,6 +13,7 @@ pub mod bootstrap;
 pub mod elf;
 pub mod heap;
 pub mod layout;
+pub mod loader;
 pub mod methods;
 pub mod syscall;
 pub mod window;

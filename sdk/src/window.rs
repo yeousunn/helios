@@ -25,11 +25,13 @@ pub const FLAG_READ: u32 = 1 << 0;
 /// Mapping flags for a server-write (result) window: `MapFlags::W`.
 pub const FLAG_WRITE: u32 = 1 << 1;
 
-/// A live window mapping in the current address space. Constructible only by
-/// [`WindowMapper`], which maps the frame before returning it.
+/// A live window mapping in the current address space. Constructible by
+/// [`WindowMapper`] — and by SDK-internal code that has just performed the
+/// mapping invoke itself (the loader's scratch copies); the field is
+/// `pub(crate)` so external crates cannot fabricate one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct MappedWindow {
-    va: u64,
+    pub(crate) va: u64,
 }
 
 impl MappedWindow {
