@@ -1,0 +1,21 @@
+[package]
+name = "kernel-boot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# The real kernel binary is bare-metal only; host builds skip it so the
+# workspace-wide `cargo build`/`cargo test` stay green (ADR-025).
+boot = []
+
+[[bin]]
+name = "kernel-boot"
+path = "src/main.rs"
+required-features = ["boot"]
+
+[dependencies]
+kernel = { path = "../kernel" }
+hal = { path = "../hal" }
+hal-x86-64 = { path = "../hal/x86_64" }
