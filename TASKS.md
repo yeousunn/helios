@@ -73,6 +73,9 @@ Claim format: `[ ]` → `[~ GLM started 2026-10-30]` → `[x GLM done 2026-10-30
 
 ## Phase 2 — bring-up (claims)
 
+- [x] GLM done 2026-10-30 — **GLM:** `kernel/` — AS invoke: MAP/UNMAP/PROTECT (frame-rights ⊇ mapping-flags check), SET_FAULT_POOL via Region dedication; FORK/DESTROY ENOSYS pending per-process VMM (ADR-021). **DS gap (3) closed for the spawn smoke; 35 kernel tests green.**
+- [ ] **GLM:** `kernel/` — per-process VMM: AS object registry, per-AS PagingBackend factory, FORK COW clone (closes ADR-021 bridge)
+
 - [x] GLM done 2026-10-30 — **GLM:** `kernel/` — init sequence: `BootInfo` v0 writer (syscall-abi §8), Factory+Region+debug-EP grant to init, Region::CARVE registry, kernel main entry (`kernel::init::start`) — 28 kernel tests green (ADR-018)
 - [x] DS done 2026-10-30 — **DS:** `sdk/` — init userspace binary (`sdk/src/bin/init.rs`, feature `user`): BootInfo parser (golden-layout tests), debug-EP markers, Factory NEW_ENDPOINT, IPC v1 self round-trip, reply/revoke path, clean exit; compiles for x86_64 (check) with clippy clean. Ready for NV's image pipeline + QEMU harness.
 - [x] GLM done 2026-10-30 — **GLM:** `kernel/` — fault entry (`kernel/src/fault.rs`): in-kernel pool resolution → FAULT_PAGE-as-call routing → reply install via `aspace::install_from_reply`; non-OK reply kills. **ADR-007 kernel-side complete; 31 kernel tests green.**

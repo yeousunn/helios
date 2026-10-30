@@ -215,6 +215,7 @@ fn invoke(pid: ProcessId, tid: ThreadId, args: SyscallArgs) -> SyscallReturn {
     match cap.typ {
         ObjType::Factory => factory_invoke(pid, tid, &cap, &args),
         ObjType::Thread => thread_invoke(pid, tid, &cap, &args),
+        ObjType::AddressSpace => as_invoke(pid, &cap, &args),
         _ => match syscall::sys_invoke(pid, tid, args.cap, args.message()) {
             Ok(status) => SyscallReturn {
                 status,
@@ -223,6 +224,92 @@ fn invoke(pid: ProcessId, tid: ThreadId, args: SyscallArgs) -> SyscallReturn {
             },
             Err(e) => SyscallReturn::err(e),
         },
+    }
+}
+
+/// AddressSpace methods (syscall-abi §7). v0: kernel-wide VMM (ADR-008/
+/// 021) — MAP/UNMAP/PROTECT/SET_FAULT_POOL; FORK/DESTROY are ENOSYS until
+/// per-process VMM objects land (board: Phase 2 kernel task).
+fn as_invoke(pid: ProcessId, cap: &Capability, args: &SyscallArgs) -> SyscallReturn {
+    use crate::aspace::{self, MapFlags, Vaddr};
+    if !cap.rights.contains(Rights::MAP) {
+        return SyscallReturn::err(ipc::status::ERIGHTS);
+    }
+    let msg = args.message();
+    const MAP: u16 = 1;
+    const UNMAP: u16 = 2;
+    const PROTECT: u16 = 3;
+    const SET_FAULT_POOL: u16 = 4;
+    const FORK: u16 = 5;
+    const DESTROY: u16 = 6;
+
+    let vaddr = Vaddr(msg.words[0]);
+    match msg.tag.label() {
+        MAP => {
+            let flags = MapFlags((msg.words[1] as u32) & 0b1_1111);
+            if flags.0 == 0 {
+                return SyscallReturn::err(ipc::status::EBADARG);
+            }
+            // Frame cap check (ANON ignores caps[0]): frame_rights ⊇ requested.
+            let frame_addr = if flags.contains(MapFlags::ANON) {
+                None
+            } else {
+                match msg.descriptor(0).filter(|cs| cs.handle() != 0) {
+                    Some(cs) => match proc::get_cap(pid, cs.handle()) {
+                        Ok(fc) if fc.typ == ObjType::Frame => {
+                            // Rights bit mapping: ipc::Rights READ=bit3, WRITE=bit4,
+                            // EXEC=bit5 (syscall-abi §5) → MapFlags bits 0..2.
+                            let want = flags.0 & 0b111;
+                            let frame_rights = fc.rights.0;
+                            let have = ((frame_rights >> 3) & 0b111) & 0xFFFF; // READ|WRITE|EXEC bits
+                            if (have & want) != want {
+                                return SyscallReturn::err(ipc::status::ERIGHTS);
+                            }
+                            Some(crate::frame::PhysAddr::new(fc.obj.0))
+                        }
+                        _ => return SyscallReturn::err(ipc::status::EBADCAP),
+                    },
+                    None => return SyscallReturn::err(ipc::status::EBADARG),
+                }
+            };
+            match aspace::map(vaddr, 1, frame_addr, flags) {
+                Ok(_) => SyscallReturn::ok(msg.tag, [0; 4]),
+                Err(aspace::VmmError::Overlap) => SyscallReturn::err(ipc::status::EBADARG),
+                Err(_) => SyscallReturn::err(ipc::status::ENOMEM),
+            }
+        }
+        UNMAP => match aspace::unmap(vaddr) {
+            Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
+            Err(_) => SyscallReturn::err(ipc::status::EBADARG),
+        },
+        PROTECT => {
+            let flags = MapFlags((msg.words[2] as u32) & 0b111);
+            match aspace::protect(vaddr, flags) {
+                Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
+                Err(_) => SyscallReturn::err(ipc::status::EBADARG),
+            }
+        }
+        SET_FAULT_POOL => {
+            // caps[0] = Region: dedicate its remaining space as the pool.
+            let Some(cs) = msg.descriptor(0).filter(|cs| cs.handle() != 0) else {
+                return SyscallReturn::err(ipc::status::EBADARG);
+            };
+            let Ok(rc) = proc::get_cap(pid, cs.handle()) else {
+                return SyscallReturn::err(ipc::status::EBADCAP);
+            };
+            if rc.typ != ObjType::Region {
+                return SyscallReturn::err(ipc::status::EBADARG);
+            }
+            match crate::init::region_dedicate_as_pool(rc.obj) {
+                Ok((base, len)) => match aspace::set_pool(base, len) {
+                    Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
+                    Err(_) => SyscallReturn::err(ipc::status::ENOMEM),
+                },
+                Err(e) => SyscallReturn::err(e),
+            }
+        }
+        FORK | DESTROY => SyscallReturn::err(ipc::status::ENOSYS),
+        _ => SyscallReturn::err(ipc::status::ENOSYS),
     }
 }
 
@@ -482,6 +569,7 @@ fn new_thread(pid: ProcessId, cap: &Capability, msg: &Message) -> SyscallReturn 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aspace::{MapFlags, Vaddr};
     use crate::sched::set_context_backend;
     use std::boxed::Box;
 
@@ -589,5 +677,114 @@ mod tests {
         let (_pid, _tid, factory) = setup();
         let r = dispatch(args(99, factory, Tag(0), [0; 4]));
         assert_eq!(r.status, ipc::status::ENOSYS);
+    }
+    #[test]
+    fn as_invoke_map_protect_unmap_and_fault_pool() {
+        let (pid, _tid, factory) = setup();
+
+        // AS cap + Frame cap.
+        let r_as = dispatch(args(num::INVOKE, factory, Tag::new(3), [0; 4]));
+        let as_h = r_as.w[0] as u32;
+        let frame_addr: u64 = 0xE0_0000;
+        let frame_h = proc::install_cap(
+            pid,
+            Capability {
+                obj: ObjId(frame_addr),
+                typ: ObjType::Frame,
+                rights: ipc::Rights::READ
+                    .union(ipc::Rights::WRITE)
+                    .union(ipc::Rights::EXEC),
+            },
+        )
+        .unwrap();
+
+        // MAP: vaddr 0xA00000, R|W, frame.
+        let mut m = Message::new(1);
+        m.words[0] = 0xA0_0000;
+        m.words[1] = 0b011; // R|W
+        m.tag = m.tag.with_caps(1);
+        m.set_descriptor(0, ipc::CapSlot::pack(frame_h, ipc::Rights::READ))
+            .unwrap();
+        let r = dispatch(args(num::INVOKE, as_h, m.tag, m.words));
+        assert_eq!(r.status, ipc::status::OK, "AS::MAP");
+        assert_eq!(
+            crate::aspace::translate(Vaddr(0xA0_0000)),
+            Ok((
+                crate::frame::PhysAddr::new(frame_addr),
+                MapFlags::READ.union(MapFlags::WRITE)
+            ))
+        );
+
+        // MAP without frame cap → EBADARG.
+        let mut m2 = Message::new(1);
+        m2.words[0] = 0xA1_0000;
+        m2.words[1] = 0b001;
+        let r = dispatch(args(num::INVOKE, as_h, m2.tag, m2.words));
+        assert_eq!(r.status, ipc::status::EBADARG);
+
+        // PROTECT → R only.
+        let mut m3 = Message::new(3);
+        m3.words[0] = 0xA0_0000;
+        m3.words[2] = 0b001;
+        assert_eq!(
+            dispatch(args(num::INVOKE, as_h, m3.tag, m3.words)).status,
+            ipc::status::OK
+        );
+        assert_eq!(
+            crate::aspace::translate(Vaddr(0xA0_0000)).unwrap().1,
+            MapFlags::READ
+        );
+
+        // UNMAP.
+        let mut m4 = Message::new(2);
+        m4.words[0] = 0xA0_0000;
+        assert_eq!(
+            dispatch(args(num::INVOKE, as_h, m4.tag, m4.words)).status,
+            ipc::status::OK
+        );
+        assert!(crate::aspace::translate(Vaddr(0xA0_0000)).is_err());
+
+        // SET_FAULT_POOL: Region cap → pool; then ANON fault resolves.
+        let region_addr: u64 = 0xC0_0000;
+        let region_h = proc::install_cap(
+            pid,
+            Capability {
+                obj: ObjId(0x501), // region id must match registry (below)
+                typ: ObjType::Region,
+                rights: ipc::Rights::default(),
+            },
+        )
+        .unwrap();
+        // Register the region in the init registry (test hook path mirrors
+        // init::start grants).
+        crate::init::register_region_for_test(
+            0x501,
+            region_addr,
+            4 * crate::aspace::PAGE_SIZE as u64,
+        );
+        let mut m5 = Message::new(4);
+        m5.tag = m5.tag.with_caps(1);
+        m5.set_descriptor(0, ipc::CapSlot::pack(region_h, ipc::Rights::default()))
+            .unwrap();
+        let r = dispatch(args(num::INVOKE, as_h, m5.tag, m5.words));
+        assert_eq!(r.status, ipc::status::OK, "SET_FAULT_POOL");
+
+        // ANON map + fault resolves from the pool.
+        let mut m6 = Message::new(1);
+        m6.words[0] = 0xB0_0000;
+        m6.words[1] = 0b1_1000; // ANON|R  (bit4 ANON, bit0 R)
+        let r = dispatch(args(num::INVOKE, as_h, m6.tag, m6.words));
+        assert_eq!(r.status, ipc::status::OK, "ANON MAP");
+        assert_eq!(
+            crate::aspace::resolve_fault(Vaddr(0xB0_0000), false),
+            Ok(crate::frame::PhysAddr::new(region_addr))
+        );
+
+        // FORK/DESTROY are ENOSYS in v0 (per-process VMM pending).
+        let m7 = Message::new(5);
+        assert_eq!(
+            dispatch(args(num::INVOKE, as_h, m7.tag, m7.words)).status,
+            ipc::status::ENOSYS
+        );
     }
 }

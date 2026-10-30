@@ -285,6 +285,17 @@ pub fn init(pool: Option<(PhysAddr, u64)>) -> Result<(), VmmError> {
     Ok(())
 }
 
+/// Attach or replace the kernel-wide fault pool (ADR-018/ADR-021 v0:
+/// single global VMM — `AddressSpace::SET_FAULT_POOL` routes here). The
+/// pool is a carve of a Region granted at boot.
+pub fn set_pool(base: PhysAddr, bytes: u64) -> Result<(), VmmError> {
+    let mut guard = VMM.lock();
+    let as_state = guard.as_mut().ok_or(VmmError::NoBackend)?;
+    let pool = Pool::new(base, bytes).ok_or(VmmError::BadVaddr)?;
+    as_state.pool = Some(pool);
+    Ok(())
+}
+
 /// Register a frame with the refcount table (acquires one ref).
 pub fn track_frame(addr: PhysAddr) {
     FRAME_REFS.lock().acquire(addr);

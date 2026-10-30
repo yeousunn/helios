@@ -175,6 +175,22 @@ impl RegionRegistry {
         }
     }
 
+    fn remaining(&self, id: u64) -> Option<(u64, u64)> {
+        let i = self.ids.iter().position(|x| *x == id)?;
+        Some((self.base[i] + self.next[i], self.len[i] - self.next[i]))
+    }
+
+    fn dedicate(&mut self, id: u64) -> bool {
+        match self.ids.iter().position(|x| *x == id) {
+            Some(i) => {
+                // Mark fully consumed: all remaining space becomes the pool.
+                self.next[i] = self.len[i];
+                true
+            }
+            None => false,
+        }
+    }
+
     fn carve(&mut self, id: u64, bytes: u64) -> Option<PhysAddr> {
         let i = self.ids.iter().position(|x| *x == id)?;
         let frame = frame::FRAME_SIZE as u64;
@@ -229,6 +245,21 @@ pub fn region_carve(pid: ProcessId, region: ObjId, w0: u64, w1: u64) -> Result<u
     .map_err(|_| ipc::status::ENOMEM)
 }
 
+/// `AddressSpace::SET_FAULT_POOL` (ADR-018 §3 + ADR-021 v0): dedicate the
+/// Region cap's remaining space as the (global, v0) fault pool. Further
+/// CARVE on that region returns ENOMEM.
+pub fn region_dedicate_as_pool(region: ObjId) -> Result<(PhysAddr, u64), i32> {
+    let mut r = REGIONS.lock();
+    let (base, len) = r.remaining(region.0).ok_or(ipc::status::EBADCAP)?;
+    if len == 0 {
+        return Err(ipc::status::ENOMEM);
+    }
+    if !r.dedicate(region.0) {
+        return Err(ipc::status::EBADCAP);
+    }
+    Ok((PhysAddr::new(base), len))
+}
+
 /// Debug endpoint fast path (ADR-018 §4): log payload words, no delivery.
 pub fn debug_ep_send(msg: &Message) {
     crate::kinfo!(
@@ -239,6 +270,11 @@ pub fn debug_ep_send(msg: &Message) {
         msg.words[2],
         msg.words[3]
     );
+}
+
+#[cfg(test)]
+pub(crate) fn register_region_for_test(id: u64, base: u64, len: u64) {
+    REGIONS.lock().add(id, base, len);
 }
 
 #[cfg(test)]

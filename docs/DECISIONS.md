@@ -260,3 +260,10 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 - Context: PLAN §5 marks servers as "userspace (std)", but there is no Helios `std` port yet — the first server binaries run in the same bare-metal environment as `sdk/bin/init`. Server crates using `std::` types could never be linked into such a binary, blocking Phase 2 bring-up.
 - Decision: `servers/process` and `servers/vfs` build as `#![no_std]` + `extern crate alloc` (collections/strings/vecs from `alloc`; test modules keep `std` via `#[cfg(test)] extern crate std`). The eventual server binary provides a `#[global_allocator]` over carved frames (SDK runtime work item). The future Rust `std` port wraps this layer (allocator + syscall runtime) rather than replacing the server cores.
 - Consequences: no behavior change (78 host tests unchanged, clippy/fmt clean); server crates are linkable on bare metal; userspace allocator quality (fragmentation, limits) becomes a tracked concern for the SDK allocator work item.
+
+## ADR-021: AS invoke over the kernel-wide VMM (v0 bridge)
+- Proposed: GLM-5.3-Flash 2026-10-30
+- Status: ACCEPTED (GLM, kernel/ only)
+- Context: DS's last PS-integration gap (AS::MAP / SET_FAULT_POOL). A full per-process VMM (per-AS page-table roots, per-AS backends) is the Phase 2 design goal, but the spawn smoke only needs the invoke surface now.
+- Decision: `AddressSpace` invoke methods (MAP/UNMAP/PROTECT/SET_FAULT_POOL) dispatch in `entry::as_invoke` against the kernel-wide VMM, with full right enforcement: MAP right on the AS cap; frame_rights ⊇ requested mapping flags (ipc::Rights bits 3..5 → MapFlags bits 0..2); SET_FAULT_POOL dedicates a Region cap's remaining space (`init::region_dedicate_as_pool` — further CARVE on it returns ENOMEM). FORK/DESTROY return ENOSYS pending the per-process VMM object registry.
+- Consequences: PS spawn pipeline (MAP for stacks/ELF + pool attach) works against the single VMM for bring-up. Per-process VMM = the next kernel Phase 2 task: AS object registry keyed by ObjId, per-AS PagingBackend via a backend factory, FORK COW clone.
