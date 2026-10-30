@@ -76,18 +76,26 @@ impl fmt::Display for CapError {
 type Result<T> = core::result::Result<T, CapError>;
 
 impl CapTable {
-    pub fn new() -> Self {
+    /// Fully-initialized empty table, evaluable at compile time so statics
+    /// never build large temporaries on the stack.
+    pub const fn empty() -> Self {
         let mut slots = [Slot::Free { next_free: 0 }; MAX_SLOTS];
-        for (i, slot) in slots.iter_mut().enumerate() {
-            *slot = Slot::Free {
-                next_free: (i + 1) % (MAX_SLOTS + 1),
+        let mut i = 0;
+        while i < MAX_SLOTS {
+            slots[i] = Slot::Free {
+                next_free: if i + 1 == MAX_SLOTS { MAX_SLOTS } else { i + 1 },
             };
+            i += 1;
         }
         CapTable {
             slots,
             free_head: 0,
             used: 0,
         }
+    }
+
+    pub fn new() -> Self {
+        Self::empty()
     }
 
     pub fn len(&self) -> usize {

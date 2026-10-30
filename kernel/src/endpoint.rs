@@ -14,8 +14,30 @@
 #![forbid(unsafe_code)]
 
 use crate::sched::{self, BlockReason, ObjRef, SchedError, ThreadId};
+use caps::Capability;
 use ipc::Message;
 use spin::Mutex;
+
+/// A message in flight, with the capability installs resolved against the
+/// sender's table at send time (ADR-011 §1). `caps[i]` corresponds to
+/// descriptor `i`; on delivery the syscall layer installs into the
+/// receiver's table and rewrites descriptor words.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Envelope {
+    pub msg: Message,
+    pub caps: [Option<Capability>; ipc::MAX_WORDS],
+    pub sender: ThreadId,
+}
+
+impl Envelope {
+    pub fn new(msg: Message, sender: ThreadId) -> Self {
+        Envelope {
+            msg,
+            caps: [const { None }; ipc::MAX_WORDS],
+            sender,
+        }
+    }
+}
 
 const MAX_ENDPOINTS: usize = 32;
 /// Waiter capacity; bounded by scheduler capacity.
@@ -38,7 +60,7 @@ impl From<SchedError> for IpcError {
 
 struct SenderQueue {
     ids: [ThreadId; MAX_WAITERS],
-    msgs: [Option<Message>; MAX_WAITERS],
+    msgs: [Option<Envelope>; MAX_WAITERS],
     len: usize,
 }
 
@@ -51,7 +73,7 @@ impl SenderQueue {
         }
     }
 
-    fn push(&mut self, id: ThreadId, msg: Message) -> Result<(), IpcError> {
+    fn push(&mut self, id: ThreadId, msg: Envelope) -> Result<(), IpcError> {
         if self.len >= MAX_WAITERS {
             return Err(IpcError::NoWaiterSlot);
         }
@@ -62,21 +84,21 @@ impl SenderQueue {
     }
 
     /// Remove the head entry (rotates the rest).
-    fn pop(&mut self) -> Option<(ThreadId, Message)> {
+    fn pop(&mut self) -> Option<Envelope> {
         if self.len == 0 {
             return None;
         }
-        let id = self.ids[0];
+        let _id = self.ids[0];
         let msg = self.msgs[0].take();
         self.ids.copy_within(1.., 0);
         self.msgs.copy_within(1.., 0);
         self.len -= 1;
         self.ids[self.len] = sched::IDLE;
         self.msgs[self.len] = None;
-        Some((id, msg.unwrap()))
+        Some(msg.unwrap())
     }
 
-    fn remove(&mut self, id: ThreadId) -> Option<Message> {
+    fn remove(&mut self, id: ThreadId) -> Option<Envelope> {
         for i in 0..self.len {
             if self.ids[i] == id {
                 let msg = self.msgs[i].take();
@@ -139,12 +161,12 @@ impl ReceiverQueue {
 }
 
 struct Endpoint {
-    mailbox: Option<Message>,
+    mailbox: Option<Envelope>,
     senders: SenderQueue,
     receivers: ReceiverQueue,
 }
 
-struct Engine {
+pub(crate) struct Engine {
     endpoints: [Option<Endpoint>; MAX_ENDPOINTS],
 }
 
@@ -199,18 +221,18 @@ fn with_ep<T>(
 }
 
 /// Per-thread rendezvous slot for direct hand-off to a parked receiver.
-struct Delivered {
+pub(crate) struct Delivered {
     who: [ThreadId; MAX_WAITERS],
-    msg: [Option<Message>; MAX_WAITERS],
+    msg: [Option<Envelope>; MAX_WAITERS],
 }
 
-static DELIVERED: Mutex<Delivered> = Mutex::new(Delivered {
+pub(crate) static DELIVERED_FOR_REPLY: Mutex<Delivered> = Mutex::new(Delivered {
     who: [sched::IDLE; MAX_WAITERS],
     msg: [const { None }; MAX_WAITERS],
 });
 
 impl Delivered {
-    fn insert(&mut self, id: ThreadId, msg: Message) {
+    pub(crate) fn insert(&mut self, id: ThreadId, msg: Envelope) {
         for i in 0..MAX_WAITERS {
             if self.who[i] == id || self.who[i] == sched::IDLE {
                 self.who[i] = id;
@@ -220,7 +242,7 @@ impl Delivered {
         }
     }
 
-    fn take(&mut self, id: ThreadId) -> Option<Message> {
+    pub(crate) fn take(&mut self, id: ThreadId) -> Option<Envelope> {
         for i in 0..MAX_WAITERS {
             if self.who[i] == id {
                 let m = self.msg[i].take();
@@ -232,32 +254,42 @@ impl Delivered {
     }
 }
 
-/// Read the message handed off to `id` by a sender rendezvous.
-pub fn take_delivered(id: ThreadId) -> Option<Message> {
-    DELIVERED.lock().take(id)
+/// Read the envelope handed off to `id` by a sender rendezvous.
+pub fn take_delivered(id: ThreadId) -> Option<Envelope> {
+    DELIVERED_FOR_REPLY.lock().take(id)
+}
+
+/// Test hook: clear the engine + rendezvous table.
+#[cfg(test)]
+pub(crate) fn reset_engine_for_test() {
+    *ENGINE.lock() = None;
+    *DELIVERED_FOR_REPLY.lock() = Delivered {
+        who: [sched::IDLE; MAX_WAITERS],
+        msg: [const { None }; MAX_WAITERS],
+    };
 }
 
 /// Non-blocking send. Fast path: direct hand-off to a parked receiver.
 /// Otherwise fills the mailbox, or reports full (caller blocks or returns
 /// EWOULDBLOCK per FLAG_NONBLOCK).
-pub fn try_send(ep: ObjRef, msg: Message, _sender: ThreadId) -> Result<(), IpcError> {
+pub fn try_send(ep: ObjRef, env: Envelope) -> Result<(), IpcError> {
     with_ep(ep, |e| {
         // Waiting receiver? Direct hand-off.
         if let Some(waiter) = e.receivers.pop() {
-            DELIVERED.lock().insert(waiter, msg);
+            DELIVERED_FOR_REPLY.lock().insert(waiter, env);
             sched::make_ready(waiter)?;
             return Ok(());
         }
         if e.mailbox.is_some() {
             return Err(IpcError::EndpointFull);
         }
-        e.mailbox = Some(msg);
+        e.mailbox = Some(env);
         Ok(())
     })
 }
 
 /// Non-blocking receive: takes the mailbox message if present.
-pub fn try_recv(ep: ObjRef) -> Result<Option<Message>, IpcError> {
+pub fn try_recv(ep: ObjRef) -> Result<Option<Envelope>, IpcError> {
     with_ep(ep, |e| Ok(e.mailbox.take()))
 }
 
@@ -269,19 +301,19 @@ pub fn try_recv(ep: ObjRef) -> Result<Option<Message>, IpcError> {
 ///
 /// Returns `Ok(None)` when the receiver parked (message arrives later via
 /// `take_delivered`).
-pub fn recv(ep: ObjRef, receiver: ThreadId) -> Result<Option<Message>, IpcError> {
+pub fn recv(ep: ObjRef, receiver: ThreadId) -> Result<Option<Envelope>, IpcError> {
     with_ep(ep, |e| {
         if let Some(m) = e.mailbox.take() {
-            // Rotate the next parked sender's message into the mailbox.
-            if let Some((sender, sm)) = e.senders.pop() {
-                e.mailbox = Some(sm);
-                sched::make_ready(sender)?;
+            // Rotate the next parked sender's envelope into the mailbox.
+            if let Some(env2) = e.senders.pop() {
+                sched::make_ready(env2.sender)?;
+                e.mailbox = Some(env2);
             }
             return Ok(Some(m));
         }
-        if let Some((sender, m)) = e.senders.pop() {
-            DELIVERED.lock().insert(receiver, m);
-            sched::make_ready(sender)?;
+        if let Some(env2) = e.senders.pop() {
+            DELIVERED_FOR_REPLY.lock().insert(receiver, env2);
+            sched::make_ready(env2.sender)?;
             // Receiver reads via take_delivered once scheduled.
             return Ok(None);
         }
@@ -293,9 +325,9 @@ pub fn recv(ep: ObjRef, receiver: ThreadId) -> Result<Option<Message>, IpcError>
 
 /// Full blocking send (syscall `send` without FLAG_NONBLOCK). Assumes
 /// `try_send` returned EndpointFull: queue (id, msg) and park the sender.
-pub fn park_send(ep: ObjRef, id: ThreadId, msg: Message) -> Result<(), IpcError> {
+pub fn park_send(ep: ObjRef, id: ThreadId, env: Envelope) -> Result<(), IpcError> {
     with_ep(ep, |e| {
-        e.senders.push(id, msg)?;
+        e.senders.push(id, env)?;
         sched::block(id, BlockReason::Send(ep))?;
         Ok(())
     })
@@ -339,7 +371,7 @@ mod tests {
     fn setup() -> (ObjRef, ThreadId, ThreadId) {
         *ENGINE.lock() = None;
         *sched::SCHED.lock() = None;
-        let _ = sched::set_context_backend(&MockCtx);
+        sched::set_context_backend(&MockCtx);
         let _ = sched::init();
         let ep = create_endpoint().unwrap();
         let a = sched::spawn(ObjRef(1), 100).unwrap();
@@ -347,10 +379,10 @@ mod tests {
         (ep, a, b)
     }
 
-    fn msg(label: u16, w0: u64) -> Message {
+    fn env(label: u16, w0: u64, sender: ThreadId) -> Envelope {
         let mut m = Message::new(label);
         m.words[0] = w0;
-        m
+        Envelope::new(m, sender)
     }
 
     #[test]
@@ -363,9 +395,9 @@ mod tests {
             crate::sched::State::Blocked(_)
         ));
         // a sends: direct hand-off, b becomes Ready, mailbox stays empty.
-        try_send(ep, msg(0x0212, 7), a).unwrap();
+        try_send(ep, env(0x0212, 7, a)).unwrap();
         assert_eq!(sched::get(b).unwrap().state, crate::sched::State::Ready);
-        assert_eq!(take_delivered(b).unwrap().words[0], 7);
+        assert_eq!(take_delivered(b).unwrap().msg.words[0], 7);
         assert!(try_recv(ep).unwrap().is_none(), "hand-off bypasses mailbox");
     }
 
@@ -373,9 +405,9 @@ mod tests {
     fn mailbox_and_parked_senders_rotate() {
         let (ep, a, b) = setup();
         // a fills the mailbox, then parks with a second message queued.
-        try_send(ep, msg(1, 100), a).unwrap();
-        assert_eq!(try_send(ep, msg(2, 200), a), Err(IpcError::EndpointFull));
-        park_send(ep, a, msg(2, 200)).unwrap();
+        try_send(ep, env(1, 100, a)).unwrap();
+        assert_eq!(try_send(ep, env(2, 200, a)), Err(IpcError::EndpointFull));
+        park_send(ep, a, env(2, 200, a)).unwrap();
         assert!(matches!(
             sched::get(a).unwrap().state,
             crate::sched::State::Blocked(_)
@@ -383,15 +415,15 @@ mod tests {
 
         // b drains the mailbox: gets msg 1, a wakes, msg 2 rotates into the
         // mailbox.
-        assert_eq!(recv(ep, b).unwrap().unwrap().words[0], 100);
+        assert_eq!(recv(ep, b).unwrap().unwrap().msg.words[0], 100);
         assert_eq!(sched::get(a).unwrap().state, crate::sched::State::Ready);
-        assert_eq!(try_recv(ep).unwrap().unwrap().words[0], 200);
+        assert_eq!(try_recv(ep).unwrap().unwrap().msg.words[0], 200);
 
         // Direct hand-off path from parked sender: a parks again, b receives
         // via rendezvous.
-        park_send(ep, a, msg(3, 300)).unwrap();
+        park_send(ep, a, env(3, 300, a)).unwrap();
         assert_eq!(recv(ep, b), Ok(None));
-        assert_eq!(take_delivered(b).unwrap().words[0], 300);
+        assert_eq!(take_delivered(b).unwrap().msg.words[0], 300);
         assert!(try_recv(ep).unwrap().is_none());
     }
 

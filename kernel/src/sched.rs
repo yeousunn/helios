@@ -19,8 +19,8 @@ pub enum BlockReason {
     Recv(ObjRef),
     /// Waiting to send into a full endpoint mailbox.
     Send(ObjRef),
-    /// Waiting for a notification signal (mask in payload).
-    Notification,
+    /// Waiting for a notification signal on this object.
+    Notification(ObjRef),
     /// Awaiting fault resolution on the given fault endpoint (ADR-007).
     Fault(ObjRef),
     /// Waiting for a reply after a `call` (reply-cap pending).
@@ -92,7 +92,7 @@ const MAX_THREADS: usize = 64;
 
 /// Free-list node / per-level run queue links.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Link {
+pub(crate) enum Link {
     None,
     Free(SlotIdx),
     Queue(SlotIdx),
@@ -100,10 +100,10 @@ enum Link {
 
 type SlotIdx = usize;
 
-struct Slots {
-    threads: [Option<Thread>; MAX_THREADS],
+pub(crate) struct Slots {
+    pub(crate) threads: [Option<Thread>; MAX_THREADS],
     /// Free-list and per-level FIFO links (next pointers), shared array.
-    next: [Link; MAX_THREADS],
+    pub(crate) next: [Link; MAX_THREADS],
 }
 
 impl Slots {
@@ -123,7 +123,7 @@ impl Slots {
 
 /// Global scheduler state.
 pub(crate) struct Sched {
-    slots: Slots,
+    pub(crate) slots: Slots,
     free_head: SlotIdx,
     used: usize,
     /// Run-queue heads per priority level (0..=255); Link::Queue = head slot.
@@ -466,7 +466,7 @@ mod tests {
     fn setup() {
         // Test-only: reset the global so each test starts fresh.
         *SCHED.lock() = None;
-        let _ = set_context_backend(&MockCtx);
+        set_context_backend(&MockCtx);
         let _ = init();
     }
 

@@ -10,8 +10,11 @@ pub mod boot;
 pub mod console;
 pub mod endpoint;
 pub mod frame;
+pub mod notification;
 pub mod panic;
+pub mod proc;
 pub mod sched;
+pub mod syscall;
 
 #[cfg(test)]
 extern crate std;
