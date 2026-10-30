@@ -9,6 +9,8 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod bootstrap;
+pub mod layout;
+pub mod methods;
 pub mod syscall;
 
 #[cfg(test)]

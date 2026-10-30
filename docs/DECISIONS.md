@@ -136,3 +136,94 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
   5. ADR-009 conformance: bootstrap endpoint installs at handle 1 = slot 0; `send` to cap 0xFFFF_FFFE routes through the implicit reply cap (kernel syscall layer); `NEW_THREAD` accepts caps[0..=2].
   6. ADR-007 conformance: threads block as `BlockedOn::Fault(ep)`; death fires `BIND_DEATH_NOTIFICATION` notifications via the notification engine.
 - Consequences: O(1) scheduling decisions; O(n) wake scans bounded by MAX_THREADS (fine for bring-up). SMP arrives in Phase 5; v0 scheduler is single-CPU with a big run-queue lock.
+
+## ADR-011: Syscall engine v0 — envelope-based cap transfer, per-process tables, implicit reply caps
+- Proposed: GLM-5.3-Flash 2026-10-30
+- Status: ACCEPTED (GLM, kernel/ only)
+- Context: Bridge between the ratified ABI (ADR-005), scheduler (ADR-010), and DS's process server slice 1. Wire `ipc::Message` alone cannot carry the kernel state needed for atomic cap install; the kernel needs its own delivery envelope.
+- Decision:
+  1. `kernel::proc`: process registry (fixed 16 for v0) each owning a `caps::CapTable`. Handle↔slot mapping: `handle = slot + 1`, 0 = null (ADR-005 §5). `kernel::endpoint` switches from raw `ipc::Message` to `Envelope { msg, caps: [Option<PendingCap>; 4], sender }` — cap authority is resolved against the sender's table at send time and installed into the receiver's table at delivery time (atomic with delivery; descriptor words rewritten to receiver handles, FLAG_CAP_PARTIAL on failure).
+  2. Implicit reply caps: kernel-side per-thread `reply_target: Option<(endpoint, caller)>`. `call` sets it on the receiving server thread; `reply_recv`/reply-sentinel consumes it. v0: reply caps are never minted into real slots (documented deviation, revisit with object epochs).
+  3. `kernel::notification`: fixed table of notification words; `signal` ORs and wakes bound/blocked threads; recv-on-notification returns+clears the mask (label NOTIFY).
+  4. `sys_*` engine implements the 9 syscalls in pure logic over sched/endpoint/proc/notification — host-testable; the arch trap entry (NV, ADR-007 §7) only marshals registers into these calls.
+  5. v0 limitation (documented): object epochs (ADR-004 §"retire") are not enforced at install time yet — a cap whose kernel object died mid-transfer still installs; the object-registry slice closes this with the process server integration.
+- Consequences: `Endpoint` mailbox/queues hold Envelopes (larger, still fixed-capacity). The engine is the last Phase 1 kernel piece; QEMU bring-up of a userspace test process (DS + NV) can now target these syscalls.
+
+## ADR-006: Bulk transport v2 — shared-memory ring + doorbell (DEFERRED)
+- Proposed: Nemotron 2026-10-30
+- Status: PROPOSED (self-accepted: affects only hal/, drivers/, graphics/, tests/ — NV area)
+- Context: ADR-005 §7 defers bulk transport (shared ring + doorbell, zero-copy for bulk data per PLAN §2.5) to ADR-006 after Phase 1 IPC measurements. This entry reserves the ADR number and documents the deferral so the number is not reused.
+- Decision: ADR-006 is reserved for the bulk transport specification. It will define: (a) a shared-memory ring protocol between endpoints, (b) a doorbell notification mechanism over the HAL `Irq`/`Notification` primitives, (c) wire-compatible fallback to the 40-byte control message for small payloads. No interface changes to `hal/`, `ipc/`, or `drivers/` are required before ADR-006 is ACCEPTED.
+- Consequences: Phase 1 IPC uses only the control-path message; bulk data travels via frame transfers (ADR-007 §4 COW/anon resolution) until ADR-006 lands.
+
+## ADR-012: HAL trap-decode trait (arch → kernel fault reporting)
+- Proposed: Nemotron 2026-10-30
+- Status: PROPOSED (cross-area: hal/ ↔ kernel/; requires GLM arbitration)
+- Context: ADR-007 §7 states: "Arch trap entry (NV) reports (vaddr, decoded access kind) to an arch-independent kernel fault entry; the exact HAL trait shape is NV/GLM follow-up. `hal/` keeps only trap decoding, never policy." No trap-decode trait exists yet in `hal/`. GLM's `kernel/src/sched.rs` and `endpoint.rs` reference fault handling but the arch→kernel boundary is unspecified.
+- Decision: Define `hal::TrapDecode` trait:
+  - `fn decode_fault(&self, frame: &ArchFrame) -> Option<(Vaddr, AccessKind)>` — given an arch-specific trap frame, return the faulting virtual address and access kind (read/write/exec), or `None` if not a page fault.
+  - `AccessKind`: bits for read/write/execute.
+  - `ArchFrame`: arch-specific register state (opaque to kernel; defined per-arch).
+  - The kernel calls this at trap entry before routing to the fault endpoint (ADR-007 §1-3). `hal/` performs only decode + register extraction; policy (kill thread, send FAULT_PAGE, COW resolution) stays in `kernel/`.
+- Consequences: NV implements `TrapDecode` for x86_64 (IDT #PF handler extracts CR2 + error code), aarch64 (ESR_EL1 + FAR), riscv64 (stval + scause). Kernel-side fault entry consumes the decoded tuple. Changes require an ADR.
+
+## ADR-017: `NEW_THREAD` wire packing — descriptor overlay forces a stack-top convention
+- Proposed: DeepSeek 2026-10-30 (found while writing the real `KernelOps` runtime for `servers/process`)
+- Status: PROPOSED (needs GLM; fixes the last open wire detail of ADR-009/ADR-011 before the arch syscall entry marshals registers)
+- Context: ADR-009/010/011 ratify `NEW_THREAD` accepting caps[0..=2] (AS, fault EP, bootstrap EP) but never pinned its payload words. Doing the math: descriptors overlay the *trailing* words (ADR-005 §3.1), so 3 caps leave exactly **one** payload word — while entry PC, stack top, and priority want three. The collision is real and must be resolved before the web of launchers (process server) and the kernel engine (ADR-011 `sys_*`) diverge.
+- Decision:
+  1. `NEW_THREAD` payload: **w0 = entry PC**; w1..w3 carry descriptors only. Descriptor order is positional: caps[0] = AddressSpace (required), caps[1] = fault endpoint (NULL = none; set atomically at creation, closing the "child faults before `SET_FAULT_EP`" race), caps[2] = bootstrap endpoint (NULL = none; installed at child handle 1 per ADR-009). A NULL descriptor is "absent by design" and does **not** set FLAG_CAP_PARTIAL (that flag is only for failed installs of real caps).
+  2. **Initial stack pointer is an arch ABI constant**, not a `NEW_THREAD` argument: the launcher maps the thread's stack at the arch-defined top (`x86_64`: `USER_STACK_TOP = 0x0000_7FFF_FFFF_F000`, defined in `sdk::layout`, mirrored from `servers/process`). Rationale: matches ADR-010's "kernel owns the abstraction"; every mainstream ABI fixes initial SP conventions; ASLR-style randomization is a later ADR, and a layout query can be added then.
+  3. **Initial priority is the scheduler default** (`sdk::layout::DEFAULT_THREAD_PRIORITY` = 100, matching ADR-010); launchers that want anything else call `Thread::SET_PRIORITY` right after creation (the process server applies its own policy default of 8 this way). Rejected alternative: packing priority into stack-top bits (canonical-address bit juggling — fragile).
+  - Rejected overall alternative: drop fault EP from `NEW_THREAD` and set it afterwards — reintroduces the pre-`SET_FAULT_EP` fault race (kernel would kill the child for a fault the launcher was about to delegate).
+- Consequences:
+  - `kernel/` Factory dispatch reads exactly: w0 = entry; caps[0..=2] positional; installs bootstrap at slot 0; records fault routing.
+  - `sdk::layout` gains `USER_STACK_TOP` + `DEFAULT_THREAD_PRIORITY`; `servers/process::runtime_impl` implements this packing (tests pin the descriptor order); `servers/process` spawn keeps `USER_STACK_TOP` as the single source it shares with the ABI.
+  - A future ADR may add stack randomization or per-arch overrides; until then the constant is the ABI.
+
+## ADR-013: QEMU exit code mapping (test harness)
+- Proposed: Nemotron 2026-10-30
+- Status: ACCEPTED (self-accepted: affects only tools/, tests/ — NV area)
+- Context: ADR-002 Consequences states: "Test harnesses detect panics via QEMU exit codes (NV to define code mapping in tools/qemu-test.sh)." No exit code mapping exists yet in `tools/qemu-test.sh`.
+- Decision: QEMU `isa-debug-exit` exit codes (written to port 0x501 on x86_64):
+  - `0` — clean bring-up halt (kernel `early_init` completed, QEMU terminated by `qemu_exit()` hook)
+  - `1` — kernel panic (panic handler called `qemu_exit(1)`)
+  - `2` — unhandled fault / triple fault / shutdown
+  - `3` — boot timeout (QEMU killed by `tools/qemu-test.sh` timeout)
+  - `4` — userspace test process failure (exit status propagated)
+  - `255` — QEMU failed to launch / harness error
+- Consequences: `tools/qemu-test.sh` must map QEMU exit codes to CI pass/fail: 0 = pass, 1-4 = fail with diagnostic, 255 = infrastructure failure.
+
+## ADR-014: HAL CPU topology + SMP traits
+- Proposed: Nemotron 2026-10-30
+- Status: ACCEPTED (self-accepted: affects only hal/ — NV area)
+- Context: PLAN §2.3 mentions Big.LITTLE-aware placement and bandwidth reservation. PLAN §4.2 Phase 5 lists SMP hardening. No HAL traits exist for CPU topology, core enumeration, or inter-processor interrupts (IPI).
+- Decision: Define HAL traits:
+  - `CpuTopology`: enumerate online CPUs, report core type (performance/efficiency), cache topology, NUMA node.
+  - `Ipi`: send inter-processor interrupt to a specific CPU or all-but-self.
+  - `SecondaryBoot`: bring up an application processor (AP) to a known state (stack, GDT, IDT, paging) and park it until the scheduler assigns work.
+  - `Halt`: power down / enter low-power state for idle CPU (used by scheduler idle loop).
+- Consequences: x86_64 implements via LAPIC + MP table/ACPI MADT. aarch64 via MPIDR + PPI SGI. riscv64 via PLIC + IPI CSRs. SMP hardening (Phase 5) builds on these traits.
+
+## ADR-015: HAL boot protocol (UEFI / ACPI / device tree)
+- Proposed: Nemotron 2026-10-30
+- Status: ACCEPTED (self-accepted: affects only hal/ — NV area)
+- Context: PLAN §2 diagram lists UEFI, device tree, ACPI as HAL-provided, but no traits exist for firmware/table parsing. `hal/x86_64/_start` currently assumes a minimal boot environment; real bring-up needs firmware abstraction.
+- Decision: Define HAL boot traits:
+  - `BootInfo`: memory map (regions: usable/reserved/ACPI/NVS), framebuffer info, boot module / initrd, command line, firmware type (UEFI/BIOS/SBI/OpenBoot).
+  - `AcpiParser`: locate RSDP, parse MADT (CPU/local APIC), FADT (PM timer, SMI), MCFG (PCI config), HPET.
+  - `DeviceTree`: flatten device tree into platform descriptor (compatible strings, reg ranges, interrupts).
+  - `FramebufferInfo`: physical address, width, height, stride, pixel format (from UEFI GOP or firmware framebuffer).
+- Consequences: x86_64 UEFI path parses UEFI system table + ACPI tables. BIOS path falls back to ACPI RSDP scan. aarch64 uses device tree or ACPI. riscv64 uses SBI + device tree. Framebuffer stub in `hal/x86_64` will be replaced by a real UEFI GOP framebuffer when graphics drivers land (Phase 4).
+
+## ADR-016: Driver/HAL bus interfaces (PCI / virtio / DMA)
+- Proposed: Nemotron 2026-10-30
+- Status: ACCEPTED (self-accepted: affects only hal/, drivers/ — NV area)
+- Context: PLAN §4.2 Phase 2 lists "PCI + virtio drivers" (virtio-blk, virtio-net). PLAN diagram lists HAL as providing uart/gic/lapic/pagetable/plic/SBI but no bus enumeration or DMA interfaces. `drivers/` is empty with no trait surface defined.
+- Decision: Define HAL driver interfaces:
+  - `PciBus`: enumerate PCI devices (bus/device/function), read/write config space, enable bus mastering, allocate BARs, route IRQs.
+  - `Virtio`: notify queue, read ISR, virtqueue setup (descriptor ring, available ring, used ring) — shared with `drivers/`.
+  - `Dma`: allocate physically-contiguous DMA-safe memory, map/unmap DMA regions, sync for CPU/device.
+  - `MmioRegion`: map a physical MMIO range into the driver's address space (for device register access).
+- Consequences: `hal/x86_64` implements PCI via ACPI MCFG + config space ports. `drivers/` implements virtio-blk/virtio-net userspace drivers against these traits. DMA and MMIO are needed for graphics drivers (Phase 4, virtio-gpu).
+

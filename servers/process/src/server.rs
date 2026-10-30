@@ -20,9 +20,11 @@ use crate::runtime::{Handle, KernelOps, LoadedImage, MapFlags, ProgramLoader, Tr
 /// Session notifications minted per child (design doc §1.5, v0 pool).
 pub const SESSION_POOL: usize = 4;
 
-/// v0 user stack placement/size (fixed until the ABI grows a layout query).
-pub const USER_STACK_TOP: u64 = 0x0000_7FFF_FFFF_F000;
+/// v0 user stack placement/size (ADR-017: the top is an arch ABI constant).
+pub use sdk::layout::USER_STACK_TOP;
 pub const DEFAULT_STACK_SIZE: u64 = 64 * 1024;
+/// Process server policy: children run at this priority (applied via
+/// `Thread::SET_PRIORITY` since creation uses the scheduler default).
 pub const DEFAULT_PRIORITY: u8 = 8;
 
 /// Rights the heap region capability is granted to children with. NOTE: the
