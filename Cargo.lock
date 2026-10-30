@@ -9,6 +9,9 @@ version = "0.1.0"
 [[package]]
 name = "caps"
 version = "0.1.0"
+dependencies = [
+ "ipc",
+]
 
 [[package]]
 name = "drivers"
@@ -41,6 +44,7 @@ name = "hal-x86-64"
 version = "0.1.0"
 dependencies = [
  "hal",
+ "kernel",
 ]
 
 [[package]]

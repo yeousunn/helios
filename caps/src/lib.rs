@@ -1,9 +1,15 @@
-//! Capability types and tables (ADR-004). Authority in Helios is entirely
-//! capability-based: unforgeable, delegable, revocable.
+//! Capability types and tables (ADR-004, amended by ADR-005). Authority in
+//! Helios is entirely capability-based: unforgeable, delegable, revocable.
+//!
+//! `Rights` is the canonical wire vocabulary from `ipc/` (re-exported here).
+//! Wire handles (`u32`, 0 = null) map to slots as `handle = slot + 1`; the
+//! kernel owns that mapping, this table is 0-based.
 #![no_std]
 #![forbid(unsafe_code)]
 
 use core::fmt;
+
+pub use ipc::Rights;
 
 /// Identifies a kernel object (endpoint, thread, address space, ...).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
@@ -18,61 +24,6 @@ pub enum ObjType {
     Thread,
     Frame,
     Irq,
-}
-
-/// Permission bits carried by a capability. Subsets of parent rights only.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct Rights(u32);
-
-impl Rights {
-    pub const READ: Rights = Rights(1 << 0);
-    pub const WRITE: Rights = Rights(1 << 1);
-    pub const GRANT: Rights = Rights(1 << 2);
-    pub const SEND: Rights = Rights(1 << 3);
-    pub const RECV: Rights = Rights(1 << 4);
-
-    /// Every right (used for freshly-minted kernel authority).
-    pub const fn all_of() -> Rights {
-        Rights(0b1_1111)
-    }
-
-    pub const fn union(self, other: Rights) -> Rights {
-        Rights(self.0 | other.0)
-    }
-
-    /// Rights present in both sets (used when masking on delegation).
-    pub const fn intersect(self, other: Rights) -> Rights {
-        Rights(self.0 & other.0)
-    }
-
-    pub const fn contains(self, other: Rights) -> bool {
-        self.0 & other.0 == other.0
-    }
-
-    pub const fn is_empty(self) -> bool {
-        self.0 == 0
-    }
-}
-
-impl fmt::Display for Rights {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.0 == 0 {
-            return write!(f, "-");
-        }
-        const NAMES: [(u32, &str); 5] = [
-            (Rights::READ.0, "R"),
-            (Rights::WRITE.0, "W"),
-            (Rights::GRANT.0, "G"),
-            (Rights::SEND.0, "S"),
-            (Rights::RECV.0, "V"),
-        ];
-        for (bit, name) in NAMES {
-            if self.0 & bit != 0 {
-                write!(f, "{name}")?;
-            }
-        }
-        Ok(())
-    }
 }
 
 /// An unforgeable token granting `rights` over the object `obj`.
@@ -104,12 +55,13 @@ pub struct CapTable {
     used: usize,
 }
 
-const MAX_SLOTS: usize = 256;
+const MAX_SLOTS: usize = 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CapError {
     TableFull,
     SlotEmpty,
+    SlotOccupied,
     BadSlot,
     MissingGrantRight,
     RightsNotSubset,
@@ -146,8 +98,8 @@ impl CapTable {
         self.used == 0
     }
 
-    /// Insert a fresh capability (no parent). Used by the kernel when minting
-    /// initial authority for a new process.
+    /// Insert a fresh capability (no parent) at the first free slot.
+    /// Used by the kernel when minting initial authority for a new process.
     pub fn insert(&mut self, cap: Capability) -> Result<SlotIdx> {
         if self.free_head == MAX_SLOTS {
             return Err(CapError::TableFull);
@@ -156,6 +108,45 @@ impl CapTable {
         match self.slots[idx] {
             Slot::Free { next_free } => self.free_head = next_free,
             Slot::Occupied { .. } => unreachable!("free list invariant"),
+        }
+        self.slots[idx] = Slot::Occupied { cap, parent: None };
+        self.used += 1;
+        Ok(idx)
+    }
+
+    /// Insert a fresh capability at an exact slot (`cap_mint` absolute
+    /// destination, ADR-005). The slot must currently be free; the free list
+    /// is repaired by unlinking it (O(free list) worst case).
+    pub fn insert_at(&mut self, idx: SlotIdx, cap: Capability) -> Result<SlotIdx> {
+        if idx >= MAX_SLOTS {
+            return Err(CapError::BadSlot);
+        }
+        if matches!(self.slots[idx], Slot::Occupied { .. }) {
+            return Err(CapError::SlotOccupied);
+        }
+        // Unlink `idx` from the free list.
+        let mut prev: Option<SlotIdx> = None;
+        let mut cur = self.free_head;
+        loop {
+            if cur == MAX_SLOTS {
+                return Err(CapError::SlotEmpty);
+            }
+            match self.slots[cur] {
+                Slot::Free { next_free } => {
+                    if cur == idx {
+                        match prev {
+                            Some(p) => {
+                                self.slots[p] = Slot::Free { next_free };
+                            }
+                            None => self.free_head = next_free,
+                        }
+                        break;
+                    }
+                    prev = Some(cur);
+                    cur = next_free;
+                }
+                Slot::Occupied { .. } => unreachable!("free list invariant"),
+            }
         }
         self.slots[idx] = Slot::Occupied { cap, parent: None };
         self.used += 1;
@@ -235,18 +226,17 @@ impl CapTable {
         }
     }
 
-    /// Remove the capability at `root` and every capability derived from it
-    /// (transitively) in this table. Parent links crossing to other tables
-    /// (e.g. the child lives in `dst` of mint) are severed by construction:
+    /// `cap_revoke` REVOKE_DERIVED mode (ADR-005): remove every capability
+    /// derived from `root` (transitively) and KEEP `root` itself.
+    ///
+    /// Parent links crossing to other tables are severed by construction:
     /// children in other tables keep their rights, which is the documented
     /// v1 semantics — cross-table revocation goes through object epochs
     /// (kernel-side registries, ADR-004).
-    pub fn revoke_cascade(&mut self, root: SlotIdx) -> Result<usize> {
+    pub fn revoke_derived(&mut self, root: SlotIdx) -> Result<usize> {
         self.get(root)?;
-        let mut removed = 0;
-        // Iterative transitive closure over parent links.
-        let mut frontier = [false; MAX_SLOTS];
-        frontier[root] = true;
+        // Transitive closure over parent links, root excluded.
+        let mut flagged = [false; MAX_SLOTS];
         loop {
             let mut changed = false;
             for (i, slot) in self.slots.iter().enumerate() {
@@ -254,8 +244,9 @@ impl CapTable {
                     parent: Some(p), ..
                 } = slot
                 {
-                    if frontier[*p] && !frontier[i] {
-                        frontier[i] = true;
+                    let marked = p == &root || flagged[*p];
+                    if marked && !flagged[i] {
+                        flagged[i] = true;
                         changed = true;
                     }
                 }
@@ -264,8 +255,9 @@ impl CapTable {
                 break;
             }
         }
-        for (i, flagged) in frontier.iter().enumerate() {
-            if *flagged && matches!(self.slots[i], Slot::Occupied { .. }) {
+        let mut removed = 0;
+        for (i, f) in flagged.iter().enumerate() {
+            if *f && matches!(self.slots[i], Slot::Occupied { .. }) {
                 self.slots[i] = Slot::Free {
                     next_free: self.free_head,
                 };
@@ -275,6 +267,14 @@ impl CapTable {
             }
         }
         Ok(removed)
+    }
+
+    /// `cap_revoke` DELETE mode (ADR-005): revoke all derived caps AND remove
+    /// the root capability itself. Returns the total number of slots freed.
+    pub fn delete_cascade(&mut self, root: SlotIdx) -> Result<usize> {
+        let removed = self.revoke_derived(root)?;
+        self.remove(root)?;
+        Ok(removed + 1)
     }
 
     /// Count of slots holding a capability for `obj` (kernel sweep support).
@@ -358,7 +358,7 @@ mod tests {
 
         // Same-table mint also works.
         let mut t = CapTable::new();
-        let r = t.insert(ep(9, Rights::all_of())).unwrap();
+        let r = t.insert(ep(9, Rights::ALL)).unwrap();
         let s = t.mint_here(r, Rights::READ).unwrap();
         assert_eq!(t.get(s).unwrap().rights, Rights::READ);
     }
@@ -366,33 +366,34 @@ mod tests {
     #[test]
     fn cascade_revoke_removes_descendants_only() {
         let mut t = CapTable::new();
-        let root = t.insert(ep(1, Rights::all_of())).unwrap();
+        let root = t.insert(ep(1, Rights::ALL)).unwrap();
         let a = t
             .mint_here(root, Rights::SEND.union(Rights::RECV).union(Rights::GRANT))
             .unwrap();
         let b = t.mint_here(a, Rights::RECV).unwrap();
         let c = t.insert(ep(2, Rights::READ)).unwrap(); // unrelated
 
-        let removed = t.revoke_cascade(root).unwrap();
-        assert_eq!(removed, 3, "root + a + b");
-        assert!(t.get(root).is_err());
+        let removed = t.revoke_derived(root).unwrap();
+        assert_eq!(removed, 2, "a + b (root kept per ADR-005)");
+        assert!(t.get(root).is_ok(), "REVOKE_DERIVED keeps the cap");
         assert!(t.get(a).is_err());
         assert!(t.get(b).is_err());
         assert!(t.get(c).is_ok(), "unrelated cap survives");
-        assert_eq!(t.len(), 1);
+        assert_eq!(t.len(), 2);
     }
 
     #[test]
     fn cascade_revoke_from_middle_keeps_root() {
         let mut t = CapTable::new();
-        let root = t.insert(ep(1, Rights::all_of())).unwrap();
+        let root = t.insert(ep(1, Rights::ALL)).unwrap();
         let a = t
             .mint_here(root, Rights::SEND.union(Rights::RECV).union(Rights::GRANT))
             .unwrap();
         let b = t.mint_here(a, Rights::SEND).unwrap();
         // Revoking the middle removes b but not root.
-        assert_eq!(t.revoke_cascade(a).unwrap(), 2);
+        assert_eq!(t.revoke_derived(a).unwrap(), 1);
         assert!(t.get(root).is_ok());
+        assert!(t.get(a).is_ok());
         assert!(t.get(b).is_err());
     }
 
@@ -405,5 +406,59 @@ mod tests {
         assert_eq!(t.count_of(ObjId(42)), 2);
         assert_eq!(t.count_of(ObjId(43)), 1);
         assert_eq!(t.count_of(ObjId(44)), 0);
+    }
+
+    #[test]
+    fn insert_at_targets_exact_slot_and_repairs_free_list() {
+        let mut t = CapTable::new();
+        // First-free fills 0,1,2.
+        for i in 0..3u64 {
+            t.insert(ep(i, Rights::READ)).unwrap();
+        }
+        t.remove(1).unwrap();
+        // Absolute insert into the freed slot.
+        t.insert_at(1, ep(99, Rights::WRITE)).unwrap();
+        assert_eq!(t.get(1).unwrap().obj, ObjId(99));
+        assert_eq!(
+            t.insert_at(1, ep(100, Rights::READ)),
+            Err(CapError::SlotOccupied)
+        );
+        assert_eq!(
+            t.insert_at(MAX_SLOTS, ep(1, Rights::READ)),
+            Err(CapError::BadSlot)
+        );
+
+        // Free list must still be consistent: remove two, insert three.
+        t.remove(0).unwrap();
+        t.remove(2).unwrap();
+        assert_eq!(t.len(), 1, "only the absolute-inserted cap remains");
+        t.insert(ep(200, Rights::READ)).unwrap();
+        t.insert(ep(201, Rights::READ)).unwrap();
+        t.insert(ep(202, Rights::READ)).unwrap();
+        assert_eq!(t.len(), 4);
+        // Every occupied slot reachable and consistent.
+        let mut occupied = 0;
+        for i in 0..MAX_SLOTS {
+            if t.get(i).is_ok() {
+                occupied += 1;
+            }
+        }
+        assert_eq!(occupied, 4);
+    }
+
+    #[test]
+    fn delete_cascade_removes_root_too() {
+        let mut t = CapTable::new();
+        let root = t.insert(ep(1, Rights::ALL)).unwrap();
+        let a = t
+            .mint_here(root, Rights::SEND.union(Rights::GRANT))
+            .unwrap();
+        let b = t.mint_here(a, Rights::SEND).unwrap();
+        assert_eq!(t.delete_cascade(a).unwrap(), 2, "a + b");
+        assert!(t.get(a).is_err());
+        assert!(t.get(b).is_err());
+        assert!(t.get(root).is_ok(), "root survives DELETE of a child");
+        assert_eq!(t.delete_cascade(root).unwrap(), 1);
+        assert!(t.is_empty());
     }
 }
