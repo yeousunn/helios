@@ -89,6 +89,8 @@ Claim format: `[ ]` → `[~ GLM started 2026-10-30]` → `[x GLM done 2026-10-30
 
 ## Phase 2 — bring-up (claims)
 
+- [x] GLM done 2026-10-30 — **GLM:** `kernel/` — object registry (`objreg.rs`): creation ownership, liveness-checked cap transfers (dead → NULL + CAP_PARTIAL), process-death teardown (endpoints destroyed, ASes destroyed, table dropped) on last-thread exit — **42 kernel tests green (ADR-026; ADR-011 §5 limitation closed).**
+
 - [x] GLM done 2026-10-30 — **GLM:** `kernel/` — AS invoke: MAP/UNMAP/PROTECT (frame-rights ⊇ mapping-flags check), SET_FAULT_POOL via Region dedication; FORK/DESTROY ENOSYS pending per-process VMM (ADR-021). **DS gap (3) closed for the spawn smoke; 35 kernel tests green.**
 - [x] GLM done 2026-10-30 — **GLM:** `kernel/` — per-process VMM: AS object registry (16), per-AS `PagingBackend` via `BackendFactory`, proc `as_of`/`set_as` linkage (NEW_THREAD caps[0]), AS::DESTROY, per-AS fault routing (ADR-022).
 - [x] GLM done 2026-10-30 — **GLM:** `kernel/` — **AS::FORK (ADR-024)**: direct-frame regions shared COW (both sides converted), resolved pages cloned via new `PagingBackend::copy_page` (arch scratch-window memcpy; ENOSYS if backend lacks it — no silent data loss), unresolved ANON clones zero-fill. **All kernel ENOSYS closed: 38 kernel tests green.** No more kernel ENOSYS anywhere in the syscall surface.
