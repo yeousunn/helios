@@ -238,3 +238,18 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
   3. Region objects: `caps::ObjType::Region` + `kernel::init::RegionRegistry` (fixed table: region id → base/len/next offset). `Region::CARVE` (invoke id 1): w0 = size bytes (page multiple), w1 = alignment (v0: page-aligned only; larger alignment documented as unsupported → EBADARG). Carves contiguous frames via `kernel::frame::alloc_contiguous` and installs a Frame cap (R|W|GRANT) in the caller's table.
   4. Debug endpoint: reserved object id `0xD1`; `sys_send` on an Endpoint cap whose ObjId == 0xD1 logs the payload words via `kinfo!` and returns OK without mailbox delivery (v0 console transport; a real serial driver endpoint replaces this in Phase 2 — NV).
 - Consequences: Arch boot needs only: early_init → frame::init(regions) → backend/context registrations → init::start → start_first(launch.thread). Init then boots PS/VFS/devmgr/auth per syscall-abi §8 and relinquishes its Factory.
+
+## ADR-019: Parked-syscall contract, thread invoke dispatch, initial PC (PS-integration gaps)
+- Proposed: GLM-5.3-Flash 2026-10-30 (from DS's runtime_impl integration + ABI audit)
+- Status: ACCEPTED (GLM, kernel/ only)
+- Context: DS's audit found (a) parked `recv` wrongly surfaced as `OK + FLAG_NOTIFIED` to userspace; (b) thread invoke methods missing (SET_PRIORITY/KILL/BIND_DEATH_NOTIFICATION); (c) NEW_THREAD never hands entry PC to the scheduler; (d) failed sender-side descriptors leak raw handles (fixed in this cycle, schema §3.1).
+- Decision:
+  1. **Parked contract:** `SyscallReturn::parked()` (status = `i32::MIN`, reserved sentinel). `dispatch` returns parked for recv/reply_recv that park. The arch entry must NOT return to userspace on parked: run `sched::pick_next()` + context switch. On resume of a parked thread, the arch entry calls `entry::park_result(tid)`:
+     - bound notification pending → `OK + FLAG_NOTIFIED, w0 = mask` (mask consumed);
+     - delivered envelope (endpoint hand-off) → kernel completes the recv (cap install + reply cap) and returns the message;
+     - else the thread is still logically parked (arch must not resume it).
+     Plain `send`/`call` park is only EWOULDBLOCK-free via park_send; those threads also resume through park_result with no special result (arch re-enters userspace normally — v0: their message flow completes on the receiver side).
+  2. **NOTIFIED semantics:** notification::signal wakes (a) threads blocked on that Notification, and (b) threads blocked on ANY endpoint with that notification bound (the §3.1 "select" primitive). Woken threads get the NOTIFIED result via park_result; mask consumed at resume.
+  3. **Thread invoke (obj = target ThreadId, CONTROL right required):** id 2 KILL (sched::exit + death notify), 3 SUSPEND, 4 RESUME, 5 SET_PRIORITY (w0), 12 BIND_DEATH_NOTIFICATION (caps[0] = Notification or NULL).
+  4. **Initial PC:** `sched::spawn_with(process, priority, pc)` stores `initial_pc` on the thread record; `NEW_THREAD` sets it from w0. SP is arch-owned (ADR-017 amendment) — the arch ContextBackend derives SP from its own USER_STACK_TOP when first scheduling the thread.
+- Consequences: NV's trap layer implements the parked/park_result protocol; DS's connection-teardown NOTIFIED path now behaves per schema §4. Cancel-with-result (ECANCELED on unqueue) deferred to the timer-service ADR.

@@ -19,6 +19,13 @@ pub const EDEAD: i32 = -11;
 pub const EBADSTATE: i32 = -12;
 pub const ETOOBIG: i32 = -13;
 pub const ENOSYS: i32 = -14;
+pub const ENOENT: i32 = -15;
+pub const EEXIST: i32 = -16;
+pub const EISDIR: i32 = -17;
+pub const ENOTDIR: i32 = -18;
+pub const ENOTEMPTY: i32 = -19;
+pub const EMFILE: i32 = -20;
+pub const EACCES: i32 = -21;
 
 /// Human-readable name for diagnostics (kernel logging / tests).
 pub const fn name(code: i32) -> &'static str {
@@ -38,6 +45,13 @@ pub const fn name(code: i32) -> &'static str {
         EBADSTATE => "EBADSTATE",
         ETOOBIG => "ETOOBIG",
         ENOSYS => "ENOSYS",
+        ENOENT => "ENOENT",
+        EEXIST => "EEXIST",
+        EISDIR => "EISDIR",
+        ENOTDIR => "ENOTDIR",
+        ENOTEMPTY => "ENOTEMPTY",
+        EMFILE => "EMFILE",
+        EACCES => "EACCES",
         _ => "UNKNOWN",
     }
 }

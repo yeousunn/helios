@@ -53,6 +53,8 @@ pub struct Thread {
     pub fault_ep: Option<ObjRef>,
     /// Bound notification (syscall-abi §3.1), if any.
     pub bound_notification: Option<ObjRef>,
+    /// Userspace entry PC (NEW_THREAD w0, ADR-019 §4). SP is arch-owned.
+    pub initial_pc: u64,
 }
 
 impl Thread {
@@ -64,6 +66,7 @@ impl Thread {
             process,
             fault_ep: None,
             bound_notification: None,
+            initial_pc: 0,
         }
     }
 
@@ -196,6 +199,19 @@ fn queue_pop(s: &mut Sched, prio: u8) -> Option<SlotIdx> {
     }
     s.slots.next[slot] = Link::None;
     Some(slot)
+}
+
+/// Register a new thread with a userspace entry PC (ADR-019 §4).
+pub fn spawn_with(process: ObjRef, priority: u8, initial_pc: u64) -> SchedResult<ThreadId> {
+    let id = spawn(process, priority)?;
+    let mut guard = SCHED.lock();
+    if let Some(t) = guard
+        .as_mut()
+        .and_then(|s| s.slots.threads[id.0 as usize].as_mut())
+    {
+        t.initial_pc = initial_pc;
+    }
+    Ok(id)
 }
 
 /// Register a new thread; returns its id. The thread starts Ready.
@@ -340,6 +356,56 @@ fn unlink_from_queue(s: &mut Sched, slot: SlotIdx, prio: u8) {
         prev = Some(c);
         cur = next;
     }
+}
+
+/// Suspend a Ready/Running thread (Thread::SUSPEND, syscall-abi §7).
+pub fn suspend(id: ThreadId) -> SchedResult<()> {
+    let mut guard = SCHED.lock();
+    let s = guard.as_mut().ok_or(SchedError::NoSuchThread)?;
+    let slot = find_slot(s, id)?;
+    let t = s.slots.threads[slot].as_mut().unwrap();
+    match t.state {
+        State::Ready => {
+            let priority = t.priority;
+            let _ = t;
+            unlink_from_queue(s, slot, priority);
+            let t = s.slots.threads[slot].as_mut().unwrap();
+            t.state = State::Suspended;
+            Ok(())
+        }
+        State::Running => {
+            t.state = State::Suspended;
+            Ok(())
+        }
+        _ => Err(SchedError::NotRunnable),
+    }
+}
+
+/// Resume a Suspended thread (Thread::RESUME).
+pub fn resume(id: ThreadId) -> SchedResult<()> {
+    let mut guard = SCHED.lock();
+    let s = guard.as_mut().ok_or(SchedError::NoSuchThread)?;
+    let slot = find_slot(s, id)?;
+    let t = s.slots.threads[slot].as_mut().unwrap();
+    match t.state {
+        State::Suspended => {
+            t.state = State::Ready;
+            let prio = t.priority;
+            queue_push(s, slot, prio);
+            Ok(())
+        }
+        _ => Err(SchedError::NotRunnable),
+    }
+}
+
+/// Rebind a thread's bound notification (Thread::BIND_DEATH_NOTIFICATION /
+/// Thread::BIND_NOTIFICATION, syscall-abi §7).
+pub fn set_bound_notification(id: ThreadId, n: Option<ObjRef>) -> SchedResult<()> {
+    let mut guard = SCHED.lock();
+    let s = guard.as_mut().ok_or(SchedError::NoSuchThread)?;
+    let slot = find_slot(s, id)?;
+    s.slots.threads[slot].as_mut().unwrap().bound_notification = n;
+    Ok(())
 }
 
 /// Exit a thread: unqueue, mark Exited, fire death notification hooks.

@@ -50,7 +50,20 @@ pub struct SyscallReturn {
     pub w: [u64; 4],
 }
 
+/// Reserved sentinel: the thread parked inside the syscall (ADR-019 §1).
+/// The arch entry must NOT return to userspace; it schedules another thread
+/// and later consults [`park_result`] when the thread is scheduled again.
+pub const PARKED_STATUS: i32 = i32::MIN;
+
 impl SyscallReturn {
+    pub const fn parked() -> Self {
+        SyscallReturn {
+            status: PARKED_STATUS,
+            tag: Tag(0),
+            w: [0; 4],
+        }
+    }
+
     pub const fn err(status: i32) -> Self {
         SyscallReturn {
             status,
@@ -102,6 +115,36 @@ fn current() -> (ProcessId, ThreadId) {
     }
 }
 
+/// Resume contract for a parked thread (ADR-019 §1): the arch entry calls
+/// this when it schedules a thread that had returned `parked()`.
+pub fn park_result(tid: ThreadId) -> Option<SyscallReturn> {
+    // 1. Delivered envelope (endpoint hand-off from reply_only / send).
+    if let Some(mut env) = crate::endpoint::take_delivered(tid) {
+        let (pid, _) = current();
+        syscall::install_transfers(pid, &mut env);
+        syscall::set_reply_if_call(&env, tid);
+        return Some(SyscallReturn::ok(env.msg.tag, env.msg.words));
+    }
+
+    // 2. Bound notification that fired.
+    let thread = sched::get(tid).ok()?;
+    let n = thread.bound_notification?;
+    let mask = match crate::notification::pending(n) {
+        Ok(m) => m,
+        Err(_) => return None,
+    };
+    if mask > 0 {
+        let _ = crate::notification::clear(n, mask);
+        return Some(SyscallReturn::ok(
+            Tag::new(0).with_flags(flags::NOTIFIED),
+            [mask as u64, 0, 0, 0],
+        ));
+    }
+
+    // 3. Still parked.
+    None
+}
+
 /// The single dispatch point for every syscall (arch entry calls this).
 pub fn dispatch(args: SyscallArgs) -> SyscallReturn {
     let (pid, tid) = current();
@@ -127,12 +170,12 @@ pub fn dispatch(args: SyscallArgs) -> SyscallReturn {
         },
         num::RECV => match syscall::sys_recv(pid, tid, args.cap) {
             Ok(Some(m)) => SyscallReturn::ok(m.tag, m.words),
-            Ok(None) => SyscallReturn::ok(Tag::new(0).with_flags(flags::NOTIFIED), [0; 4]),
+            Ok(None) => SyscallReturn::parked(), // ADR-019 §1
             Err(e) => SyscallReturn::err(e),
         },
         num::REPLY_RECV => match syscall::sys_reply_recv(pid, tid, args.cap, args.message()) {
             Ok(Some(m)) => SyscallReturn::ok(m.tag, m.words),
-            Ok(None) => SyscallReturn::ok(Tag::new(0).with_flags(flags::NOTIFIED), [0; 4]),
+            Ok(None) => SyscallReturn::parked(), // ADR-019 §1
             Err(e) => SyscallReturn::err(e),
         },
         num::INVOKE => invoke(pid, tid, args),
@@ -171,6 +214,7 @@ fn invoke(pid: ProcessId, tid: ThreadId, args: SyscallArgs) -> SyscallReturn {
     };
     match cap.typ {
         ObjType::Factory => factory_invoke(pid, tid, &cap, &args),
+        ObjType::Thread => thread_invoke(pid, tid, &cap, &args),
         _ => match syscall::sys_invoke(pid, tid, args.cap, args.message()) {
             Ok(status) => SyscallReturn {
                 status,
@@ -180,6 +224,109 @@ fn invoke(pid: ProcessId, tid: ThreadId, args: SyscallArgs) -> SyscallReturn {
             Err(e) => SyscallReturn::err(e),
         },
     }
+}
+
+/// Thread methods (syscall-abi §7, ADR-019 §3). cap.obj = target ThreadId;
+/// CONTROL right required for everything except... everything (all methods
+/// control the target).
+fn thread_invoke(
+    pid: ProcessId,
+    _tid: ThreadId,
+    cap: &Capability,
+    args: &SyscallArgs,
+) -> SyscallReturn {
+    if !cap.rights.contains(Rights::CONTROL) {
+        return SyscallReturn::err(ipc::status::ERIGHTS);
+    }
+    let target = ThreadId(cap.obj.0);
+    let msg = args.message();
+    const EXIT: u16 = 1;
+    const KILL: u16 = 2;
+    const SUSPEND: u16 = 3;
+    const RESUME: u16 = 4;
+    const SET_PRIORITY: u16 = 5;
+    const BIND_DEATH_NOTIFICATION: u16 = 12;
+
+    let control_ok = sched::get(target)
+        .map(|t| t.process.0 == pid.0 || cap.rights.contains(Rights::CONTROL))
+        .unwrap_or(false);
+    if !control_ok {
+        return SyscallReturn::err(ipc::status::EBADCAP);
+    }
+
+    match msg.tag.label() {
+        EXIT | KILL => {
+            let status = if msg.tag.label() == EXIT {
+                msg.words[0] as i32
+            } else {
+                -1
+            };
+            let _ = syscall::sys_exit(target, status);
+            SyscallReturn::ok(msg.tag, [0; 4])
+        }
+        SUSPEND => match suspend(target) {
+            Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
+            Err(e) => SyscallReturn::err(e),
+        },
+        RESUME => match resume(target) {
+            Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
+            Err(e) => SyscallReturn::err(e),
+        },
+        SET_PRIORITY => match sched::set_priority(target, msg.words[0] as u8) {
+            Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
+            Err(_) => SyscallReturn::err(ipc::status::EBADCAP),
+        },
+        BIND_DEATH_NOTIFICATION => {
+            // caps[0] = Notification or NULL to clear.
+            let bound = msg
+                .descriptor(0)
+                .filter(|cs| cs.handle() != 0)
+                .and_then(|cs| proc::get_cap(pid, cs.handle()).ok())
+                .filter(|c| c.typ == ObjType::Notification);
+            match set_bound_notification(target, bound.map(|c| crate::sched::ObjRef(c.obj.0))) {
+                Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
+                Err(e) => SyscallReturn::err(e),
+            }
+        }
+        _ => SyscallReturn::err(ipc::status::ENOSYS),
+    }
+}
+
+/// Test hook for syscall.rs tests (thread_invoke is private).
+#[cfg(test)]
+pub(crate) fn thread_invoke_for_test(
+    pid: ProcessId,
+    tid: ThreadId,
+    cap: &Capability,
+    msg: Message,
+) -> i32 {
+    match thread_invoke(
+        pid,
+        tid,
+        cap,
+        &SyscallArgs {
+            num: crate::entry::num::INVOKE,
+            cap: 0,
+            tag: msg.tag,
+            w: msg.words,
+            nonblock: false,
+        },
+    ) {
+        r if r.status == PARKED_STATUS => 0,
+        r => r.status,
+    }
+}
+
+fn suspend(target: ThreadId) -> Result<(), i32> {
+    sched::suspend(target).map_err(|_| ipc::status::EBADCAP)
+}
+
+fn resume(target: ThreadId) -> Result<(), i32> {
+    sched::resume(target).map_err(|_| ipc::status::EBADCAP)
+}
+
+fn set_bound_notification(target: ThreadId, n: Option<crate::sched::ObjRef>) -> Result<(), i32> {
+    sched::set_bound_notification(target, n).map_err(|_| ipc::status::EBADCAP)
 }
 
 /// Factory methods (syscall-abi §7). NEW_THREAD per ADR-017:
@@ -311,7 +458,9 @@ fn new_thread(pid: ProcessId, cap: &Capability, msg: &Message) -> SyscallReturn 
     }
 
     // Spawn at scheduler default priority (ADR-017 §3); SET_PRIORITY refines.
-    let child_tid = match sched::spawn(ObjRef(child_pid.0), sched::DEFAULT_PRIORITY) {
+    // Entry PC from w0 (ADR-019 §4); SP is arch-owned.
+    let child_tid = match sched::spawn_with(ObjRef(child_pid.0), sched::DEFAULT_PRIORITY, entry_pc)
+    {
         Ok(t) => t,
         Err(_) => return SyscallReturn::err(ipc::status::ENOMEM),
     };

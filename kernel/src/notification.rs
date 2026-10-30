@@ -53,10 +53,35 @@ pub fn signal(n: ObjRef, mask: u64) -> Result<(), crate::endpoint::IpcError> {
         .ok_or(crate::endpoint::IpcError::NoSuchEndpoint)?;
     let slot = slot_of(n).ok_or(crate::endpoint::IpcError::NoSuchEndpoint)?;
     engine.word[slot] |= mask;
-    // Wake threads blocked receiving on THIS notification.
-    let waiting = sched::blocked_matching(
+    // Wake threads blocked receiving on THIS notification...
+    let mut waiting = sched::blocked_matching(
         |r| matches!(r, crate::sched::BlockReason::Notification(o) if *o == n),
     );
+    // ...and the §3.1 "select" primitive: threads blocked on ANY endpoint
+    // with this notification bound (ADR-019 §2).
+    let bound = sched::blocked_matching(|r| {
+        matches!(
+            r,
+            crate::sched::BlockReason::Recv(_)
+                | crate::sched::BlockReason::Send(_)
+                | crate::sched::BlockReason::Reply
+        )
+    });
+    for tid in bound {
+        if tid == sched::IDLE {
+            break;
+        }
+        if waiting.contains(&tid) {
+            continue;
+        }
+        if let Ok(t) = sched::get(tid) {
+            if t.bound_notification == Some(n) {
+                if let Some(f) = waiting.iter().position(|x| *x == sched::IDLE) {
+                    waiting[f] = tid;
+                }
+            }
+        }
+    }
     for tid in waiting {
         if tid == sched::IDLE {
             break;

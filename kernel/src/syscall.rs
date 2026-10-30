@@ -10,7 +10,7 @@ use crate::proc::{self, ProcError, ProcessId};
 use crate::sched::{self, BlockReason, ObjRef, ThreadId};
 use caps::Capability;
 use caps::{ObjType, Rights};
-use ipc::{flags, CapSlot, Message};
+use ipc::{flags, CapSlot, Message, Tag};
 use spin::Mutex;
 
 pub const REPLY_CAP_SENTINEL: u32 = 0xFFFF_FFFE;
@@ -112,10 +112,19 @@ fn resolve_transfers(pid: ProcessId, msg: &Message, sender: ThreadId) -> (Envelo
 
 /// Install pending caps into the receiver's table and rewrite descriptor
 /// words to (receiver handle, granted rights).
-fn install_transfers(pid: ProcessId, env: &mut Envelope) {
+pub(crate) fn install_transfers(pid: ProcessId, env: &mut Envelope) {
     let mut partial = false;
     for i in 0..env.msg.cap_count() {
-        let Some(cap) = env.caps[i] else { continue };
+        // A None slot means the sender-side descriptor already failed
+        // (dead handle / missing GRANT / reserved value): per schema §3.1
+        // the wire word must become NULL and FLAG_CAP_PARTIAL must be set —
+        // the sender's raw handle value must NEVER reach the wire
+        // (confused-deputy surface; found by DS's ABI audit).
+        let Some(cap) = env.caps[i] else {
+            let _ = env.msg.set_descriptor(i, CapSlot::NULL);
+            partial = true;
+            continue;
+        };
         let requested = env
             .msg
             .descriptor(i)
@@ -237,6 +246,88 @@ pub fn sys_call(pid: ProcessId, tid: ThreadId, dst_handle: u32, msg: Message) ->
     Ok(ipc::status::OK)
 }
 
+/// Parked-recv records: tid → (src handle, pid), so `park_result` can
+/// complete the recv into the right table on resume (ADR-019 §1).
+struct Parks {
+    who: [Option<(ThreadId, u32, ProcessId)>; 64],
+}
+
+static PARKS: Mutex<Parks> = Mutex::new(Parks {
+    who: [const { None }; 64],
+});
+
+fn record_park(tid: ThreadId, src_handle: u32, pid: ProcessId) {
+    let mut p = PARKS.lock();
+    for slot in p.who.iter_mut() {
+        if slot.is_none() {
+            *slot = Some((tid, src_handle, pid));
+            return;
+        }
+    }
+}
+
+fn clear_park(tid: ThreadId) {
+    let mut p = PARKS.lock();
+    for slot in p.who.iter_mut() {
+        if let Some((t, _, _)) = slot {
+            if *t == tid {
+                *slot = None;
+                return;
+            }
+        }
+    }
+}
+
+/// Resume contract for a parked thread (ADR-019 §1): called by the arch
+/// entry when a parked thread is scheduled again.
+/// Priority: `call` reply → bound notification (NOTIFIED + mask) → endpoint
+/// delivery (completed recv).
+pub fn park_result(tid: ThreadId) -> Option<crate::entry::SyscallReturn> {
+    // 0. A `call` reply delivered while parked → complete the call.
+    {
+        let mut d = crate::endpoint::DELIVERED_FOR_REPLY.lock();
+        if let Some(env) = d.take(tid) {
+            clear_reply(tid);
+            clear_park(tid);
+            return Some(crate::entry::SyscallReturn::ok(env.msg.tag, env.msg.words));
+        }
+    }
+    // 1. Bound notification pending → NOTIFIED + mask (schema §4).
+    if let Ok(t) = sched::get(tid) {
+        if let Some(n) = t.bound_notification {
+            if let Ok(mask) = crate::notification::pending(n) {
+                if mask != 0 {
+                    let _ = crate::notification::take(n);
+                    clear_park(tid);
+                    return Some(crate::entry::SyscallReturn::ok(
+                        Tag::new(ipc::labels::kernel::NOTIFY).with_flags(ipc::flags::NOTIFIED),
+                        [mask, 0, 0, 0],
+                    ));
+                }
+            }
+        }
+    }
+    // 2. Endpoint delivery → complete the recv into the parking process's
+    //    table (cap install + implicit reply, then the message).
+    if let Some(env) = endpoint::take_delivered(tid) {
+        let park_pid = {
+            let p = PARKS.lock();
+            p.who
+                .iter()
+                .find_map(|s| s.as_ref().filter(|(t, _, _)| *t == tid))
+                .map(|(_, _, pid)| *pid)
+        };
+        clear_park(tid);
+        let mut env = env;
+        if let Some(ppid) = park_pid {
+            set_reply_if_call(&env, tid);
+            install_transfers(ppid, &mut env);
+        }
+        return Some(crate::entry::SyscallReturn::ok(env.msg.tag, env.msg.words));
+    }
+    None
+}
+
 /// SYS 3: `recv`. Returns (status, delivered message or none).
 /// `woken_by_notification` is surfaced via FLAG_NOTIFIED + label 0.
 pub fn sys_recv(pid: ProcessId, tid: ThreadId, src_handle: u32) -> SysResult<Option<Message>> {
@@ -262,8 +353,8 @@ pub fn sys_recv(pid: ProcessId, tid: ThreadId, src_handle: u32) -> SysResult<Opt
                     Ok(Some(env.msg))
                 }
                 Ok(None) => {
-                    // Parked; the reply arrives via DELIVERED_FOR_REPLY or a
-                    // plain envelope via take_delivered.
+                    // Parked; record for park_result (ADR-019 §1).
+                    record_park(tid, src_handle, pid);
                     Ok(None)
                 }
                 Err(e) => Err(err(map_ipc(e))),
@@ -287,7 +378,7 @@ pub fn sys_recv(pid: ProcessId, tid: ThreadId, src_handle: u32) -> SysResult<Opt
     }
 }
 
-fn set_reply_if_call(env: &Envelope, server: ThreadId) {
+pub(crate) fn set_reply_if_call(env: &Envelope, server: ThreadId) {
     // v0 heuristic: every endpoint delivery grants the implicit reply cap
     // (matches `call`/`reply_recv` fast path; plain `send` receivers simply
     // have no pending caller when they reply → EBADSTATE, per syscall-abi §4).
@@ -386,6 +477,11 @@ mod tests {
         *REPLY.lock() = ReplyState {
             who: [const { None }; 64],
         };
+        *PARKS.lock() = Parks {
+            who: [const { None }; 64],
+        };
+        proc::reset_for_test();
+        crate::notification::reset_for_test();
         crate::endpoint::reset_engine_for_test();
         set_context_backend(&MockCtx);
         let _ = sched::init();
@@ -576,5 +672,144 @@ mod tests {
         assert_eq!(sys_exit(server, 0), Ok(true));
         assert_eq!(notification::pending(n), Ok(1));
         assert_eq!(take_reply(server), None);
+    }
+    #[test]
+    fn failed_sender_descriptor_nulls_wire_word() {
+        // DS ABI audit: a failed sender-side descriptor must become NULL +
+        // FLAG_CAP_PARTIAL — the sender's raw handle must never reach the
+        // wire (confused-deputy surface).
+        let (pid, _server, client, ep_h) = setup();
+        // Client references a handle that doesn't exist in its table.
+        let mut m = msg(0x0111, 1);
+        m.tag = m.tag.with_caps(2);
+        // desc 0: bad handle (unmapped)
+        m.set_descriptor(0, ipc::CapSlot::pack(999, ipc::Rights::READ))
+            .unwrap();
+        // desc 1: valid frame cap
+        let frame_h = proc::install_cap(
+            pid,
+            caps::Capability {
+                obj: caps::ObjId(0xCAFE),
+                typ: ObjType::Frame,
+                rights: ipc::Rights::READ.union(ipc::Rights::GRANT),
+            },
+        )
+        .unwrap();
+        m.set_descriptor(1, ipc::CapSlot::pack(frame_h, ipc::Rights::READ))
+            .unwrap();
+        assert_eq!(sys_send(pid, client, ep_h, m, false), Ok(0));
+
+        let got = sys_recv(pid, _server, ep_h).unwrap().unwrap();
+        assert!(
+            got.tag.flags() & ipc::flags::CAP_PARTIAL != 0,
+            "partial flag set"
+        );
+        assert_eq!(got.descriptor(0).unwrap().0, 0, "failed descriptor is NULL");
+        assert_ne!(
+            got.descriptor(1).unwrap().0,
+            0,
+            "valid descriptor transferred"
+        );
+        // The NULL word must NOT contain the sender's raw handle value (999).
+        assert_ne!(got.words[2], 999);
+    }
+
+    #[test]
+    fn park_result_completes_recv_and_notified_wake() {
+        let (pid, server, _client, ep_h) = setup();
+
+        // Server parks in recv (mailbox empty).
+        assert_eq!(sys_recv(pid, server, ep_h), Ok(None));
+        assert!(matches!(
+            sched::get(server).unwrap().state,
+            crate::sched::State::Blocked(_)
+        ));
+
+        // Client sends: direct hand-off delivers the envelope; server wakes.
+        assert_eq!(sys_send(pid, _client, ep_h, msg(0x0110, 5), false), Ok(0));
+        assert_eq!(
+            sched::get(server).unwrap().state,
+            crate::sched::State::Ready
+        );
+
+        // On resume, park_result completes the recv (message + caps).
+        let r = park_result(server).expect("completed recv on resume");
+        assert_eq!(r.status, ipc::status::OK);
+        assert_eq!(r.w[0], 5);
+
+        // NOTIFIED wake: bind a notification, park in recv again.
+        let n = notification::create().unwrap();
+        {
+            let mut guard = SCHED.lock();
+            guard.as_mut().unwrap().slots.threads[server.0 as usize]
+                .as_mut()
+                .unwrap()
+                .bound_notification = Some(n);
+        }
+        assert_eq!(sys_recv(pid, server, ep_h), Ok(None));
+        notification::signal(n, 0b110).unwrap();
+        assert_eq!(
+            sched::get(server).unwrap().state,
+            crate::sched::State::Ready
+        );
+        let r = park_result(server).expect("notified resume");
+        assert_eq!(r.status, ipc::status::OK);
+        assert_eq!(r.tag.label(), ipc::labels::kernel::NOTIFY);
+        assert!(r.tag.flags() & ipc::flags::NOTIFIED != 0);
+        assert_eq!(r.w[0], 0b110, "mask consumed");
+    }
+
+    #[test]
+    fn thread_invoke_kill_priority_and_death_binding() {
+        let (pid, _server, client, _ep) = setup();
+        // Server gets a Thread cap over client (CONTROL).
+        let tc = proc::install_cap(
+            pid,
+            caps::Capability {
+                obj: caps::ObjId(client.0),
+                typ: ObjType::Thread,
+                rights: ipc::Rights::CONTROL,
+            },
+        )
+        .unwrap();
+
+        // SET_PRIORITY (id 5).
+        let m = msg(5, 200);
+        assert_eq!(thread_invoke_entry(pid, tc, m), 0);
+        assert_eq!(sched::get(client).unwrap().priority, 200);
+
+        // BIND_DEATH_NOTIFICATION (id 12): caps[0] = notification.
+        let n = notification::create().unwrap();
+        let n_h = proc::install_cap(
+            pid,
+            caps::Capability {
+                obj: caps::ObjId(n.0),
+                typ: ObjType::Notification,
+                rights: ipc::Rights::RECV,
+            },
+        )
+        .unwrap();
+        let mut m = msg(12, 0);
+        m.tag = m.tag.with_caps(1);
+        m.set_descriptor(0, ipc::CapSlot::pack(n_h, ipc::Rights::RECV))
+            .unwrap();
+        assert_eq!(thread_invoke_entry(pid, tc, m), 0);
+
+        // KILL (id 2) → client exits, death notification fires.
+        let m = msg(2, 0);
+        assert_eq!(thread_invoke_entry(pid, tc, m), 0);
+        assert!(matches!(
+            sched::get(client).unwrap().state,
+            crate::sched::State::Exited(-1)
+        ));
+        assert_eq!(notification::pending(n), Ok(1));
+    }
+
+    /// Helper: run entry::thread_invoke via dispatch INVOKE.
+    fn thread_invoke_entry(pid: ProcessId, thread_cap: u32, m: Message) -> i32 {
+        // dispatch uses CurrentContext; entry tests set it via FixedCtx —
+        // here we call the kernel path directly for simplicity.
+        let cap = proc::get_cap(pid, thread_cap).unwrap();
+        crate::entry::thread_invoke_for_test(pid, ThreadId(1), &cap, m)
     }
 }
