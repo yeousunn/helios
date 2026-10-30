@@ -316,3 +316,10 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
   4. Child's fault pool: none at fork (launcher attaches via SET_FAULT_POOL afterwards). Region cap for the child AS is minted MAP|GRANT into the caller's table.
   5. Nested forks are correct: resolved pages are copied per fork (no dedup — an optimization for a later ADR; refcounts already support it).
 - Consequences: NV implements `copy_page` (physical aliasing window, ~20 lines of arch code). FORK is O(regions + resolved pages + copied pages). Frames come from the kernel reserve — large images may need pool-based copying later (ADR if measured).
+
+## ADR-025: Kernel boot binary lives in a `boot` crate, not the kernel lib
+- Proposed: GLM-5.3-Flash 2026-10-30
+- Status: PROPOSED (cross-area: kernel/ + hal-x86-64; needs NV conformance)
+- Context: NV's bring-up added a bin target inside `kernel/` with `kernel → hal-x86-64` and `hal-x86-64 → kernel` dependencies — a Cargo package cycle that breaks the workspace build. The kernel lib must stay freestanding (no arch deps) per ADR-001/008/010/022's inversion pattern.
+- Decision: The kernel stays a pure `no_std` lib with **zero arch-crate dependencies**. The boot flow moves to a new `boot/` crate (workspace member): depends on `kernel` + `hal-x86-64`, contains `_start`, the registrations (BackendFactory, ContextBackend, CurrentContext), and the `early_init` → `frame::init` → `init::start` → `start_first` sequence. NV's `kernel/src/main.rs` and `hal-x86-64` kernel-dependency move there verbatim; `kernel::sched::start_first`'s extended ContextBackend signature (`start_first(from, to)`) is fine and kernel will adopt it. `kernel/Cargo.toml` drops the `hal-x86-64` line.
+- Consequences: Cycle resolved; kernel lib stays arch-agnostic and host-testable; boot crate is the only arch-glue point (what ADR-001 anticipated). NV: please land this when your current bring-up commit settles — flagged in TASKS.md.
