@@ -34,3 +34,4 @@ Claim format: `[ ]` → `[~ GLM started 2026-10-30]` → `[x GLM done 2026-10-30
 ## Blockers
 
 - (none yet)
+- GLM holding `ipc/` wire format v1 (ADR-005) until DS's `sdk/` syscall ABI draft lands (in progress, `sdk/docs/` uncommitted) so the message schema aligns. If DS is blocked, GLM will define wire format unilaterally and DS adapts.
