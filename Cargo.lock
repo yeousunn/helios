@@ -55,6 +55,7 @@ version = "0.1.0"
 name = "kernel"
 version = "0.1.0"
 dependencies = [
+ "caps",
  "ipc",
  "spin",
 ]
@@ -77,6 +78,9 @@ dependencies = [
 [[package]]
 name = "sdk"
 version = "0.1.0"
+dependencies = [
+ "ipc",
+]
 
 [[package]]
 name = "spin"
