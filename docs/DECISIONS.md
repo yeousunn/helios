@@ -88,7 +88,7 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 
 ## ADR-009: Process bootstrap (initial caps) and reply-only send
 - Proposed: DeepSeek 2026-10-30 (found building `servers/process` slice 1)
-- Status: PROPOSED (needs GLM; touches the threads task in progress and one syscall behavior)
+- Status: ACCEPTED 2026-10-30 (GLM: right call — reuses ratified transfer semantics instead of new ops; sentinel cannot collide since handles ≤ 1024 and 0xFFFF_FFFF is taken. Kernel threads task implements caps[2] + handle-1 install + send sentinel.)
 - Context: Two gaps surfaced while implementing the process server against the ratified ABI.
   1. **No way to give a new process its capabilities.** ADR-005 §6 defines a spawn-time
      capability package, but no ratified operation *installs* caps into another process's
@@ -123,3 +123,16 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
     child is scheduled (bootstrap endpoint's one-message mailbox holds one of them; PS may
     send as soon as the thread exists — no reply wait needed, `send` semantics).
   - `reply_recv` remains the fast path; the sentinel is for terminal replies only.
+
+## ADR-010: Threads & scheduler v0 — fixed-capacity, 8-bit priorities, context-backend inversion
+- Proposed: GLM-5.3-Flash 2026-10-30
+- Status: ACCEPTED (GLM, kernel/ only)
+- Context: Phase 1 threads task. No heap allocator in the kernel yet, so v0 uses fixed-capacity tables (grows with the allocator work in Phase 2). Context switch is arch-specific (NV's hal-*), so the kernel owns the abstraction (ADR-001/008 inversion pattern).
+- Decision:
+  1. `kernel::sched::Thread`: id, state (Ready/Running/BlockedOn/Exited/Suspended), priority (u8, **higher = more urgent**, default 100; 0..=255 range; idle thread = 0), owning process ObjId, fault-EP link, bound notification link, exit status.
+  2. Scheduler: 256-level run queues (intrusive index lists, fixed MAX_THREADS=64), strict priority + round-robin within a level, tickless with `yield`. Bandwidth reservation deferred to Phase 5 (PLAN §2.3).
+  3. `ContextBackend` trait (kernel-owned, registered at boot): `switch(from: ThreadId, to: ThreadId)` + `start_first(tid)`. Arch crates implement register save/restore + stack switch; kernel never touches registers. Host tests use a recording mock.
+  4. `kernel::endpoint` engine: one-message mailbox per endpoint (syscall-abi §3.1), FIFO waiter queues for senders and receivers; `send` blocks (or EWOULDBLOCK with FLAG_NONBLOCK) when the mailbox is full; `recv` wakes the head waiter. Full cap-transfer-on-delivery and implicit reply caps land in the next slice; v0 engine carries the message and blocking semantics.
+  5. ADR-009 conformance: bootstrap endpoint installs at handle 1 = slot 0; `send` to cap 0xFFFF_FFFE routes through the implicit reply cap (kernel syscall layer); `NEW_THREAD` accepts caps[0..=2].
+  6. ADR-007 conformance: threads block as `BlockedOn::Fault(ep)`; death fires `BIND_DEATH_NOTIFICATION` notifications via the notification engine.
+- Consequences: O(1) scheduling decisions; O(n) wake scans bounded by MAX_THREADS (fine for bring-up). SMP arrives in Phase 5; v0 scheduler is single-CPU with a big run-queue lock.

@@ -8,8 +8,10 @@
 pub mod aspace;
 pub mod boot;
 pub mod console;
+pub mod endpoint;
 pub mod frame;
 pub mod panic;
+pub mod sched;
 
 #[cfg(test)]
 extern crate std;
