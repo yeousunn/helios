@@ -22,6 +22,14 @@ pub const BOOTSTRAP_HANDLE: Handle = 1;
 /// (owned by the process server; this constant mirrors the design doc).
 pub const PACKAGE_LABEL: u16 = 0x0102;
 
+/// Ready callback: a spawned server, after a successful startup, sends one
+/// message to its package's service-endpoint slot (the launcher's endpoint)
+/// with this label and [`READY_MAGIC`] in `w0` (+ diagnostics in `w1..w3`)
+/// before entering its real loop. Launchers assert on it — it is the proof
+/// that the child executed its own code.
+pub const READY_LABEL: u16 = 0x5053;
+pub const READY_MAGIC: u64 = 0x5053_0000_0001;
+
 /// Session notifications in the fixed prefix.
 pub const SESSION_POOL: usize = 4;
 

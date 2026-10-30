@@ -78,12 +78,25 @@ pub extern "C" fn _start() -> ! {
         let mut sys = Syscalls::new(&mut raw);
         sys.invoke(factory, &Message::new(methods::factory::NEW_ENDPOINT))
     };
-    let _service_ep = match minted {
+    let service_ep = match minted {
         Ok(reply) if reply.words[0] != 0 => reply.words[0] as u32,
         _ => Syscalls::new(&mut raw).exit(0xE2),
     };
 
-    // 5. Clean exit; the launcher's death notification fires (ADR-007 §6).
+    // 5. Ready callback to the launcher (package service-endpoint slot):
+    //    proof that this process ran its own code, plus its minted handle.
+    {
+        let mut sys = Syscalls::new(&mut raw);
+        let mut ready = Message::new(sdk::bootstrap::READY_LABEL);
+        ready.words[0] = sdk::bootstrap::READY_MAGIC;
+        ready.words[1] = service_ep as u64;
+        ready.words[2] = HEAP.capacity() as u64;
+        if sys.send(package.process_server_ep, &ready).is_err() {
+            Syscalls::new(&mut raw).exit(0xE5);
+        }
+    }
+
+    // 6. Clean exit; the launcher's death notification fires (ADR-007 §6).
     Syscalls::new(&mut raw).exit(0)
 }
 

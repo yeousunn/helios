@@ -49,7 +49,8 @@ const STEP_IPC: u64 = 4;
 const STEP_REVOKE: u64 = 5;
 const STEP_HEAP: u64 = 6;
 const STEP_SPAWNED: u64 = 7;
-const STEP_CHILD_EXIT: u64 = 8;
+const STEP_CHILD_READY: u64 = 8;
+const STEP_CHILD_EXIT: u64 = 9;
 const STEP_DONE: u64 = 0x0F;
 /// Failure marker family for exits: `0xDEAD_0000_00SS_EEEE` (step, errno).
 const FAIL: u64 = 0xDEAD_0000_0000_0000;
@@ -143,7 +144,19 @@ fn run(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
     let pid = spawn_ps(raw, info, self_as, region)?;
     mark(raw, info.debug_ep, STEP_SPAWNED, pid);
 
-    // Step 8: reap — the death notification fires when PS exits (ADR-007 §6).
+    // Step 8: ready callback — PS reports its minted service endpoint over the
+    // package's service-endpoint slot before exiting (proves it ran).
+    let ready = {
+        let mut sys = Syscalls::new(raw);
+        sys.recv(READY_EP.load(core::sync::atomic::Ordering::Relaxed))
+            .map_err(|e| fail_code(STEP_CHILD_READY, e as u64))?
+    };
+    if ready.tag.label() != bootstrap::READY_LABEL || ready.words[0] != bootstrap::READY_MAGIC {
+        return Err(fail_code(STEP_CHILD_READY, 0xE1));
+    }
+    mark(raw, info.debug_ep, STEP_CHILD_READY, ready.words[1]);
+
+    // Step 9: reap — the death notification fires when PS exits (ADR-007 §6).
     let death = ps_death_handle(raw)?;
     let notified = {
         let mut sys = Syscalls::new(raw);
@@ -154,11 +167,12 @@ fn run(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
     Ok(())
 }
 
-/// The death notification handle is stashed by `spawn_ps` at a fixed index in
-/// its returned thread tuple; see `spawn_ps` docs.
+/// The launcher's service endpoint for the spawned child, set by `spawn_ps`
+/// when building the package (prefix[7]).
+static READY_EP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 fn ps_death_handle(raw: &mut X86_64Syscalls) -> Result<Handle> {
     let _ = raw;
-    // Set by spawn_ps via a small module-local cell.
     DEATH_HANDLE.get().ok_or(fail_code(STEP_CHILD_EXIT, 0xE6))
 }
 
@@ -266,6 +280,7 @@ fn spawn_ps(
     }
     caps.push(CapSlot::pack(init_ep, Rights::SEND.union(Rights::GRANT)));
     caps.push(CapSlot::pack(info.factory, Rights::ALL));
+    READY_EP.store(init_ep, core::sync::atomic::Ordering::Relaxed);
     {
         let mut sys = Syscalls::new(raw);
         bootstrap::deliver(&mut sys, bootstrap_ep, &caps)
