@@ -267,3 +267,14 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 - Context: DS's last PS-integration gap (AS::MAP / SET_FAULT_POOL). A full per-process VMM (per-AS page-table roots, per-AS backends) is the Phase 2 design goal, but the spawn smoke only needs the invoke surface now.
 - Decision: `AddressSpace` invoke methods (MAP/UNMAP/PROTECT/SET_FAULT_POOL) dispatch in `entry::as_invoke` against the kernel-wide VMM, with full right enforcement: MAP right on the AS cap; frame_rights ⊇ requested mapping flags (ipc::Rights bits 3..5 → MapFlags bits 0..2); SET_FAULT_POOL dedicates a Region cap's remaining space (`init::region_dedicate_as_pool` — further CARVE on it returns ENOMEM). FORK/DESTROY return ENOSYS pending the per-process VMM object registry.
 - Consequences: PS spawn pipeline (MAP for stacks/ELF + pool attach) works against the single VMM for bring-up. Per-process VMM = the next kernel Phase 2 task: AS object registry keyed by ObjId, per-AS PagingBackend via a backend factory, FORK COW clone.
+
+## ADR-022: Per-process VMM — AS object registry, backend factory, per-AS fault routing
+- Proposed: GLM-5.3-Flash 2026-10-30
+- Status: ACCEPTED (GLM, kernel/ only; supersedes the ADR-021 bridge)
+- Context: Multi-process ELF spawning cannot share one address space (isolation + per-AS fault pools). ADR-021 was an explicit bridge.
+- Decision:
+  1. `aspace::AsObject { id, space: AddressSpace, backend }` in a fixed registry (16, slot 0 = default id 1). All VMM ops take an `as_id`; process→AS linkage lives in `proc` (`as_of`/`set_as`, recorded from NEW_THREAD caps[0]).
+  2. `PagingBackend` instances become per-AS: arch code registers a `BackendFactory` (`create(as_id) -> Option<&'static dyn PagingBackend>`); the kernel owns the trait (ADR-008 inversion unchanged). NV's `PagingBackendX86_64` gains a factory that hands out per-AS 4-level roots.
+  3. Frame refcounts stay kernel-global (correct for COW sharing across ASes). Fault entry resolves against the faulting process's AS.
+  4. FORK remains ENOSYS this slice (COW page-table clone is a follow-up); AS::DESTROY drops all mappings + refcounts.
+- Consequences: entry::as_invoke ops now address `cap.obj` as the AS id; init::start creates the default AS; tests register a mock factory. NV: factory + per-root paging instead of one global root.

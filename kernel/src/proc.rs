@@ -33,6 +33,7 @@ pub type ProcessId = ObjId;
 struct RegistryInner {
     used: [bool; MAX_PROCESSES],
     tables: [CapTable; MAX_PROCESSES],
+    as_ids: [Option<ObjId>; MAX_PROCESSES],
 }
 
 impl RegistryInner {
@@ -40,6 +41,7 @@ impl RegistryInner {
         RegistryInner {
             used: [false; MAX_PROCESSES],
             tables: [const { CapTable::empty() }; MAX_PROCESSES],
+            as_ids: [const { None }; MAX_PROCESSES],
         }
     }
 }
@@ -56,6 +58,7 @@ pub fn create() -> ProcResult<ProcessId> {
         .ok_or(ProcError::TableFull)?;
     guard.used[idx] = true;
     guard.tables[idx] = CapTable::empty();
+    guard.as_ids[idx] = None;
     Ok(ObjId(idx as u64 + 1))
 }
 
@@ -70,6 +73,7 @@ pub fn destroy(pid: ProcessId) -> ProcResult<()> {
     }
     guard.used[idx] = false;
     guard.tables[idx] = CapTable::empty();
+    guard.as_ids[idx] = None;
     Ok(())
 }
 
@@ -163,6 +167,29 @@ pub fn revoke(pid: ProcessId, handle: u32, mode: u64) -> ProcResult<usize> {
     })
 }
 
+/// Record the process's address space (NEW_THREAD caps[0]; ADR-022 §1).
+pub fn set_as(pid: ProcessId, as_id: ObjId) -> ProcResult<()> {
+    let mut guard = REGISTRY.lock();
+    let idx = (pid.0 as usize)
+        .checked_sub(1)
+        .ok_or(ProcError::NoSuchProcess)?;
+    if idx >= MAX_PROCESSES || !guard.used[idx] {
+        return Err(ProcError::NoSuchProcess);
+    }
+    guard.as_ids[idx] = Some(as_id);
+    Ok(())
+}
+
+/// The process's address space, if recorded.
+pub fn as_of(pid: ProcessId) -> Option<ObjId> {
+    let guard = REGISTRY.lock();
+    let idx = (pid.0 as usize).checked_sub(1)?;
+    if idx >= MAX_PROCESSES || !guard.used[idx] {
+        return None;
+    }
+    guard.as_ids[idx]
+}
+
 /// Remove a single cap (internal; e.g. reply-cap cleanup paths).
 pub fn remove_cap(pid: ProcessId, handle: u32) -> ProcResult<()> {
     with_table(pid, |t| {
@@ -177,6 +204,7 @@ pub(crate) fn reset_for_test() {
     for i in 0..MAX_PROCESSES {
         guard.used[i] = false;
         guard.tables[i] = CapTable::empty();
+        guard.as_ids[i] = None;
     }
 }
 

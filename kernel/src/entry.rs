@@ -232,6 +232,7 @@ fn invoke(pid: ProcessId, tid: ThreadId, args: SyscallArgs) -> SyscallReturn {
 /// per-process VMM objects land (board: Phase 2 kernel task).
 fn as_invoke(pid: ProcessId, cap: &Capability, args: &SyscallArgs) -> SyscallReturn {
     use crate::aspace::{self, MapFlags, Vaddr};
+    let as_id = cap.obj;
     if !cap.rights.contains(Rights::MAP) {
         return SyscallReturn::err(ipc::status::ERIGHTS);
     }
@@ -272,19 +273,19 @@ fn as_invoke(pid: ProcessId, cap: &Capability, args: &SyscallArgs) -> SyscallRet
                     None => return SyscallReturn::err(ipc::status::EBADARG),
                 }
             };
-            match aspace::map(vaddr, 1, frame_addr, flags) {
+            match aspace::map(as_id, vaddr, 1, frame_addr, flags) {
                 Ok(_) => SyscallReturn::ok(msg.tag, [0; 4]),
                 Err(aspace::VmmError::Overlap) => SyscallReturn::err(ipc::status::EBADARG),
                 Err(_) => SyscallReturn::err(ipc::status::ENOMEM),
             }
         }
-        UNMAP => match aspace::unmap(vaddr) {
+        UNMAP => match aspace::unmap(as_id, vaddr) {
             Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
             Err(_) => SyscallReturn::err(ipc::status::EBADARG),
         },
         PROTECT => {
             let flags = MapFlags((msg.words[2] as u32) & 0b111);
-            match aspace::protect(vaddr, flags) {
+            match aspace::protect(as_id, vaddr, flags) {
                 Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
                 Err(_) => SyscallReturn::err(ipc::status::EBADARG),
             }
@@ -301,7 +302,7 @@ fn as_invoke(pid: ProcessId, cap: &Capability, args: &SyscallArgs) -> SyscallRet
                 return SyscallReturn::err(ipc::status::EBADARG);
             }
             match crate::init::region_dedicate_as_pool(rc.obj) {
-                Ok((base, len)) => match aspace::set_pool(base, len) {
+                Ok((base, len)) => match aspace::set_pool(as_id, base, len) {
                     Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
                     Err(_) => SyscallReturn::err(ipc::status::ENOMEM),
                 },
@@ -453,15 +454,17 @@ fn factory_invoke(
             Err(_) => SyscallReturn::err(ipc::status::ENOMEM),
         },
         NEW_ADDRESS_SPACE => {
-            // v0: kernel-wide VMM (ADR-008); per-process AS objects arrive
-            // with process server integration (Phase 2).
-            install_ret(
-                pid,
-                0xA5A5,
-                ObjType::AddressSpace,
-                Rights::MAP.union(Rights::GRANT),
-                msg.tag,
-            )
+            // Per-process AS object (ADR-022 §1).
+            match crate::aspace::create() {
+                Ok(as_id) => install_ret(
+                    pid,
+                    as_id.0,
+                    ObjType::AddressSpace,
+                    Rights::MAP.union(Rights::GRANT),
+                    msg.tag,
+                ),
+                Err(_) => SyscallReturn::err(ipc::status::ENOMEM),
+            }
         }
         NEW_THREAD => new_thread(pid, cap, &msg),
         _ => SyscallReturn::err(ipc::status::ENOSYS),
@@ -495,6 +498,18 @@ fn new_thread(pid: ProcessId, cap: &Capability, msg: &Message) -> SyscallReturn 
         Ok(p) => p,
         Err(e) => return SyscallReturn::err(map_proc(e)),
     };
+
+    // caps[0] = AddressSpace (required): record as the child's AS (ADR-022).
+    if let Some(cs) = msg.descriptor(0) {
+        if cs.handle() != 0 {
+            match proc::get_cap(pid, cs.handle()) {
+                Ok(as_cap) if as_cap.typ == ObjType::AddressSpace => {
+                    let _ = proc::set_as(child_pid, as_cap.obj);
+                }
+                _ => return SyscallReturn::err(ipc::status::EBADARG),
+            }
+        }
+    }
 
     // caps[1] = fault endpoint (optional).
     if let Some(cs) = msg.descriptor(1) {
@@ -589,7 +604,23 @@ mod tests {
         }
     }
 
+    struct MockFactory;
+    impl crate::aspace::BackendFactory for MockFactory {
+        fn create(&self, _as_id: u64) -> Option<&'static dyn crate::aspace::PagingBackend> {
+            Some(&MockBackend)
+        }
+    }
+
+    struct MockBackend;
+    impl crate::aspace::PagingBackend for MockBackend {
+        fn map_page(&self, _v: crate::aspace::Vaddr, _p: crate::frame::PhysAddr, _f: MapFlags) {}
+        fn unmap_page(&self, _v: crate::aspace::Vaddr) {}
+        fn protect_page(&self, _v: crate::aspace::Vaddr, _f: MapFlags) {}
+    }
+
     fn setup() -> (ProcessId, ThreadId, u32) {
+        crate::aspace::set_backend_factory(&MockFactory);
+        let _ = crate::aspace::init_default();
         crate::proc::reset_for_test();
         crate::endpoint::reset_engine_for_test();
         crate::notification::reset_for_test();
@@ -685,6 +716,7 @@ mod tests {
         // AS cap + Frame cap.
         let r_as = dispatch(args(num::INVOKE, factory, Tag::new(3), [0; 4]));
         let as_h = r_as.w[0] as u32;
+        let as_id = proc::get_cap(pid, as_h).unwrap().obj;
         let frame_addr: u64 = 0xE0_0000;
         let frame_h = proc::install_cap(
             pid,
@@ -708,7 +740,7 @@ mod tests {
         let r = dispatch(args(num::INVOKE, as_h, m.tag, m.words));
         assert_eq!(r.status, ipc::status::OK, "AS::MAP");
         assert_eq!(
-            crate::aspace::translate(Vaddr(0xA0_0000)),
+            crate::aspace::translate(as_id, Vaddr(0xA0_0000)),
             Ok((
                 crate::frame::PhysAddr::new(frame_addr),
                 MapFlags::READ.union(MapFlags::WRITE)
@@ -731,7 +763,7 @@ mod tests {
             ipc::status::OK
         );
         assert_eq!(
-            crate::aspace::translate(Vaddr(0xA0_0000)).unwrap().1,
+            crate::aspace::translate(as_id, Vaddr(0xA0_0000)).unwrap().1,
             MapFlags::READ
         );
 
@@ -742,7 +774,7 @@ mod tests {
             dispatch(args(num::INVOKE, as_h, m4.tag, m4.words)).status,
             ipc::status::OK
         );
-        assert!(crate::aspace::translate(Vaddr(0xA0_0000)).is_err());
+        assert!(crate::aspace::translate(as_id, Vaddr(0xA0_0000)).is_err());
 
         // SET_FAULT_POOL: Region cap → pool; then ANON fault resolves.
         let region_addr: u64 = 0xC0_0000;
@@ -776,7 +808,7 @@ mod tests {
         let r = dispatch(args(num::INVOKE, as_h, m6.tag, m6.words));
         assert_eq!(r.status, ipc::status::OK, "ANON MAP");
         assert_eq!(
-            crate::aspace::resolve_fault(Vaddr(0xB0_0000), false),
+            crate::aspace::resolve_fault(as_id, Vaddr(0xB0_0000), false),
             Ok(crate::frame::PhysAddr::new(region_addr))
         );
 

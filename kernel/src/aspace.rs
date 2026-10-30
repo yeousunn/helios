@@ -1,11 +1,11 @@
-//! Arch-independent virtual memory core (ADR-008): mapping registry, COW
-//! refcounting, fault pools, and backend trait inversion.
-//!
-//! Arch crates provide a [`PagingBackend`] registered at boot; all policy
-//! (regions, COW, pools) lives here and is host-testable.
+//! Arch-independent virtual memory core (ADR-008, per-process VMM per
+//! ADR-022): AS object registry, per-AS paging backends, COW refcounting,
+//! fault pools. Arch code registers a `BackendFactory`; all policy lives
+//! here and is host-testable.
 #![forbid(unsafe_code)]
 
 use crate::frame::{self, PhysAddr};
+use caps::ObjId;
 use core::fmt;
 use spin::Mutex;
 
@@ -104,6 +104,8 @@ pub enum VmmError {
     BadVaddr,
     NoBackend,
     FrameNotOwned,
+    TableFull,
+    AlreadyExists,
 }
 
 impl fmt::Display for VmmError {
@@ -112,9 +114,9 @@ impl fmt::Display for VmmError {
     }
 }
 
-/// Kernel-owned page-table interface. Arch crates (hal-*) implement this and
-/// register via [`set_backend`]. Implementations do raw MMIO — the safety
-/// burden is theirs, per hal/ ownership.
+/// Kernel-owned page-table interface (ADR-022 §2): one instance per
+/// address space, created through a `BackendFactory`. Arch implementations
+/// do raw MMIO — the safety burden is theirs, per hal/ ownership.
 pub trait PagingBackend: Sync + Send {
     /// Install one page mapping.
     fn map_page(&self, vaddr: Vaddr, paddr: PhysAddr, flags: MapFlags);
@@ -124,115 +126,29 @@ pub trait PagingBackend: Sync + Send {
     fn protect_page(&self, vaddr: Vaddr, flags: MapFlags);
 }
 
-static BACKEND: Mutex<Option<&'static dyn PagingBackend>> = Mutex::new(None);
-
-/// Register the arch paging backend. Call once from boot after `early_init`.
-pub fn set_backend(b: &'static dyn PagingBackend) -> Result<(), VmmError> {
-    let mut guard = BACKEND.lock();
-    if guard.is_some() {
-        return Err(VmmError::NoBackend);
-    }
-    *guard = Some(b);
-    Ok(())
+/// Arch-provided backend factory (ADR-022 §2). Registered at boot; hands
+/// out one paging root per address space.
+pub trait BackendFactory: Sync + Send {
+    fn create(&self, as_id: u64) -> Option<&'static dyn PagingBackend>;
 }
 
-fn with_backend<T>(f: impl FnOnce(&dyn PagingBackend) -> T, or: T) -> T {
-    // Brief lock; backend calls are expected to be short, no reentry.
-    let guard = BACKEND.lock();
-    match guard.as_ref() {
-        Some(b) => f(*b),
-        None => or,
-    }
+static FACTORY: Mutex<Option<&'static dyn BackendFactory>> = Mutex::new(None);
+
+pub fn set_backend_factory(f: &'static dyn BackendFactory) {
+    *FACTORY.lock() = Some(f);
 }
 
-/// Physical frame refcounts. COW children share; last unmap releases the
-/// frame back to the allocator.
-struct FrameRefs {
-    counts: [RefEntry; MAX_TRACKED],
-}
-
-impl FrameRefs {
-    const fn new() -> Self {
-        FrameRefs {
-            counts: [RefEntry {
-                addr: None,
-                count: 0,
-            }; MAX_TRACKED],
-        }
-    }
-}
-
-impl Default for FrameRefs {
-    fn default() -> Self {
-        FrameRefs::new()
-    }
-}
-
-const MAX_TRACKED: usize = 64;
-
-#[derive(Clone, Copy, Default)]
-struct RefEntry {
-    addr: Option<PhysAddr>,
-    count: usize,
-}
-
-impl FrameRefs {
-    fn acquire(&mut self, addr: PhysAddr) {
-        for e in self.counts.iter_mut() {
-            if e.addr == Some(addr) {
-                e.count += 1;
-                return;
-            }
-            if e.addr.is_none() {
-                *e = RefEntry {
-                    addr: Some(addr),
-                    count: 1,
-                };
-                return;
-            }
-        }
-        // Tracked table full — kernel reserve growth is a Phase 2 concern;
-        // caller paths guard with has_capacity.
-        crate::kwarn!("FrameRefs table full at {}", addr);
-    }
-
-    fn release(&mut self, addr: PhysAddr) -> usize {
-        for (i, e) in self.counts.iter_mut().enumerate() {
-            if e.addr == Some(addr) {
-                e.count -= 1;
-                let remaining = e.count;
-                if remaining == 0 {
-                    let _ = frame::free(addr);
-                    self.counts[i] = RefEntry::default();
-                }
-                return remaining;
-            }
-        }
-        0
-    }
-
-    fn count(&self, addr: PhysAddr) -> usize {
-        self.counts
-            .iter()
-            .find(|e| e.addr == Some(addr))
-            .map(|e| e.count)
-            .unwrap_or(0)
-    }
-}
-
-/// Per-address-space state. In v0 the kernel holds one registry keyed by
-/// ObjId; a full per-process instance model arrives with threads (Phase 1).
+/// Per-address-space VMM state.
 pub struct AddressSpace {
     regions: [Option<Mapping>; MAX_REGIONS],
     pool: Option<Pool>,
-    /// Per-page frames for ANON regions (single-base model cannot represent
-    /// lazily-faulted pages). Keyed by global page index.
+    /// Per-page frames for ANON/resolved pages (single-base model cannot
+    /// represent lazily-faulted pages). Keyed by global page index.
     page_frames: [(u64, PhysAddr); MAX_PAGE_FRAMES],
 }
 
-const MAX_PAGE_FRAMES: usize = 64;
-
 const MAX_REGIONS: usize = 32;
+const MAX_PAGE_FRAMES: usize = 64;
 
 /// Reserve of physical frames for in-kernel COW/anon resolution (ADR-007 §4).
 #[derive(Clone, Copy, Debug)]
@@ -265,35 +181,522 @@ impl Pool {
     }
 }
 
-/// Global address space state. One kernel-wide instance for v0 (single AS
-/// bring-up); multi-AS keyed by ObjId lands with the process server.
-static VMM: Mutex<Option<AddressSpace>> = Mutex::new(None);
+impl AddressSpace {
+    const fn new() -> Self {
+        AddressSpace {
+            regions: [const { None }; MAX_REGIONS],
+            pool: None,
+            page_frames: [(0, PhysAddr::new(0)); MAX_PAGE_FRAMES],
+        }
+    }
+
+    fn set_pool(&mut self, base: PhysAddr, bytes: u64) -> Result<(), VmmError> {
+        let pool = Pool::new(base, bytes).ok_or(VmmError::BadVaddr)?;
+        self.pool = Some(pool);
+        Ok(())
+    }
+
+    fn map(
+        &mut self,
+        vaddr: Vaddr,
+        pages: u64,
+        base: Option<PhysAddr>,
+        flags: MapFlags,
+    ) -> Result<PhysAddr, VmmError> {
+        if !vaddr.is_page_aligned() || pages == 0 {
+            return vmm_err(VmmError::BadVaddr);
+        }
+        if base.is_some() && flags.contains(MapFlags::ANON) {
+            return vmm_err(VmmError::FrameNotOwned);
+        }
+        let end_idx = vaddr
+            .page_index()
+            .checked_add(pages)
+            .ok_or(VmmError::BadVaddr)?;
+        // Overlap check.
+        for r in self.regions.iter().flatten() {
+            let rs = r.vaddr.page_index();
+            let re = rs + r.pages;
+            let s = vaddr.page_index();
+            if s < re && rs < end_idx {
+                return vmm_err(VmmError::Overlap);
+            }
+        }
+        let slot = self
+            .regions
+            .iter_mut()
+            .position(|r| r.is_none())
+            .ok_or(VmmError::Overlap)?;
+        if let Some(b) = base {
+            if !b.is_frame_aligned() {
+                return vmm_err(VmmError::BadVaddr);
+            }
+            FRAME_REFS.lock().acquire(b);
+        }
+        self.regions[slot] = Some(Mapping {
+            vaddr,
+            pages,
+            base,
+            flags,
+        });
+        Ok(base.unwrap_or(PhysAddr::new(0)))
+    }
+
+    /// Install backend entries page by page (called by the registry layer
+    /// which owns the backend reference).
+    fn map_backend(
+        &self,
+        be: &dyn PagingBackend,
+        vaddr: Vaddr,
+        pages: u64,
+        base: PhysAddr,
+        flags: MapFlags,
+    ) {
+        for i in 0..pages {
+            if let Some(pa) = base.checked_add(i * PAGE_SIZE as u64) {
+                let va = Vaddr(vaddr.as_u64() + i * PAGE_SIZE as u64);
+                be.map_page(va, pa, flags);
+            }
+        }
+    }
+
+    fn unmap(&mut self, be: &dyn PagingBackend, vaddr: Vaddr) -> Result<(), VmmError> {
+        if !vaddr.is_page_aligned() {
+            return vmm_err(VmmError::BadVaddr);
+        }
+        let slot = self
+            .regions
+            .iter()
+            .position(|r| matches!(r, Some(m) if m.contains(vaddr)))
+            .ok_or(VmmError::NotFound)?;
+        let m = self.regions[slot].take().unwrap();
+        if let Some(b) = m.base {
+            self.map_backend_unmap(be, m.vaddr, m.pages);
+            for i in 0..m.pages {
+                if let Some(pa) = b.checked_add(i * PAGE_SIZE as u64) {
+                    FRAME_REFS.lock().release(pa);
+                }
+            }
+        } else if m.flags.contains(MapFlags::ANON) {
+            // ANON: release every per-page frame in range.
+            let start = m.vaddr.page_index();
+            let end = start + m.pages;
+            for i in 0..self.page_frames.len() {
+                let (p, f) = self.page_frames[i];
+                if p >= start && p < end {
+                    FRAME_REFS.lock().release(f);
+                    be.unmap_page(Vaddr(p * PAGE_SIZE as u64));
+                    self.page_frames[i] = (0, PhysAddr::new(0));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn map_backend_unmap(&self, be: &dyn PagingBackend, vaddr: Vaddr, pages: u64) {
+        for i in 0..pages {
+            let va = Vaddr(vaddr.as_u64() + i * PAGE_SIZE as u64);
+            be.unmap_page(va);
+        }
+    }
+
+    fn protect(
+        &mut self,
+        be: &dyn PagingBackend,
+        vaddr: Vaddr,
+        flags: MapFlags,
+    ) -> Result<(), VmmError> {
+        for r in self.regions.iter_mut().flatten() {
+            if r.contains(vaddr) {
+                r.flags = flags;
+                for i in 0..r.pages {
+                    let va = Vaddr(r.vaddr.as_u64() + i * PAGE_SIZE as u64);
+                    be.protect_page(va, flags);
+                }
+                return Ok(());
+            }
+        }
+        vmm_err(VmmError::NotFound)
+    }
+
+    fn translate(&self, vaddr: Vaddr) -> Result<(PhysAddr, MapFlags), VmmError> {
+        let idx = vaddr.page_index();
+        for m in self.regions.iter().flatten() {
+            if m.contains(vaddr) {
+                // Per-page overrides (resolved ANON/COW pages) take precedence.
+                for (p, f) in self.page_frames.iter() {
+                    if *p == idx {
+                        return Ok((*f, m.flags));
+                    }
+                }
+                if let Some(base) = m.base {
+                    return Ok((base.checked_add(m.offset(vaddr)).unwrap(), m.flags));
+                }
+                return vmm_err(VmmError::NotMapped);
+            }
+        }
+        vmm_err(VmmError::NotFound)
+    }
+
+    /// Install a mapping from a pager's FAULT_RESOLVE reply (ADR-007 §2).
+    fn install_from_reply(
+        &mut self,
+        be: &dyn PagingBackend,
+        vaddr: Vaddr,
+        frame_addr: PhysAddr,
+        flags: MapFlags,
+    ) -> Result<bool, VmmError> {
+        if !vaddr.is_page_aligned() || !frame_addr.is_frame_aligned() {
+            return vmm_err(VmmError::BadVaddr);
+        }
+        let idx = vaddr.page_index();
+        FRAME_REFS.lock().acquire(frame_addr);
+        let covered = self.regions.iter().flatten().any(|m| m.contains(vaddr));
+        if covered {
+            let slot_pf = self
+                .page_frames
+                .iter()
+                .position(|(p, _)| *p == 0 || *p == idx)
+                .ok_or(VmmError::Overlap)?;
+            self.page_frames[slot_pf] = (idx, frame_addr);
+        } else {
+            let slot = self
+                .regions
+                .iter_mut()
+                .position(|r| r.is_none())
+                .ok_or(VmmError::Overlap)?;
+            self.regions[slot] = Some(Mapping {
+                vaddr,
+                pages: 1,
+                base: None,
+                flags,
+            });
+            let slot_pf = self
+                .page_frames
+                .iter()
+                .position(|(p, _)| *p == 0)
+                .ok_or(VmmError::Overlap)?;
+            self.page_frames[slot_pf] = (idx, frame_addr);
+        }
+        be.map_page(vaddr, frame_addr, flags);
+        Ok(covered)
+    }
+
+    fn resolve_fault(
+        &mut self,
+        be: &dyn PagingBackend,
+        vaddr: Vaddr,
+        write: bool,
+    ) -> Result<PhysAddr, VmmError> {
+        if !vaddr.is_page_aligned() {
+            return vmm_err(VmmError::BadVaddr);
+        }
+        let slot = self
+            .regions
+            .iter()
+            .position(|r| matches!(r, Some(m) if m.contains(vaddr)))
+            .ok_or(VmmError::NotFound)?;
+
+        // Already-resolved page (ANON or COW copy): return the per-page frame.
+        let page_idx = vaddr.page_index();
+        for (p, f) in self.page_frames.iter() {
+            if *p == page_idx {
+                return Ok(*f);
+            }
+        }
+
+        let m = self.regions[slot].as_mut().unwrap();
+
+        // Anonymous zero-fill (idempotent: a refault returns the same frame).
+        if m.flags.contains(MapFlags::ANON) {
+            let pool = self.pool.as_mut().ok_or(VmmError::NoPool)?;
+            let frame = pool.take().ok_or(VmmError::PoolEmpty)?;
+            FRAME_REFS.lock().acquire(frame);
+            let slot_pf = self
+                .page_frames
+                .iter()
+                .position(|(p, _)| *p == 0)
+                .ok_or(VmmError::PoolEmpty)?;
+            self.page_frames[slot_pf] = (page_idx, frame);
+            let va = Vaddr(m.vaddr.as_u64() + m.offset(vaddr));
+            be.map_page(va, frame, m.flags);
+            return Ok(frame);
+        }
+
+        // COW copy-on-write.
+        if write && m.flags.contains(MapFlags::COW) {
+            let base = m.base.ok_or(VmmError::NotMapped)?;
+            let old = base.checked_add(m.offset(vaddr)).unwrap();
+            if FRAME_REFS.lock().count(old) <= 1 {
+                // Sole owner: promote in place (per-page override, COW cleared).
+                let va = Vaddr(m.vaddr.as_u64() + m.offset(vaddr));
+                let flags = MapFlags(m.flags.0 & !MapFlags::COW.0);
+                let slot_pf = self
+                    .page_frames
+                    .iter()
+                    .position(|(p, _)| *p == 0)
+                    .ok_or(VmmError::PoolEmpty)?;
+                self.page_frames[slot_pf] = (page_idx, old);
+                be.protect_page(va, flags);
+                return Ok(old);
+            }
+            let pool = self.pool.as_mut().ok_or(VmmError::NoPool)?;
+            let fresh = pool.take().ok_or(VmmError::PoolEmpty)?;
+            // NOTE: byte-copy of the page happens in the backend/arch layer
+            // when it has a direct map (ADR-008).
+            FRAME_REFS.lock().acquire(fresh);
+            FRAME_REFS.lock().release(old);
+            let va = Vaddr(m.vaddr.as_u64() + m.offset(vaddr));
+            let flags = MapFlags(m.flags.0 & !MapFlags::COW.0);
+            let slot_pf = self
+                .page_frames
+                .iter()
+                .position(|(p, _)| *p == 0)
+                .ok_or(VmmError::PoolEmpty)?;
+            self.page_frames[slot_pf] = (page_idx, fresh);
+            be.map_page(va, fresh, flags);
+            return Ok(fresh);
+        }
+
+        if write && !m.flags.contains(MapFlags::WRITE) {
+            return vmm_err(VmmError::NoWritePerm);
+        }
+        m.base.ok_or(VmmError::NotMapped)
+    }
+
+    /// Drop all mappings and per-page frames (AS::DESTROY).
+    fn destroy(&mut self, be: &dyn PagingBackend) {
+        for i in 0..self.regions.len() {
+            if let Some(m) = self.regions[i].take() {
+                if let Some(b) = m.base {
+                    self.map_backend_unmap(be, m.vaddr, m.pages);
+                    for j in 0..m.pages {
+                        if let Some(pa) = b.checked_add(j * PAGE_SIZE as u64) {
+                            FRAME_REFS.lock().release(pa);
+                        }
+                    }
+                }
+            }
+        }
+        for i in 0..self.page_frames.len() {
+            let (p, f) = self.page_frames[i];
+            if p != 0 {
+                be.unmap_page(Vaddr(p * PAGE_SIZE as u64));
+                FRAME_REFS.lock().release(f);
+                self.page_frames[i] = (0, PhysAddr::new(0));
+            }
+        }
+        self.pool = None;
+    }
+}
+
+fn vmm_err<T>(e: VmmError) -> Result<T, VmmError> {
+    Err(e)
+}
+
+/// Physical frame refcounts — kernel-global (correct for COW sharing
+/// across address spaces, ADR-022 §3).
+struct FrameRefs {
+    counts: [RefEntry; MAX_TRACKED],
+}
+
+const MAX_TRACKED: usize = 64;
+
+#[derive(Clone, Copy, Default)]
+struct RefEntry {
+    addr: Option<PhysAddr>,
+    count: usize,
+}
+
+impl FrameRefs {
+    fn acquire(&mut self, addr: PhysAddr) {
+        for e in self.counts.iter_mut() {
+            if e.addr == Some(addr) {
+                e.count += 1;
+                return;
+            }
+            if e.addr.is_none() {
+                *e = RefEntry {
+                    addr: Some(addr),
+                    count: 1,
+                };
+                return;
+            }
+        }
+        crate::kwarn!("FrameRefs table full at {}", addr);
+    }
+
+    fn release(&mut self, addr: PhysAddr) -> usize {
+        for (i, e) in self.counts.iter_mut().enumerate() {
+            if e.addr == Some(addr) {
+                e.count -= 1;
+                let remaining = e.count;
+                if remaining == 0 {
+                    let _ = frame::free(addr);
+                    self.counts[i] = RefEntry::default();
+                }
+                return remaining;
+            }
+        }
+        0
+    }
+
+    fn count(&self, addr: PhysAddr) -> usize {
+        self.counts
+            .iter()
+            .find(|e| e.addr == Some(addr))
+            .map(|e| e.count)
+            .unwrap_or(0)
+    }
+}
+
+impl FrameRefs {
+    /// Fully const constructor (static init never builds stack temporaries).
+    const fn new() -> Self {
+        FrameRefs {
+            counts: [RefEntry {
+                addr: None,
+                count: 0,
+            }; MAX_TRACKED],
+        }
+    }
+}
+
 static FRAME_REFS: Mutex<FrameRefs> = Mutex::new(FrameRefs::new());
 
-/// Initialize the VMM with an optional fault pool (base, size in bytes).
-pub fn init(pool: Option<(PhysAddr, u64)>) -> Result<(), VmmError> {
-    let mut guard = VMM.lock();
-    if guard.is_some() {
-        return Err(VmmError::NoBackend); // reuse: "already initialized"
+/// AS object: VMM state + its own paging backend (ADR-022 §1).
+pub struct AsObject {
+    pub id: ObjId,
+    space: AddressSpace,
+    backend: &'static dyn PagingBackend,
+}
+
+/// Fixed AS registry. Slot 0 = default AS (id 1, kernel-wide bring-up VMM).
+const MAX_AS: usize = 16;
+pub const DEFAULT_AS: ObjId = ObjId(1);
+
+static AS_TABLE: Mutex<[Option<AsObject>; MAX_AS]> = Mutex::new([const { None }; MAX_AS]);
+
+/// Create the default AS (id 1) with a factory-produced backend. Call once
+/// from boot (init sequence) before any VMM op.
+pub fn init_default() -> Result<(), VmmError> {
+    create_as(DEFAULT_AS)
+}
+
+fn create_as(id: ObjId) -> Result<(), VmmError> {
+    let factory = FACTORY
+        .lock()
+        .as_ref()
+        .copied()
+        .ok_or(VmmError::NoBackend)?;
+    let backend = factory.create(id.0).ok_or(VmmError::NoBackend)?;
+    let mut table = AS_TABLE.lock();
+    let slot = (id.0 as usize).checked_sub(1).ok_or(VmmError::BadVaddr)?;
+    if slot >= MAX_AS {
+        return vmm_err(VmmError::TableFull);
     }
-    let pool = pool.and_then(|(b, sz)| Pool::new(b, sz));
-    *guard = Some(AddressSpace {
-        regions: [const { None }; MAX_REGIONS],
-        pool,
-        page_frames: [(0, PhysAddr::new(0)); MAX_PAGE_FRAMES],
+    if table[slot].is_some() {
+        return vmm_err(VmmError::AlreadyExists);
+    }
+    table[slot] = Some(AsObject {
+        id,
+        space: AddressSpace::new(),
+        backend,
     });
     Ok(())
 }
 
-/// Attach or replace the kernel-wide fault pool (ADR-018/ADR-021 v0:
-/// single global VMM — `AddressSpace::SET_FAULT_POOL` routes here). The
-/// pool is a carve of a Region granted at boot.
-pub fn set_pool(base: PhysAddr, bytes: u64) -> Result<(), VmmError> {
-    let mut guard = VMM.lock();
-    let as_state = guard.as_mut().ok_or(VmmError::NoBackend)?;
-    let pool = Pool::new(base, bytes).ok_or(VmmError::BadVaddr)?;
-    as_state.pool = Some(pool);
-    Ok(())
+/// Create a new address space; returns its id.
+pub fn create() -> Result<ObjId, VmmError> {
+    let table = AS_TABLE.lock();
+    for slot in 0..MAX_AS {
+        if table[slot].is_none() {
+            let id = ObjId(slot as u64 + 1);
+            drop(table);
+            create_as(id)?;
+            return Ok(id);
+        }
+    }
+    vmm_err(VmmError::TableFull)
+}
+
+/// Destroy an AS: drop all mappings and refcounts, free the registry slot.
+pub fn destroy(id: ObjId) -> Result<(), VmmError> {
+    let mut table = AS_TABLE.lock();
+    let slot = (id.0 as usize).checked_sub(1).ok_or(VmmError::BadVaddr)?;
+    if slot >= MAX_AS {
+        return vmm_err(VmmError::BadVaddr);
+    }
+    match table[slot].as_mut() {
+        Some(aso) => {
+            aso.space.destroy(aso.backend);
+            table[slot] = None;
+            Ok(())
+        }
+        None => vmm_err(VmmError::NotFound),
+    }
+}
+
+fn with_as<T>(
+    id: ObjId,
+    f: impl FnOnce(&mut AddressSpace, &dyn PagingBackend) -> Result<T, VmmError>,
+) -> Result<T, VmmError> {
+    let mut table = AS_TABLE.lock();
+    let slot = (id.0 as usize).checked_sub(1).ok_or(VmmError::BadVaddr)?;
+    match table[slot].as_mut() {
+        Some(aso) => f(&mut aso.space, aso.backend),
+        None => vmm_err(VmmError::NotFound),
+    }
+}
+
+/// Map `pages` pages at `vaddr` in address space `as_id`.
+pub fn map(
+    as_id: ObjId,
+    vaddr: Vaddr,
+    pages: u64,
+    base: Option<PhysAddr>,
+    flags: MapFlags,
+) -> Result<PhysAddr, VmmError> {
+    with_as(as_id, |space, be| {
+        let mapped = space.map(vaddr, pages, base, flags)?;
+        if let Some(b) = base {
+            space.map_backend(be, vaddr, pages, b, flags);
+        }
+        Ok(mapped)
+    })
+}
+
+pub fn unmap(as_id: ObjId, vaddr: Vaddr) -> Result<(), VmmError> {
+    with_as(as_id, |space, be| space.unmap(be, vaddr))
+}
+
+pub fn protect(as_id: ObjId, vaddr: Vaddr, flags: MapFlags) -> Result<(), VmmError> {
+    with_as(as_id, |space, be| space.protect(be, vaddr, flags))
+}
+
+pub fn translate(as_id: ObjId, vaddr: Vaddr) -> Result<(PhysAddr, MapFlags), VmmError> {
+    with_as(as_id, |space, _| space.translate(vaddr))
+}
+
+pub fn resolve_fault(as_id: ObjId, vaddr: Vaddr, write: bool) -> Result<PhysAddr, VmmError> {
+    with_as(as_id, |space, be| space.resolve_fault(be, vaddr, write))
+}
+
+/// Install a mapping from a pager's FAULT_RESOLVE reply (ADR-007 §2).
+pub fn install_from_reply(
+    as_id: ObjId,
+    vaddr: Vaddr,
+    frame_addr: PhysAddr,
+    flags: MapFlags,
+) -> Result<bool, VmmError> {
+    with_as(as_id, |space, be| {
+        space.install_from_reply(be, vaddr, frame_addr, flags)
+    })
+}
+
+/// Attach or replace the fault pool of `as_id`.
+pub fn set_pool(as_id: ObjId, base: PhysAddr, bytes: u64) -> Result<(), VmmError> {
+    with_as(as_id, |space, _| space.set_pool(base, bytes))
 }
 
 /// Register a frame with the refcount table (acquires one ref).
@@ -306,315 +709,9 @@ pub fn frame_refs(addr: PhysAddr) -> usize {
     FRAME_REFS.lock().count(addr)
 }
 
-fn vmm_err<T>(e: VmmError) -> Result<T, VmmError> {
-    Err(e)
-}
-
-/// Map `pages` pages at `vaddr`. COW/ANON mappings may pass `base = None`.
-/// Returns the registered mapping base.
-pub fn map(
-    vaddr: Vaddr,
-    pages: u64,
-    base: Option<PhysAddr>,
-    flags: MapFlags,
-) -> Result<PhysAddr, VmmError> {
-    if !vaddr.is_page_aligned() || pages == 0 {
-        return vmm_err(VmmError::BadVaddr);
-    }
-    if base.is_some() && flags.contains(MapFlags::ANON) {
-        return vmm_err(VmmError::FrameNotOwned);
-    }
-    let end_idx = vaddr
-        .page_index()
-        .checked_add(pages)
-        .ok_or(VmmError::BadVaddr)?;
-    let mut guard = VMM.lock();
-    let as_state = guard.as_mut().ok_or(VmmError::NoBackend)?;
-    // Overlap check.
-    for r in as_state.regions.iter().flatten() {
-        let rs = r.vaddr.page_index();
-        let re = rs + r.pages;
-        let s = vaddr.page_index();
-        if s < re && rs < end_idx {
-            return vmm_err(VmmError::Overlap);
-        }
-    }
-    let slot = as_state
-        .regions
-        .iter_mut()
-        .position(|r| r.is_none())
-        .ok_or(VmmError::Overlap)?;
-    if let Some(b) = base {
-        if !b.is_frame_aligned() {
-            return vmm_err(VmmError::BadVaddr);
-        }
-        FRAME_REFS.lock().acquire(b);
-    }
-    as_state.regions[slot] = Some(Mapping {
-        vaddr,
-        pages,
-        base,
-        flags,
-    });
-    // Install into the backend page by page.
-    if let Some(b) = base {
-        for i in 0..pages {
-            let pa = b
-                .checked_add(i * PAGE_SIZE as u64)
-                .ok_or(VmmError::BadVaddr)?;
-            let va = Vaddr(vaddr.as_u64() + i * PAGE_SIZE as u64);
-            with_backend(|be| be.map_page(va, pa, flags), ());
-        }
-    }
-    Ok(base.unwrap_or(PhysAddr::new(0)))
-}
-
-/// Remove the mapping containing `vaddr`, dropping refs and backend entries.
-pub fn unmap(vaddr: Vaddr) -> Result<(), VmmError> {
-    if !vaddr.is_page_aligned() {
-        return vmm_err(VmmError::BadVaddr);
-    }
-    let mut guard = VMM.lock();
-    let as_state = guard.as_mut().ok_or(VmmError::NoBackend)?;
-    let slot = as_state
-        .regions
-        .iter()
-        .position(|r| matches!(r, Some(m) if m.contains(vaddr)))
-        .ok_or(VmmError::NotFound)?;
-    let m = as_state.regions[slot].take().unwrap();
-    if m.base.is_none() && m.flags.contains(MapFlags::ANON) {
-        // ANON: release every per-page frame in range.
-        let start = m.vaddr.page_index();
-        let end = start + m.pages;
-        for i in 0..as_state.page_frames.len() {
-            let (p, f) = as_state.page_frames[i];
-            if p >= start && p < end {
-                FRAME_REFS.lock().release(f);
-                with_backend(|be| be.unmap_page(Vaddr(p * PAGE_SIZE as u64)), ());
-                as_state.page_frames[i] = (0, PhysAddr::new(0));
-            }
-        }
-        return Ok(());
-    }
-    if let Some(b) = m.base {
-        for i in 0..m.pages {
-            let va = Vaddr(m.vaddr.as_u64() + i * PAGE_SIZE as u64);
-            with_backend(|be| be.unmap_page(va), ());
-        }
-        // Drop one ref per page (each page holds a ref on its frame; for a
-        // contiguous mapping the frames are contiguous, refcount is per-page).
-        for i in 0..m.pages {
-            let pa = b.checked_add(i * PAGE_SIZE as u64).unwrap();
-            FRAME_REFS.lock().release(pa);
-        }
-    }
-    Ok(())
-}
-
-/// Change permissions of an existing mapping (must contain `vaddr`).
-pub fn protect(vaddr: Vaddr, flags: MapFlags) -> Result<(), VmmError> {
-    let mut guard = VMM.lock();
-    let as_state = guard.as_mut().ok_or(VmmError::NoBackend)?;
-    for r in as_state.regions.iter_mut().flatten() {
-        if r.contains(vaddr) {
-            r.flags = flags;
-            for i in 0..r.pages {
-                let va = Vaddr(r.vaddr.as_u64() + i * PAGE_SIZE as u64);
-                with_backend(|be| be.protect_page(va, flags), ());
-            }
-            return Ok(());
-        }
-    }
-    vmm_err(VmmError::NotFound)
-}
-
-/// Translate a vaddr to its current physical frame + flags.
-pub fn translate(vaddr: Vaddr) -> Result<(PhysAddr, MapFlags), VmmError> {
-    let guard = VMM.lock();
-    let as_state = guard.as_ref().ok_or(VmmError::NoBackend)?;
-    let idx = vaddr.page_index();
-    for m in as_state.regions.iter().flatten() {
-        if m.contains(vaddr) {
-            // Per-page overrides (resolved ANON/COW pages) take precedence.
-            for (p, f) in as_state.page_frames.iter() {
-                if *p == idx {
-                    return Ok((*f, m.flags));
-                }
-            }
-            if let Some(base) = m.base {
-                return Ok((base.checked_add(m.offset(vaddr)).unwrap(), m.flags));
-            }
-            return vmm_err(VmmError::NotMapped);
-        }
-    }
-    vmm_err(VmmError::NotFound)
-}
-
-/// Install a mapping from a pager's FAULT_RESOLVE reply (ADR-007 §2): the
-/// kernel installs from the reply — the resolver needs no AS authority.
-/// If a region already covers `vaddr`, this sets a per-page frame override;
-/// otherwise it creates a one-page region. Returns previous coverage.
-pub fn install_from_reply(
-    vaddr: Vaddr,
-    frame_addr: PhysAddr,
-    flags: MapFlags,
-) -> Result<bool, VmmError> {
-    if !vaddr.is_page_aligned() || !frame_addr.is_frame_aligned() {
-        return vmm_err(VmmError::BadVaddr);
-    }
-    let mut guard = VMM.lock();
-    let as_state = guard.as_mut().ok_or(VmmError::NoBackend)?;
-    let idx = vaddr.page_index();
-    FRAME_REFS.lock().acquire(frame_addr);
-    let covered = as_state.regions.iter().flatten().any(|m| m.contains(vaddr));
-    if covered {
-        // Per-page override (same mechanism as resolved ANON/COW pages).
-        let slot_pf = as_state
-            .page_frames
-            .iter()
-            .position(|(p, _)| *p == 0 || *p == idx)
-            .ok_or(VmmError::Overlap)?;
-        as_state.page_frames[slot_pf] = (idx, frame_addr);
-    } else {
-        let slot = as_state
-            .regions
-            .iter_mut()
-            .position(|r| r.is_none())
-            .ok_or(VmmError::Overlap)?;
-        as_state.regions[slot] = Some(Mapping {
-            vaddr,
-            pages: 1,
-            base: None,
-            flags,
-        });
-        let slot_pf = as_state
-            .page_frames
-            .iter()
-            .position(|(p, _)| *p == 0)
-            .ok_or(VmmError::Overlap)?;
-        as_state.page_frames[slot_pf] = (idx, frame_addr);
-    }
-    with_backend(|be| be.map_page(vaddr, frame_addr, flags), ());
-    Ok(covered)
-}
-
-/// Handle a page fault (ADR-007 §4, §9):
-/// - ANON region → zero-frame from pool (pool required);
-/// - COW write → copy page from pool, remap writable, old ref dropped;
-/// - otherwise → `NoPool`/`NoWritePerm` meaning "raise FAULT_PAGE to the
-///   fault endpoint" (the caller decides; kernel syscall layer routes).
-///
-/// Returns the frame now backing the page.
-pub fn resolve_fault(vaddr: Vaddr, write: bool) -> Result<PhysAddr, VmmError> {
-    if !vaddr.is_page_aligned() {
-        return vmm_err(VmmError::BadVaddr);
-    }
-    let mut guard = VMM.lock();
-    let as_state = guard.as_mut().ok_or(VmmError::NoBackend)?;
-    let slot = as_state
-        .regions
-        .iter()
-        .position(|r| matches!(r, Some(m) if m.contains(vaddr)))
-        .ok_or(VmmError::NotFound)?;
-    let m = as_state.regions[slot].as_mut().unwrap();
-
-    // Already-resolved page (ANON or COW copy): return the per-page frame.
-    let page_idx = vaddr.page_index();
-    for (p, f) in as_state.page_frames.iter() {
-        if *p == page_idx {
-            return Ok(*f);
-        }
-    }
-
-    // Anonymous zero-fill (idempotent: a refault returns the same frame).
-    if m.flags.contains(MapFlags::ANON) {
-        let pool = as_state.pool.as_mut().ok_or(VmmError::NoPool)?;
-        let frame = pool.take().ok_or(VmmError::PoolEmpty)?;
-        FRAME_REFS.lock().acquire(frame);
-        let slot = as_state
-            .page_frames
-            .iter()
-            .position(|(p, _)| *p == 0)
-            .ok_or(VmmError::PoolEmpty)?;
-        as_state.page_frames[slot] = (page_idx, frame);
-        let va = Vaddr(m.vaddr.as_u64() + m.offset(vaddr));
-        with_backend(|be| be.map_page(va, frame, m.flags), ());
-        return Ok(frame);
-    }
-
-    // COW copy-on-write.
-    if write && m.flags.contains(MapFlags::COW) {
-        let base = m.base.ok_or(VmmError::NotMapped)?;
-        let old = base.checked_add(m.offset(vaddr)).unwrap();
-        if FRAME_REFS.lock().count(old) <= 1 {
-            // Sole owner: promote in place (per-page override, COW cleared).
-            let va = Vaddr(m.vaddr.as_u64() + m.offset(vaddr));
-            let flags = MapFlags(m.flags.0 & !MapFlags::COW.0);
-            let slot_pf = as_state
-                .page_frames
-                .iter()
-                .position(|(p, _)| *p == 0)
-                .ok_or(VmmError::PoolEmpty)?;
-            as_state.page_frames[slot_pf] = (page_idx, old);
-            with_backend(|be| be.protect_page(va, flags), ());
-            return Ok(old);
-        }
-        let pool = as_state.pool.as_mut().ok_or(VmmError::NoPool)?;
-        let fresh = pool.take().ok_or(VmmError::PoolEmpty)?;
-        // NOTE: byte-copy of the page happens in the backend/arch layer when
-        // it has a direct map; v0 host logic tracks refcounts only. The
-        // backend hook `map_page` installs the fresh frame; content copy is
-        // arch responsibility (documented in ADR-008).
-        FRAME_REFS.lock().acquire(fresh);
-        FRAME_REFS.lock().release(old);
-        let va = Vaddr(m.vaddr.as_u64() + m.offset(vaddr));
-        let flags = MapFlags(m.flags.0 & !MapFlags::COW.0);
-        let slot_pf = as_state
-            .page_frames
-            .iter()
-            .position(|(p, _)| *p == 0)
-            .ok_or(VmmError::PoolEmpty)?;
-        as_state.page_frames[slot_pf] = (page_idx, fresh);
-        with_backend(|be| be.map_page(va, fresh, flags), ());
-        return Ok(fresh);
-    }
-
-    if write && !m.flags.contains(MapFlags::WRITE) {
-        return vmm_err(VmmError::NoWritePerm);
-    }
-    m.base.ok_or(VmmError::NotMapped)
-}
-
-#[cfg(test)]
-pub(crate) fn vmm_for_test() -> spin::MutexGuard<'static, Option<AddressSpace>> {
-    *VMM.lock() = None;
-    VMM.lock()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Test helper: swap in a fresh pool without full re-init (init is
-    /// once-only in production; tests advance the same VMM sequentially).
-    fn init_pool_for_test(pool: Option<(PhysAddr, u64)>) -> Result<(), VmmError> {
-        let mut guard = VMM.lock();
-        let pool = pool.and_then(|(b, sz)| Pool::new(b, sz));
-        match guard.as_mut() {
-            Some(as_state) => {
-                as_state.pool = pool;
-                Ok(())
-            }
-            None => {
-                *guard = Some(AddressSpace {
-                    regions: [const { None }; MAX_REGIONS],
-                    pool,
-                    page_frames: [(0, PhysAddr::new(0)); MAX_PAGE_FRAMES],
-                });
-                Ok(())
-            }
-        }
-    }
 
     struct Recorder {
         ops: [(&'static str, u64); 16],
@@ -639,7 +736,6 @@ mod tests {
     static REC: Mutex<Recorder> = Mutex::new(Recorder::new());
 
     struct TestBackend;
-
     impl PagingBackend for TestBackend {
         fn map_page(&self, v: Vaddr, p: PhysAddr, _f: MapFlags) {
             REC.lock().push("map", v.as_u64() ^ p.as_u64());
@@ -652,102 +748,126 @@ mod tests {
         }
     }
 
-    fn setup() {
-        let _ = set_backend(&TestBackend);
+    struct TestFactory;
+    impl BackendFactory for TestFactory {
+        fn create(&self, _as_id: u64) -> Option<&'static dyn PagingBackend> {
+            Some(&TestBackend)
+        }
+    }
+
+    fn setup() -> ObjId {
+        set_backend_factory(&TestFactory);
         REC.lock().n = 0;
+        // Reset registry for tests: drop all ASes.
+        for i in 0..MAX_AS {
+            AS_TABLE.lock()[i] = None;
+        }
+        let _ = init_default();
+        DEFAULT_AS
     }
 
     #[test]
-    fn aspace_lifecycle() {
-        setup();
-        init(None).unwrap();
-
-        // --- map / translate / unmap ---
+    fn as_lifecycle_map_translate_unmap() {
+        let as_id = setup();
         let base = PhysAddr::new(0x10_0000);
         track_frame(base);
         let v = Vaddr(0x40_0000);
-        map(v, 2, Some(base), MapFlags::READ.union(MapFlags::WRITE)).unwrap();
+        map(
+            as_id,
+            v,
+            2,
+            Some(base),
+            MapFlags::READ.union(MapFlags::WRITE),
+        )
+        .unwrap();
 
-        let (pa, fl) = translate(Vaddr(0x40_1000)).unwrap();
+        let (pa, fl) = translate(as_id, Vaddr(0x40_1000)).unwrap();
         assert_eq!(pa, PhysAddr::new(0x10_1000));
         assert!(fl.contains(MapFlags::WRITE));
         assert_eq!(frame_refs(base), 2, "owner grant + mapping ref");
 
-        unmap(v).unwrap();
-        assert!(translate(v).is_err());
+        unmap(as_id, v).unwrap();
+        assert!(translate(as_id, v).is_err());
         assert_eq!(frame_refs(base), 1, "mapping ref released, owner ref kept");
 
         // Overlap detection.
-        map(v, 1, Some(base), MapFlags::READ).unwrap();
+        map(as_id, v, 1, Some(base), MapFlags::READ).unwrap();
         assert_eq!(
-            map(Vaddr(0x40_0000), 1, None, MapFlags::ANON),
+            map(as_id, Vaddr(0x40_0000), 1, None, MapFlags::ANON),
             Err(VmmError::Overlap)
         );
-        unmap(v).unwrap();
+        unmap(as_id, v).unwrap();
+    }
 
-        // --- anon zero-fill from pool ---
-        let _ = init_pool_for_test(Some((PhysAddr::new(0x20_0000), 8 * PAGE_SIZE as u64)));
+    #[test]
+    fn per_as_isolation() {
+        let a = setup();
+        // Two distinct address spaces must not see each other's mappings.
+        let b = create().unwrap();
+        assert_ne!(a, b);
+        let base = PhysAddr::new(0x11_0000);
+        track_frame(base);
+        map(a, Vaddr(0x45_0000), 1, Some(base), MapFlags::READ).unwrap();
+        assert!(translate(a, Vaddr(0x45_0000)).is_ok());
+        assert!(translate(b, Vaddr(0x45_0000)).is_err(), "AS isolation");
+        // Same vaddr in b is free.
+        assert!(map(b, Vaddr(0x45_0000), 1, None, MapFlags::ANON).is_ok());
+        assert_eq!(destroy(b), Ok(()));
+        assert!(translate(b, Vaddr(0x45_0000)).is_err());
+    }
+
+    #[test]
+    fn anon_pool_cow_lifecycle() {
+        let as_id = setup();
+        // Pool for anon + COW.
+        set_pool(as_id, PhysAddr::new(0x20_0000), 8 * PAGE_SIZE as u64).unwrap();
+
+        // ANON zero-fill from pool.
         let va = Vaddr(0x50_0000);
-        map(va, 2, None, MapFlags::ANON.union(MapFlags::READ)).unwrap();
-        assert_eq!(
-            translate(va),
-            Err(VmmError::NotMapped),
-            "no frame until fault"
-        );
+        map(as_id, va, 2, None, MapFlags::ANON.union(MapFlags::READ)).unwrap();
+        assert_eq!(translate(as_id, va), Err(VmmError::NotMapped));
+        let f = resolve_fault(as_id, va, false).unwrap();
+        assert_eq!(f, PhysAddr::new(0x20_0000), "pool frames in order");
+        assert_eq!(translate(as_id, va).unwrap().0, f);
 
-        let f = resolve_fault(va, false).unwrap();
-        assert_eq!(f, PhysAddr::new(0x20_0000), "pool frames handed in order");
-        let (pa2, _) = translate(va).unwrap();
-        assert_eq!(pa2, f);
-
-        // Pool exhaustion surfaces as PoolEmpty -> FAULT_PAGE POOL_EMPTY.
+        // Pool exhaustion → PoolEmpty.
         let v2 = Vaddr(0x50_2000);
-        map(v2, 8, None, MapFlags::ANON.union(MapFlags::READ)).unwrap();
-        // 7 frames remain: fault pages 1..=7 of v2, then the 8th must fail.
+        map(as_id, v2, 8, None, MapFlags::ANON.union(MapFlags::READ)).unwrap();
         for i in 1..8u64 {
-            resolve_fault(Vaddr(v2.as_u64() + i * PAGE_SIZE as u64), false).unwrap();
+            resolve_fault(as_id, Vaddr(v2.as_u64() + i * PAGE_SIZE as u64), false).unwrap();
         }
-        // Refault of an already-resolved page is idempotent.
-        assert_eq!(
-            resolve_fault(Vaddr(v2.as_u64() + PAGE_SIZE as u64), false),
-            Ok(PhysAddr::new(0x20_1000))
-        );
-        // Pool is now empty: page 0 of v2 and a fresh ANON fault both fail.
-        assert_eq!(resolve_fault(v2, false), Err(VmmError::PoolEmpty));
-        let v3 = Vaddr(0x90_0000);
-        map(v3, 1, None, MapFlags::ANON.union(MapFlags::READ)).unwrap();
-        assert_eq!(resolve_fault(v3, false), Err(VmmError::PoolEmpty));
-        unmap(v3).unwrap();
-        unmap(va).unwrap();
-        unmap(v2).unwrap();
+        assert_eq!(resolve_fault(as_id, v2, false), Err(VmmError::PoolEmpty));
 
-        // --- COW: shared copies, sole owner promotes ---
-        let _ = init_pool_for_test(Some((PhysAddr::new(0x30_0000), 4 * PAGE_SIZE as u64)));
+        // Fresh (smaller) pool for the COW section.
+        set_pool(as_id, PhysAddr::new(0x30_0000), 4 * PAGE_SIZE as u64).unwrap();
+
+        // COW: shared write copies, sole owner promotes.
         let cow_base = PhysAddr::new(0x11_0000);
         track_frame(cow_base);
         track_frame(cow_base); // refcount 2 = "shared with fork child"
         let vc = Vaddr(0x60_0000);
         map(
+            as_id,
             vc,
             1,
             Some(cow_base),
             MapFlags::READ.union(MapFlags::WRITE).union(MapFlags::COW),
         )
         .unwrap();
+        let fresh = resolve_fault(as_id, vc, true).unwrap();
+        assert_eq!(fresh, PhysAddr::new(0x30_0000));
+        assert_eq!(frame_refs(cow_base), 2, "one mapping ref dropped");
+        assert_eq!(resolve_fault(as_id, vc, true), Ok(fresh), "promote");
 
-        let fresh = resolve_fault(vc, true).unwrap();
-        assert_eq!(fresh, PhysAddr::new(0x30_0000), "shared COW write copies");
-        assert_eq!(frame_refs(cow_base), 2, "one mapping ref dropped on copy");
-        assert_eq!(frame_refs(fresh), 1);
-
-        let again = resolve_fault(vc, true).unwrap();
-        assert_eq!(again, fresh, "sole owner promotes in place, no copy");
-
-        // --- write without permission -> userspace fault ---
+        // Write without permission → userspace fault.
         let v3 = Vaddr(0x70_0000);
         let base3 = PhysAddr::new(0x12_0000);
         track_frame(base3);
-        map(v3, 1, Some(base3), MapFlags::READ).unwrap();
-        assert_eq!(resolve_fault(v3, true), Err(VmmError::NoWritePerm));
+        map(as_id, v3, 1, Some(base3), MapFlags::READ).unwrap();
+        assert_eq!(resolve_fault(as_id, v3, true), Err(VmmError::NoWritePerm));
+
+        // AS::DESTROY drops mappings + refcounts.
+        destroy(as_id).unwrap();
+        assert!(translate(as_id, vc).is_err());
     }
 }

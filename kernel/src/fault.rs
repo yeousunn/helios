@@ -96,9 +96,10 @@ pub fn handle_page_fault(
     }
     let v = Vaddr(vaddr);
     let write = access & ACCESS_WRITE != 0;
+    let as_id = proc::as_of(pid).unwrap_or(aspace::DEFAULT_AS);
 
     // 1. In-kernel resolution (ANON zero-fill, COW copy/promote, pool).
-    match aspace::resolve_fault(v, write) {
+    match aspace::resolve_fault(as_id, v, write) {
         Ok(_) => Ok(FaultOutcome::Resolved),
         Err(aspace::VmmError::NoWritePerm) => route_to_pager(pid, tid, vaddr, access, FAULT_PERM),
         Err(aspace::VmmError::NotFound) | Err(aspace::VmmError::NoBackend) => {
@@ -220,7 +221,12 @@ pub fn handle_resolve_reply(
         return Ok(FaultOutcome::Killed);
     }
 
-    match aspace::install_from_reply(Vaddr(pending_vaddr), PhysAddr::new(frame_addr), flags) {
+    match aspace::install_from_reply(
+        proc::as_of(pid).unwrap_or(aspace::DEFAULT_AS),
+        Vaddr(pending_vaddr),
+        PhysAddr::new(frame_addr),
+        flags,
+    ) {
         Ok(_) => {
             sched::make_ready(tid).map_err(|_| FaultError::NoSuchThread)?;
             Ok(FaultOutcome::Resolved)
@@ -255,8 +261,7 @@ mod tests {
         notification::reset_for_test();
         syscall::reset_reply_for_test();
         reset_for_test();
-        drop(aspace::vmm_for_test());
-        let _ = aspace::init(None);
+        let _ = aspace::init_default();
         *SCHED.lock() = None;
         set_context_backend(&MockCtx);
         let _ = sched::init();
@@ -346,7 +351,7 @@ mod tests {
         // Victim is ready again; the mapping is installed.
         assert_eq!(sched::get(victim).unwrap().state, sched::State::Ready);
         assert_eq!(
-            aspace::translate(Vaddr(vaddr)),
+            aspace::translate(proc::as_of(pid).unwrap_or(aspace::DEFAULT_AS), Vaddr(vaddr)),
             Ok((frame, MapFlags::READ.union(MapFlags::WRITE)))
         );
     }
