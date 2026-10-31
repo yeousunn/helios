@@ -56,14 +56,18 @@ PS_IMAGE=target/x86_64-unknown-none/release/ps \
   cargo build -p sdk --bin init --features user --target x86_64-unknown-none --release
 ```
 
-ADR-023 kernel prerequisites (requested from GLM): BootInfo `self_as`@20 (`MAP|GRANT`),
+ADR-023 kernel prerequisites (all landed): BootInfo `self_as`@20 (`MAP|GRANT`),
 init Region caps carry `GRANT`, `NEW_NOTIFICATION` installs `SIGNAL|RECV|GRANT`,
 `NEW_THREAD`'s thread cap gains `GRANT` — all transfers enforce `GRANT` in
 `resolve_transfers`, so launchers cannot pass zero-rights caps onward.
 
-- Success exit status: 0 (init calls `exit(0)`; kernel should halt cleanly with the
-  registered exit hook so the harness sees a deterministic QEMU exit — requested of GLM).
-- Expected serial flow: five `userspace[debug]:` lines (steps 1–5), then the DONE line.
+- On this workspace the build commands above can be simplified: `.cargo/config.toml`
+  defaults `INIT_IMAGE`/`PS_IMAGE` to `target/x86_64-unknown-none/release/{init,ps}`
+  (kernel-boot's build script embeds init; init's embeds ps).
+- Success exit status: 0 (init calls `exit(0)`; the kernel's ADR-028/029 clean-halt
+  path fires and QEMU exits with code 1, decoded to kernel code 0).
+- Expected serial flow (M3, verified 2026-10-31): ten `userspace[debug]:` lines —
+  steps 1–9 — then the DONE line, PS exit log, and `all threads exited — clean halt`.
 
 ## 3. Syscall register contract (syscall-abi §2 ≙ `sdk/src/syscall.rs` asm)
 
