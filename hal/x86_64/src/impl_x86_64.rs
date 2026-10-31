@@ -77,7 +77,11 @@ pub struct X86_64EarlyBoot;
 /// GDT table: null, code, data descriptors.
 #[repr(C, align(8))]
 pub struct Gdt {
-    entries: [u64; 3],
+    /// Layout (fixed ABI for iretq/sysret selectors):
+    /// 0 null | 1 kernel code 64 (0x08) | 2 kernel data (0x10) |
+    /// 3 user data (0x18 → 0x1B) | 4 user code 64 (0x20 → 0x23) |
+    /// 5+6 64-bit TSS descriptor (0x28) | 7 spare.
+    entries: [u64; 8],
 }
 
 /// IDT table: 256 entries, each 8 bytes.
@@ -563,18 +567,20 @@ impl MmioRegion for MmioRegionX86_64 {
 #[allow(clippy::new_without_default)]
 impl Gdt {
     pub const fn new() -> Self {
-        Self { entries: [0; 3] }
+        Self { entries: [0; 8] }
     }
 
-    /// Build a code / data GDT and install it.
+    /// Build a code / data GDT (kernel + user); TSS descriptor slots 5/6 are
+    /// filled by [`install_tss`]. Installs the GDTR.
     pub fn install(&mut self) {
-        // Entry 1: 64-bit code segment, base 0, limit max, present, ring 0.
-        let code: u64 = 0x00AF9A000000FFFF;
-        // Entry 2: data segment, base 0, limit max, present, ring 0.
-        let data: u64 = 0x00CF92000000FFFF;
         self.entries[0] = 0x0000000000000000; // null
-        self.entries[1] = code;
-        self.entries[2] = data;
+        self.entries[1] = 0x00AF9A000000FFFF; // kernel code (64-bit), ring 0
+        self.entries[2] = 0x00CF92000000FFFF; // kernel data, ring 0
+        self.entries[3] = 0x00CFF2000000FFFF; // user data, ring 3 (SS 0x1B)
+        self.entries[4] = 0x00AFFA000000FFFF; // user code (64-bit), ring 3 (CS 0x23)
+        self.entries[5] = 0x0000000000000000; // TSS low (install_tss)
+        self.entries[6] = 0x0000000000000000; // TSS high (install_tss)
+        self.entries[7] = 0x0000000000000000; // spare
 
         // SAFETY: Loading a freshly-constructed GDT into the CPU.
         unsafe { Self::load_gdt(self) };
@@ -583,10 +589,9 @@ impl Gdt {
         // SAFETY: Reloading segment registers with valid GDT selectors.
         unsafe {
             core::arch::asm!(
-                "mov ax, {sel}",
                 "mov fs, ax",
                 "mov gs, ax",
-                sel = const SEL_DATA,
+                in("ax") SEL_DATA,
                 options(nostack),
             );
         }
@@ -610,10 +615,9 @@ impl HalGdt for Gdt {
         // SAFETY: Reloading segment registers with valid GDT selectors.
         unsafe {
             core::arch::asm!(
-                "mov ax, {sel}",
                 "mov fs, ax",
                 "mov gs, ax",
-                sel = const SEL_DATA,
+                in("ax") SEL_DATA,
                 options(nostack),
             );
         }
@@ -634,6 +638,17 @@ impl Idt {
         // All entries remain zero (invalid); lidt still requires a valid table.
         // SAFETY: Loading a zeroed IDT; no interrupts will be enabled yet.
         unsafe { Self::load_idt(self) };
+    }
+
+    /// Install a 64-bit interrupt gate (DPL0) for `vector`.
+    pub fn set_gate(&mut self, vector: u8, handler: u64, selector: u16) {
+        let lo = (handler & 0xFFFF)
+            | ((selector as u64) << 16)
+            | (0x8E_u64 << 40)
+            | (((handler >> 16) & 0xFFFF) << 48);
+        let hi = (handler >> 32) & 0xFFFF_FFFF;
+        self.entries[vector as usize * 2] = lo;
+        self.entries[vector as usize * 2 + 1] = hi;
     }
 
     unsafe fn load_idt(idt: &Idt) {
@@ -706,11 +721,17 @@ impl EarlyBoot for X86_64EarlyBoot {
             Irq::mask(&mut pic, irq);
         }
 
-        let mut gdt = Gdt::new();
-        Gdt::install(&mut gdt);
-
-        let mut idt = Idt::new();
-        Idt::install(&mut idt);
+        // GDT/IDT must live for the whole kernel lifetime: static storage, not
+        // stack locals (a stack-local GDTR base gets clobbered by later stack
+        // use — found via the first ring-3 entry #GP).
+        {
+            // SAFETY: single-threaded boot; exclusive boot-time access.
+            let gdt = unsafe { &mut *core::ptr::addr_of_mut!(BOOT_GDT) };
+            Gdt::install(gdt);
+            // SAFETY: as above.
+            let idt = unsafe { &mut *core::ptr::addr_of_mut!(BOOT_IDT) };
+            Idt::install(idt);
+        }
 
         let _timer = TimerSrc::new(); // PIT oneshot/TSC timebase ready.
         let _fb = StubFramebuffer::default();
@@ -772,14 +793,201 @@ impl Default for ContextBackendX86_64 {
     }
 }
 
+/// BootInfo VA handed to the first userspace entry in `rdi` (set by the boot
+/// crate before `start_first`).
+pub static BOOTINFO_VA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Kernel-lifetime GDT/IDT storage (loaded once at `early_init`).
+static mut BOOT_GDT: Gdt = Gdt::new();
+static mut BOOT_IDT: Idt = Idt::new();
+
+/// Install exception/interrupt stub gates (vectors 0..=47) into the boot IDT
+/// and reload it. Bring-up safety net: a fault reports (vector/error/CR2/RIP)
+/// and halts instead of triple-faulting silently.
+///
+/// # Safety
+/// Boot-time only; must run after `X86_64EarlyBoot::early_init`.
+pub unsafe fn install_exception_stubs() {
+    // SAFETY: boot-time exclusive access to the static IDT.
+    let idt = unsafe { &mut *core::ptr::addr_of_mut!(BOOT_IDT) };
+    for vector in 0..48u8 {
+        if let Some(addr) = crate::exceptions::stub_addr(vector) {
+            idt.set_gate(vector, addr, SEL_CODE);
+        }
+    }
+    // SAFETY: reloading the IDTR with the table we just populated.
+    unsafe { Idt::load_idt(idt) };
+}
+
+/// 64-bit Task State Segment (only `rsp0` is meaningful in v0: the ring-0
+/// stack used when an interrupt/exception is delivered from ring 3).
+#[repr(C, packed)]
+pub struct Tss {
+    reserved0: u32,
+    rsp0: u64,
+    rsp1: u64,
+    rsp2: u64,
+    reserved1: u64,
+    ist: [u64; 7],
+    reserved2: u64,
+    reserved3: u16,
+    iomap_base: u16,
+}
+
+/// Ring-0 stack used for exception delivery from userspace.
+#[repr(C, align(16))]
+struct ExcStack([u8; 16384]);
+
+static mut TSS: Tss = Tss {
+    reserved0: 0,
+    rsp0: 0,
+    rsp1: 0,
+    rsp2: 0,
+    reserved1: 0,
+    ist: [0; 7],
+    reserved2: 0,
+    reserved3: 0,
+    iomap_base: 0xFFFF,
+};
+
+static mut EXC_STACK: ExcStack = ExcStack([0; 16384]);
+
+/// Install the TSS (GDT slots 5/6, selector 0x28) and load TR. Without it,
+/// any exception already in ring 3 cannot switch stacks and turns into a
+/// triple fault — hiding the real fault.
+///
+/// # Safety
+/// Boot-time only; GDT must be installed first.
+pub unsafe fn install_tss() {
+    // SAFETY: boot-time exclusive access to the statics.
+    unsafe {
+        let tss = &mut *core::ptr::addr_of_mut!(TSS);
+        let stack_top = core::ptr::addr_of!(EXC_STACK).add(1) as u64;
+        tss.rsp0 = stack_top;
+
+        let base = tss as *const Tss as u64;
+        let limit: u64 = core::mem::size_of::<Tss>() as u64 - 1;
+        let gdt = &mut *core::ptr::addr_of_mut!(BOOT_GDT);
+        gdt.entries[5] = (limit & 0xFFFF)
+            | ((base & 0xFF_FFFF) << 16)
+            | (0x89_u64 << 40)          // available 64-bit TSS
+            | (((limit >> 16) & 0xF) << 48)
+            | (((base >> 24) & 0xFF) << 56);
+        gdt.entries[6] = (base >> 32) & 0xFFFF_FFFF;
+
+        // Load TR with selector 0x28.
+        core::arch::asm!("ltr ax", in("ax") 0x28u16, options(nostack));
+    }
+}
+
+/// Kernel stack top of the currently running thread (updated by `switch` and
+/// at boot). The syscall entry stacks onto this address.
+#[no_mangle]
+pub static CURRENT_KSTACK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Set the running thread's kernel stack top (boot: the initial boot stack).
+pub fn set_kstack(top: u64) {
+    CURRENT_KSTACK.store(top, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn switch_fatal(msg: &str) -> ! {
+    crate::uart_writer(msg);
+    loop {
+        // SAFETY: halting after a fatal context-switch condition.
+        unsafe { core::arch::asm!("cli; hlt", options(nostack, nomem)) };
+    }
+}
+
 impl sched::ContextBackend for ContextBackendX86_64 {
-    fn switch(&self, _from: sched::ThreadId, _to: sched::ThreadId) {
-        // SAFETY: No-op for single-CPU v0; real impl saves/restores registers.
+    fn switch(&self, from: sched::ThreadId, to: sched::ThreadId) {
+        let Some(from_slot) = kernel::sched::ksp_slot_ptr(from) else {
+            switch_fatal("\n[kernel] switch: no saved-state slot for caller\n");
+        };
+        let to_ksp = kernel::sched::ksp_of(to);
+        let to_top = kernel::sched::kstack_top_of(to);
+        if to_ksp == 0 || to_top == 0 {
+            switch_fatal("\n[kernel] switch: target thread has no kernel context\n");
+        }
+        set_kstack(to_top);
+        // SAFETY: pure-asm cooperative switch (syscall_entry.S). `from_slot`
+        // belongs to the running thread (only writer); `to_ksp` is either a
+        // context saved by a previous switch (resuming mid-dispatch) or a
+        // fresh frame built by `init_context` (starting at the trampoline).
+        // Control returns here when this thread is scheduled again.
+        unsafe {
+            crate::syscall_entry::switch_to_context(from_slot, to_ksp);
+        }
     }
 
-    fn start_first(&self, _to: sched::ThreadId) {
-        // SAFETY: No-op for single-CPU v0; the initial stack is set up by the
-        // arch boot code before entering the first thread.
+    fn activate_aspace(&self, as_id: u64) {
+        if !crate::paging::activate_as(as_id) {
+            switch_fatal("\n[kernel] switch: target AS has no paging root\n");
+        }
+    }
+
+    fn init_context(&self, kstack_top: u64, entry_pc: u64) -> u64 {
+        // Fresh-thread kernel stack layout (top-down):
+        //   [top-8] arg (rdi) | [top-16] user RSP | [top-24] entry |
+        //   [top-32] trampoline | [top-40..top-80] rbx,rbp,r12..r15
+        // `switch` pops the six callee-saved regs and `ret`s into the
+        // trampoline, which iretqs to ring 3.
+        let top = kstack_top as *mut u64;
+        // SAFETY: `kstack_top` is the top of a freshly allocated kernel stack
+        // (identity-mapped RAM); the writes stay within that stack.
+        unsafe {
+            *top.sub(1) = 0; // arg: v0 children take none
+            *top.sub(2) = crate::layout::USER_STACK_TOP as u64;
+            *top.sub(3) = entry_pc;
+            *top.sub(4) = crate::syscall_entry::thread_trampoline_addr();
+            for i in 5..=10 {
+                *top.sub(i) = 0;
+            }
+        }
+        kstack_top - 10 * 8
+    }
+
+    fn start_first(&self, to: sched::ThreadId) {
+        let pc = match kernel::sched::get(to) {
+            Ok(t) => t.initial_pc,
+            Err(_) => 0,
+        };
+        if pc == 0 {
+            crate::uart_writer("start_first: thread has no entry PC (staging missing)\n");
+            loop {
+                core::hint::spin_loop();
+            }
+        }
+        let bootinfo = BOOTINFO_VA.load(core::sync::atomic::Ordering::Relaxed);
+        // SAFETY: ring-3 segments exist in the installed GDT (`Gdt::install`)
+        // and the page tables already contain the user mappings staged by the
+        // boot crate; boot is single-threaded at this point.
+        unsafe { enter_user(pc, bootinfo) }
+    }
+}
+
+/// `iretq` to ring 3: RIP=`entry`, RSP=`USER_STACK_TOP`, `rdi`=`bootinfo`.
+///
+/// # Safety
+/// Call once, after: GDT installed with ring-3 segments, user pages mapped,
+/// syscall MSRs configured (if userspace will issue syscalls).
+unsafe fn enter_user(entry: u64, bootinfo: u64) -> ! {
+    let stack = crate::layout::USER_STACK_TOP as u64;
+    // SAFETY: pushes the iretq frame (SS,RSP,RFLAGS,CS,RIP) on the current
+    // kernel stack and transfers control to ring 3; never returns.
+    unsafe {
+        core::arch::asm!(
+            "mov rdi, {bi}",
+            "push 0x1B",        // SS: user data
+            "push {sp}",        // RSP
+            "push 0x202",       // RFLAGS: IF | reserved
+            "push 0x23",        // CS: user code
+            "push {ip}",        // RIP
+            "iretq",
+            bi = in(reg) bootinfo,
+            sp = in(reg) stack,
+            ip = in(reg) entry,
+            options(noreturn)
+        );
     }
 }
 
@@ -802,14 +1010,18 @@ impl Default for CurrentContextX86_64 {
 }
 
 impl entry::CurrentContext for CurrentContextX86_64 {
+    /// Owning process of the scheduled thread (multi-process correctness:
+    /// a child's syscalls must act on the child's capability table).
     fn pid(&self) -> kernel::proc::ProcessId {
-        // v0: single process, pid 1 (init).
-        ObjId(1)
+        let tid = sched::current();
+        kernel::sched::get(tid)
+            .ok()
+            .map(|t| ObjId(t.process.0))
+            .unwrap_or(ObjId(1))
     }
 
     fn tid(&self) -> sched::ThreadId {
-        // v0: the boot thread.
-        sched::ThreadId(1)
+        sched::current()
     }
 }
 

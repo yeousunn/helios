@@ -55,6 +55,11 @@ pub struct Thread {
     pub bound_notification: Option<ObjRef>,
     /// Userspace entry PC (NEW_THREAD w0, ADR-019 §4). SP is arch-owned.
     pub initial_pc: u64,
+    /// Kernel stack top for this thread (allocated at spawn, M3).
+    pub kstack_top: u64,
+    /// Saved kernel stack pointer while the thread is not running (M3).
+    /// Written by the arch context switch; 0 until first use.
+    pub ksp: u64,
 }
 
 impl Thread {
@@ -67,6 +72,8 @@ impl Thread {
             fault_ep: None,
             bound_notification: None,
             initial_pc: 0,
+            kstack_top: 0,
+            ksp: 0,
         }
     }
 
@@ -202,8 +209,33 @@ fn queue_pop(s: &mut Sched, prio: u8) -> Option<SlotIdx> {
 }
 
 /// Set a thread's userspace entry PC after creation (boot launcher staging:
-/// the init thread is spawned by `init::start` before its image is mapped).
+/// the init thread is spawned by `init::start` before its image is mapped)
+/// and build its initial kernel context when a backend is registered.
 pub fn set_initial_pc(id: ThreadId, pc: u64) -> SchedResult<()> {
+    let mut top = kstack_top_of(id);
+    if top == 0 {
+        // First time this thread acquires a userspace entry: give it a
+        // kernel stack (16 KiB) for syscalls/parks (M3). Lazy allocation
+        // keeps kernel-internal test threads (no pc) frame-free.
+        if let Some(base) = crate::frame::alloc_contiguous(KSTACK_FRAMES) {
+            top = base.as_u64() + (KSTACK_FRAMES as u64) * 4096;
+            let mut guard = SCHED.lock();
+            if let Some(t) = guard
+                .as_mut()
+                .and_then(|s| s.slots.threads[id.0 as usize].as_mut())
+            {
+                t.kstack_top = top;
+            }
+        }
+    }
+    let ksp = if top != 0 {
+        CTX.lock()
+            .as_ref()
+            .map(|b| b.init_context(top, pc))
+            .unwrap_or(0)
+    } else {
+        0
+    };
     let mut guard = SCHED.lock();
     match guard
         .as_mut()
@@ -211,23 +243,55 @@ pub fn set_initial_pc(id: ThreadId, pc: u64) -> SchedResult<()> {
     {
         Some(t) => {
             t.initial_pc = pc;
+            t.ksp = ksp;
             Ok(())
         }
         None => Err(SchedError::NoSuchThread),
     }
 }
 
-/// Register a new thread with a userspace entry PC (ADR-019 §4).
+/// Kernel stack size per thread: 16 KiB (4 frames).
+pub const KSTACK_FRAMES: usize = 4;
+
+/// Register a new thread with a userspace entry PC (ADR-019 §4); builds its
+/// initial kernel context (M3) when a context backend is registered.
 pub fn spawn_with(process: ObjRef, priority: u8, initial_pc: u64) -> SchedResult<ThreadId> {
     let id = spawn(process, priority)?;
+    set_initial_pc(id, initial_pc)?;
+    Ok(id)
+}
+
+/// Read a thread's saved kernel stack pointer (arch switch).
+pub fn ksp_of(id: ThreadId) -> u64 {
+    let guard = SCHED.lock();
+    guard
+        .as_ref()
+        .and_then(|s| s.slots.threads[id.0 as usize].as_ref())
+        .map(|t| t.ksp)
+        .unwrap_or(0)
+}
+
+/// Read a thread's kernel stack top (arch switch, for CURRENT_KSTACK).
+pub fn kstack_top_of(id: ThreadId) -> u64 {
+    let guard = SCHED.lock();
+    guard
+        .as_ref()
+        .and_then(|s| s.slots.threads[id.0 as usize].as_ref())
+        .map(|t| t.kstack_top)
+        .unwrap_or(0)
+}
+
+/// Raw pointer to a thread's saved-ksp slot (written by the arch switch).
+///
+/// # Safety
+/// Single-CPU v0: the slot belongs to the currently running thread (the only
+/// writer) and is accessed only from the switch path.
+pub fn ksp_slot_ptr(id: ThreadId) -> Option<*mut u64> {
     let mut guard = SCHED.lock();
-    if let Some(t) = guard
+    guard
         .as_mut()
         .and_then(|s| s.slots.threads[id.0 as usize].as_mut())
-    {
-        t.initial_pc = initial_pc;
-    }
-    Ok(id)
+        .map(|t| &mut t.ksp as *mut u64)
 }
 
 /// Register a new thread; returns its id. The thread starts Ready.
@@ -478,11 +542,12 @@ pub fn pick_next() -> ThreadId {
         return IDLE;
     };
     // 255..=1: idle (level 0) is chosen only if nothing else is ready.
+    // Pure pick: `s.current` is updated by `switch_to` only (a double update
+    // corrupted `from`-bookkeeping and clobbered the target's saved context).
     for prio in (1..=255).rev() {
         if let Some(slot) = queue_pop(s, prio as u8) {
             let t = s.slots.threads[slot].as_mut().unwrap();
             t.state = State::Running;
-            s.current = t.id;
             return t.id;
         }
     }
@@ -531,6 +596,12 @@ pub trait ContextBackend: Sync + Send {
     fn switch(&self, from: ThreadId, to: ThreadId);
     /// Enter the first thread (no saved state to restore).
     fn start_first(&self, to: ThreadId);
+    /// Build the initial kernel context for a new thread on `kstack_top`
+    /// (entry trampoline arrangement is arch-owned); returns the initial
+    /// kernel stack pointer for `Thread.ksp`.
+    fn init_context(&self, kstack_top: u64, entry_pc: u64) -> u64;
+    /// Make `as_id` the address space the CPU translates through (CR3).
+    fn activate_aspace(&self, as_id: u64);
 }
 
 static CTX: Mutex<Option<&'static dyn ContextBackend>> = Mutex::new(None);
@@ -549,15 +620,24 @@ pub fn set_context_backend(b: &'static dyn ContextBackend) {
 /// switching so trap entry observes the new thread immediately.
 pub fn switch_to(next: ThreadId) {
     let from = current();
+    // Snapshot the backend ('static, registered once at boot) and release
+    // the lock before switching away.
+    let backend = *CTX.lock();
+    // Activate the target's address space first: threads of different
+    // processes must translate through their own page tables (CR3).
+    if let Some(b) = backend {
+        if let Ok(t) = get(next) {
+            if let Some(as_id) = crate::proc::as_of(caps::ObjId(t.process.0)) {
+                b.activate_aspace(as_id.0);
+            }
+        }
+    }
     {
         let mut g = SCHED.lock();
         if let Some(s) = g.as_mut() {
             s.current = next;
         }
     }
-    // Snapshot the backend ('static, registered once at boot) and release
-    // the lock before switching away.
-    let backend = *CTX.lock();
     if let Some(b) = backend {
         b.switch(from, next);
         // Control returns here when THIS thread is scheduled again; `current`
@@ -618,6 +698,8 @@ mod tests {
     impl ContextBackend for MockCtx {
         fn switch(&self, _from: ThreadId, _to: ThreadId) {}
         fn start_first(&self, _to: ThreadId) {}
+        fn init_context(&self, _kstack_top: u64, _entry_pc: u64) -> u64 { 0 }
+        fn activate_aspace(&self, _as_id: u64) {}
     }
 
     fn setup() {

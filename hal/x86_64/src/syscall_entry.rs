@@ -1,0 +1,183 @@
+//! `syscall`/`sysret` entry and dispatch marshaling (syscall-abi §2,
+//! ADR-011). The asm stub lives in `syscall_entry.S`; this module enables the
+//! MSRs, provides the Rust dispatcher, and owns the parked-policy stopgap.
+//!
+//! v0 scope: synchronous syscalls only. A syscall that *parks* (ADR-019:
+//! `dispatch` returns `PARKED_STATUS`) halts with a loud message — context
+//! switching (M3) is not wired yet; the M2 init binary never parks.
+
+use core::arch::{asm, global_asm};
+
+use ipc::{flags, Tag};
+use kernel::entry::{self, SyscallArgs, SyscallReturn, PARKED_STATUS};
+
+global_asm!(include_str!("syscall_entry.S"));
+
+extern "C" {
+    fn helios_syscall_entry();
+    fn thread_trampoline();
+    fn helios_switch(from_slot: *mut u64, to_ksp: u64);
+    static mut SYS_RET: [u64; 6];
+}
+
+/// Address of the fresh-thread ring-3 entry trampoline (used by
+/// `ContextBackend::init_context`).
+pub fn thread_trampoline_addr() -> u64 {
+    thread_trampoline as *const () as u64
+}
+
+/// Perform the raw kernel context switch (pure asm; see `syscall_entry.S`).
+///
+/// # Safety
+/// `from_slot` must point to the running thread's saved-ksp slot and
+/// `to_ksp` must be a valid kernel stack pointer (saved context or freshly
+/// built thread frame). Returns when this thread is switched back in.
+pub(crate) unsafe fn switch_to_context(from_slot: *mut u64, to_ksp: u64) {
+    // SAFETY: caller contract above.
+    unsafe { helios_switch(from_slot, to_ksp) };
+}
+
+const IA32_EFER: u32 = 0xC000_0080;
+const IA32_STAR: u32 = 0xC000_0081;
+const IA32_LSTAR: u32 = 0xC000_0082;
+const IA32_FMASK: u32 = 0xC000_0084;
+const EFER_SCE: u64 = 1 << 0;
+/// IRQ (0x200) | TF (0x100) cleared on entry.
+const FMASK: u64 = 0x300;
+
+/// Enable `syscall`/`sysret`: EFER.SCE, STAR (kernel CS 0x08; sysret computes
+/// user CS/SS as STAR[63:48]+16/+8 → user code 0x23, user data 0x1B), LSTAR,
+/// FMASK. Call once at boot after the GDT is installed.
+pub unsafe fn enable() {
+    // SAFETY: MSR programming is IA32 architectural state; values assembled
+    // from the fixed GDT layout (see `Gdt` docs).
+    unsafe {
+        let mut efer_lo: u32;
+        let mut efer_hi: u32;
+        asm!("rdmsr", in("ecx") IA32_EFER, out("eax") efer_lo, out("edx") efer_hi, options(nostack));
+        let efer = ((efer_hi as u64) << 32 | efer_lo as u64) | EFER_SCE;
+        asm!("wrmsr", in("ecx") IA32_EFER, in("eax") efer as u32, in("edx") (efer >> 32) as u32, options(nostack));
+
+        let star: u64 = (0x10_u64 << 48) | (0x08_u64 << 32);
+        asm!("wrmsr", in("ecx") IA32_STAR, in("eax") star as u32, in("edx") (star >> 32) as u32, options(nostack));
+
+        let lstar = helios_syscall_entry as *const () as u64;
+        asm!("wrmsr", in("ecx") IA32_LSTAR, in("eax") lstar as u32, in("edx") (lstar >> 32) as u32, options(nostack));
+
+        asm!("wrmsr", in("ecx") IA32_FMASK, in("eax") FMASK as u32, in("edx") 0u32, options(nostack));
+    }
+}
+
+/// SysV64 dispatcher called by `helios_syscall_entry` with the raw syscall
+/// registers shuffled into the C argument order. Writes the return registers
+/// into `SYS_RET` for the stub, and performs cooperative scheduling when the
+/// calling thread parked or exited (M3).
+#[no_mangle]
+extern "sysv64" fn helios_syscall_dispatch(
+    num: u64,
+    cap: u64,
+    tag: u64,
+    w0: u64,
+    w1: u64,
+    w2: u64,
+    w3: u64,
+) {
+    let t = Tag(tag);
+    let args = SyscallArgs {
+        num,
+        cap: cap as u32,
+        tag: t,
+        w: [w0, w1, w2, w3],
+        nonblock: t.flags() & flags::NONBLOCK != 0,
+    };
+    let ret = entry::dispatch(args);
+    if ret.status == PARKED_STATUS {
+        // Parked inside recv/reply_recv: the result materializes on resume.
+        resume_loop(None);
+        return;
+    }
+    store_ret(ret);
+    if !thread_is_runnable() {
+        // Blocked (send/recv park) or exited: do not sysret now; the thread
+        // resumes here later (with its result re-stored) or never (exit).
+        resume_loop(Some(ret));
+    }
+}
+
+fn thread_is_runnable() -> bool {
+    let tid = kernel::sched::current();
+    matches!(
+        kernel::sched::get(tid).map(|t| t.state),
+        Ok(kernel::sched::State::Ready) | Ok(kernel::sched::State::Running)
+    )
+}
+
+/// Cooperative scheduling: switch to the next runnable thread and, when this
+/// thread is later resumed, complete its syscall (parked result or the saved
+/// return value). Never returns unless the syscall may sysret.
+fn resume_loop(saved: Option<SyscallReturn>) {
+    let tid = kernel::sched::current();
+    kernel::kinfo!(
+        "resume: tid={} saved={} live={}",
+        tid.0,
+        saved.is_some(),
+        kernel::sched::thread_count()
+    );
+    loop {
+        if kernel::sched::thread_count() == 0 {
+            kernel::panic::clean_exit();
+        }
+        let next = kernel::sched::pick_next();
+        kernel::kinfo!("resume: tid={} -> next={}", tid.0, next.0);
+        if next.0 == 0 {
+            // Idle only: no runnable thread in a cooperative v0.
+            crate::uart_writer("\n[kernel] no runnable thread (cooperative deadlock)\n");
+            loop {
+                // SAFETY: halting the CPU with nothing to run.
+                unsafe { asm!("cli; hlt", options(nostack, nomem)) };
+            }
+        }
+        kernel::kinfo!(
+            "switch: {} -> {} (from_ksp={:#x} to_ksp={:#x} to_top={:#x})",
+            tid.0,
+            next.0,
+            kernel::sched::ksp_of(tid),
+            kernel::sched::ksp_of(next),
+            kernel::sched::kstack_top_of(next)
+        );
+        kernel::sched::switch_to(next);
+        kernel::kinfo!("resumed: tid={}", tid.0);
+
+        // Resumed: was this thread completed while parked?
+        if let Some(r) = entry::park_result(tid) {
+            store_ret(r);
+            return;
+        }
+        let runnable = matches!(
+            kernel::sched::get(tid).map(|t| t.state),
+            Ok(kernel::sched::State::Ready) | Ok(kernel::sched::State::Running)
+        );
+        if runnable {
+            if let Some(r) = saved {
+                // Re-store: other threads overwrote SYS_RET while we parked.
+                store_ret(r);
+            }
+            return;
+        }
+        // Still blocked (woken spuriously): keep waiting.
+    }
+}
+
+fn store_ret(ret: SyscallReturn) {
+    // SAFETY: single-CPU v0; `SYS_RET` is only touched on the syscall path.
+    unsafe {
+        let p = core::ptr::addr_of_mut!(SYS_RET) as *mut u64;
+        p.write_volatile(ret.status as i64 as u64);
+        p.add(1).write_volatile(ret.tag.0);
+        p.add(2).write_volatile(ret.w[0]);
+        p.add(3).write_volatile(ret.w[1]);
+        p.add(4).write_volatile(ret.w[2]);
+        p.add(5).write_volatile(ret.w[3]);
+    }
+}
+

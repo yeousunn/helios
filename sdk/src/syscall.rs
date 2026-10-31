@@ -145,10 +145,13 @@ impl<'a, R: RawSyscalls> Syscalls<'a, R> {
         check(self.raw.raw(number::YIELD, [0; 6]).status)
     }
 
-    /// `exit`: terminate the calling thread. The kernel never resumes it; a
-    /// host-test mock returning here is a loud failure.
+    /// `exit`: terminate the calling thread (status travels in `w0` per
+    /// syscall-abi §3). The kernel never resumes it; a host-test mock
+    /// returning here is a loud failure.
     pub fn exit(&mut self, status: i32) -> ! {
-        let _ = self.raw.raw(number::EXIT, [status as u64, 0, 0, 0, 0, 0]);
+        let _ = self
+            .raw
+            .raw(number::EXIT, [0, 0, status as i64 as u64, 0, 0, 0]);
         panic!("exit syscall returned");
     }
 }

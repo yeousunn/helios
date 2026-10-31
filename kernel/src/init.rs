@@ -241,17 +241,19 @@ pub fn region_carve(pid: ProcessId, region: ObjId, w0: u64, w1: u64) -> Result<u
     if w0 == 0 || !w0.is_multiple_of(frame::FRAME_SIZE as u64) {
         return Err(ipc::status::EBADARG);
     }
-    let addr = REGIONS
+    // The registry tracks region exhaustion (capacity accounting); the frame
+    // allocator is authoritative for the actual physical range — the two can
+    // drift apart once other kernel actors allocate from the same region
+    // (found via heap aliasing init's own staged image: the carved cap must
+    // reference the frames `alloc_contiguous` really reserved).
+    let _ = REGIONS
         .lock()
         .carve(region.0, w0)
         .ok_or(ipc::status::ENOMEM)?;
-    // Reserve the frame range with the frame allocator so nothing double-
-    // allocates it (the boot regions must be registered with frame::init as
-    // managed regions by arch code).
     let frames = (w0 / frame::FRAME_SIZE as u64) as usize;
-    if frame::alloc_contiguous(frames).is_none() {
+    let Some(addr) = frame::alloc_contiguous(frames) else {
         return Err(ipc::status::ENOMEM);
-    }
+    };
     proc::install_cap(
         pid,
         Capability {
@@ -313,6 +315,8 @@ mod tests {
     impl crate::sched::ContextBackend for TestCtx {
         fn switch(&self, _f: ThreadId, _t: ThreadId) {}
         fn start_first(&self, _t: ThreadId) {}
+        fn init_context(&self, _kstack_top: u64, _entry_pc: u64) -> u64 { 0 }
+        fn activate_aspace(&self, _as_id: u64) {}
     }
 
     struct BootFactory;

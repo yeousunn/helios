@@ -5,4 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+caps = { path = "../../caps" }
 hal = { path = ".." }
+ipc = { path = "../../ipc" }
+kernel = { path = "../../kernel" }
+spin = "0.9"

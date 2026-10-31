@@ -19,3 +19,4 @@ required-features = ["boot"]
 kernel = { path = "../kernel" }
 hal = { path = "../hal" }
 hal-x86-64 = { path = "../hal/x86_64" }
+sdk = { path = "../sdk" }

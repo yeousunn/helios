@@ -281,6 +281,7 @@ pub fn try_send(ep: ObjRef, env: Envelope) -> Result<(), IpcError> {
     with_ep(ep, |e| {
         // Waiting receiver? Direct hand-off.
         if let Some(waiter) = e.receivers.pop() {
+            crate::kinfo!("ep {} hands off to {}", ep.0, waiter.0);
             DELIVERED_FOR_REPLY.lock().insert(waiter, env);
             sched::make_ready(waiter)?;
             return Ok(());
@@ -288,8 +289,9 @@ pub fn try_send(ep: ObjRef, env: Envelope) -> Result<(), IpcError> {
         if e.mailbox.is_some() {
             return Err(IpcError::EndpointFull);
         }
+        crate::kinfo!("ep {} mailboxes (no receiver)", ep.0);
         e.mailbox = Some(env);
-        Ok(())
+        Ok(())  
     })
 }
 
@@ -322,6 +324,7 @@ pub fn recv(ep: ObjRef, receiver: ThreadId) -> Result<Option<Envelope>, IpcError
             // Receiver reads via take_delivered once scheduled.
             return Ok(None);
         }
+        crate::kinfo!("ep {} parks receiver {}", ep.0, receiver.0);
         e.receivers.push(receiver)?;
         sched::block(receiver, BlockReason::Recv(ep))?;
         Ok(None)
@@ -371,6 +374,8 @@ mod tests {
     impl sched::ContextBackend for MockCtx {
         fn switch(&self, _f: ThreadId, _t: ThreadId) {}
         fn start_first(&self, _t: ThreadId) {}
+        fn init_context(&self, _kstack_top: u64, _entry_pc: u64) -> u64 { 0 }
+        fn activate_aspace(&self, _as_id: u64) {}
     }
 
     fn setup() -> (ObjRef, ThreadId, ThreadId) {

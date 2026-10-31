@@ -148,6 +148,7 @@ pub fn park_result(tid: ThreadId) -> Option<SyscallReturn> {
 /// The single dispatch point for every syscall (arch entry calls this).
 pub fn dispatch(args: SyscallArgs) -> SyscallReturn {
     let (pid, tid) = current();
+    crate::kinfo!("sys: pid={} tid={} num={} cap={}", pid.0, tid.0, args.num, args.cap);
     match args.num {
         num::YIELD => syscall::sys_yield(tid)
             .map(|_| SyscallReturn::ok(Tag(0), [0; 4]))
@@ -217,10 +218,10 @@ fn invoke(pid: ProcessId, tid: ThreadId, args: SyscallArgs) -> SyscallReturn {
         ObjType::Thread => thread_invoke(pid, tid, &cap, &args),
         ObjType::AddressSpace => as_invoke(pid, &cap, &args),
         _ => match syscall::sys_invoke(pid, tid, args.cap, args.message()) {
-            Ok(status) => SyscallReturn {
+            Ok((status, w)) => SyscallReturn {
                 status,
                 tag: Tag(0),
-                w: [0; 4],
+                w,
             },
             Err(e) => SyscallReturn::err(e),
         },
@@ -247,13 +248,22 @@ fn as_invoke(pid: ProcessId, cap: &Capability, args: &SyscallArgs) -> SyscallRet
     let vaddr = Vaddr(msg.words[0]);
     match msg.tag.label() {
         MAP => {
-            let flags = MapFlags((msg.words[1] as u32) & 0b1_1111);
+            let mut flags = MapFlags((msg.words[1] as u32) & 0b1_1111);
             if flags.0 == 0 {
                 return SyscallReturn::err(ipc::status::EBADARG);
             }
             // Frame cap check (ANON ignores caps[0]): frame_rights ⊇ requested.
+            // v0: ANON pages are resolved EAGERLY with a zeroed frame (lazy
+            // pool resolution needs SET_FAULT_POOL + fault routing, which
+            // not every launcher sets up — stubs get zero-filled pages now).
             let frame_addr = if flags.contains(MapFlags::ANON) {
-                None
+                let Some(frame) = crate::mem::alloc_zeroed() else {
+                    return SyscallReturn::err(ipc::status::ENOMEM);
+                };
+                // The frame now exists: map it as an ordinary frame-backed
+                // region (FrameNotOwned rejects ANON together with a base).
+                flags = MapFlags(flags.0 & !MapFlags::ANON.0);
+                Some(frame)
             } else {
                 match msg.descriptor(0).filter(|cs| cs.handle() != 0) {
                     Some(cs) => match proc::get_cap(pid, cs.handle()) {
@@ -620,6 +630,8 @@ mod tests {
     impl crate::sched::ContextBackend for MockCtx {
         fn switch(&self, _f: ThreadId, _t: ThreadId) {}
         fn start_first(&self, _t: ThreadId) {}
+        fn init_context(&self, _kstack_top: u64, _entry_pc: u64) -> u64 { 0 }
+        fn activate_aspace(&self, _as_id: u64) {}
     }
 
     struct FixedCtx(ProcessId, ThreadId);

@@ -157,7 +157,8 @@ pd_table:
     .skip 4096
 
 .align 16
+.global stack_top
 stack_bottom:
-    .skip 524288                /* 512 KiB: kernel init_frame builds ~256 KiB
+    .skip 1048576               /* 1 MiB: kernel init_frame builds ~256 KiB
                                    tables on the stack (frame allocator) */
 stack_top:

@@ -176,6 +176,14 @@ pub fn sys_send(
         return reply_only(tid, msg);
     }
     let cap = proc::get_cap(pid, dst_handle).map_err(|e| err(map_proc(e)))?;
+    crate::kinfo!(
+        "send: pid={} cap={} typ={:?} obj={} label={:#x}",
+        pid.0,
+        dst_handle,
+        cap.typ,
+        cap.obj.0,
+        msg.tag.label()
+    );
     match cap.typ {
         ObjType::Endpoint => {
             if !cap.rights.contains(Rights::SEND) {
@@ -407,7 +415,14 @@ pub fn sys_reply_recv(
 
 /// SYS 5: `invoke` — method dispatch on kernel object caps.
 /// v0: Notification SIGNAL(1)/CLEAR(2), Region CARVE(1); else ENOSYS.
-pub fn sys_invoke(pid: ProcessId, _tid: ThreadId, cap_handle: u32, msg: Message) -> SysResult<i32> {
+/// Returns `(status, words)` — methods that install capabilities hand the new
+/// handle back in `w0` (syscall-abi §7; `Region::CARVE` does).
+pub fn sys_invoke(
+    pid: ProcessId,
+    _tid: ThreadId,
+    cap_handle: u32,
+    msg: Message,
+) -> SysResult<(i32, [u64; 4])> {
     let cap = proc::get_cap(pid, cap_handle).map_err(|e| err(map_proc(e)))?;
     match cap.typ {
         ObjType::Notification => match msg.tag.label() {
@@ -416,16 +431,17 @@ pub fn sys_invoke(pid: ProcessId, _tid: ThreadId, cap_handle: u32, msg: Message)
                     return Err(err(ipc::status::ERIGHTS));
                 }
                 notification::signal(ObjRef(cap.obj.0), msg.words[0])
-                    .map(|_| ipc::status::OK)
+                    .map(|_| (ipc::status::OK, [0; 4]))
                     .map_err(|e| err(map_ipc(e)))
             }
             2 => notification::clear(ObjRef(cap.obj.0), msg.words[0])
-                .map(|_| ipc::status::OK)
+                .map(|_| (ipc::status::OK, [0; 4]))
                 .map_err(|e| err(map_ipc(e))),
             _ => Err(err(ipc::status::ENOSYS)),
         },
         ObjType::Region => match msg.tag.label() {
-            1 => crate::init::region_carve(pid, cap.obj, msg.words[0], msg.words[1]).map(|_| 0),
+            1 => crate::init::region_carve(pid, cap.obj, msg.words[0], msg.words[1])
+                .map(|handle| (ipc::status::OK, [handle as u64, 0, 0, 0])),
             _ => Err(err(ipc::status::ENOSYS)),
         },
         _ => Err(err(ipc::status::ENOSYS)),
@@ -451,6 +467,7 @@ pub fn sys_cap_revoke(pid: ProcessId, handle: u32, mode: u64) -> SysResult<usize
 /// the last thread of the process is gone, retires the process's kernel
 /// objects and its capability table (ADR-026).
 pub fn sys_exit(tid: ThreadId, status: i32) -> SysResult<bool> {
+    crate::kinfo!("thread {} exited (status {})", tid.0, status);
     // Clear any pending reply/park state so late replies are discarded.
     clear_reply(tid);
     clear_park(tid);
@@ -501,6 +518,8 @@ mod tests {
     impl crate::sched::ContextBackend for MockCtx {
         fn switch(&self, _f: ThreadId, _t: ThreadId) {}
         fn start_first(&self, _t: ThreadId) {}
+        fn init_context(&self, _kstack_top: u64, _entry_pc: u64) -> u64 { 0 }
+        fn activate_aspace(&self, _as_id: u64) {}
     }
 
     fn setup() -> (ProcessId, ThreadId, ThreadId, u32) {
@@ -640,7 +659,7 @@ mod tests {
 
         // invoke SIGNAL.
         let mut m = msg(1, 0b1010);
-        assert_eq!(sys_invoke(pid, server, n_h, m), Ok(0));
+        assert_eq!(sys_invoke(pid, server, n_h, m), Ok((0, [0; 4])));
 
         // recv-on-notification returns and clears the mask.
         let got = sys_recv(pid, server, n_h).unwrap().unwrap();

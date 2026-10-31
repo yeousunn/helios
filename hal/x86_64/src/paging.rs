@@ -1,0 +1,501 @@
+//! x86_64 4-level paging backend support.
+//!
+//! Architecture-specific page table constants, PTE flag bits, and page-table
+//! walking helpers. Implements [`kernel::aspace::PagingBackend`] for x86_64,
+//! plus [`kernel::aspace::BackendFactory`] for per-AS paging roots (ADR-022).
+//!
+//! Boot flow: arch `_start` calls `enable_nx()` once, then registers
+//! `BackendFactoryX86_64` with `kernel::aspace::set_backend_factory()`. The
+//! factory hands out one `PagingBackendX86_64` (owning a PML4 root page) per
+//! address space.
+
+#![allow(dead_code)]
+
+use kernel::aspace::{BackendFactory, MapFlags, PagingBackend, Vaddr};
+use kernel::frame::{self, PhysAddr};
+use spin::Mutex;
+
+/// Page size (4 KiB).
+pub const PAGE_SIZE: usize = 4096;
+
+/// Page table entry count per level (512 entries, 9 bits each).
+pub const PT_ENTRIES: usize = 512;
+
+/// Page table index bit widths (x86_64 4-level paging, 9 bits per level).
+const PML4_SHIFT: usize = 39;
+const PDPT_SHIFT: usize = 30;
+const PD_SHIFT: usize = 21;
+const PT_SHIFT: usize = 12;
+
+/// Page table index masks.
+const PT_INDEX_MASK: usize = 0x1FF;
+
+/// Physical address mask for PTE page frame address (bits 12..51).
+const PTE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+
+/// PTE flag: Present.
+const PTE_PRESENT: u64 = 1 << 0;
+/// PTE flag: Read/Write (1 = writable).
+const PTE_WRITABLE: u64 = 1 << 1;
+/// PTE flag: User/Supervisor (1 = user-accessible).
+const PTE_USER: u64 = 1 << 2;
+/// PTE flag: Accessed (set by CPU on access).
+const PTE_ACCESSED: u64 = 1 << 5;
+/// PTE flag: Dirty (set by CPU on write).
+const PTE_DIRTY: u64 = 1 << 6;
+/// PTE flag: Page Size (1 = huge page, only valid in PD/PDPT entries).
+const PTE_PAGE_SIZE: u64 = 1 << 7;
+/// PTE flag: Global (not flushed on CR3 write).
+const PTE_GLOBAL: u64 = 1 << 8;
+/// PTE flag: No Execute (NX bit, requires EFER.NXE).
+const PTE_NX: u64 = 1 << 63;
+
+/// MapFlags -> x86_64 PTE flag translation.
+fn map_flags_to_pte(flags: MapFlags) -> u64 {
+    let mut pte = PTE_PRESENT | PTE_USER; // v0: all mapped pages are user-accessible
+    if flags.contains(MapFlags::WRITE) {
+        pte |= PTE_WRITABLE;
+    }
+    if flags.contains(MapFlags::EXEC) {
+        // Executable: do NOT set NX.
+    } else {
+        pte |= PTE_NX;
+    }
+    pte
+}
+
+/// A page table entry (8 bytes).
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+pub struct Pte(u64);
+
+impl Pte {
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    pub fn is_present(self) -> bool {
+        self.0 & PTE_PRESENT != 0
+    }
+
+    pub fn addr(self) -> usize {
+        (self.0 & PTE_ADDR_MASK) as usize
+    }
+
+    pub fn flags(self) -> u64 {
+        self.0 & !PTE_ADDR_MASK
+    }
+
+    pub fn set_present(&mut self) {
+        self.0 |= PTE_PRESENT;
+    }
+
+    pub fn set_writable(&mut self) {
+        self.0 |= PTE_WRITABLE;
+    }
+
+    pub fn set_user(&mut self) {
+        self.0 |= PTE_USER;
+    }
+
+    pub fn set_nx(&mut self) {
+        self.0 |= PTE_NX;
+    }
+
+    pub fn set_frame(&mut self, paddr: usize) {
+        self.0 = (self.0 & !PTE_ADDR_MASK) | (paddr as u64 & PTE_ADDR_MASK);
+    }
+
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+/// Page table (512 entries, 4 KiB, aligned).
+#[repr(C, align(4096))]
+pub struct PageTable {
+    entries: [Pte; PT_ENTRIES],
+}
+
+impl PageTable {
+    pub const fn new() -> Self {
+        Self {
+            entries: [Pte::empty(); PT_ENTRIES],
+        }
+    }
+
+    pub fn entry(&mut self, index: usize) -> &mut Pte {
+        &mut self.entries[index]
+    }
+}
+
+/// Extract the page table index at a given level from a virtual address.
+#[inline(always)]
+fn pt_index(vaddr: usize, shift: usize) -> usize {
+    (vaddr >> shift) & PT_INDEX_MASK
+}
+
+/// Read the current CR3 value (page table base).
+#[inline(always)]
+pub fn read_cr3() -> usize {
+    let cr3: usize;
+    // SAFETY: `mov cr3, rax` reads a control register; safe in kernel context.
+    unsafe {
+        core::arch::asm!("mov {0}, cr3", out(reg) cr3, options(nostack, readonly));
+    }
+    cr3
+}
+
+/// Write CR3 (switch page tables / flush TLB).
+#[inline(always)]
+pub fn write_cr3(cr3: usize) {
+    // SAFETY: `mov cr3, rax` writes a control register; safe in kernel context.
+    unsafe {
+        core::arch::asm!("mov cr3, {0}", in(reg) cr3, options(nostack));
+    }
+}
+
+/// Invalidate a single TLB entry for `vaddr`.
+#[inline(always)]
+pub fn flush_tlb_page(vaddr: usize) {
+    // SAFETY: `invlpg` invalidates one TLB entry; safe in kernel context.
+    unsafe {
+        core::arch::asm!("invlpg [{0}]", in(reg) vaddr, options(nostack));
+    }
+}
+
+/// Flush the entire TLB by rewriting CR3.
+#[inline(always)]
+pub fn flush_tlb_all() {
+    let cr3 = read_cr3();
+    write_cr3(cr3);
+}
+
+/// Paging mode bits in EFER (IA32_EFER MSR).
+const EFER_NXE: u64 = 1 << 11;
+
+/// Read IA32_EFER MSR.
+fn read_efer() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    let msr: u32 = 0xC0000080;
+    // SAFETY: `rdmsr` reads a model-specific register; safe in kernel context.
+    unsafe {
+        core::arch::asm!("rdmsr", out("eax") lo, out("edx") hi, in("ecx") msr, options(nostack, readonly));
+    }
+    ((hi as u64) << 32) | (lo as u64)
+}
+
+/// Enable the NXE bit in EFER (required for the PTE_NX bit).
+/// Called once at boot before any PagingBackendX86_64 is created.
+pub fn enable_nx() {
+    let efer = read_efer() | EFER_NXE;
+    let lo = efer as u32;
+    let hi = (efer >> 32) as u32;
+    let msr: u32 = 0xC0000080;
+    // SAFETY: `wrmsr` writes a model-specific register; safe in kernel context.
+    unsafe {
+        core::arch::asm!("wrmsr", in("ecx") msr, in("eax") lo, in("edx") hi, options(nostack));
+    }
+}
+
+/// Maximum number of per-AS paging roots (matches `aspace::MAX_REGIONS`).
+const MAX_BACKENDS: usize = 16;
+
+/// Static pool of per-AS paging backends.
+static BACKEND_POOL: Mutex<[Option<PagingBackendX86_64>; MAX_BACKENDS]> =
+    Mutex::new([None; MAX_BACKENDS]);
+
+/// x86_64 paging backend: walks a 4-level page table and installs mappings
+/// into the PML4 rooted at `pml4_paddr`. One instance per address space.
+#[derive(Clone, Copy)]
+pub struct PagingBackendX86_64 {
+    /// Physical address of the PML4 page.
+    pml4_paddr: usize,
+}
+
+#[allow(dead_code)]
+#[allow(clippy::mut_from_ref)]
+impl PagingBackendX86_64 {
+    /// Create a new backend from a PML4 page already allocated and zeroed at
+    /// `pml4_paddr`. Does NOT enable NXE or install CR3 — those are boot-time
+    /// actions done once globally.
+    ///
+    /// # Safety
+    ///
+    /// `pml4_paddr` must point to a valid, zeroed 4 KiB page of physical
+    /// memory.
+    fn new(pml4_paddr: usize) -> Self {
+        Self { pml4_paddr }
+    }
+
+    /// Get a mutable reference to the PML4 page table.
+    ///
+    /// # Safety
+    ///
+    /// Assumes `pml4_paddr` is a valid, mapped, writable page table page.
+    unsafe fn pml4_mut(&self) -> &mut PageTable {
+        &mut *(self.pml4_paddr as *mut PageTable)
+    }
+
+    /// Allocate and zero one page-table page from the frame allocator.
+    ///
+    /// # Safety
+    /// The frame allocator must be initialized (boot sequence guarantees it
+    /// before any AS operation).
+    unsafe fn new_table() -> Option<usize> {
+        let paddr = frame::alloc()?;
+        // SAFETY: fresh frame; identity direct map covers allocated RAM.
+        unsafe {
+            core::ptr::write_bytes(paddr.as_u64() as *mut u8, 0, PAGE_SIZE);
+        }
+        Some(paddr.as_u64() as usize)
+    }
+
+    /// Pointer-style entry for an intermediate table (present|rw|user).
+    fn table_entry(addr: usize) -> u64 {
+        (addr as u64 & PTE_ADDR_MASK) | PTE_PRESENT | PTE_WRITABLE | PTE_USER
+    }
+
+    /// Walk the 4-level page table for `vaddr`, **creating intermediate
+    /// tables from the frame allocator as needed** and splitting 2 MiB PD
+    /// huge pages into 4 KiB tables (boot identity map) so leaf permissions
+    /// can be adjusted. Returns the leaf PTE.
+    ///
+    /// # Safety
+    ///
+    /// All reachable table pages must be identity-mapped and writable (true
+    /// for kernel/frame memory in the v0 direct map), and `pml4_paddr` valid.
+    unsafe fn walk_create(&self, vaddr: usize) -> Option<&mut Pte> {
+        // PML4 -> PDPT
+        let pml4 = self.pml4_mut();
+        let e = pml4.entry(pt_index(vaddr, PML4_SHIFT));
+        if !e.is_present() {
+            let t = unsafe { Self::new_table() }?;
+            e.0 = Self::table_entry(t);
+        }
+        // Existing (boot-created) intermediate entries must allow user access
+        // at every level or ring-3 leaves under them fault regardless of leaf
+        // permissions (x86 requires U/S=1 on all levels; leaves still govern).
+        e.0 |= PTE_USER;
+        // SAFETY: entry holds a valid page-table physical address per above.
+        let pdpt = unsafe { &mut *(e.addr() as *mut PageTable) };
+
+        // PDPT -> PD
+        let e = pdpt.entry(pt_index(vaddr, PDPT_SHIFT));
+        if !e.is_present() {
+            let t = unsafe { Self::new_table() }?;
+            e.0 = Self::table_entry(t);
+        }
+        e.0 |= PTE_USER;
+        // SAFETY: as above.
+        let pd = unsafe { &mut *(e.addr() as *mut PageTable) };
+
+        // PD -> PT (splitting 2 MiB huge pages if the boot map used them)
+        let pd_idx = pt_index(vaddr, PD_SHIFT);
+        let e = pd.entry(pd_idx);
+        if e.is_present() && (e.0 & PTE_PAGE_SIZE) != 0 {
+            // Split: materialize a PT replicating the huge page. The split
+            // leaves keep the huge page's own permissions (boot identity map
+            // is supervisor) — the caller's per-page map sets the leaf.
+            let base = e.addr();
+            let old = e.0;
+            let t = unsafe { Self::new_table() }?;
+            let pt = unsafe { &mut *(t as *mut PageTable) };
+            let keep = old & (PTE_USER | PTE_WRITABLE | PTE_NX | PTE_GLOBAL);
+            for i in 0..512 {
+                pt.entry(i).0 = ((base as u64 + (i as u64) * PAGE_SIZE as u64) & PTE_ADDR_MASK)
+                    | keep
+                    | PTE_PRESENT;
+            }
+            // The PD entry now points at a 4 KiB table and must carry U/S=1
+            // so user leaves under it can be reached.
+            e.0 = Self::table_entry(t);
+            flush_tlb_all();
+        } else if !e.is_present() {
+            let t = unsafe { Self::new_table() }?;
+            e.0 = Self::table_entry(t);
+        } else {
+            // Existing 4 KiB table: intermediates need U/S=1 (leaves govern).
+            e.0 |= PTE_USER;
+        }
+        // SAFETY: entry holds a valid page-table physical address per above.
+        let pt = unsafe { &mut *(e.addr() as *mut PageTable) };
+
+        Some(pt.entry(pt_index(vaddr, PT_SHIFT)))
+    }
+}
+
+impl PagingBackend for PagingBackendX86_64 {
+    fn map_page(&self, vaddr: Vaddr, paddr: PhysAddr, flags: MapFlags) {
+        let va = vaddr.as_u64() as usize;
+        let pa = paddr.as_u64() as usize;
+        let pte_flags = map_flags_to_pte(flags);
+        // SAFETY: Walk/create page tables and install the PTE.
+        unsafe {
+            let Some(pte) = self.walk_create(va) else {
+                // Intermediate page table missing — allocation not yet wired
+                // to the frame allocator. In v0 this is a hard failure since
+                // we cannot silently drop mappings.
+                panic!("page table allocation not yet wired to frame allocator");
+            };
+            pte.set_frame(pa);
+            pte.set_present();
+            pte.0 |= pte_flags;
+            flush_tlb_page(va);
+        }
+    }
+
+    fn unmap_page(&self, vaddr: Vaddr) {
+        let va = vaddr.as_u64() as usize;
+        // SAFETY: Clear the PTE for `vaddr`.
+        unsafe {
+            if let Some(pte) = self.walk_create(va) {
+                pte.0 = 0;
+                flush_tlb_page(va);
+            }
+        }
+    }
+
+    fn protect_page(&self, vaddr: Vaddr, flags: MapFlags) {
+        let va = vaddr.as_u64() as usize;
+        let pte_flags = map_flags_to_pte(flags);
+        // SAFETY: Update PTE flags in place.
+        unsafe {
+            if let Some(pte) = self.walk_create(va) {
+                let old = pte.0;
+                let new_flags = pte_flags | (old & PTE_ADDR_MASK);
+                pte.0 = new_flags;
+                flush_tlb_page(va);
+            }
+        }
+    }
+}
+
+/// Root PML4 physical addresses by AS id (index = `as_id - 1`). 0 = none.
+static AS_ROOTS: Mutex<[usize; MAX_BACKENDS]> = Mutex::new([0; MAX_BACKENDS]);
+
+/// Activate an address space: load `as_id`'s root into CR3 (v0: no PCID;
+/// full TLB flush via the CR3 write). Returns false when the AS has no root.
+pub fn activate_as(as_id: u64) -> bool {
+    let idx = (as_id as usize).wrapping_sub(1);
+    if idx >= MAX_BACKENDS {
+        return false;
+    }
+    let root = AS_ROOTS.lock()[idx];
+    if root == 0 {
+        return false;
+    }
+    write_cr3(root);
+    true
+}
+
+/// x86_64 backend factory: hands out one `PagingBackendX86_64` per address
+/// space. Allocates a PML4 page from the kernel frame allocator for each AS.
+pub struct BackendFactoryX86_64;
+
+impl Default for BackendFactoryX86_64 {
+    fn default() -> Self {
+        Self
+    }
+}
+
+/// Kernel identity window per AS: first 8 MiB (kernel image + boot stack +
+/// statics) and 16..256 MiB (frame allocator region, used for direct-map
+/// access to physical frames). Supervisor 2 MiB pages, PRIVATE to this AS —
+/// sharing the boot chain leaked mappings across address spaces (found when
+/// a child's segment mappings overwrote the parent's live code).
+const KERNEL_LOW_MIB: usize = 8;
+const FRAME_REGION_START_MIB: usize = 16;
+const FRAME_REGION_END_MIB: usize = 256;
+
+impl BackendFactory for BackendFactoryX86_64 {
+    fn create(&self, as_id: u64) -> Option<&'static dyn PagingBackend> {
+        // Allocate a PML4 page from the kernel frame allocator.
+        let paddr = frame::alloc()?;
+        let pml4 = paddr.as_u64() as usize;
+        // Private kernel window: PML4[0] -> fresh PDPT -> fresh PD with
+        // supervisor 2 MiB identity entries (U=1 on the pointing entries so
+        // user mappings under PML4[0] remain reachable; the huge leaves keep
+        // U=0, blocking user access to kernel memory).
+        //
+        // SAFETY: freshly allocated frames; identity direct map covers them.
+        unsafe {
+            core::ptr::write_bytes(pml4 as *mut u8, 0, PAGE_SIZE);
+            let pdpt = frame::alloc()?;
+            let pd = frame::alloc()?;
+            core::ptr::write_bytes(pdpt.as_u64() as *mut u8, 0, PAGE_SIZE);
+            core::ptr::write_bytes(pd.as_u64() as *mut u8, 0, PAGE_SIZE);
+
+            let pml4e = (pml4 as *mut u64).add(0);
+            *pml4e = (pdpt.as_u64() & PTE_ADDR_MASK) | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+            let pdpte = (pdpt.as_u64() as *mut u64).add(0);
+            *pdpte = (pd.as_u64() & PTE_ADDR_MASK) | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+
+            let pd_entries = pd.as_u64() as *mut u64;
+            let huge = PTE_PRESENT | PTE_WRITABLE | PTE_PAGE_SIZE;
+            for i in 0..(KERNEL_LOW_MIB / 2) {
+                *pd_entries.add(i) = ((i as u64) * 0x20_0000) | huge;
+            }
+            for i in (FRAME_REGION_START_MIB / 2)..(FRAME_REGION_END_MIB / 2) {
+                *pd_entries.add(i) = ((i as u64) * 0x20_0000) | huge;
+            }
+        }
+
+        // Allocate a slot in the static pool.
+        let mut slots = BACKEND_POOL.lock();
+        let idx = slots.iter().position(|s| s.is_none())?;
+        slots[idx] = Some(PagingBackendX86_64::new(paddr.as_u64() as usize));
+
+        // Record the root for `activate_as` (indexed by AS id).
+        let as_idx = (as_id as usize).wrapping_sub(1);
+        if as_idx < MAX_BACKENDS {
+            AS_ROOTS.lock()[as_idx] = paddr.as_u64() as usize;
+        }
+
+        // Get a &'static reference into the static pool array.
+        let slot_ptr = &slots[idx] as *const Option<PagingBackendX86_64>;
+        drop(slots);
+
+        unsafe { Some((*slot_ptr).as_ref().unwrap() as &dyn PagingBackend) }
+    }
+}
+
+/// Static factory instance registered with `kernel::aspace::set_backend_factory`.
+pub static BACKEND_FACTORY_X86_64: BackendFactoryX86_64 = BackendFactoryX86_64;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pte_roundtrip() {
+        let mut pte = Pte::empty();
+        pte.set_frame(0x123_4000);
+        pte.set_present();
+        pte.set_writable();
+        pte.set_user();
+        assert!(pte.is_present());
+        assert_eq!(pte.addr(), 0x123_4000);
+    }
+
+    #[test]
+    fn pt_index_bits() {
+        assert_eq!(pt_index(0x123_4567_89AB, PML4_SHIFT), 0x123);
+        assert_eq!(pt_index(0x123_4567_89AB, PDPT_SHIFT), 0x456);
+        assert_eq!(pt_index(0x123_4567_89AB, PD_SHIFT), 0x789);
+        assert_eq!(pt_index(0x123_4567_89AB, PT_SHIFT), 0xAAB);
+    }
+
+    #[test]
+    fn map_flags_translation() {
+        let r = map_flags_to_pte(MapFlags::READ);
+        assert!(r & PTE_PRESENT != 0);
+        assert!(r & PTE_WRITABLE == 0);
+        assert!(r & PTE_NX != 0); // non-executable -> NX set
+        let rw = map_flags_to_pte(MapFlags::READ.union(MapFlags::WRITE));
+        assert!(rw & PTE_WRITABLE != 0);
+        let rx = map_flags_to_pte(MapFlags::READ.union(MapFlags::EXEC));
+        assert!(rx & PTE_NX == 0); // executable -> NX clear
+    }
+}

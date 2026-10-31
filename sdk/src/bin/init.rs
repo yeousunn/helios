@@ -124,13 +124,69 @@ fn run(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
     }
     mark(raw, info.debug_ep, STEP_REVOKE, 0);
 
+    // From here failures report their code on the serial BEFORE exiting (the
+    // kernel's last-thread clean halt masks the exit status otherwise).
+    let stepped = heap_and_spawn(raw, info).map_err(|code| {
+        mark(raw, info.debug_ep, 0xEE, code);
+        code
+    });
+    stepped?;
+    Ok(())
+}
+
+/// Steps 6-9 (heap, spawn, reap) split out so `run` can report failures.
+fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
     // Step 6: heap over the boot Region (ADR-023 self_as).
     let self_as = info.self_as.ok_or(fail_code(STEP_HEAP, 0xE4))?;
     let region = info.region(0).ok_or(fail_code(STEP_HEAP, 0xE5))?.handle;
+    // Diagnostic probes (temporary): separate CARVE and MAP invokes.
+    let probe_frame = {
+        let mut sys = Syscalls::new(raw);
+        let mut carve = Message::new(methods::region::CARVE);
+        carve.words[0] = 4096;
+        carve.words[1] = 4096;
+        match sys.invoke(region, &carve) {
+            Ok(reply) => {
+                mark(raw, info.debug_ep, 0xE1, reply.words[0]);
+                reply.words[0] as Handle
+            }
+            Err(e) => {
+                mark(raw, info.debug_ep, 0xE1, 0x8000_0000 | (e as u64 & 0xFF));
+                return Err(fail_code(STEP_HEAP, 0xE1));
+            }
+        }
+    };
+    {
+        use ipc::{CapSlot, Rights};
+        let mut sys = Syscalls::new(raw);
+        let mut map = Message::new(methods::aspace::MAP);
+        map.tag = map.tag.with_caps(1);
+        map.words[0] = 0x0000_3F00_3000_0000;
+        map.words[1] = 0b011;
+        let _ = map.set_descriptor(0, CapSlot::pack(probe_frame, Rights::default()));
+        match sys.invoke(self_as, &map) {
+            Ok(_) => mark(raw, info.debug_ep, 0xE2, 0),
+            Err(e) => mark(raw, info.debug_ep, 0xE2, 0x8000_0000 | (e as u64 & 0xFF)),
+        }
+    }
+
     let span = {
         let mut src = RegionSource::new(raw, region, self_as, INIT_HEAP_VA_BASE, HEAP_CHUNK);
-        src.map_startup(HEAP_CHUNKS)
-            .map_err(|e| fail_code(STEP_HEAP, e as u64))?
+        let mut chunk = 0u64;
+        let err = loop {
+            if chunk == HEAP_CHUNKS {
+                break None;
+            }
+            if let Err(e) = src.grow(HEAP_CHUNK) {
+                // Encode chunk number + underlying errno for diagnosis.
+                break Some(fail_code(STEP_HEAP, ((e as u64 & 0xFF) << 8) | (chunk + 1)));
+            }
+            chunk += 1;
+        };
+        match err {
+            Some(code) => return Err(code),
+            None => (INIT_HEAP_VA_BASE as usize, (HEAP_CHUNKS * HEAP_CHUNK) as usize),
+        }
     };
     HEAP.init(span.0, span.1)
         .map_err(|e| fail_code(STEP_HEAP, e as u64))?;
@@ -185,9 +241,32 @@ fn spawn_ps(
     self_as: Handle,
     region: Handle,
 ) -> Result<u64> {
+    mark(raw, info.debug_ep, 0xE7, 1); // spawn: before ELF parse
     let image = ElfImage::parse(PS_IMAGE).map_err(|e| fail_code(STEP_SPAWNED, e as u64))?;
+    mark(raw, info.debug_ep, 0xE7, 2); // parsed
     let ops = loader::plan(&image, INIT_SCRATCH_VA_BASE)
         .map_err(|e| fail_code(STEP_SPAWNED, 0xE0_00 | (e as u64 & 0xFF)))?;
+    mark(raw, info.debug_ep, 0xE7, 3); // planned
+    // Logical integrity checks of the ops vector (heap read-back):
+    // 0xE6|w1 = len; 0xE5|w1 = variant of op0 (1=Carve,2=MapF,3=other);
+    // 0xE5|w2 = variant of op1.
+    {
+        use sdk::loader::LoadOp;
+        mark(raw, info.debug_ep, 0xE6, ops.len() as u64);
+        let v0 = match ops.first() {
+            Some(LoadOp::CarvePage) => 1,
+            Some(LoadOp::MapFrame { .. }) => 2,
+            Some(_) => 3,
+            None => 0,
+        };
+        let v1 = match ops.get(1) {
+            Some(LoadOp::CarvePage) => 1,
+            Some(LoadOp::MapFrame { .. }) => 2,
+            Some(_) => 3,
+            None => 0,
+        };
+        mark(raw, info.debug_ep, 0xE5, (v1 << 8) | v0);
+    }
 
     let child_as = {
         let mut sys = Syscalls::new(raw);
@@ -201,6 +280,7 @@ fn spawn_ps(
     if child_as == 0 {
         return Err(fail_code(STEP_SPAWNED, 0xE0_02));
     }
+    mark(raw, info.debug_ep, 0xE7, 4); // child AS created
 
     {
         let mut sys = Syscalls::new(raw);
@@ -223,6 +303,7 @@ fn spawn_ps(
         )
         .map_err(|e| fail_code(STEP_SPAWNED, 0xE1_01 | (e as u64 & 0xFF)))?;
     }
+    mark(raw, info.debug_ep, 0xE7, 5); // segments + stack mapped
 
     // Endpoints + notifications for the package.
     let bootstrap_ep = mint(raw, info.factory, methods::factory::NEW_ENDPOINT, 0xE2)?;
@@ -253,6 +334,7 @@ fn spawn_ps(
             .map_err(|e| fail_code(STEP_SPAWNED, 0xE6_00 | (e as u64 & 0xFF)))?;
         (reply.words[0] as Handle, reply.words[2])
     };
+    mark(raw, info.debug_ep, 0xE7, 6); // child thread created
     if thread_cap == 0 {
         return Err(fail_code(STEP_SPAWNED, 0xE6_01));
     }

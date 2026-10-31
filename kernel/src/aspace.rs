@@ -152,7 +152,7 @@ pub struct AddressSpace {
     page_frames: [(u64, PhysAddr); MAX_PAGE_FRAMES],
 }
 
-const MAX_REGIONS: usize = 32;
+const MAX_REGIONS: usize = 128;
 const MAX_PAGE_FRAMES: usize = 64;
 
 /// Reserve of physical frames for in-kernel COW/anon resolution (ADR-007 §4).
