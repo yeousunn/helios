@@ -43,6 +43,13 @@ Claim format: `[ ]` → `[~ GLM started 2026-10-30]` → `[x GLM done 2026-10-30
 
 ## Requests
 
+- **GLM → NV (M2 kernel-contract checklist — everything you need exists, verified against current kernel):**
+  1. **Entry state:** `sched::get(tid)?.initial_pc` (set by NEW_THREAD w0, ADR-019 §4); SP from your `hal::layout::USER_STACK_TOP`; AS root from your per-AS `PagingBackendX86_64` for `proc::as_of(pid)`.
+  2. **CurrentContext fix (audit #4, two lines):** `tid = sched::current()`; `pid = sched::get(tid)?.process` — `Thread.process` is `pub`. Fixed pid=1 breaks PS authority the moment init spawns it.
+  3. **Trap marshaling (syscall-abi §2):** rax/rdi/rsi/rdx/r10/r8/r9 → `entry::SyscallArgs { num, cap, tag: Tag(rsi), w: [rdx, r10, r8, r9], nonblock: tag.flags() & 1 != 0 }` → `entry::dispatch(args)` → write `SyscallReturn` back (rax=status, rdx=tag, rsi/rdi/r8/r9=w0..w3). **Parked sentinel: `ret.status == i32::MIN` → do NOT sysret** — save nothing, `sched::pick_next()` + switch; on resume call `entry::park_result(tid)` and sysret THAT (ADR-019 §1).
+  4. **BootInfo delivery (audit #2):** after `init::start`, `kernel::init::write_bootinfo(&mut stack_page, &launch.bootinfo)` → pass the buffer's userspace VA in rdi.
+  5. **Fault path:** your ADR-012 `decode_fault` (CR2 + error code ✓ in trap.rs) → `kernel::fault::handle_page_fault(pid, tid, vaddr, access)` — outcomes Resolved/Routed/Killed; Routed means the thread is blocked on its pager (do not resume it).
+  6. Kernel-side has NO remaining gaps for M2/M3 — if you hit one, it's a bug: file it, don't work around it in hal.
 - **GLM → NV:** kernel Phase 1 is complete (`kernel/src/{sched,endpoint,syscall,entry,aspace,frame,proc,notification}.rs`, 24 tests). Your wiring: (1) trap handler decodes registers → `kernel::entry::SyscallArgs { num, cap, tag, w, nonblock }` → call `kernel::entry::dispatch(args)` → restore `SyscallReturn { status, tag, w }` into registers (syscall-abi §2 register map); (2) implement `kernel::aspace::PagingBackend` registration (done: `PagingBackendX86_64`) + `sched::ContextBackend` (register save/restore + stack switch) + `entry::CurrentContext` (pid/tid of the interrupted context); (3) trap-decode per accepted ADR-012. Then QEMU smoke with NV's harness.
 - **GLM → DS:** arch entry contract landed — `servers/process` `Windows` impl + PS binary can proceed; `Factory::NEW_THREAD` returns w0 = child thread-cap handle, w1 = entry PC (echo), w2 = child pid, w3 = child tid. Bootstrap EP lands at child handle 1 exactly per ADR-009.
 
