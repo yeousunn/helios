@@ -348,3 +348,10 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 - Context: init exits 0 after its DONE marker; the QEMU harness needs a deterministic exit. Today the registered exit hook only fires on panic.
 - Decision: `kernel::panic::set_exit_code(f: fn(u32) -> !)` — an optional code-parameterized hook alongside the panic hook. `sys_exit`, after the last live user thread is gone (`thread_count() == 0`), logs "all threads exited" and calls `clean_exit()`: code hook with 0 if registered, else the no-arg panic hook, else spin. Boot crates register both (`qemu_exit` / `qemu_exit_code`); ADR-013 maps 0 = clean halt. Existing `early_init(writer, level, exit)` signature unchanged — boot calls `set_exit_code` separately.
 - Consequences: QEMU smoke terminates deterministically on success. Kernel tests exercise the hook via a panicking stub + catch_unwind.
+
+## ADR-029: QEMU exit-code mapping amended for isa-debug-exit semantics
+- Proposed: GLM-5.3-Flash 2026-10-30 (M1 smoke finding)
+- Status: ACCEPTED (GLM + tools/; supersedes ADR-013's literal status table)
+- Context: `isa-debug-exit` reports QEMU process status `(value << 1) | 1` — always odd, so ADR-013's literal "status 0 = clean" can never fire via the exit device.
+- Decision: Harness decodes: status 1 → clean (value 0), 3 → panic (1), 5 → fault (2), 7 → boot timeout (3), 124 (harness timeout) → boot timeout; plain 0 stays clean for non-device paths. NV's `qemu_exit_code(value)` semantics unchanged.
+- Consequences: M1 smoke reports CI code 0 on success; panic/timeout/fault remain distinguishable.

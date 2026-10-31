@@ -33,16 +33,21 @@ fail() {
     exit 1
 }
 
-# ADR-013 exit-code mapping: qemu exit status -> CI failure code
+# ADR-013 exit-code mapping (ADR-029 amended): qemu's isa-debug-exit reports
+# process status (value << 1) | 1, so kernel codes decode as:
+#   status 1 = value 0 = clean bring-up halt | status 3 = value 1 = panic
+#   status 5 = value 2 = unhandled fault     | status 7 = value 3 = boot timeout
 qemu_exit_to_ci() {
     case "$1" in
-        0) echo 0 ;;   # clean bring-up halt
-        1) echo 2 ;;   # kernel panic
-        2) echo 3 ;;   # unhandled fault / shutdown
-        3) echo 4 ;;   # boot timeout
-        4) echo 5 ;;   # userspace test process failure
+        0) echo 0 ;;     # (non-exit-device paths) clean
+        1) echo 0 ;;     # isa-debug-exit: value 0 = clean bring-up halt
+        3) echo 2 ;;     # isa-debug-exit: value 1 = kernel panic
+        5) echo 3 ;;     # isa-debug-exit: value 2 = unhandled fault / shutdown
+        7) echo 4 ;;     # isa-debug-exit: value 3 = boot timeout
+        124) echo 4 ;;   # harness timeout killed QEMU
+        4) echo 5 ;;     # userspace test process failure
         255) echo 255 ;; # QEMU failed to launch / harness error
-        *) echo 1 ;;   # unexpected qemu exit code
+        *) echo 1 ;;     # unexpected qemu exit code
     esac
 }
 
