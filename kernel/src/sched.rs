@@ -312,11 +312,26 @@ pub fn block(id: ThreadId, reason: BlockReason) -> SchedResult<()> {
     let mut guard = SCHED.lock();
     let s = guard.as_mut().ok_or(SchedError::NoSuchThread)?;
     let slot = find_slot(s, id)?;
-    let t = s.slots.threads[slot].as_mut().unwrap();
-    if t.state != State::Running && t.state != State::Ready {
+    let (prio, runnable) = {
+        let t = s.slots.threads[slot].as_ref().unwrap();
+        (t.priority, matches!(t.state, State::Running | State::Ready))
+    };
+    if !runnable {
         return Err(SchedError::NotRunnable);
     }
-    t.state = State::Blocked(reason);
+    // A Ready thread sits in its run queue — unlink before parking, or
+    // pick_next could later pop a Blocked thread (found in M2 audit).
+    let was_ready = {
+        let t = s.slots.threads[slot].as_ref().unwrap();
+        matches!(t.state, State::Ready)
+    };
+    if was_ready {
+        unlink_from_queue(s, slot, prio);
+    }
+    {
+        let t = s.slots.threads[slot].as_mut().unwrap();
+        t.state = State::Blocked(reason);
+    }
     Ok(())
 }
 
@@ -577,6 +592,16 @@ pub fn start_first(next: ThreadId) {
         let mut g = SCHED.lock();
         if let Some(s) = g.as_mut() {
             s.current = next;
+            // The spawned thread is still queued as Ready — unlink it and
+            // mark it Running, or pick_next could later pop the very thread
+            // that is already on-CPU (and, after it blocks, a parked one).
+            if let Ok(slot) = find_slot(s, next) {
+                if matches!(s.slots.threads[slot].as_ref().unwrap().state, State::Ready) {
+                    let prio = s.slots.threads[slot].as_ref().unwrap().priority;
+                    unlink_from_queue(s, slot, prio);
+                    s.slots.threads[slot].as_mut().unwrap().state = State::Running;
+                }
+            }
         }
     }
     let backend = *CTX.lock();
@@ -697,5 +722,37 @@ mod tests {
         assert_eq!(next, t);
         switch_to(next);
         assert_eq!(current(), t);
+    }
+    #[test]
+    fn start_first_unqueues_and_marks_running() {
+        // M2 audit: the boot-started thread must not remain in the run
+        // queue, or pick_next can pop a blocked/current thread.
+        setup();
+        let p = ObjRef(9);
+        let t = spawn(p, 100).unwrap();
+        start_first(t);
+        assert_eq!(current(), t);
+        // The queue must be empty at t's level: nothing else spawns at 100,
+        // so pick_next falls through to IDLE.
+        assert_eq!(pick_next(), IDLE);
+        // And blocking it works from Running state.
+        block(t, BlockReason::Recv(ObjRef(3))).unwrap();
+        assert_eq!(pick_next(), IDLE, "parked thread is never re-picked");
+    }
+
+    #[test]
+    fn block_from_ready_unqueues() {
+        setup();
+        let p = ObjRef(10);
+        let t = spawn(p, 100).unwrap();
+        // t is Ready (queued). Block it WITHOUT it ever being picked.
+        block(t, BlockReason::Recv(ObjRef(4))).unwrap();
+        assert_eq!(
+            pick_next(),
+            IDLE,
+            "blocked-from-ready thread must be unqueued"
+        );
+        make_ready(t).unwrap();
+        assert_eq!(pick_next(), t, "requeued after wake");
     }
 }
