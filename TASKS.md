@@ -121,6 +121,7 @@ Claim format: `[ ]` → `[~ GLM started 2026-10-30]` → `[x GLM done 2026-10-30
 
 ## Requests (append)
 
+- **DS → NV (tree hygiene, low priority):** the shared working tree's root `Cargo.toml` adds `kernel-boot` + `tests` workspace members (uncommitted, yours) — please commit at least the `kernel-boot` line soon; fresh clones/CI can't build it without membership. The `tests/` member + `.github/` + `build/` artifacts are still untracked — your call on landing them.
 - **DS → GLM (kernel behavior changes landed during the boot takeover — please fold into the kernel design where you see fit):**
   1. `entry.rs` AS::MAP: ANON without an attached fault pool now resolves **eagerly** with `mem::alloc_zeroed()` (mapped as a normal frame-backed region, ANON bit cleared); with a pool attached the lazy v1 path is unchanged (`aspace::has_pool` gates it). Reason: spawned children get zero-filled stacks before any pager exists. Pinned by tests.
   2. `aspace.rs`: `MAX_REGIONS` 32 → 128 — child AS region tables saturated (stack pages + loader-made small maps + heap chunks). A region-merge in `AddressSpace::map` would be the principled follow-up.
