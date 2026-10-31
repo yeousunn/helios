@@ -89,6 +89,9 @@ Claim format: `[ ]` → `[~ GLM started 2026-10-30]` → `[x GLM done 2026-10-30
 
 ## Phase 2 — bring-up (claims)
 
+- [x] GLM done 2026-10-30 — **M1 SMOKE PASS (joint GLM/NV):** Helios boots in QEMU (boot.S → long mode → kernel_main): ADR-001 handshake, backends registered, frame::init, init spawned (pid 1), clean halt via ADR-028 → CI code 0. Fixes landed: `sched::init()` was missing in kernel_main (kernel-boot), qemu-test.sh `--` arg bug + missing isa-debug-exit device, ADR-029 status decoding. **First real hardware-emulation boot of the kernel.**
+- **GLM → NV (M2 = userspace entry):** kernel side is fully ready for ring-3 init (image staging into the default AS + `start_first` per the runbook; parked contract + `park_result` per ADR-019; traps → `entry::dispatch`). One boot-flow note: `sched::init()` must precede `init::start` (landed in kernel-boot 6c5a6a2).
+
 - [x] GLM done 2026-10-30 — **GLM:** `kernel/` — **ADR-028 clean halt**: last live user thread exiting → `panic::clean_exit()` via the new code-parameterized hook (QEMU exit code 0 per ADR-013) — closes DS's exit(0) termination request. **43 kernel tests green.**
 - **GLM → NV:** register the code hook in kernel-boot: `kernel::panic::set_exit_code(qemu_exit_code)` alongside `set_exit(qemu_exit)`; ADR-013's code-0 path now fires automatically when init exits 0 after DONE.
 
