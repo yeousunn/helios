@@ -467,6 +467,9 @@ pub fn sys_exit(tid: ThreadId, status: i32) -> SysResult<bool> {
         .map_err(|_| err(ipc::status::EBADCAP))?
         .process;
     let fired = sched::exit(tid, status).map_err(|_| err(ipc::status::EBADCAP))?;
+    // ADR-031: the exiting thread's kernel stack goes to the graveyard
+    // (cannot be freed while this exit runs on it); the idle path drains.
+    sched::bury_thread_kstack_for_exit(tid);
     if fired {
         // Read the bound notification from the (now Exited) record and signal.
         if let Some(n) = sched::get(tid).ok().and_then(|t| t.bound_notification) {

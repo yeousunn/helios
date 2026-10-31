@@ -650,6 +650,73 @@ pub fn reset_for_bench() {
     *SCHED.lock() = None;
 }
 
+/// Register a thread's kernel stack (arch boot allocates 16 KiB / 4 frames
+/// at `kstack_top - 16 KiB`; ADR-031 bookkeeping).
+pub fn set_kstack(id: ThreadId, base: u64, frames: u32) -> SchedResult<()> {
+    let mut guard = SCHED.lock();
+    let s = guard.as_mut().ok_or(SchedError::NoSuchThread)?;
+    let slot = find_slot(s, id)?;
+    s.slots.threads[slot].as_mut().unwrap().kstack_top =
+        base + frames as u64 * crate::frame::FRAME_SIZE as u64;
+    Ok(())
+}
+
+/// Graveyard: kstacks of exited threads, drained when provably off-stack
+/// (idle). Bounded — overflow leaks the oldest entry rather than
+/// use-after-free (ADR-031 §1).
+struct Graveyard {
+    entries: [(u64, u32); 16],
+    len: usize,
+}
+
+static GRAVEYARD: Mutex<Graveyard> = Mutex::new(Graveyard {
+    entries: [(0, 0); 16],
+    len: 0,
+});
+
+fn bury_kstack(base: u64, frames: u32) {
+    let mut g = GRAVEYARD.lock();
+    if g.len < g.entries.len() {
+        let slot = g.len;
+        g.entries[slot] = (base, frames);
+        g.len += 1;
+    }
+    // else: bounded leak, never UAF.
+}
+
+/// Drain the graveyard: free buried kstacks. MUST only be called when no
+/// buried stack can be in use — the idle path (ADR-031 §1).
+pub fn drain_graveyard() -> usize {
+    let mut g = GRAVEYARD.lock();
+    let mut freed = 0;
+    for i in 0..g.len {
+        let (base, frames) = g.entries[i];
+        for f in 0..frames {
+            let _ = crate::frame::free(crate::frame::PhysAddr::new(
+                base + f as u64 * crate::frame::FRAME_SIZE as u64,
+            ));
+        }
+        freed += 1;
+    }
+    g.len = 0;
+    freed
+}
+
+/// Public exit-path hook: bury the exiting thread's kernel stack.
+pub fn bury_thread_kstack_for_exit(id: ThreadId) {
+    bury_thread_kstack(id);
+}
+
+/// Bury a thread's kstack on exit (called by sys_exit teardown).
+fn bury_thread_kstack(id: ThreadId) {
+    if let Ok(t) = get(id) {
+        if t.kstack_top != 0 {
+            // M3 allocation: 16 KiB = 4 frames ending at kstack_top (ADR-031).
+            bury_kstack(t.kstack_top - 4 * crate::frame::FRAME_SIZE as u64, 4);
+        }
+    }
+}
+
 /// Are there live (non-Exited) threads for this process? (ADR-026 reaper.)
 pub fn process_has_live_threads(process: ObjRef) -> bool {
     let guard = SCHED.lock();
@@ -838,5 +905,32 @@ mod tests {
         );
         make_ready(t).unwrap();
         assert_eq!(pick_next(), t, "requeued after wake");
+    }
+    #[test]
+    fn graveyard_bury_and_drain() {
+        // ADR-031: exited-thread kstacks are buried, then freed on idle drain.
+        setup();
+        let p = ObjRef(20);
+        let t = spawn(p, 100).unwrap();
+        // Arch backend reports a 4-frame kstack (16 KiB) ending at kstack_top.
+        let top: u64 = 0x200_0000;
+        let base = top - 4 * crate::frame::FRAME_SIZE as u64;
+        set_kstack(t, base, 4).unwrap();
+        exit(t, 0).unwrap();
+        bury_thread_kstack_for_exit(t);
+
+        // Nothing freed yet (still buried).
+        let drained = drain_graveyard();
+        assert_eq!(drained, 1, "one kstack buried and drained");
+        assert_eq!(drain_graveyard(), 0, "second drain is a no-op");
+
+        // Fill the graveyard to exactly capacity (16) with distinct stacks.
+        for i in 0..16u64 {
+            let tt = spawn(p, 100).unwrap();
+            set_kstack(tt, 0x300_0000 + i * 0x1_0000, 4).unwrap();
+            exit(tt, 0).unwrap();
+            bury_thread_kstack_for_exit(tt);
+        }
+        assert_eq!(drain_graveyard(), 16);
     }
 }
