@@ -106,19 +106,28 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
-    // 6. Serve loop (design §1.7): one `recv`, then `reply_recv` per request.
+    // 6. Serve loop (design §1.7): one `recv` on the service endpoint, then
+    //    `reply_recv` per request. `CONNECT` publishes a connection endpoint;
+    //    all later operations are served on it (design §1.2).
     let mut sys = Syscalls::new(&mut raw);
     let mut req = match sys.recv(service_ep) {
         Ok(m) => m,
         Err(_) => Syscalls::new(&mut raw).exit(0xE6),
     };
+    let mut session_ep = service_ep;
     loop {
         let reply = match req.tag.label() {
-            methods::process::CONNECT => connect_reply(&mut sys, &package, &req),
+            methods::process::CONNECT => {
+                let (reply, conn_ep) = connect_reply(&mut sys, &package, &req, factory);
+                if let Some(ep) = conn_ep {
+                    session_ep = ep;
+                }
+                reply
+            }
             methods::process::KILL => {
                 // v0: KILL applies to this single-process server — ack, then
                 // exit with the caller's raw status (design §2.6).
-                let mut ack = Message::new(methods::process::KILL);
+                let ack = Message::new(methods::process::KILL);
                 let _ = sys.send(REPLY_CAP, &ack);
                 Syscalls::new(&mut raw).exit(req.words[1] as i32);
             }
@@ -128,7 +137,7 @@ pub extern "C" fn _start() -> ! {
                 reply
             }
         };
-        req = match sys.reply_recv(service_ep, &reply) {
+        req = match sys.reply_recv(session_ep, &reply) {
             Ok(m) => m,
             Err(_) => Syscalls::new(&mut raw).exit(0xE7),
         };
@@ -144,11 +153,12 @@ fn connect_reply(
     sys: &mut Syscalls<'_, X86_64Syscalls>,
     package: &sdk::bootstrap::BootstrapPackage,
     req: &Message,
-) -> Message {
+    factory: u32,
+) -> (Message, Option<u32>) {
     let mut reply = Message::new(methods::process::CONNECT);
     if req.words[0] != 1 {
         reply.words[0] = ipc::status::EBADARG as i64 as u64;
-        return reply;
+        return (reply, None);
     }
     let window =
         |i: usize| -> Option<u32> { req.descriptor(i).map(|cs| cs.handle()).filter(|h| *h != 0) };
@@ -158,7 +168,7 @@ fn connect_reply(
         (Some(a), Some(r)) => (a, r),
         _ => {
             reply.words[0] = ipc::status::EBADARG as i64 as u64;
-            return reply;
+            return (reply, None);
         }
     };
     for (frame, va, flags) in [
@@ -172,11 +182,31 @@ fn connect_reply(
         let _ = map.set_descriptor(0, CapSlot::pack(frame, Rights::READ));
         if let Err(e) = sys.invoke(package.aspace, &map) {
             reply.words[0] = e as i64 as u64;
-            return reply;
+            return (reply, None);
         }
     }
+    // Mint the connection endpoint and hand it to the client (design §1.2).
+    let conn_ep = match sys.invoke(factory, &Message::new(methods::factory::NEW_ENDPOINT)) {
+        Ok(minted) if minted.words[0] != 0 => minted.words[0] as u32,
+        Ok(_) => {
+            reply.words[0] = ipc::status::ENOMEM as i64 as u64;
+            return (reply, None);
+        }
+        Err(e) => {
+            reply.words[0] = e as i64 as u64;
+            return (reply, None);
+        }
+    };
+    reply.tag = reply.tag.with_caps(1);
+    if reply
+        .set_descriptor(0, CapSlot::pack(conn_ep, Rights::SEND.union(Rights::RECV)))
+        .is_none()
+    {
+        reply.words[0] = ipc::status::EBADARG as i64 as u64;
+        return (reply, None);
+    }
     reply.words[1] = 1; // connection id (v0: the single published endpoint)
-    reply
+    (reply, Some(conn_ep))
 }
 
 #[panic_handler]

@@ -211,6 +211,13 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
     if conn.words[0] != 0 || conn.words[1] == 0 {
         return Err(fail_code(STEP_CONNECT, 0xE1));
     }
+    // The connection endpoint rides in descriptor 0 (design §1.2); all later
+    // operations go there, not to the service endpoint.
+    let session_ep = conn
+        .descriptor(0)
+        .map(|cs| cs.handle())
+        .filter(|h| *h != 0)
+        .ok_or(fail_code(STEP_CONNECT, 0xE2))?;
     mark(raw, info.debug_ep, STEP_CONNECT, conn.words[1]);
 
     // Step 10: shut the child down (KILL acks, then PS exits) and reap — the
@@ -220,7 +227,7 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
         let mut kill = Message::new(methods::process::KILL);
         kill.words[0] = pid;
         let ack = sys
-            .call(svc, &kill)
+            .call(session_ep, &kill)
             .map_err(|e| fail_code(STEP_CHILD_EXIT, e as u64))?;
         if ack.words[0] != 0 {
             return Err(fail_code(STEP_CHILD_EXIT, 0xE2));
