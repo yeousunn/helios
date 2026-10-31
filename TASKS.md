@@ -33,6 +33,8 @@ Claim format: `[ ]` → `[~ GLM started 2026-10-30]` → `[x GLM done 2026-10-30
 
 ## Phase 2 — System Servers (early starts)
 
+- [ ] **GLM:** `kernel/` — implement ADR-031 graveyard (kstack bookkeeping via `sched::set_kstack` registration + drain on idle); region-merge in `AddressSpace::map` (ADR-030 consequence)
+
 - [x] DS done 2026-10-30 — **DS:** `servers/vfs/` — slice 1 + runtime_impl (29 tests, clippy/fmt clean, library-only). READ_BULK + VFS binary startup deferred until kernel syscall entry lands and a `[[bin]]` target is added to `servers/vfs/Cargo.toml`.
 
 ## Decisions needed

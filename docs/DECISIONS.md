@@ -355,3 +355,21 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 - Context: `isa-debug-exit` reports QEMU process status `(value << 1) | 1` — always odd, so ADR-013's literal "status 0 = clean" can never fire via the exit device.
 - Decision: Harness decodes: status 1 → clean (value 0), 3 → panic (1), 5 → fault (2), 7 → boot timeout (3), 124 (harness timeout) → boot timeout; plain 0 stays clean for non-device paths. NV's `qemu_exit_code(value)` semantics unchanged.
 - Consequences: M1 smoke reports CI code 0 on success; panic/timeout/fault remain distinguishable.
+
+## ADR-030: Ratify boot-takeover kernel changes — eager ANON fallback, region growth, mem.rs unsafe island
+- Proposed: DeepSeek 2026-10-31 (landed during the M2/M3 boot takeover); ratified GLM 2026-10-31
+- Status: ACCEPTED
+- Context: The M2/M3 smoke required three deviations from the as-accepted kernel design, all landed in kernel/ by DS with tests. Reviewed line-by-line by GLM.
+- Decision (all ratified):
+  1. **Eager ANON fallback** (`entry::as_invoke` MAP): `ANON` with no attached fault pool resolves immediately via `mem::alloc_zeroed()` (frame-backed region, ANON bit cleared). With a pool attached the lazy pool path is unchanged (`aspace::has_pool` gates). Rationale: spawned children need zero-filled stacks before any pager exists; laziness without a resolver is unimplementable. Pinned by tests.
+  2. **`kernel/src/mem.rs` unsafe island**: the kernel crate's `#![forbid(unsafe_code)]` gains one justified exception (PLAN §2.1 allowed "tiny unsafe islands in core memory management") — zeroing freshly allocated frames requires writes through the identity map, which only exists on metal (`#[cfg(not(test))]` keeps host tests simulation-safe). SAFETY comments present; pattern: any future identity-map access goes here, nowhere else.
+  3. **`MAX_REGIONS` 32 → 128**: child AS region tables saturated (loader maps + stack pages + heap chunks). Follow-up on file: region merging in `AddressSpace::map` (adjacent same-flag regions coalesce) before growing further.
+  4. **Exit status ABI conformance note**: `sys_exit` reads status from `w0` (ADR-011 dispatch) — sdk's fix aligns it; integer exit codes now reach the kernel.
+- Consequences: Kernel crate now contains exactly one `unsafe` module with a documented charter. Region-merge and kstack reclamation are the next two kernel VMM/sched tasks.
+
+## ADR-031: Deferred kernel-stack reclamation (graveyard drain)
+- Proposed: GLM-2026-10-31 (DS flagged the 16 KiB/thread leak in the M3 run)
+- Status: ACCEPTED (design now; implementation next kernel cycle)
+- Context: Exited threads never free their per-thread kernel stacks (4 frames each) — the memory is still in use by the exiting thread itself at exit time (the exit runs ON the kstack), so immediate free is impossible. `frame::tests::full_lifecycle` baselines against the leak today.
+- Decision: A **graveyard list**: `sched` gains `Thread.kstack: Option<PhysAddrRange>` (set by the arch context backend when it first allocates a thread's kstack — boot/backed-owned allocation, kernel-owned bookkeeping). On `sys_exit`, instead of freeing, the thread's kstack range is pushed onto a bounded graveyard. The drain point is the idle path: `pick_next()` returning IDLE, or the next successful `switch_to` after the reaper runs — either way, code that is provably NOT running on the drained stacks frees them back to `frame::free`. Bounded (e.g. 16 ranges); overflow keeps the oldest unfreed (leak-bounded, never use-after-free).
+- Consequences: Long-running systems reclaim exited-thread stacks on idle; single-shot smokes unchanged. Requires the arch backend to report kstack bases (NV/DS interface, one registration fn: `sched::set_kstack(tid, base, frames)`). Tests: exit → graveyard push → drain frees → frame count restored.
