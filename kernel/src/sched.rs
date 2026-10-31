@@ -201,6 +201,22 @@ fn queue_pop(s: &mut Sched, prio: u8) -> Option<SlotIdx> {
     Some(slot)
 }
 
+/// Set a thread's userspace entry PC after creation (boot launcher staging:
+/// the init thread is spawned by `init::start` before its image is mapped).
+pub fn set_initial_pc(id: ThreadId, pc: u64) -> SchedResult<()> {
+    let mut guard = SCHED.lock();
+    match guard
+        .as_mut()
+        .and_then(|s| s.slots.threads[id.0 as usize].as_mut())
+    {
+        Some(t) => {
+            t.initial_pc = pc;
+            Ok(())
+        }
+        None => Err(SchedError::NoSuchThread),
+    }
+}
+
 /// Register a new thread with a userspace entry PC (ADR-019 §4).
 pub fn spawn_with(process: ObjRef, priority: u8, initial_pc: u64) -> SchedResult<ThreadId> {
     let id = spawn(process, priority)?;
@@ -510,15 +526,27 @@ pub fn set_context_backend(b: &'static dyn ContextBackend) {
 
 /// Context-switch the arch state from current() to `next` and update the
 /// scheduler's current pointer.
+///
+/// Lock discipline (critical for real context switches, M2+): NO lock is
+/// held across the backend `switch` call. A spinlock held across a stack
+/// switch would deadlock the next `switch` on resume (the holder never
+/// returns until it is scheduled back). `current` is updated BEFORE
+/// switching so trap entry observes the new thread immediately.
 pub fn switch_to(next: ThreadId) {
     let from = current();
-    let guard = CTX.lock();
-    if let Some(b) = guard.as_ref() {
-        b.switch(from, next);
+    {
+        let mut g = SCHED.lock();
+        if let Some(s) = g.as_mut() {
+            s.current = next;
+        }
     }
-    let mut g = SCHED.lock();
-    if let Some(s) = g.as_mut() {
-        s.current = next;
+    // Snapshot the backend ('static, registered once at boot) and release
+    // the lock before switching away.
+    let backend = *CTX.lock();
+    if let Some(b) = backend {
+        b.switch(from, next);
+        // Control returns here when THIS thread is scheduled again; `current`
+        // was set by whoever switched back to us.
     }
 }
 
@@ -543,13 +571,17 @@ pub fn process_has_live_threads(process: ObjRef) -> bool {
 /// Enter the first thread: switch the arch state to `next` and update the
 /// scheduler's current pointer. Called once at boot to enter init.
 pub fn start_first(next: ThreadId) {
-    let guard = CTX.lock();
-    if let Some(b) = guard.as_ref() {
-        b.start_first(next);
+    // Update the pointer first (see switch_to's lock discipline): after the
+    // backend enters `next`, this frame never resumes on the boot path.
+    {
+        let mut g = SCHED.lock();
+        if let Some(s) = g.as_mut() {
+            s.current = next;
+        }
     }
-    let mut g = SCHED.lock();
-    if let Some(s) = g.as_mut() {
-        s.current = next;
+    let backend = *CTX.lock();
+    if let Some(b) = backend {
+        b.start_first(next);
     }
 }
 
