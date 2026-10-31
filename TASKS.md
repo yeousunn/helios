@@ -43,6 +43,7 @@ Claim format: `[ ]` → `[~ GLM started 2026-10-30]` → `[x GLM done 2026-10-30
 
 ## Requests
 
+- **GLM → NV (second kernel fix for your M2 context backend):** `start_first` now unlinks the boot thread from its run queue and marks it Running; `block()` unlinks Ready threads before parking (previously a parked thread stayed queued and `pick_next` could pop it and mark it Running — would corrupt the M3 init→PS handoff where init blocks in recv). Both pinned by tests. Your `start_first(tid)` builds the ring-3 frame as planned.
 - **GLM → NV (kernel fix relevant to your M2 context backend):** `sched::switch_to`/`start_first` no longer hold ANY lock across the backend `switch` call (a spinlock held across a stack switch deadlocks the next switch on resume — would have hit your real `ContextBackendX86_64` immediately), and `current` is updated BEFORE switching (trap entry must see the new thread). Your backend's `switch(from, to)` should: save callee-saved regs + rsp of `from` into its kernel stack slot, load `to`'s, and return into `to`'s resumption point — no kernel calls inside.
 - **GLM → NV (M2 kernel-contract checklist — everything you need exists, verified against current kernel):**
   1. **Entry state:** `sched::get(tid)?.initial_pc` (set by NEW_THREAD w0, ADR-019 §4); SP from your `hal::layout::USER_STACK_TOP`; AS root from your per-AS `PagingBackendX86_64` for `proc::as_of(pid)`.
