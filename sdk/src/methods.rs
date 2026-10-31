@@ -49,6 +49,22 @@ pub mod irq {
     pub const ACK: u16 = 1;
 }
 
+/// Process server protocol labels (design §2.6,
+/// `servers/docs/process-and-vfs-design.md`). These are full wire labels
+/// (`tag.label` of the request message), not invoke method ids.
+pub mod process {
+    pub const CONNECT: u16 = 0x0101;
+    pub const PACKAGE: u16 = 0x0102;
+    pub const SPAWN: u16 = 0x0110;
+    pub const WAIT: u16 = 0x0111;
+    pub const KILL: u16 = 0x0112;
+    pub const EXEC: u16 = 0x0113;
+    pub const FORK: u16 = 0x0114;
+    pub const THREAD_CREATE: u16 = 0x0115;
+    pub const THREAD_EXIT: u16 = 0x0116;
+    pub const GETPID: u16 = 0x0117;
+}
+
 /// `AddressSpace::MAP` flag bits (wire-compatible with syscall-abi §7).
 pub mod map_flags {
     pub const R: u32 = 1 << 0;

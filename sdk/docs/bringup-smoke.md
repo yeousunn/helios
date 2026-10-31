@@ -43,8 +43,9 @@ cargo build -p sdk --bin init --features user --target x86_64-unknown-none --rel
 | 5 | `...0005` | 0 | `cap_revoke(DELETE)` ok |
 | 6 | `...0006` | heap KiB (1024) | heap mapped (`self_as` + Region, ADR-023) |
 | 7 | `...0007` | child pid (or `0xFFFFFFFFFFFFFFFF` = no embedded image) | PS spawned: ELF loaded, package delivered |
-| 8 | `...0008` | PS's service-endpoint handle | PS sent its ready callback over IPC (`READY_MAGIC` in `w0`) — proves the child ran its own code |
-| 9 | `...0009` | death-notification tag | PS exited, reaped via NOTIFIED |
+| 8 | `...0008` | heap KiB | PS sent its ready callback (`READY_MAGIC` in `w0`); its service endpoint arrives as capability descriptor 0 |
+| 9 | `...0009` | connection id (1) | `CONNECT` round-trip over the service endpoint: init transfers session notif + arg/result frames (4 KiB each), PS maps both windows and replies |
+| 10 | `...000a` | death-notification tag | init sent `KILL` (PS acks then exits); reaped via NOTIFIED |
 | DONE | `0x494e49540000000f` | 0 | all passed |
 | fail | exit code `0xDEAD_0000_00SS_EEEE` (SS = step, EEEE = errno) | | |
 

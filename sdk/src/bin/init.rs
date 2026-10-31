@@ -50,7 +50,8 @@ const STEP_REVOKE: u64 = 5;
 const STEP_HEAP: u64 = 6;
 const STEP_SPAWNED: u64 = 7;
 const STEP_CHILD_READY: u64 = 8;
-const STEP_CHILD_EXIT: u64 = 9;
+const STEP_CONNECT: u64 = 9;
+const STEP_CHILD_EXIT: u64 = 10;
 const STEP_DONE: u64 = 0x0F;
 /// Failure marker family for exits: `0xDEAD_0000_00SS_EEEE` (step, errno).
 const FAIL: u64 = 0xDEAD_0000_0000_0000;
@@ -172,8 +173,8 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
     let pid = spawn_ps(raw, info, self_as, region)?;
     mark(raw, info.debug_ep, STEP_SPAWNED, pid);
 
-    // Step 8: ready callback — PS reports its minted service endpoint over the
-    // package's service-endpoint slot before exiting (proves it ran).
+    // Step 8: ready callback — PS publishes its service endpoint as a
+    // capability (descriptor 0) over the package's service-endpoint slot.
     let ready = {
         let mut sys = Syscalls::new(raw);
         sys.recv(READY_EP.load(core::sync::atomic::Ordering::Relaxed))
@@ -182,9 +183,49 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
     if ready.tag.label() != bootstrap::READY_LABEL || ready.words[0] != bootstrap::READY_MAGIC {
         return Err(fail_code(STEP_CHILD_READY, 0xE1));
     }
+    let svc = ready
+        .descriptor(0)
+        .map(|cs| cs.handle())
+        .filter(|h| *h != 0)
+        .ok_or(fail_code(STEP_CHILD_READY, 0xE2))?;
     mark(raw, info.debug_ep, STEP_CHILD_READY, ready.words[1]);
 
-    // Step 9: reap — the death notification fires when PS exits (ADR-007 §6).
+    // Step 9: CONNECT round-trip (design §2.6, label 0x0101). The v0 packing
+    // keeps the version in w0; the three caps (session notification, arg
+    // frame, result frame) overlay w1..w3 per the v1 message format; windows
+    // are 4 KiB each (design §1.3) so no size words travel.
+    let session = mint(raw, info.factory, methods::factory::NEW_NOTIFICATION, 0xE6)?;
+    let arg_frame = carve_frame(raw, region)?;
+    let result_frame = carve_frame(raw, region)?;
+    let conn = {
+        let mut sys = Syscalls::new(raw);
+        let mut connect = Message::new(methods::process::CONNECT);
+        connect.tag = connect.tag.with_caps(3);
+        connect.words[0] = 1; // protocol version
+        let _ = connect.set_descriptor(0, ipc::CapSlot::pack(session, ipc::Rights::SIGNAL));
+        let _ = connect.set_descriptor(1, ipc::CapSlot::pack(arg_frame, ipc::Rights::READ));
+        let _ = connect.set_descriptor(2, ipc::CapSlot::pack(result_frame, ipc::Rights::WRITE));
+        sys.call(svc, &connect)
+            .map_err(|e| fail_code(STEP_CONNECT, e as u64))?
+    };
+    if conn.words[0] != 0 || conn.words[1] == 0 {
+        return Err(fail_code(STEP_CONNECT, 0xE1));
+    }
+    mark(raw, info.debug_ep, STEP_CONNECT, conn.words[1]);
+
+    // Step 10: shut the child down (KILL acks, then PS exits) and reap — the
+    // death notification fires when it exits (ADR-007 §6).
+    {
+        let mut sys = Syscalls::new(raw);
+        let mut kill = Message::new(methods::process::KILL);
+        kill.words[0] = pid;
+        let ack = sys
+            .call(svc, &kill)
+            .map_err(|e| fail_code(STEP_CHILD_EXIT, e as u64))?;
+        if ack.words[0] != 0 {
+            return Err(fail_code(STEP_CHILD_EXIT, 0xE2));
+        }
+    }
     let death = ps_death_handle(raw)?;
     let notified = {
         let mut sys = Syscalls::new(raw);
@@ -193,6 +234,22 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
     };
     mark(raw, info.debug_ep, STEP_CHILD_EXIT, notified.tag.0);
     Ok(())
+}
+
+/// Carve one 4 KiB frame from the boot Region (CONNECT windows, design §1.3).
+fn carve_frame(raw: &mut X86_64Syscalls, region: Handle) -> Result<Handle> {
+    let mut sys = Syscalls::new(raw);
+    let mut carve = Message::new(methods::region::CARVE);
+    carve.words[0] = 4096;
+    carve.words[1] = 4096;
+    let reply = sys
+        .invoke(region, &carve)
+        .map_err(|e| fail_code(STEP_CONNECT, e as u64))?;
+    let handle = reply.words[0] as Handle;
+    if handle == 0 {
+        return Err(fail_code(STEP_CONNECT, 0xE3));
+    }
+    Ok(handle)
 }
 
 /// The launcher's service endpoint for the spawned child, set by `spawn_ps`
