@@ -698,7 +698,9 @@ mod tests {
     impl ContextBackend for MockCtx {
         fn switch(&self, _from: ThreadId, _to: ThreadId) {}
         fn start_first(&self, _to: ThreadId) {}
-        fn init_context(&self, _kstack_top: u64, _entry_pc: u64) -> u64 { 0 }
+        fn init_context(&self, _kstack_top: u64, _entry_pc: u64) -> u64 {
+            0
+        }
         fn activate_aspace(&self, _as_id: u64) {}
     }
 

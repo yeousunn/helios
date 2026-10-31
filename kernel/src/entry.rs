@@ -148,7 +148,6 @@ pub fn park_result(tid: ThreadId) -> Option<SyscallReturn> {
 /// The single dispatch point for every syscall (arch entry calls this).
 pub fn dispatch(args: SyscallArgs) -> SyscallReturn {
     let (pid, tid) = current();
-    crate::kinfo!("sys: pid={} tid={} num={} cap={}", pid.0, tid.0, args.num, args.cap);
     match args.num {
         num::YIELD => syscall::sys_yield(tid)
             .map(|_| SyscallReturn::ok(Tag(0), [0; 4]))
@@ -252,11 +251,12 @@ fn as_invoke(pid: ProcessId, cap: &Capability, args: &SyscallArgs) -> SyscallRet
             if flags.0 == 0 {
                 return SyscallReturn::err(ipc::status::EBADARG);
             }
-            // Frame cap check (ANON ignores caps[0]): frame_rights ⊇ requested.
-            // v0: ANON pages are resolved EAGERLY with a zeroed frame (lazy
-            // pool resolution needs SET_FAULT_POOL + fault routing, which
-            // not every launcher sets up — stubs get zero-filled pages now).
-            let frame_addr = if flags.contains(MapFlags::ANON) {
+            // Frame cap check (ANON ignores caps[0]). ANON maps resolve from
+            // the AS fault pool when one is attached (v1 lazy path); without a
+            // pool they resolve EAGERLY with a zeroed frame — non-pager
+            // launchers (e.g. spawned children) get zero-filled pages now.
+            let has_pool = aspace::has_pool(as_id).unwrap_or(false);
+            let frame_addr = if flags.contains(MapFlags::ANON) && !has_pool {
                 let Some(frame) = crate::mem::alloc_zeroed() else {
                     return SyscallReturn::err(ipc::status::ENOMEM);
                 };
@@ -264,6 +264,8 @@ fn as_invoke(pid: ProcessId, cap: &Capability, args: &SyscallArgs) -> SyscallRet
                 // region (FrameNotOwned rejects ANON together with a base).
                 flags = MapFlags(flags.0 & !MapFlags::ANON.0);
                 Some(frame)
+            } else if flags.contains(MapFlags::ANON) {
+                None // lazy: the first fault resolves from the pool
             } else {
                 match msg.descriptor(0).filter(|cs| cs.handle() != 0) {
                     Some(cs) => match proc::get_cap(pid, cs.handle()) {
@@ -630,7 +632,9 @@ mod tests {
     impl crate::sched::ContextBackend for MockCtx {
         fn switch(&self, _f: ThreadId, _t: ThreadId) {}
         fn start_first(&self, _t: ThreadId) {}
-        fn init_context(&self, _kstack_top: u64, _entry_pc: u64) -> u64 { 0 }
+        fn init_context(&self, _kstack_top: u64, _entry_pc: u64) -> u64 {
+            0
+        }
         fn activate_aspace(&self, _as_id: u64) {}
     }
 
@@ -862,7 +866,7 @@ mod tests {
         let r = dispatch(args(num::INVOKE, as_h, m5.tag, m5.words));
         assert_eq!(r.status, ipc::status::OK, "SET_FAULT_POOL");
 
-        // ANON map + fault resolves from the pool.
+        // ANON map + fault resolves from the attached pool (lazy path).
         let mut m6 = Message::new(1);
         m6.words[0] = 0xB0_0000;
         m6.words[1] = 0b1_1000; // ANON|R  (bit4 ANON, bit0 R)

@@ -117,18 +117,11 @@ fn thread_is_runnable() -> bool {
 /// return value). Never returns unless the syscall may sysret.
 fn resume_loop(saved: Option<SyscallReturn>) {
     let tid = kernel::sched::current();
-    kernel::kinfo!(
-        "resume: tid={} saved={} live={}",
-        tid.0,
-        saved.is_some(),
-        kernel::sched::thread_count()
-    );
     loop {
         if kernel::sched::thread_count() == 0 {
             kernel::panic::clean_exit();
         }
         let next = kernel::sched::pick_next();
-        kernel::kinfo!("resume: tid={} -> next={}", tid.0, next.0);
         if next.0 == 0 {
             // Idle only: no runnable thread in a cooperative v0.
             crate::uart_writer("\n[kernel] no runnable thread (cooperative deadlock)\n");
@@ -137,16 +130,7 @@ fn resume_loop(saved: Option<SyscallReturn>) {
                 unsafe { asm!("cli; hlt", options(nostack, nomem)) };
             }
         }
-        kernel::kinfo!(
-            "switch: {} -> {} (from_ksp={:#x} to_ksp={:#x} to_top={:#x})",
-            tid.0,
-            next.0,
-            kernel::sched::ksp_of(tid),
-            kernel::sched::ksp_of(next),
-            kernel::sched::kstack_top_of(next)
-        );
         kernel::sched::switch_to(next);
-        kernel::kinfo!("resumed: tid={}", tid.0);
 
         // Resumed: was this thread completed while parked?
         if let Some(r) = entry::park_result(tid) {
@@ -180,4 +164,3 @@ fn store_ret(ret: SyscallReturn) {
         p.add(5).write_volatile(ret.w[3]);
     }
 }
-

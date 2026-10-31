@@ -176,14 +176,6 @@ pub fn sys_send(
         return reply_only(tid, msg);
     }
     let cap = proc::get_cap(pid, dst_handle).map_err(|e| err(map_proc(e)))?;
-    crate::kinfo!(
-        "send: pid={} cap={} typ={:?} obj={} label={:#x}",
-        pid.0,
-        dst_handle,
-        cap.typ,
-        cap.obj.0,
-        msg.tag.label()
-    );
     match cap.typ {
         ObjType::Endpoint => {
             if !cap.rights.contains(Rights::SEND) {
@@ -518,7 +510,9 @@ mod tests {
     impl crate::sched::ContextBackend for MockCtx {
         fn switch(&self, _f: ThreadId, _t: ThreadId) {}
         fn start_first(&self, _t: ThreadId) {}
-        fn init_context(&self, _kstack_top: u64, _entry_pc: u64) -> u64 { 0 }
+        fn init_context(&self, _kstack_top: u64, _entry_pc: u64) -> u64 {
+            0
+        }
         fn activate_aspace(&self, _as_id: u64) {}
     }
 

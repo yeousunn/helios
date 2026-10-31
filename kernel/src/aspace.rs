@@ -201,6 +201,11 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Whether a fault pool is attached (drives lazy vs eager ANON, entry.rs).
+    fn has_pool(&self) -> bool {
+        self.pool.is_some()
+    }
+
     fn map(
         &mut self,
         vaddr: Vaddr,
@@ -814,6 +819,11 @@ pub fn fork(parent: ObjId) -> Result<ObjId, VmmError> {
 /// Attach or replace the fault pool of `as_id`.
 pub fn set_pool(as_id: ObjId, base: PhysAddr, bytes: u64) -> Result<(), VmmError> {
     with_as(as_id, |space, _| space.set_pool(base, bytes))
+}
+
+/// Whether `as_id` has a fault pool attached.
+pub fn has_pool(as_id: ObjId) -> Result<bool, VmmError> {
+    with_as(as_id, |space, _| Ok(space.has_pool()))
 }
 
 /// Register a frame with the refcount table (acquires one ref).

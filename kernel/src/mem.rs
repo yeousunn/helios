@@ -8,11 +8,16 @@ use crate::frame::{self, PhysAddr};
 /// Allocate one frame and zero it (eager ANON resolution for `AS::MAP`).
 pub fn alloc_zeroed() -> Option<PhysAddr> {
     let frame = frame::alloc()?;
-    // SAFETY: freshly allocated frame; the identity direct map covers all
-    // allocator-managed RAM, so writing through the physical address is valid
-    // and exclusively ours until mapped elsewhere.
-    unsafe {
-        core::ptr::write_bytes(frame.as_u64() as *mut u8, 0, frame::FRAME_SIZE);
+    // The identity direct map only exists on the metal; host tests hold
+    // simulated addresses that are not mapped, so skip the wipe there.
+    #[cfg(not(test))]
+    {
+        // SAFETY: freshly allocated frame; the identity direct map covers all
+        // allocator-managed RAM, so writing through the physical address is
+        // valid and exclusively ours until mapped elsewhere.
+        unsafe {
+            core::ptr::write_bytes(frame.as_u64() as *mut u8, 0, frame::FRAME_SIZE);
+        }
     }
     Some(frame)
 }

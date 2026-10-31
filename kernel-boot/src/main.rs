@@ -123,7 +123,7 @@ pub extern "C" fn kernel_main() -> ! {
             static stack_top: u8;
         }
         // SAFETY: the linker symbol is the boot stack top defined in boot.S.
-        let boot_stack_top = unsafe { core::ptr::addr_of!(stack_top) } as u64;
+        let boot_stack_top = core::ptr::addr_of!(stack_top) as u64;
         hal_x86_64::set_kstack(boot_stack_top);
         hal_x86_64::BOOTINFO_VA.store(bootinfo_va, Ordering::Relaxed);
         kernel::kinfo!(
@@ -199,8 +199,7 @@ fn stage_init(launch: &kernel::init::InitLaunch, image: &[u8]) -> (u64, u64) {
     // Stack + BootInfo page: 64 KiB below USER_STACK_TOP.
     const STACK_PAGES: u64 = 16;
     let stack_bottom = hal_x86_64::USER_STACK_TOP as u64 - STACK_PAGES * 4096;
-    let sp =
-        kernel::frame::alloc_contiguous(STACK_PAGES as usize).expect("frames for init stack");
+    let sp = kernel::frame::alloc_contiguous(STACK_PAGES as usize).expect("frames for init stack");
     // SAFETY: freshly allocated, identity-mapped frames.
     unsafe { zero_phys(sp.as_u64(), STACK_PAGES * 4096) };
     aspace::map(
@@ -224,10 +223,7 @@ fn stage_init(launch: &kernel::init::InitLaunch, image: &[u8]) -> (u64, u64) {
     // Switch the CPU to the staged address space (DEFAULT_AS = id 1) — the
     // mappings above went into its tables; running on the boot root would
     // leave top-level branches (e.g. the stack's PML4 entry) invisible.
-    assert!(
-        hal_x86_64::activate_as(1),
-        "DEFAULT_AS has no paging root"
-    );
+    assert!(hal_x86_64::activate_as(1), "DEFAULT_AS has no paging root");
     // Post-staging TLB invalidate (covers huge-page splits done by the maps).
     hal_x86_64::flush_tlb_all();
 
@@ -272,13 +268,20 @@ fn dump_pte_chain(va: u64) {
         if pde & 0x80 != 0 {
             kernel::kinfo!(
                 "pte-chain {:#x}: pml4e={:#x} pdpte={:#x} pde={:#x} (2MiB huge)",
-                va, pml4e, pdpte, pde
+                va,
+                pml4e,
+                pdpte,
+                pde
             );
         } else {
             let pte = rd((pde & !0xFFF) + idx(va, 12) * 8);
             kernel::kinfo!(
                 "pte-chain {:#x}: pml4e={:#x} pdpte={:#x} pde={:#x} pte={:#x}",
-                va, pml4e, pdpte, pde, pte
+                va,
+                pml4e,
+                pdpte,
+                pde,
+                pte
             );
         }
     }

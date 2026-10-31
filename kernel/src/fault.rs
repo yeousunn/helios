@@ -253,7 +253,9 @@ mod tests {
     impl crate::sched::ContextBackend for MockCtx {
         fn switch(&self, _f: ThreadId, _t: ThreadId) {}
         fn start_first(&self, _t: ThreadId) {}
-        fn init_context(&self, _kstack_top: u64, _entry_pc: u64) -> u64 { 0 }
+        fn init_context(&self, _kstack_top: u64, _entry_pc: u64) -> u64 {
+            0
+        }
         fn activate_aspace(&self, _as_id: u64) {}
     }
 
