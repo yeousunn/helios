@@ -171,9 +171,12 @@ pub fn sys_send(
     msg: Message,
     nonblock: bool,
 ) -> SysResult<i32> {
-    // Reply-only send.
+    // Reply-only send. Descriptors must still resolve against the sender's
+    // table (ADR-011 §1): the parked caller installs them on resume, so an
+    // unresolved envelope would null every replied capability.
     if dst_handle == REPLY_CAP_SENTINEL {
-        return reply_only(tid, msg);
+        let (env, _) = resolve_transfers(pid, &msg, tid);
+        return reply_only(tid, env);
     }
     let cap = proc::get_cap(pid, dst_handle).map_err(|e| err(map_proc(e)))?;
     match cap.typ {
@@ -213,12 +216,12 @@ pub fn sys_send(
     }
 }
 
-fn reply_only(tid: ThreadId, msg: Message) -> SysResult<i32> {
+fn reply_only(tid: ThreadId, env: Envelope) -> SysResult<i32> {
     match take_reply(tid) {
         Some(caller) => {
             // Deliver the reply to the blocked caller (must be Blocked(Reply)).
             let mut d = crate::endpoint::DELIVERED_FOR_REPLY.lock();
-            d.insert(caller, Envelope::new(msg, tid));
+            d.insert(caller, env);
             drop(d);
             sched::make_ready(caller).map_err(|_| err(ipc::status::EDEAD))?;
             Ok(ipc::status::OK)
@@ -395,9 +398,12 @@ pub fn sys_reply_recv(
 ) -> SysResult<Option<Message>> {
     match take_reply(tid) {
         Some(caller) => {
+            // Same contract as `reply_only`: resolve descriptors before the
+            // parked caller installs them on resume (ADR-011 §1).
+            let (env, _) = resolve_transfers(pid, &reply, tid);
             crate::endpoint::DELIVERED_FOR_REPLY
                 .lock()
-                .insert(caller, Envelope::new(reply, tid));
+                .insert(caller, env);
             sched::make_ready(caller).map_err(|_| err(ipc::status::EDEAD))?;
         }
         None => return Err(err(ipc::status::EBADSTATE)),
@@ -585,6 +591,44 @@ mod tests {
             .unwrap();
         assert_eq!(reply.msg.words[0], 77);
         assert_eq!(take_reply(client), None, "client never had a reply cap");
+    }
+
+    #[test]
+    fn reply_caps_resolve_and_install() {
+        let (pid, server, client, ep_h) = setup();
+        // Server owns a frame cap to hand back with the reply.
+        let frame_h = proc::install_cap(
+            pid,
+            caps::Capability {
+                obj: ObjId(0xBEEF),
+                typ: ObjType::Frame,
+                rights: Rights::READ.union(Rights::GRANT),
+            },
+        )
+        .unwrap();
+
+        // Client calls; server replies carrying the frame cap.
+        assert_eq!(sys_call(pid, client, ep_h, msg(0x0101, 1)), Ok(0));
+        let _req = sys_recv(pid, server, ep_h).unwrap().unwrap();
+        let mut rep = msg(0x0101, 2);
+        rep.tag = rep.tag.with_caps(1);
+        rep.set_descriptor(0, CapSlot::pack(frame_h, Rights::READ))
+            .unwrap();
+        assert!(sys_reply_recv(pid, server, ep_h, rep).is_ok());
+
+        // The parked caller's envelope must carry the resolved cap and
+        // install it into the receiver's table on resume (regression: the
+        // reply paths used to skip resolve_transfers, nulling every cap).
+        let mut env = crate::endpoint::DELIVERED_FOR_REPLY
+            .lock()
+            .take(client)
+            .unwrap();
+        install_transfers(pid, &mut env);
+        let cs = env.msg.descriptor(0).unwrap();
+        assert_ne!(cs.handle(), frame_h, "receiver-local handle");
+        let got = proc::get_cap(pid, cs.handle()).unwrap();
+        assert_eq!(got.typ, ObjType::Frame);
+        assert_eq!(got.obj, ObjId(0xBEEF));
     }
 
     #[test]
