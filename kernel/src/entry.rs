@@ -126,8 +126,23 @@ pub fn park_result(tid: ThreadId) -> Option<SyscallReturn> {
         return Some(SyscallReturn::ok(env.msg.tag, env.msg.words));
     }
 
-    // 2. Bound notification that fired.
+    // 2. The notification this thread actually blocked on (recv-on-
+    //    notification): return its mask with NOTIFIED. Checking the thread's
+    //    *bound* notification instead missed this completion entirely.
     let thread = sched::get(tid).ok()?;
+    if let sched::State::Blocked(sched::BlockReason::Notification(obj)) = thread.state {
+        if let Ok(mask) = crate::notification::pending(obj) {
+            if mask != 0 {
+                let _ = crate::notification::clear(obj, mask);
+                return Some(SyscallReturn::ok(
+                    Tag::new(0).with_flags(flags::NOTIFIED),
+                    [mask, 0, 0, 0],
+                ));
+            }
+        }
+    }
+
+    // 3. Bound notification that fired.
     let n = thread.bound_notification?;
     let mask = match crate::notification::pending(n) {
         Ok(m) => m,
@@ -141,7 +156,7 @@ pub fn park_result(tid: ThreadId) -> Option<SyscallReturn> {
         ));
     }
 
-    // 3. Still parked.
+    // 4. Still parked.
     None
 }
 

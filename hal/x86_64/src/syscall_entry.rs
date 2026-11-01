@@ -145,9 +145,20 @@ fn resume_loop(saved: Option<SyscallReturn>) {
             Ok(kernel::sched::State::Ready) | Ok(kernel::sched::State::Running)
         );
         if runnable {
-            if let Some(r) = saved {
+            match saved {
                 // Re-store: other threads overwrote SYS_RET while we parked.
-                store_ret(r);
+                Some(r) => store_ret(r),
+                // Runnable without any completion data: impossible for a
+                // well-formed park. Returning would sysret STALE `SYS_RET`
+                // (another thread's handles!) into userspace — re-block and
+                // keep waiting instead (found via PS spawning its child).
+                None => {
+                    let reason = match kernel::sched::get(tid).map(|t| t.state) {
+                        Ok(kernel::sched::State::Blocked(r)) => r,
+                        _ => kernel::sched::BlockReason::Reply,
+                    };
+                    let _ = kernel::sched::block(tid, reason);
+                }
             }
             return;
         }
