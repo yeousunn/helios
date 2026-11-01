@@ -49,6 +49,22 @@ extern "sysv64" fn exception_report(vector: u64, error: u64, cr2: u64, rip: u64,
         rip,
         cs
     );
+    if rip != 0 {
+        // SAFETY: diagnostic read of the (mapped, faulting) code page; the
+        // CPU halts right after, so a secondary fault here is fatal anyway.
+        let bytes = unsafe { core::ptr::read_unaligned(rip as *const [u8; 8]) };
+        kernel::kerror!(
+            "  code@rip: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+            bytes[0],
+            bytes[1],
+            bytes[2],
+            bytes[3],
+            bytes[4],
+            bytes[5],
+            bytes[6],
+            bytes[7]
+        );
+    }
     loop {
         // SAFETY: stopping the CPU after a fatal exception report.
         unsafe { core::arch::asm!("cli; hlt", options(nostack, nomem)) };
