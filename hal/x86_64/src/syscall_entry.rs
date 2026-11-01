@@ -123,7 +123,10 @@ fn resume_loop(saved: Option<SyscallReturn>) {
         }
         let next = kernel::sched::pick_next();
         if next.0 == 0 {
-            // Idle only: no runnable thread in a cooperative v0.
+            // Idle: nothing runnable. Drain the kstack graveyard first
+            // (ADR-031): this context is provably not on any buried stack.
+            // Draining frees frames but wakes no threads — halt after.
+            kernel::sched::drain_graveyard();
             crate::uart_writer("\n[kernel] no runnable thread (cooperative deadlock)\n");
             loop {
                 // SAFETY: halting the CPU with nothing to run.
