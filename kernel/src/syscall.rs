@@ -478,8 +478,12 @@ pub fn sys_exit(tid: ThreadId, status: i32) -> SysResult<bool> {
     sched::bury_thread_kstack_for_exit(tid);
     if fired {
         // Read the bound notification from the (now Exited) record and signal.
+        // Payload convention (v0, consumed by PS's `WAIT` reaper): bit 0 = the
+        // death event, bits 32.. = the raw exit status. OR-ing semantics mean
+        // a later signal cannot clear an earlier event; status 0 keeps bit 0.
         if let Some(n) = sched::get(tid).ok().and_then(|t| t.bound_notification) {
-            let _ = notification::signal(n, 1);
+            let payload = 1 | ((status as u32 as u64) << 32);
+            let _ = notification::signal(n, payload);
         }
     }
     // ADR-026: last thread out retires the process.
@@ -893,7 +897,11 @@ mod tests {
             sched::get(client).unwrap().state,
             crate::sched::State::Exited(-1)
         ));
-        assert_eq!(notification::pending(n), Ok(1));
+        assert_eq!(
+            notification::pending(n),
+            Ok(1 | ((-1i32 as u32 as u64) << 32)),
+            "death payload: bit 0 = event, bits 32.. = raw exit status"
+        );
     }
 
     /// Helper: run entry::thread_invoke via dispatch INVOKE.

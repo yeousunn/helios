@@ -249,7 +249,59 @@ impl AddressSpace {
             base,
             flags,
         });
+        self.merge_neighbors(slot);
         Ok(base.unwrap_or(PhysAddr::new(0)))
+    }
+
+    /// Coalesce a freshly inserted region with adjacent regions that have
+    /// identical flags and contiguous backing (ADR-030 consequence: keeps
+    /// the region table small under loader/heap map patterns). Per-page
+    /// overrides (`page_frames`) key on global page index and survive
+    /// merging untouched.
+    fn merge_neighbors(&mut self, slot: usize) {
+        let Some(new) = self.regions[slot] else {
+            return;
+        };
+        // Left neighbor: ends exactly where `new` begins.
+        let left = self.regions.iter().position(|r| {
+            matches!(r, Some(m)
+            if m.flags == new.flags
+                && m.vaddr.as_u64() + m.pages * PAGE_SIZE as u64 == new.vaddr.as_u64()
+                && match (m.base, new.base) {
+                    (Some(a), Some(b)) => {
+                        a.as_u64() + m.pages * PAGE_SIZE as u64 == b.as_u64()
+                    }
+                    (None, None) => true,
+                    _ => false,
+                })
+        });
+        if let Some(l) = left {
+            let mut m = self.regions[l].take().unwrap();
+            m.pages += new.pages;
+            self.regions[slot] = Some(m);
+            // Re-merge rightward from the grown region.
+            self.merge_neighbors(slot);
+            return;
+        }
+        // Right neighbor: begins exactly where `new` ends.
+        let right = self.regions.iter().position(|r| {
+            matches!(r, Some(m)
+            if m.flags == new.flags
+                && m.vaddr.as_u64() == new.vaddr.as_u64() + new.pages * PAGE_SIZE as u64
+                && match (new.base, m.base) {
+                    (Some(a), Some(b)) => {
+                        a.as_u64() + new.pages * PAGE_SIZE as u64 == b.as_u64()
+                    }
+                    (None, None) => true,
+                    _ => false,
+                })
+        });
+        if let Some(r) = right {
+            let m = self.regions[r].take().unwrap();
+            if let Some(n) = self.regions[slot].as_mut() {
+                n.pages += m.pages;
+            }
+        }
     }
 
     /// Install backend entries page by page (called by the registry layer
@@ -996,5 +1048,90 @@ mod tests {
         // AS::DESTROY drops mappings + refcounts.
         destroy(as_id).unwrap();
         assert!(translate(as_id, vc).is_err());
+    }
+    #[test]
+    fn map_merges_adjacent_same_flag_regions() {
+        let as_id = setup();
+        let base = PhysAddr::new(0x14_0000);
+        track_frame(base);
+        // Three contiguous 1-page maps with identical flags/backing coalesce.
+        map(as_id, Vaddr(0x80_0000), 1, Some(base), MapFlags::READ).unwrap();
+        map(
+            as_id,
+            Vaddr(0x80_1000),
+            1,
+            Some(base.checked_add(PAGE_SIZE as u64).unwrap()),
+            MapFlags::READ,
+        )
+        .unwrap();
+        map(
+            as_id,
+            Vaddr(0x80_2000),
+            1,
+            Some(base.checked_add(2 * PAGE_SIZE as u64).unwrap()),
+            MapFlags::READ,
+        )
+        .unwrap();
+        // Internals: only one region covers all three pages.
+        let count = AS_TABLE.lock()[(as_id.0 - 1) as usize]
+            .as_ref()
+            .unwrap()
+            .space
+            .regions
+            .iter()
+            .flatten()
+            .count();
+        assert_eq!(count, 1, "three adjacent maps merged into one region");
+        // Translations still resolve per page.
+        assert_eq!(
+            translate(as_id, Vaddr(0x80_1000)).unwrap().0,
+            base.checked_add(PAGE_SIZE as u64).unwrap()
+        );
+
+        // Different flags do NOT merge.
+        map(
+            as_id,
+            Vaddr(0x80_3000),
+            1,
+            Some(base.checked_add(3 * PAGE_SIZE as u64).unwrap()),
+            MapFlags::READ.union(MapFlags::WRITE),
+        )
+        .unwrap();
+        let count = AS_TABLE.lock()[(as_id.0 - 1) as usize]
+            .as_ref()
+            .unwrap()
+            .space
+            .regions
+            .iter()
+            .flatten()
+            .count();
+        assert_eq!(count, 2, "flag change prevents merge");
+
+        // ANON regions merge too.
+        map(
+            as_id,
+            Vaddr(0x90_0000),
+            1,
+            None,
+            MapFlags::ANON.union(MapFlags::READ),
+        )
+        .unwrap();
+        map(
+            as_id,
+            Vaddr(0x90_1000),
+            1,
+            None,
+            MapFlags::ANON.union(MapFlags::READ),
+        )
+        .unwrap();
+        let count = AS_TABLE.lock()[(as_id.0 - 1) as usize]
+            .as_ref()
+            .unwrap()
+            .space
+            .regions
+            .iter()
+            .flatten()
+            .count();
+        assert_eq!(count, 3, "ANON pair merged (R map + RW map + ANON pair)");
     }
 }
