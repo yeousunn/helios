@@ -129,14 +129,19 @@ impl<'a, R: RawSyscalls> Syscalls<'a, R> {
         dst: Option<u32>,
     ) -> Result<Handle, Status> {
         let slot = dst.unwrap_or(FIRST_FREE_SLOT);
-        let args = [src as u64, slot as u64, rights.0 as u64, 0, 0, 0];
+        // Raw args are [cap, tag, w0, w1, w2, w3]: the kernel reads the
+        // destination slot from w0 and the rights from w1, and returns the
+        // new handle in w0 (previously this wrapper shifted every field).
+        let args = [src as u64, 0, slot as u64, rights.0 as u64, 0, 0];
         let r = self.raw.raw(number::CAP_MINT, args);
-        check(r.status).map(|_| r.tag as u32)
+        check(r.status).map(|_| r.words[0] as u32)
     }
 
     /// `cap_revoke`: mode 0 = `REVOKE_DERIVED` (keep cap), 1 = `DELETE`.
     pub fn cap_revoke(&mut self, cap: Handle, mode: u32) -> Result<(), Status> {
-        let args = [cap as u64, mode as u64, 0, 0, 0, 0];
+        // The kernel reads `mode` from w0 — not the tag slot (which is where
+        // it used to land, making every revoke a silent no-op).
+        let args = [cap as u64, 0, mode as u64, 0, 0, 0];
         check(self.raw.raw(number::CAP_REVOKE, args).status)
     }
 
@@ -307,7 +312,7 @@ mod tests {
     #[test]
     fn cap_mint_reads_handle_from_first_return_word_and_defaults_slot() {
         let mut raw = MockRaw::ok();
-        raw.reply.tag = 42;
+        raw.reply.words = [42, 0, 0, 0];
         {
             let mut sys = Syscalls::new(&mut raw);
             let h = sys
@@ -318,12 +323,13 @@ mod tests {
         }
         assert_eq!(raw.calls[0].0, number::CAP_MINT);
         assert_eq!(raw.calls[0].1[0], 8, "source handle");
-        assert_eq!(raw.calls[0].1[1], FIRST_FREE_SLOT as u64);
+        assert_eq!(raw.calls[0].1[2], FIRST_FREE_SLOT as u64, "w0 = slot");
         assert_eq!(
-            raw.calls[0].1[2],
-            Rights::SEND.union(Rights::GRANT).0 as u64
+            raw.calls[0].1[3],
+            Rights::SEND.union(Rights::GRANT).0 as u64,
+            "w1 = rights"
         );
-        assert_eq!(raw.calls[1].1[1], 11, "absolute slot");
+        assert_eq!(raw.calls[1].1[2], 11, "absolute slot");
     }
 
     #[test]
@@ -336,6 +342,7 @@ mod tests {
         }
         assert_eq!(raw.calls[0], (number::YIELD, [0; 6]));
         assert_eq!(raw.calls[1].0, number::CAP_REVOKE);
-        assert_eq!(raw.calls[1].1[..2], [5, 1]);
+        assert_eq!(raw.calls[1].1[0], 5, "cap");
+        assert_eq!(raw.calls[1].1[2], 1, "mode in w0");
     }
 }

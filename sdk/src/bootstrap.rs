@@ -239,7 +239,7 @@ mod tests {
         let (number, args) = raw.calls.last().unwrap();
         assert_eq!(*number, crate::syscall::number::CAP_REVOKE);
         assert_eq!(args[0], BOOTSTRAP_HANDLE as u64);
-        assert_eq!(args[1], 1, "DELETE mode");
+        assert_eq!(args[2], 1, "DELETE mode travels in w0 (raw args[2])");
     }
 
     #[test]

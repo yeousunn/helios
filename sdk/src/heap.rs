@@ -112,26 +112,32 @@ impl<'a, R: RawSyscalls> RegionSource<'a, R> {
         Ok((start, (count * self.chunk) as usize))
     }
 
-    /// Carve `len` bytes (page multiple) and map them at the next VA chunk.
-    /// Returns the mapped `(start, len)`.
+    /// Carve `len` bytes (page multiple) and map them at the next VA chunk,
+    /// **one 4 KiB carve+map per page**: the v1 `AddressSpace::MAP` invoke
+    /// maps exactly one page, and a frame cap always resolves to its base
+    /// page, so a single multi-page carve/map would leave every page after
+    /// the first unmapped (latent until a heap user outgrew 4 KiB/chunk).
     pub fn grow(&mut self, len: u64) -> Result<(usize, usize), Status> {
-        let mut carve = Message::new(methods::region::CARVE);
-        carve.words[0] = len;
-        carve.words[1] = 4096;
-        let reply = self.sys.invoke(self.region, &carve)?;
-        let frame = reply.words[0] as Handle;
-        if frame == 0 {
-            return Err(status::ENOMEM);
+        let start = self.next_va as usize;
+        let pages = len / 4096;
+        for i in 0..pages {
+            let mut carve = Message::new(methods::region::CARVE);
+            carve.words[0] = 4096;
+            carve.words[1] = 4096;
+            let reply = self.sys.invoke(self.region, &carve)?;
+            let frame = reply.words[0] as Handle;
+            if frame == 0 {
+                return Err(status::ENOMEM);
+            }
+
+            let mut map = Message::new(methods::aspace::MAP);
+            map.tag = map.tag.with_caps(1);
+            map.words[0] = self.next_va + i * 4096;
+            map.words[1] = HEAP_FLAGS as u64;
+            let _ = map.set_descriptor(0, CapSlot::pack(frame, Rights::default()));
+            self.sys.invoke(self.as_cap, &map)?;
         }
 
-        let mut map = Message::new(methods::aspace::MAP);
-        map.tag = map.tag.with_caps(1);
-        map.words[0] = self.next_va;
-        map.words[1] = HEAP_FLAGS as u64;
-        let _ = map.set_descriptor(0, CapSlot::pack(frame, Rights::default()));
-        self.sys.invoke(self.as_cap, &map)?;
-
-        let start = self.next_va as usize;
         self.next_va += len;
         Ok((start, len as usize))
     }
@@ -261,11 +267,13 @@ mod tests {
             "next VA follows the first chunk"
         );
 
+        // Per-page carve+map (v1 MAP maps one page; a frame cap always
+        // resolves to its base page).
         let (num, args) = raw.calls[0];
         assert_eq!(num, number::INVOKE);
         assert_eq!(args[0], 5, "invoke on the Region cap");
         assert_eq!(args[1] as u16, methods::region::CARVE);
-        assert_eq!(args[2], 0x2000, "w0 = length");
+        assert_eq!(args[2], 4096, "w0 = one page");
         assert_eq!(args[3], 4096, "w1 = alignment");
 
         let (num, args) = raw.calls[1];
@@ -275,6 +283,14 @@ mod tests {
         assert_eq!(args[2], 0xAA00_0000, "w0 = vaddr");
         assert_eq!(args[3], HEAP_FLAGS as u64, "w1 = R|W");
         assert_eq!(args[5] as u32, 1, "caps[0] = carved frame");
+
+        let (num, args) = raw.calls[2];
+        assert_eq!(num, number::INVOKE);
+        assert_eq!(args[1] as u16, methods::region::CARVE);
+        let (num, args) = raw.calls[3];
+        assert_eq!(num, number::INVOKE);
+        assert_eq!(args[1] as u16, methods::aspace::MAP);
+        assert_eq!(args[2], 0xAA00_1000, "second page of the chunk");
     }
 
     #[test]
@@ -300,7 +316,10 @@ mod tests {
             span = src.map_startup(3).unwrap();
         }
         assert_eq!(span, (0xBB00_0000, 3 * 0x2000));
-        assert_eq!(raw.count, 6, "3 chunks × (carve + map)");
+        assert_eq!(
+            raw.count, 12,
+            "3 chunks × 2 pages × (carve + map) — per-page, see grow()"
+        );
     }
 
     #[test]
