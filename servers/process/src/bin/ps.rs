@@ -43,6 +43,15 @@ static CHILD_PID: AtomicU64 = AtomicU64::new(0);
 static CHILD_THREAD: AtomicU32 = AtomicU32::new(0);
 static CHILD_NOTIF: AtomicU32 = AtomicU32::new(0);
 
+/// Pin the child's package handles immediately at mint time: register/spill
+/// reuse in the inlined spawn path has proven unreliable, so every value
+/// travels through a volatile atomic instead of a plain local.
+static CH_BOOT: AtomicU32 = AtomicU32::new(0);
+static CH_S0: AtomicU32 = AtomicU32::new(0);
+static CH_S1: AtomicU32 = AtomicU32::new(0);
+static CH_S2: AtomicU32 = AtomicU32::new(0);
+static CH_S3: AtomicU32 = AtomicU32::new(0);
+
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     let mut raw = X86_64Syscalls;
@@ -318,12 +327,18 @@ fn spawn_child(
         0b011,
     )?;
     craft_stack(sys, package, child_as, arg_off, arg_len)?;
-    // 4. Endpoints + notifications for the child's package.
+    // 4. Endpoints + notifications for the child's package (straight-line
+    // mints; no arrays — spill-slot reuse made the old form unreliable).
     let bootstrap_ep = invoke_w0(sys, factory, methods::factory::NEW_ENDPOINT, [0; 4])? as u32;
-    let mut sessions = [0u32; 4];
-    for slot in sessions.iter_mut() {
-        *slot = invoke_w0(sys, factory, methods::factory::NEW_NOTIFICATION, [0; 4])? as u32;
-    }
+    CH_BOOT.store(bootstrap_ep, Ordering::Relaxed);
+    let s0 = invoke_w0(sys, factory, methods::factory::NEW_NOTIFICATION, [0; 4])? as u32;
+    CH_S0.store(s0, Ordering::Relaxed);
+    let s1 = invoke_w0(sys, factory, methods::factory::NEW_NOTIFICATION, [0; 4])? as u32;
+    CH_S1.store(s1, Ordering::Relaxed);
+    let s2 = invoke_w0(sys, factory, methods::factory::NEW_NOTIFICATION, [0; 4])? as u32;
+    CH_S2.store(s2, Ordering::Relaxed);
+    let s3 = invoke_w0(sys, factory, methods::factory::NEW_NOTIFICATION, [0; 4])? as u32;
+    CH_S3.store(s3, Ordering::Relaxed);
     let exit_notif = invoke_w0(sys, factory, methods::factory::NEW_NOTIFICATION, [0; 4])? as u32;
     // 5. Child thread (ADR-017 packing; ADR-009 bootstrap at child handle 1).
     let mut m = Message::new(methods::factory::NEW_THREAD);
@@ -338,24 +353,26 @@ fn spawn_child(
     if thread_cap == 0 {
         return Err(ipc::status::ENOMEM);
     }
+    // 7. ADR-009 package (prefix only — no Factory for regular processes).
+    //    Stack array: the Vec form was silently corrupted (heap aliasing).
+    let session_rights = Rights::SIGNAL.union(Rights::RECV).union(Rights::GRANT);
+    let caps: [CapSlot; bootstrap::FIXED_CAPS] = [
+        CapSlot::pack(child_as, Rights::MAP.union(Rights::GRANT)),
+        CapSlot::pack(thread_cap, Rights::CONTROL),
+        CapSlot::pack(package.region, Rights::GRANT),
+        CapSlot::pack(CH_S0.load(Ordering::Relaxed), session_rights),
+        CapSlot::pack(CH_S1.load(Ordering::Relaxed), session_rights),
+        CapSlot::pack(CH_S2.load(Ordering::Relaxed), session_rights),
+        CapSlot::pack(CH_S3.load(Ordering::Relaxed), session_rights),
+        CapSlot::pack(service_ep, Rights::SEND.union(Rights::GRANT)),
+    ];
     // 6. PS's death binding on the child thread.
     let mut bind = Message::new(methods::thread::BIND_DEATH_NOTIFICATION);
     bind.tag = bind.tag.with_caps(1);
     let _ = bind.set_descriptor(0, CapSlot::pack(exit_notif, Rights::SIGNAL));
     sys.invoke(thread_cap, &bind)?;
-    // 7. ADR-009 package (prefix only — no Factory for regular processes).
-    let mut caps: Vec<CapSlot> = Vec::with_capacity(bootstrap::FIXED_CAPS);
-    caps.push(CapSlot::pack(child_as, Rights::MAP.union(Rights::GRANT)));
-    caps.push(CapSlot::pack(thread_cap, Rights::CONTROL));
-    caps.push(CapSlot::pack(package.region, Rights::GRANT));
-    for s in sessions {
-        caps.push(CapSlot::pack(
-            s,
-            Rights::SIGNAL.union(Rights::RECV).union(Rights::GRANT),
-        ));
-    }
-    caps.push(CapSlot::pack(service_ep, Rights::SEND.union(Rights::GRANT)));
-    bootstrap::deliver(sys, bootstrap_ep, &caps)?;
+
+    bootstrap::deliver(sys, CH_BOOT.load(Ordering::Relaxed), &caps)?;
     // 8. Publish for WAIT/KILL.
     CHILD_PID.store(pid, Ordering::Relaxed);
     CHILD_THREAD.store(thread_cap, Ordering::Relaxed);

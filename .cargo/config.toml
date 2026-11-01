@@ -14,9 +14,12 @@ RUST_TEST_THREADS = "1"
 #   - kernel-boot embeds `init` as the first userspace process (M2)
 #   - `init` embeds `ps` as the process server to spawn (M3)
 # Real environment variables still take precedence (force is false).
+#   - `ps` embeds `child` as the v0 SPAWN payload (Phase 2)
+#   - `init` also embeds `vfs` as the second system server (Phase 2)
 INIT_IMAGE = "target/x86_64-unknown-none/release/init"
 PS_IMAGE = "target/x86_64-unknown-none/release/ps"
 CHILD_IMAGE = "target/x86_64-unknown-none/release/child"
+VFS_IMAGE = "target/x86_64-unknown-none/release/vfs"
 
 # Bare-metal userspace binaries (init, ps) must be fixed-address ET_EXEC
 # images: the SDK ELF loader and the kernel boot path reject PIE (ET_DYN).

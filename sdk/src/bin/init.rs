@@ -53,7 +53,9 @@ const STEP_CHILD_READY: u64 = 8;
 const STEP_CONNECT: u64 = 9;
 const STEP_SPAWN_CHILD: u64 = 10;
 const STEP_WAIT: u64 = 11;
-const STEP_CHILD_EXIT: u64 = 12;
+const STEP_VFS_SPAWNED: u64 = 12;
+const STEP_VFS_READY: u64 = 13;
+const STEP_CHILD_EXIT: u64 = 14;
 const STEP_DONE: u64 = 0x0F;
 /// Failure marker family for exits: `0xDEAD_0000_00SS_EEEE` (step, errno).
 const FAIL: u64 = 0xDEAD_0000_0000_0000;
@@ -172,14 +174,14 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
         mark(raw, info.debug_ep, STEP_SPAWNED, SPAWN_SKIPPED);
         return Ok(());
     }
-    let pid = spawn_ps(raw, info, self_as, region)?;
-    mark(raw, info.debug_ep, STEP_SPAWNED, pid);
+    let ps = spawn_server(raw, info, self_as, region, PS_IMAGE, STEP_SPAWNED)?;
+    mark(raw, info.debug_ep, STEP_SPAWNED, ps.pid);
 
     // Step 8: ready callback — PS publishes its service endpoint as a
     // capability (descriptor 0) over the package's service-endpoint slot.
     let ready = {
         let mut sys = Syscalls::new(raw);
-        sys.recv(READY_EP.load(core::sync::atomic::Ordering::Relaxed))
+        sys.recv(ps.ready_ep)
             .map_err(|e| fail_code(STEP_CHILD_READY, e as u64))?
     };
     if ready.tag.label() != bootstrap::READY_LABEL || ready.words[0] != bootstrap::READY_MAGIC {
@@ -196,7 +198,13 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
     // keeps the version in w0; the three caps (session notification, arg
     // frame, result frame) overlay w1..w3 per the v1 message format; windows
     // are 4 KiB each (design §1.3) so no size words travel.
-    let session = mint(raw, info.factory, methods::factory::NEW_NOTIFICATION, 0xE6)?;
+    let session = mint(
+        raw,
+        info.factory,
+        methods::factory::NEW_NOTIFICATION,
+        STEP_CONNECT,
+        0xE6,
+    )?;
     let arg_frame = carve_frame(raw, region)?;
     let result_frame = carve_frame(raw, region)?;
     let conn = {
@@ -271,12 +279,51 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
     }
     mark(raw, info.debug_ep, STEP_WAIT, waited.words[1]);
 
-    // Step 12: shut PS down (KILL acks, then PS exits) and reap — the death
+    // Steps 12–13: the second system server — spawn the VFS (same package
+    // shape), accept its ready callback, then shut it down through its
+    // service endpoint (v0 KILL convention) and reap it.
+    if !HAS_VFS_IMAGE {
+        mark(raw, info.debug_ep, STEP_VFS_SPAWNED, SPAWN_SKIPPED);
+    } else {
+        let vfs = spawn_server(raw, info, self_as, region, VFS_IMAGE, STEP_VFS_SPAWNED)?;
+        mark(raw, info.debug_ep, STEP_VFS_SPAWNED, vfs.pid);
+        let ready = {
+            let mut sys = Syscalls::new(raw);
+            sys.recv(vfs.ready_ep)
+                .map_err(|e| fail_code(STEP_VFS_READY, e as u64))?
+        };
+        if ready.tag.label() != bootstrap::READY_LABEL || ready.words[0] != bootstrap::READY_MAGIC {
+            return Err(fail_code(STEP_VFS_READY, 0xE1));
+        }
+        let vfs_svc = ready
+            .descriptor(0)
+            .map(|cs| cs.handle())
+            .filter(|h| *h != 0)
+            .ok_or(fail_code(STEP_VFS_READY, 0xE2))?;
+        mark(raw, info.debug_ep, STEP_VFS_READY, ready.words[1]);
+        {
+            let mut sys = Syscalls::new(raw);
+            let kill = Message::new(methods::process::KILL);
+            let ack = sys
+                .call(vfs_svc, &kill)
+                .map_err(|e| fail_code(STEP_CHILD_EXIT, e as u64))?;
+            if ack.words[0] != 0 {
+                return Err(fail_code(STEP_CHILD_EXIT, 0xE3));
+            }
+        }
+        {
+            let mut sys = Syscalls::new(raw);
+            sys.recv(vfs.death)
+                .map_err(|e| fail_code(STEP_CHILD_EXIT, e as u64))?;
+        }
+    }
+
+    // Step 14: shut PS down (KILL acks, then PS exits) and reap — the death
     // notification fires when it exits (ADR-007 §6).
     {
         let mut sys = Syscalls::new(raw);
         let mut kill = Message::new(methods::process::KILL);
-        kill.words[0] = pid;
+        kill.words[0] = ps.pid;
         let ack = sys
             .call(session_ep, &kill)
             .map_err(|e| fail_code(STEP_CHILD_EXIT, e as u64))?;
@@ -284,10 +331,9 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
             return Err(fail_code(STEP_CHILD_EXIT, 0xE2));
         }
     }
-    let death = ps_death_handle(raw)?;
     let notified = {
         let mut sys = Syscalls::new(raw);
-        sys.recv(death)
+        sys.recv(ps.death)
             .map_err(|e| fail_code(STEP_CHILD_EXIT, e as u64))?
     };
     mark(raw, info.debug_ep, STEP_CHILD_EXIT, notified.tag.0);
@@ -310,27 +356,30 @@ fn carve_frame(raw: &mut X86_64Syscalls, region: Handle) -> Result<Handle> {
     Ok(handle)
 }
 
-/// The launcher's service endpoint for the spawned child, set by `spawn_ps`
-/// when building the package (prefix[7]).
-static READY_EP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-
-fn ps_death_handle(raw: &mut X86_64Syscalls) -> Result<Handle> {
-    let _ = raw;
-    DEATH_HANDLE.get().ok_or(fail_code(STEP_CHILD_EXIT, 0xE6))
+/// What a spawned server hands back to the launcher.
+struct ServerSpawn {
+    pid: u64,
+    /// The `init_ep` minted for this child (prefix[7]): its ready callback
+    /// arrives here.
+    ready_ep: Handle,
+    /// The child's death notification, bound to its thread at spawn.
+    death: Handle,
 }
 
-/// Spawn the process server: load `PS_IMAGE` into a fresh AS, mint its
-/// endpoints/notifications, create the thread, deliver the ADR-009 package,
-/// and bind its death notification. Returns the child pid.
-fn spawn_ps(
+/// Spawn a system server from an embedded image: fresh AS + ELF load,
+/// endpoints/notifications, thread, ADR-009 package (with Factory tail),
+/// death binding. `step` tags every failure for the serial marker stream.
+fn spawn_server(
     raw: &mut X86_64Syscalls,
     info: &BootInfo,
     self_as: Handle,
     region: Handle,
-) -> Result<u64> {
-    let image = ElfImage::parse(PS_IMAGE).map_err(|e| fail_code(STEP_SPAWNED, e as u64))?;
-    let ops = loader::plan(&image, INIT_SCRATCH_VA_BASE)
-        .map_err(|e| fail_code(STEP_SPAWNED, 0xE0_00 | (e as u64 & 0xFF)))?;
+    image: &[u8],
+    step: u64,
+) -> Result<ServerSpawn> {
+    let elf = ElfImage::parse(image).map_err(|e| fail_code(step, e as u64))?;
+    let ops = loader::plan(&elf, INIT_SCRATCH_VA_BASE)
+        .map_err(|e| fail_code(step, 0xE0_00 | (e as u64 & 0xFF)))?;
 
     let child_as = {
         let mut sys = Syscalls::new(raw);
@@ -338,11 +387,11 @@ fn spawn_ps(
             info.factory,
             &Message::new(methods::factory::NEW_ADDRESS_SPACE),
         )
-        .map_err(|e| fail_code(STEP_SPAWNED, 0xE0_01 | (e as u64 & 0xFF)))?
+        .map_err(|e| fail_code(step, 0xE0_01 | (e as u64 & 0xFF)))?
         .words[0] as Handle
     };
     if child_as == 0 {
-        return Err(fail_code(STEP_SPAWNED, 0xE0_02));
+        return Err(fail_code(step, 0xE0_02));
     }
 
     {
@@ -354,9 +403,9 @@ fn spawn_ps(
             child_as,
             region,
             self_as,
-            PS_IMAGE,
+            image,
         )
-        .map_err(|e| fail_code(STEP_SPAWNED, 0xE1_00 | (e as u64 & 0xFF)))?;
+        .map_err(|e| fail_code(step, 0xE1_00 | (e as u64 & 0xFF)))?;
         loader::map_anon(
             &mut sys,
             child_as,
@@ -364,16 +413,40 @@ fn spawn_ps(
             CHILD_STACK_PAGES,
             STACK_FLAGS,
         )
-        .map_err(|e| fail_code(STEP_SPAWNED, 0xE1_01 | (e as u64 & 0xFF)))?;
+        .map_err(|e| fail_code(step, 0xE1_01 | (e as u64 & 0xFF)))?;
     }
 
     // Endpoints + notifications for the package.
-    let bootstrap_ep = mint(raw, info.factory, methods::factory::NEW_ENDPOINT, 0xE2)?;
-    let init_ep = mint(raw, info.factory, methods::factory::NEW_ENDPOINT, 0xE3)?;
-    let death = mint(raw, info.factory, methods::factory::NEW_NOTIFICATION, 0xE4)?;
+    let bootstrap_ep = mint(
+        raw,
+        info.factory,
+        methods::factory::NEW_ENDPOINT,
+        step,
+        0xE2,
+    )?;
+    let init_ep = mint(
+        raw,
+        info.factory,
+        methods::factory::NEW_ENDPOINT,
+        step,
+        0xE3,
+    )?;
+    let death = mint(
+        raw,
+        info.factory,
+        methods::factory::NEW_NOTIFICATION,
+        step,
+        0xE4,
+    )?;
     let mut sessions = [0 as Handle; 4];
     for slot in sessions.iter_mut() {
-        *slot = mint(raw, info.factory, methods::factory::NEW_NOTIFICATION, 0xE5)?;
+        *slot = mint(
+            raw,
+            info.factory,
+            methods::factory::NEW_NOTIFICATION,
+            step,
+            0xE5,
+        )?;
     }
 
     // Child thread (ADR-017 packing): w0 = entry; caps[0] = AS (input),
@@ -382,17 +455,17 @@ fn spawn_ps(
         let mut sys = Syscalls::new(raw);
         let mut m = Message::new(methods::factory::NEW_THREAD);
         m.tag = m.tag.with_caps(3);
-        m.words[0] = image.entry;
+        m.words[0] = elf.entry;
         let _ = m.set_descriptor(0, CapSlot::pack(child_as, Rights::MAP.union(Rights::GRANT)));
         let _ = m.set_descriptor(1, CapSlot::NULL);
         let _ = m.set_descriptor(2, CapSlot::pack(bootstrap_ep, Rights::RECV));
         let reply = sys
             .invoke(info.factory, &m)
-            .map_err(|e| fail_code(STEP_SPAWNED, 0xE6_00 | (e as u64 & 0xFF)))?;
+            .map_err(|e| fail_code(step, 0xE6_00 | (e as u64 & 0xFF)))?;
         (reply.words[0] as Handle, reply.words[2])
     };
     if thread_cap == 0 {
-        return Err(fail_code(STEP_SPAWNED, 0xE6_01));
+        return Err(fail_code(step, 0xE6_01));
     }
 
     // Bind the child's death notification to its thread (ADR-007 §6).
@@ -402,7 +475,7 @@ fn spawn_ps(
         m.tag = m.tag.with_caps(1);
         let _ = m.set_descriptor(0, CapSlot::pack(death, Rights::SIGNAL));
         sys.invoke(thread_cap, &m)
-            .map_err(|e| fail_code(STEP_SPAWNED, 0xE7_00 | (e as u64 & 0xFF)))?;
+            .map_err(|e| fail_code(step, 0xE7_00 | (e as u64 & 0xFF)))?;
     }
 
     // ADR-009 package: §2.3 prefix + ADR-023 tail[0] = Factory.
@@ -418,51 +491,36 @@ fn spawn_ps(
     }
     caps.push(CapSlot::pack(init_ep, Rights::SEND.union(Rights::GRANT)));
     caps.push(CapSlot::pack(info.factory, Rights::ALL));
-    READY_EP.store(init_ep, core::sync::atomic::Ordering::Relaxed);
     {
         let mut sys = Syscalls::new(raw);
         bootstrap::deliver(&mut sys, bootstrap_ep, &caps)
-            .map_err(|e| fail_code(STEP_SPAWNED, 0xE8_00 | (e as u64 & 0xFF)))?;
+            .map_err(|e| fail_code(step, 0xE8_00 | (e as u64 & 0xFF)))?;
     }
 
-    DEATH_HANDLE.set(death);
-    Ok(pid)
+    Ok(ServerSpawn {
+        pid,
+        ready_ep: init_ep,
+        death,
+    })
 }
 
-fn mint(raw: &mut X86_64Syscalls, factory: Handle, method: u16, errno: u64) -> Result<Handle> {
+fn mint(
+    raw: &mut X86_64Syscalls,
+    factory: Handle,
+    method: u16,
+    step: u64,
+    errno: u64,
+) -> Result<Handle> {
     let mut sys = Syscalls::new(raw);
     let handle = sys
         .invoke(factory, &Message::new(method))
-        .map_err(|e| fail_code(STEP_SPAWNED, errno | (e as u64 & 0xFF)))?
+        .map_err(|e| fail_code(step, errno | (e as u64 & 0xFF)))?
         .words[0] as Handle;
     if handle == 0 {
-        return Err(fail_code(STEP_SPAWNED, errno | 0xFF));
+        return Err(fail_code(step, errno | 0xFF));
     }
     Ok(handle)
 }
-
-/// Tiny module-local state: the death notification handle for the reaper
-/// step (single-threaded init; no allocator needed). 0 = unset.
-struct DeathHandle(core::sync::atomic::AtomicU32);
-
-impl DeathHandle {
-    const fn new() -> Self {
-        Self(core::sync::atomic::AtomicU32::new(0))
-    }
-
-    fn set(&self, death: Handle) {
-        self.0.store(death, core::sync::atomic::Ordering::Relaxed);
-    }
-
-    fn get(&self) -> Option<Handle> {
-        match self.0.load(core::sync::atomic::Ordering::Relaxed) {
-            0 => None,
-            h => Some(h),
-        }
-    }
-}
-
-static DEATH_HANDLE: DeathHandle = DeathHandle::new();
 
 fn exit_with(code: u64) -> ! {
     Syscalls::new(&mut X86_64Syscalls).exit(code as i32)
