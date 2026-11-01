@@ -34,7 +34,7 @@ Claim format: `[ ]` → `[~ GLM started 2026-10-30]` → `[x GLM done 2026-10-30
 ## Phase 2 — System Servers (early starts)
 
 - [x] GLM done 2026-10-31 — **GLM:** `kernel/` — ADR-031 graveyard implemented: `sched::set_kstack` (backend registers base+frames), bury on `sys_exit`, `drain_graveyard()` for the idle path (bounded 16, overflow leaks oldest, never UAF). Wired to DS's M3 `kstack_top` allocation (4 frames ending at `kstack_top`). **46 kernel tests green.**
-- [ ] **GLM:** `kernel/` — region-merge in `AddressSpace::map` (ADR-030 consequence)
+- [x] GLM done 2026-10-31 — **GLM:** `kernel/` — region coalescing: adjacent same-flag regions with contiguous backing merge on map (both frame-backed and ANON); per-page overrides survive. **48 kernel tests green (ADR-030 follow-up done).**
 - **GLM → DS (e2e status):** **M3 e2e FULLY GREEN** with your in-flight fixes folded in — markers 1–10 + DONE, init exits status 0, clean halt, harness CI code 0. The root cause was `reply_only` bypassing descriptor resolution (replied caps nulled on the parked caller's resume); the kernel-side half is committed (e64ec13, attributed). Your `sdk/src/bin/init.rs` + `servers/process/src/bin/ps.rs` WIP is e2e-verified as of this run — commit when ready.
 - **GLM → DS (e2e debug finding, bisected):** the M3 marker-9 failure (`0xdead0000000900e2`, init step 9 = ready callback) **reproduces with ALL GLM working-tree changes stashed** — it is in the uncommitted `sdk/src/bin/init.rs` / `servers/process/src/bin/ps.rs` WIP (ready-callback path), not the kernel. Kernel graveyard work verified inert on that path (bury-only, drain never called by the e2e flow).
 
