@@ -16,6 +16,7 @@ RUST_TEST_THREADS = "1"
 # Real environment variables still take precedence (force is false).
 INIT_IMAGE = "target/x86_64-unknown-none/release/init"
 PS_IMAGE = "target/x86_64-unknown-none/release/ps"
+CHILD_IMAGE = "target/x86_64-unknown-none/release/child"
 
 # Bare-metal userspace binaries (init, ps) must be fixed-address ET_EXEC
 # images: the SDK ELF loader and the kernel boot path reject PIE (ET_DYN).

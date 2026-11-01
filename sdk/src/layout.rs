@@ -27,9 +27,15 @@ pub const VFS_HEAP_VA_BASE: u64 = 0x0000_4001_1000_0000;
 pub const HEAP_CHUNK: u64 = 64 * 1024;
 pub const HEAP_CHUNKS: u64 = 16;
 
-/// init (launcher) VA reservations: its own heap and loader scratch mappings.
+/// init (launcher) VA reservations: its own heap, loader scratch mappings,
+/// and the CONNECT arg window (client side writes request data there).
 pub const INIT_HEAP_VA_BASE: u64 = 0x0000_3F00_1000_0000;
 pub const INIT_SCRATCH_VA_BASE: u64 = 0x0000_3F00_2000_0000;
+pub const INIT_WINDOW_VA_BASE: u64 = 0x0000_3F00_3000_0000;
+
+/// PS (process server) loader scratch: transient self-mappings while crafting
+/// frames for children (ELF segments, the argv-carrying stack top page).
+pub const PS_SCRATCH_VA_BASE: u64 = 0x0000_4000_2000_0000;
 
 /// Initial stack for spawned processes: 64 KiB of ANON pages below
 /// `USER_STACK_TOP`.

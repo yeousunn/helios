@@ -29,7 +29,7 @@ use sdk::elf::ElfImage;
 use sdk::heap::{GlobalHeap, RegionSource};
 use sdk::layout::{
     CHILD_STACK_PAGES, HEAP_CHUNK, HEAP_CHUNKS, INIT_HEAP_VA_BASE, INIT_SCRATCH_VA_BASE,
-    USER_STACK_TOP,
+    INIT_WINDOW_VA_BASE, USER_STACK_TOP,
 };
 use sdk::loader;
 use sdk::methods;
@@ -51,7 +51,9 @@ const STEP_HEAP: u64 = 6;
 const STEP_SPAWNED: u64 = 7;
 const STEP_CHILD_READY: u64 = 8;
 const STEP_CONNECT: u64 = 9;
-const STEP_CHILD_EXIT: u64 = 10;
+const STEP_SPAWN_CHILD: u64 = 10;
+const STEP_WAIT: u64 = 11;
+const STEP_CHILD_EXIT: u64 = 12;
 const STEP_DONE: u64 = 0x0F;
 /// Failure marker family for exits: `0xDEAD_0000_00SS_EEEE` (step, errno).
 const FAIL: u64 = 0xDEAD_0000_0000_0000;
@@ -220,8 +222,57 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
         .ok_or(fail_code(STEP_CONNECT, 0xE2))?;
     mark(raw, info.debug_ep, STEP_CONNECT, conn.words[1]);
 
-    // Step 10: shut the child down (KILL acks, then PS exits) and reap — the
-    // death notification fires when it exits (ADR-007 §6).
+    // Step 10: SPAWN a child through PS (design §2.6). The argv blob travels
+    // in the arg window: map it into our own AS and write "42" — the child
+    // exits with argv[0], proving window → server → child-stack data flow.
+    {
+        let mut sys = Syscalls::new(raw);
+        let mut m = Message::new(methods::aspace::MAP);
+        m.tag = m.tag.with_caps(1);
+        m.words[0] = INIT_WINDOW_VA_BASE;
+        m.words[1] = 0b011; // R | W
+        let _ = m.set_descriptor(
+            0,
+            ipc::CapSlot::pack(arg_frame, ipc::Rights::READ.union(ipc::Rights::WRITE)),
+        );
+        sys.invoke(self_as, &m)
+            .map_err(|e| fail_code(STEP_SPAWN_CHILD, e as u64))?;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(b"42".as_ptr(), INIT_WINDOW_VA_BASE as *mut u8, 2);
+    }
+    let spawned = {
+        let mut sys = Syscalls::new(raw);
+        let mut m = Message::new(methods::process::SPAWN);
+        m.words[2] = 2; // argv: (off = 0, len = 2)
+        sys.call(session_ep, &m)
+            .map_err(|e| fail_code(STEP_SPAWN_CHILD, e as u64))?
+    };
+    if spawned.words[0] != 0 || spawned.words[1] == 0 {
+        // Encode the server status (and a nonzero pid check) for diagnosis.
+        return Err(fail_code(
+            STEP_SPAWN_CHILD,
+            0xE1 | ((spawned.words[0] as u64 & 0xFFFF) << 8),
+        ));
+    }
+    let child_pid = spawned.words[1];
+    mark(raw, info.debug_ep, STEP_SPAWN_CHILD, child_pid);
+
+    // Step 11: WAIT — blocking wait for the child's exit status (design §2.6).
+    let waited = {
+        let mut sys = Syscalls::new(raw);
+        let mut m = Message::new(methods::process::WAIT);
+        m.words[0] = child_pid;
+        sys.call(session_ep, &m)
+            .map_err(|e| fail_code(STEP_WAIT, e as u64))?
+    };
+    if waited.words[0] != 0 || waited.words[1] != 42 {
+        return Err(fail_code(STEP_WAIT, 0xE1 | (waited.words[1] << 8)));
+    }
+    mark(raw, info.debug_ep, STEP_WAIT, waited.words[1]);
+
+    // Step 12: shut PS down (KILL acks, then PS exits) and reap — the death
+    // notification fires when it exits (ADR-007 §6).
     {
         let mut sys = Syscalls::new(raw);
         let mut kill = Message::new(methods::process::KILL);

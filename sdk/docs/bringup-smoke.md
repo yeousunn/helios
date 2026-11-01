@@ -44,9 +44,25 @@ cargo build -p sdk --bin init --features user --target x86_64-unknown-none --rel
 | 6 | `...0006` | heap KiB (1024) | heap mapped (`self_as` + Region, ADR-023) |
 | 7 | `...0007` | child pid (or `0xFFFFFFFFFFFFFFFF` = no embedded image) | PS spawned: ELF loaded, package delivered |
 | 8 | `...0008` | heap KiB | PS sent its ready callback (`READY_MAGIC` in `w0`); its service endpoint arrives as capability descriptor 0 |
-| 9 | `...0009` | connection id (1) | `CONNECT` round-trip over the service endpoint: init transfers session notif + arg/result frames (4 KiB each), PS maps both windows and replies |
-| 10 | `...000a` | death-notification tag | init sent `KILL` (PS acks then exits); reaped via NOTIFIED |
+| 9 | `...0009` | connection id (1) | `CONNECT` round-trip over the service endpoint: init transfers session notif + arg/result frames (4 KiB each), PS maps both windows and replies with the connection endpoint (descriptor 0) |
+| 10 | `...000a` | child pid | `SPAWN` over the connection: argv blob in the arg window (`(off<<32)\|len` in `w2`); PS loads its embedded child image, crafts the stack, replies with pid + out-caps |
+| 11 | `...000b` | child exit status (42) | `WAIT`: PS parks on the child's death notification and reports the raw status (kernel payload: bit 0 = event, bits 32.. = status) |
+| 12 | `...000c` | death-notification tag | init sent `KILL` (PS acks then exits); reaped via NOTIFIED |
 | DONE | `0x494e49540000000f` | 0 | all passed |
+
+v0 conventions this smoke pins (all design §2.4/§2.6 provisional):
+
+- **`SPAWN` packing:** `w1` = program `(off,len)` — ignored v0 (PS loads the image
+  embedded via `CHILD_IMAGE`); `w2` = argv `(off << 32) | len`, blob read from the
+  **arg window**; `w3` = env (unused). Reply `w0 = status, w1 = pid`; descriptor 0 =
+  thread control (`CONTROL`), 1 = exit notification (`SIGNAL|RECV`).
+- **Child stack convention:** at entry `sp = USER_STACK_TOP`; PS crafts the top
+  page with `[sp-8] = argc`, `[sp-16] = argv[0] VA`; the entry stub captures both
+  into registers **before any push**, then moves `sp` below the header. String
+  bytes live at page offset 0x800 (parking them near the header got them
+  clobbered by the child's own early stack frames).
+- **`WAIT`** is blocking (parks the connection, design §2.6 note); it consumes the
+  child's death-notification word built by the kernel on exit.
 | fail | exit code `0xDEAD_0000_00SS_EEEE` (SS = step, EEEE = errno) | | |
 
 Build with the process server embedded (pipeline, ADR-023):
