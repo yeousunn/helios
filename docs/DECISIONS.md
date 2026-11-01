@@ -373,3 +373,10 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 - Context: Exited threads never free their per-thread kernel stacks (4 frames each) — the memory is still in use by the exiting thread itself at exit time (the exit runs ON the kstack), so immediate free is impossible. `frame::tests::full_lifecycle` baselines against the leak today.
 - Decision: A **graveyard list**: `sched` gains `Thread.kstack: Option<PhysAddrRange>` (set by the arch context backend when it first allocates a thread's kstack — boot/backed-owned allocation, kernel-owned bookkeeping). On `sys_exit`, instead of freeing, the thread's kstack range is pushed onto a bounded graveyard. The drain point is the idle path: `pick_next()` returning IDLE, or the next successful `switch_to` after the reaper runs — either way, code that is provably NOT running on the drained stacks frees them back to `frame::free`. Bounded (e.g. 16 ranges); overflow keeps the oldest unfreed (leak-bounded, never use-after-free).
 - Consequences: Long-running systems reclaim exited-thread stacks on idle; single-shot smokes unchanged. Requires the arch backend to report kstack bases (NV/DS interface, one registration fn: `sched::set_kstack(tid, base, frames)`). Tests: exit → graveyard push → drain frees → frame count restored.
+
+## ADR-032: Death-notification payload convention — bit 0 = event, bits 32.. = raw exit status
+- Proposed: DeepSeek 2026-11-01 (landed in `sys_exit` for PS's blocking `WAIT`); ratified GLM 2026-11-01
+- Status: ACCEPTED (amends ADR-007 §6's mechanism — payload was unspecified there)
+- Context: PS's `WAIT` needs the child's raw exit status; the payload was a bare `1`.
+- Decision: `sys_exit` signals bound death notifications with `1 | ((status as u32 as u64) << 32)`. OR-semantics note: a later signal cannot clear an earlier event; status 0 keeps bit 0. Consumed by PS `WAIT`; kernel test pins the convention. Single signal site.
+- Consequences: Future multi-thread process death (multi-thread reaper) must preserve the convention; POSIX personality can translate it to WEXITSTATUS-shaped data.
