@@ -46,9 +46,11 @@ pub enum LoadOp {
         flags: u32,
     },
     /// Copy `len` bytes from `src_off` in the image into the scratch page at
-    /// `scratch_vaddr` (offset 0).
+    /// `scratch_vaddr + offset`. `offset` mirrors the segment's intra-page
+    /// VADDR offset on its first page (`vaddr % PAGE`); always 0 afterwards.
     Copy {
         scratch_vaddr: u64,
+        offset: u32,
         src_off: u64,
         len: u32,
     },
@@ -133,6 +135,7 @@ fn plan_segment(seg: &ElfSegment, scratch: &mut u64, ops: &mut Vec<LoadOp>) -> R
         if want > 0 {
             ops.push(LoadOp::Copy {
                 scratch_vaddr: *scratch,
+                offset: copy_start as u32,
                 src_off: seg.offset + copied,
                 len: want as u32,
             });
@@ -253,13 +256,17 @@ pub fn execute(
             }
             LoadOp::Copy {
                 scratch_vaddr,
+                offset,
                 src_off,
                 len,
             } => {
                 let start = src_off as usize;
                 let end = start.checked_add(len as usize).ok_or(status::EBADARG)?;
                 let src = image.get(start..end).ok_or(status::EBADARG)?;
-                writer.write(scratch_vaddr, 0, src)?;
+                if offset as usize + src.len() > PAGE as usize {
+                    return Err(status::EBADARG);
+                }
+                writer.write(scratch_vaddr, offset, src)?;
             }
             LoadOp::ZeroFill {
                 scratch_vaddr,
@@ -358,6 +365,7 @@ mod tests {
             ops[3],
             LoadOp::Copy {
                 scratch_vaddr: 0x7000,
+                offset: 0,
                 src_off: 0,
                 len: 4096
             }
@@ -380,6 +388,7 @@ mod tests {
             ops[page2 + 2],
             LoadOp::Copy {
                 scratch_vaddr: 0x8000,
+                offset: 0,
                 src_off: 0x1000,
                 len: 0x800
             }
@@ -455,8 +464,11 @@ mod tests {
             offset: 0,
             len: 0x540
         }));
+        // First page of a segment with intra-page offset 0x540: the bytes
+        // land at scratch offset 0x540 (regression: used to copy at 0).
         assert!(ops.contains(&LoadOp::Copy {
             scratch_vaddr: 0x7000,
+            offset: 0x540,
             src_off: 0x540,
             len: 0x1000 - 0x540
         }));
@@ -466,6 +478,7 @@ mod tests {
         assert!(ops.iter().any(|op| matches!(
             op,
             LoadOp::Copy {
+                offset: 0,
                 src_off: 0x1000,
                 len: 0x6AF,
                 scratch_vaddr: 0x8000
