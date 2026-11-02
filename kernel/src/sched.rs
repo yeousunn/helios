@@ -727,17 +727,21 @@ pub fn drain_graveyard() -> usize {
     freed
 }
 
-/// Public exit-path hook: bury the exiting thread's kernel stack.
+/// Public exit-path hook: bury the exiting thread's kernel stack (logged,
+/// clobber hunt).
+/// Bury trace: log the buried range at bury time (pairs with the FA trace
+/// to prove factory/page-table reuse of drained frames). Temporary.
 pub fn bury_thread_kstack_for_exit(id: ThreadId) {
-    bury_thread_kstack(id);
-}
-
-/// Bury a thread's kstack on exit (called by sys_exit teardown).
-fn bury_thread_kstack(id: ThreadId) {
     if let Ok(t) = get(id) {
         if t.kstack_top != 0 {
-            // M3 allocation: 16 KiB = 4 frames ending at kstack_top (ADR-031).
-            bury_kstack(t.kstack_top - 4 * crate::frame::FRAME_SIZE as u64, 4);
+            let base = t.kstack_top - 4 * 4096;
+            crate::kinfo!(
+                "BURIED kstack pid={} frames {:#x}..{:#x}",
+                t.process.0,
+                base,
+                t.kstack_top
+            );
+            bury_kstack(base, 4);
         }
     }
 }
