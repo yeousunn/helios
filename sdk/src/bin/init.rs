@@ -511,36 +511,55 @@ fn spawn_server(
     }
 
     // ADR-009 package: §2.3 prefix + ADR-023 tail[0] = Factory.
-    let mut caps: Vec<CapSlot> = Vec::with_capacity(9);
-    caps.push(CapSlot::pack(child_as, Rights::MAP.union(Rights::GRANT)));
-    caps.push(CapSlot::pack(
-        SP_THREAD.load(SpOrdering::Relaxed),
-        Rights::CONTROL,
-    ));
-    caps.push(CapSlot::pack(
-        SP_REGION.load(SpOrdering::Relaxed),
-        Rights::GRANT,
-    ));
-    for s in [
-        SP_S0.load(SpOrdering::Relaxed),
-        SP_S1.load(SpOrdering::Relaxed),
-        SP_S2.load(SpOrdering::Relaxed),
-        SP_S3.load(SpOrdering::Relaxed),
-    ] {
-        caps.push(CapSlot::pack(
-            s,
-            Rights::SIGNAL.union(Rights::RECV).union(Rights::GRANT),
-        ));
-    }
-    caps.push(CapSlot::pack(
-        SP_INIT_EP.load(SpOrdering::Relaxed),
-        Rights::SEND.union(Rights::GRANT),
-    ));
-    caps.push(CapSlot::pack(info.factory, Rights::ALL));
+    // Manual chunked delivery: values are loaded from `.data` atomics and
+    // packed into the outgoing Message immediately before each send, so no
+    // stack structure spans a syscall (a live-local clobbering kernel bug —
+    // see TASKS.md — corrupts anything that does; proven by the four
+    // spawn-handle pins).
+    let sr = Rights::SIGNAL.union(Rights::RECV).union(Rights::GRANT);
+    let boot = SP_BOOT.load(SpOrdering::Relaxed);
     {
         let mut sys = Syscalls::new(raw);
-        bootstrap::deliver(&mut sys, SP_BOOT.load(SpOrdering::Relaxed), &caps)
+        let mut hdr = Message::new(bootstrap::PACKAGE_LABEL);
+        hdr.words[0] = bootstrap::FIXED_CAPS as u64 + 1;
+        sys.send(boot, &hdr)
             .map_err(|e| fail_code(step, 0xE8_00 | (e as u64 & 0xFF)))?;
+
+        let mut c1 = Message::new(bootstrap::PACKAGE_LABEL);
+        c1.tag = c1.tag.with_caps(4);
+        let _ = c1.set_descriptor(0, CapSlot::pack(child_as, Rights::MAP.union(Rights::GRANT)));
+        let _ = c1.set_descriptor(
+            1,
+            CapSlot::pack(SP_THREAD.load(SpOrdering::Relaxed), Rights::CONTROL),
+        );
+        let _ = c1.set_descriptor(
+            2,
+            CapSlot::pack(SP_REGION.load(SpOrdering::Relaxed), Rights::GRANT),
+        );
+        let _ = c1.set_descriptor(3, CapSlot::pack(SP_S0.load(SpOrdering::Relaxed), sr));
+        sys.send(boot, &c1)
+            .map_err(|e| fail_code(step, 0xE8_01 | (e as u64 & 0xFF)))?;
+
+        let mut c2 = Message::new(bootstrap::PACKAGE_LABEL);
+        c2.tag = c2.tag.with_caps(4);
+        let _ = c2.set_descriptor(0, CapSlot::pack(SP_S1.load(SpOrdering::Relaxed), sr));
+        let _ = c2.set_descriptor(1, CapSlot::pack(SP_S2.load(SpOrdering::Relaxed), sr));
+        let _ = c2.set_descriptor(2, CapSlot::pack(SP_S3.load(SpOrdering::Relaxed), sr));
+        let _ = c2.set_descriptor(
+            3,
+            CapSlot::pack(
+                SP_INIT_EP.load(SpOrdering::Relaxed),
+                Rights::SEND.union(Rights::GRANT),
+            ),
+        );
+        sys.send(boot, &c2)
+            .map_err(|e| fail_code(step, 0xE8_02 | (e as u64 & 0xFF)))?;
+
+        let mut c3 = Message::new(bootstrap::PACKAGE_LABEL);
+        c3.tag = c3.tag.with_caps(1);
+        let _ = c3.set_descriptor(0, CapSlot::pack(info.factory, Rights::ALL));
+        sys.send(boot, &c3)
+            .map_err(|e| fail_code(step, 0xE8_03 | (e as u64 & 0xFF)))?;
     }
 
     Ok(ServerSpawn {

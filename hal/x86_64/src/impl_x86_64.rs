@@ -957,6 +957,15 @@ impl sched::ContextBackend for ContextBackendX86_64 {
                 core::hint::spin_loop();
             }
         }
+        // The first user thread's syscalls must stack on ITS kernel stack, not
+        // the boot stack: `start_first` bypasses `switch` (which is the only
+        // place that arms `CURRENT_KSTACK`), and dispatching on the boot stack
+        // leaked kernel frames into the wrong place (KSTACK GUARD, "live-local
+        // clobbering" family).
+        let top = kernel::sched::kstack_top_of(to);
+        if top != 0 {
+            set_kstack(top);
+        }
         let bootinfo = BOOTINFO_VA.load(core::sync::atomic::Ordering::Relaxed);
         // SAFETY: ring-3 segments exist in the installed GDT (`Gdt::install`)
         // and the page tables already contain the user mappings staged by the
