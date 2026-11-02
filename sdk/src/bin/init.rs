@@ -174,14 +174,16 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
         mark(raw, info.debug_ep, STEP_SPAWNED, SPAWN_SKIPPED);
         return Ok(());
     }
-    let ps = spawn_server(raw, info, self_as, region, PS_IMAGE, STEP_SPAWNED)?;
-    mark(raw, info.debug_ep, STEP_SPAWNED, ps.pid);
+    let ps_pid = spawn_server(raw, info, self_as, region, PS_IMAGE, STEP_SPAWNED)?;
+    let ps_ready_ep = SP_INIT_EP.load(SpOrdering::Relaxed);
+    let ps_death = SP_DEATH.load(SpOrdering::Relaxed);
+    mark(raw, info.debug_ep, STEP_SPAWNED, ps_pid);
 
     // Step 8: ready callback — PS publishes its service endpoint as a
     // capability (descriptor 0) over the package's service-endpoint slot.
     let ready = {
         let mut sys = Syscalls::new(raw);
-        sys.recv(ps.ready_ep)
+        sys.recv(ps_ready_ep)
             .map_err(|e| fail_code(STEP_CHILD_READY, e as u64))?
     };
     if ready.tag.label() != bootstrap::READY_LABEL || ready.words[0] != bootstrap::READY_MAGIC {
@@ -204,9 +206,10 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
         methods::factory::NEW_NOTIFICATION,
         STEP_CONNECT,
         0xE6,
-    )?;
-    let arg_frame = carve_frame(raw, region)?;
-    let result_frame = carve_frame(raw, region)?;
+    )
+    .map_err(|c| c | 0x0100)?;
+    let arg_frame = carve_frame(raw, region).map_err(|c| c | 0x0200)?;
+    let result_frame = carve_frame(raw, region).map_err(|c| c | 0x0300)?;
     let conn = {
         let mut sys = Syscalls::new(raw);
         let mut connect = Message::new(methods::process::CONNECT);
@@ -216,7 +219,7 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
         let _ = connect.set_descriptor(1, ipc::CapSlot::pack(arg_frame, ipc::Rights::READ));
         let _ = connect.set_descriptor(2, ipc::CapSlot::pack(result_frame, ipc::Rights::WRITE));
         sys.call(svc, &connect)
-            .map_err(|e| fail_code(STEP_CONNECT, e as u64))?
+            .map_err(|e| fail_code(STEP_CONNECT, e as u64) | 0x0400)?
     };
     if conn.words[0] != 0 || conn.words[1] == 0 {
         return Err(fail_code(STEP_CONNECT, 0xE1));
@@ -285,11 +288,13 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
     if !HAS_VFS_IMAGE {
         mark(raw, info.debug_ep, STEP_VFS_SPAWNED, SPAWN_SKIPPED);
     } else {
-        let vfs = spawn_server(raw, info, self_as, region, VFS_IMAGE, STEP_VFS_SPAWNED)?;
-        mark(raw, info.debug_ep, STEP_VFS_SPAWNED, vfs.pid);
+        let vfs_pid = spawn_server(raw, info, self_as, region, VFS_IMAGE, STEP_VFS_SPAWNED)?;
+        let vfs_ready_ep = SP_INIT_EP.load(SpOrdering::Relaxed);
+        let vfs_death = SP_DEATH.load(SpOrdering::Relaxed);
+        mark(raw, info.debug_ep, STEP_VFS_SPAWNED, vfs_pid);
         let ready = {
             let mut sys = Syscalls::new(raw);
-            sys.recv(vfs.ready_ep)
+            sys.recv(vfs_ready_ep)
                 .map_err(|e| fail_code(STEP_VFS_READY, e as u64))?
         };
         if ready.tag.label() != bootstrap::READY_LABEL || ready.words[0] != bootstrap::READY_MAGIC {
@@ -313,7 +318,7 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
         }
         {
             let mut sys = Syscalls::new(raw);
-            sys.recv(vfs.death)
+            sys.recv(vfs_death)
                 .map_err(|e| fail_code(STEP_CHILD_EXIT, e as u64))?;
         }
     }
@@ -323,7 +328,7 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
     {
         let mut sys = Syscalls::new(raw);
         let mut kill = Message::new(methods::process::KILL);
-        kill.words[0] = ps.pid;
+        kill.words[0] = ps_pid;
         let ack = sys
             .call(session_ep, &kill)
             .map_err(|e| fail_code(STEP_CHILD_EXIT, e as u64))?;
@@ -333,7 +338,7 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
     }
     let notified = {
         let mut sys = Syscalls::new(raw);
-        sys.recv(ps.death)
+        sys.recv(ps_death)
             .map_err(|e| fail_code(STEP_CHILD_EXIT, e as u64))?
     };
     mark(raw, info.debug_ep, STEP_CHILD_EXIT, notified.tag.0);
@@ -356,16 +361,11 @@ fn carve_frame(raw: &mut X86_64Syscalls, region: Handle) -> Result<Handle> {
     Ok(handle)
 }
 
-/// What a spawned server hands back to the launcher.
-struct ServerSpawn {
-    pid: u64,
-    /// The `init_ep` minted for this child (prefix[7]): its ready callback
-    /// arrives here.
-    ready_ep: Handle,
-    /// The child's death notification, bound to its thread at spawn.
-    death: Handle,
-}
-
+/// What a spawned server hands back to the launcher: everything lives in the
+/// pinned `.data` atomics (SP_INIT_EP/SP_DEATH) and the function returns only
+/// the pid — a scalar return goes in registers, avoiding the compiler's
+/// struct-return (sret) slot entirely (it was observed corrupted across the
+/// spawn's syscalls; harness pins alone could not protect a compiler temp).
 // Pinned spawn handles, in .data (live locals across this inlined spawn path
 // were observed clobbered — a stale value silently mis-delivers caps and
 // misbinds death notifications; atomics are immune. Same fix as PS).
@@ -390,7 +390,7 @@ fn spawn_server(
     region: Handle,
     image: &[u8],
     step: u64,
-) -> Result<ServerSpawn> {
+) -> Result<u64> {
     SP_REGION.store(region, SpOrdering::Relaxed);
     let elf = ElfImage::parse(image).map_err(|e| fail_code(step, e as u64))?;
     let ops = loader::plan(&elf, INIT_SCRATCH_VA_BASE)
@@ -401,7 +401,7 @@ fn spawn_server(
     #[inline(never)]
     fn walk_probe(raw: &mut X86_64Syscalls, debug_ep: u32, tag: u64) {
         let mut sys = Syscalls::new(raw);
-        let mut m = Message::new(0xFFFF);
+        let mut m = Message::new(0xFFFE);
         m.words[0] = sdk::layout::USER_STACK_TOP - 0x1000;
         m.words[1] = tag;
         let _ = sys.send(debug_ep, &m);
@@ -577,11 +577,7 @@ fn spawn_server(
             .map_err(|e| fail_code(step, 0xE8_03 | (e as u64 & 0xFF)))?;
     }
 
-    Ok(ServerSpawn {
-        pid,
-        ready_ep: SP_INIT_EP.load(SpOrdering::Relaxed),
-        death: SP_DEATH.load(SpOrdering::Relaxed),
-    })
+    Ok(pid)
 }
 
 fn mint(
