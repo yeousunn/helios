@@ -245,6 +245,7 @@ fn invoke(pid: ProcessId, tid: ThreadId, args: SyscallArgs) -> SyscallReturn {
 /// AddressSpace methods (syscall-abi §7). v0: kernel-wide VMM (ADR-008/
 /// 021) — MAP/UNMAP/PROTECT/SET_FAULT_POOL; FORK/DESTROY are ENOSYS until
 /// per-process VMM objects land (board: Phase 2 kernel task).
+
 fn as_invoke(pid: ProcessId, cap: &Capability, args: &SyscallArgs) -> SyscallReturn {
     use crate::aspace::{self, MapFlags, Vaddr};
     let as_id = cap.obj;
@@ -306,18 +307,10 @@ fn as_invoke(pid: ProcessId, cap: &Capability, args: &SyscallArgs) -> SyscallRet
                 Err(_) => SyscallReturn::err(ipc::status::ENOMEM),
             }
         }
-        UNMAP => {
-            crate::kinfo!(
-                "UNMAP: as={} vaddr={:#x} pages={}",
-                as_id.0,
-                vaddr.as_u64(),
-                msg.words[1].max(1)
-            );
-            match aspace::unmap(as_id, vaddr, msg.words[1].max(1)) {
-                Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
-                Err(_) => SyscallReturn::err(ipc::status::EBADARG),
-            }
-        }
+        UNMAP => match aspace::unmap(as_id, vaddr, msg.words[1].max(1)) {
+            Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
+            Err(_) => SyscallReturn::err(ipc::status::EBADARG),
+        },
         PROTECT => {
             let flags = MapFlags((msg.words[2] as u32) & 0b111);
             match aspace::protect(as_id, vaddr, flags) {

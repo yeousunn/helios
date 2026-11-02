@@ -200,11 +200,6 @@ fn stage_init(launch: &kernel::init::InitLaunch, image: &[u8]) -> (u64, u64) {
     const STACK_PAGES: u64 = 16;
     let stack_bottom = hal_x86_64::USER_STACK_TOP as u64 - STACK_PAGES * 4096;
     let sp = kernel::frame::alloc_contiguous(STACK_PAGES as usize).expect("frames for init stack");
-    kernel::kinfo!(
-        "stage: init user stack frames {:#x}..{:#x}",
-        sp.as_u64(),
-        sp.as_u64() + STACK_PAGES * 4096
-    );
     // SAFETY: freshly allocated, identity-mapped frames.
     unsafe { zero_phys(sp.as_u64(), STACK_PAGES * 4096) };
     aspace::map(
