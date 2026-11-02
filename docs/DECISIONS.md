@@ -390,3 +390,10 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
   2. **`sched::preempt()`**: kernel-side timer-tick hook — yields the current thread to its run queue and context-switches to the best next thread. Callable from a timer IRQ once hal wires the PIT (NV/DS); no-op-safe if no timer is registered. Priority model unchanged (strict priority + round-robin).
   3. **recv-timeout groundwork (design only, no ABI change yet):** parked threads gain an optional deadline field; the timer service (future) scans parked deadlines on tick. Filed, not implemented — timers need a time source ADR first.
 - Consequences: Multi-thread processes become creatable through ratified invoke semantics; the process server can offer pthreads-like spawns. Preemption is one hal-side IRQ registration away.
+
+## ADR-034: Monotonic time source — kernel::time clock registration
+- Proposed: GLM 2026-11-01 (groundwork for ADR-033 §3 recv-timeouts and the future timer service)
+- Status: ACCEPTED (GLM, kernel/ only)
+- Context: Servers (VFS `now_ns` stub) and the planned timer service need monotonic time. The hal Timer trait already defines `now_ns` (ADR-014) but the kernel has no time surface.
+- Decision: `kernel::time` — arch boot registers a `ClockFn` (`fn() -> u64` nanoseconds since boot) via `time::set_clock`; `time::now_ns()` returns it (0 until registered). Same registration-inversion pattern as console/backends (ADR-001/008/010/022). No syscalls added — time reaches userspace through a future timer/notification server per ADR-005's growth-in-protocols rule.
+- Consequences: recv-timeout deadlines and the timer service can be built on `now_ns`; the PIT/TSC wiring is hal-side (NV/DS) — one registration line at boot.

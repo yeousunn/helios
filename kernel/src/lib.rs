@@ -20,6 +20,7 @@ pub mod panic;
 pub mod proc;
 pub mod sched;
 pub mod syscall;
+pub mod time;
 
 #[cfg(test)]
 extern crate std;
