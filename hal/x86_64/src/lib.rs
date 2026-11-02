@@ -33,7 +33,9 @@ pub use impl_x86_64::*;
 pub use layout::*;
 
 #[cfg(target_arch = "x86_64")]
-pub use paging::{activate_as, enable_nx, flush_tlb_all, BACKEND_FACTORY_X86_64};
+pub use paging::{
+    activate_as, enable_nx, flush_tlb_all, probe_walk, root_of, BACKEND_FACTORY_X86_64,
+};
 
 #[cfg(not(target_arch = "x86_64"))]
 pub use impl_stub::*;

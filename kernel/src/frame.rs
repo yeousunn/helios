@@ -132,9 +132,9 @@ pub fn alloc() -> Option<PhysAddr> {
             if !slot.get(i) {
                 slot.set(i, true);
                 slot.used += 1;
-                let a = slot.region.base.as_u64() + i as u64 * FRAME_SIZE as u64;
-                crate::kinfo!("FA {:x}", a);
-                return Some(PhysAddr::new(a));
+                return Some(PhysAddr::new(
+                    slot.region.base.as_u64() + i as u64 * FRAME_SIZE as u64,
+                ));
             }
         }
     }
