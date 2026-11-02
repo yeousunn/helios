@@ -41,13 +41,17 @@ stubs! {
 /// rcx=rip, r8=cs). Reports and halts; never returns.
 #[no_mangle]
 extern "sysv64" fn exception_report(vector: u64, error: u64, cr2: u64, rip: u64, cs: u64) -> ! {
+    let cr3: u64;
+    // SAFETY: reading CR3 in the fatal handler.
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem)) };
     kernel::kerror!(
-        "EXCEPTION: vector={} error={:#x} cr2={:#x} rip={:#x} cs={:#x}",
+        "EXCEPTION: vector={} error={:#x} cr2={:#x} rip={:#x} cs={:#x} cr3={:#x}",
         vector,
         error,
         cr2,
         rip,
-        cs
+        cs,
+        cr3
     );
     if rip != 0 {
         // SAFETY: diagnostic read of the (mapped, faulting) code page; the
@@ -64,6 +68,50 @@ extern "sysv64" fn exception_report(vector: u64, error: u64, cr2: u64, rip: u64,
             bytes[6],
             bytes[7]
         );
+    }
+    if vector == 14 {
+        // Registry↔hardware PTE discriminator (clobber hunt): for page
+        // faults, walk the CURRENT AS root's hardware PTE for cr2 and print
+        // it next to the kernel registry's view. CR3 identifies the active
+        // AS root directly (roots are physical PML4 addresses).
+        if let Some(pa) = crate::paging::probe_walk(cr3 as usize, cr2) {
+            kernel::kerror!("  pte@cr2: hw-physical={:#x} (present)", pa);
+        } else {
+            kernel::kerror!("  pte@cr2: hw=NOT-PRESENT (cr3={:#x})", cr3);
+        }
+        // Root cross-check: walk AS 1's REGISTERED root for cr2 — if it is
+        // present there but not under the live CR3, the activation path is
+        // loading the wrong root; if both are absent, the backend install
+        // never landed (or was cleared).
+        if let Some(root1) = crate::paging::root_of(1) {
+            kernel::kerror!("  as1-root={:#x} live-cr3={:#x}", root1 as u64, cr3);
+            match crate::paging::probe_walk(root1, cr2) {
+                Some(pa) => {
+                    kernel::kerror!("  pte@cr2 via as1-root: PRESENT phys={:#x}", pa)
+                }
+                None => kernel::kerror!("  pte@cr2 via as1-root: NOT-PRESENT"),
+            }
+        } else {
+            kernel::kerror!("  as1-root: not registered");
+        }
+        // Kernel registry view (translate) for the same address.
+        let pid = kernel::proc::from_ref(kernel::sched::ObjRef(kernel::sched::current().0));
+        match kernel::proc::as_of(pid) {
+            Some(as_id) => match kernel::aspace::translate(as_id, kernel::aspace::Vaddr(cr2)) {
+                Ok((pa, fl)) => kernel::kerror!(
+                    "  registry@cr2: as={} -> phys={:#x} flags={}",
+                    as_id.0,
+                    pa.as_u64(),
+                    fl
+                ),
+                Err(e) => kernel::kerror!(
+                    "  registry@cr2: as={} -> {:?} (registry/hardware DIVERGE if hw present)",
+                    as_id.0,
+                    e
+                ),
+            },
+            None => kernel::kerror!("  registry@cr2: current thread has NO recorded AS"),
+        }
     }
     loop {
         // SAFETY: stopping the CPU after a fatal exception report.
