@@ -375,6 +375,55 @@ impl PagingBackend for PagingBackendX86_64 {
 /// Root PML4 physical addresses by AS id (index = `as_id - 1`). 0 = none.
 static AS_ROOTS: Mutex<[usize; MAX_BACKENDS]> = Mutex::new([0; MAX_BACKENDS]);
 
+/// Kernel-side hardware page-table walk (diagnostics): the physical address
+/// behind `vaddr` under the PML4 at `pml4_paddr`, or `None` when the walk
+/// stops at a not-present entry. Reads via the identity direct map.
+pub fn probe_walk(pml4_paddr: usize, vaddr: u64) -> Option<u64> {
+    const P: u64 = 1;
+    const PS: u64 = 1 << 7;
+    const ADDR: u64 = 0x000F_FFFF_FFFF_F000;
+    // SAFETY: physical addresses are identity-map readable in kernel context;
+    // this is a read-only diagnostics walk.
+    unsafe {
+        let e4 = *((pml4_paddr as *const u64).add(((vaddr >> 39) & 0x1FF) as usize));
+        if e4 & P == 0 {
+            return None;
+        }
+        let pdpt = (e4 & ADDR) as usize;
+        let e3 = *((pdpt as *const u64).add(((vaddr >> 30) & 0x1FF) as usize));
+        if e3 & P == 0 {
+            return None;
+        }
+        if e3 & PS != 0 {
+            return Some(e3 & 0x000F_FFFF_C000_0000);
+        }
+        let pd = (e3 & ADDR) as usize;
+        let e2 = *((pd as *const u64).add(((vaddr >> 21) & 0x1FF) as usize));
+        if e2 & P == 0 {
+            return None;
+        }
+        if e2 & PS != 0 {
+            return Some(e2 & 0x000F_FFFF_FFE0_0000);
+        }
+        let pt = (e2 & ADDR) as usize;
+        let e1 = *((pt as *const u64).add(((vaddr >> 12) & 0x1FF) as usize));
+        if e1 & P == 0 {
+            return None;
+        }
+        Some(e1 & ADDR)
+    }
+}
+
+/// The registered root page for `as_id`, if any.
+pub fn root_of(as_id: u64) -> Option<usize> {
+    let idx = (as_id as usize).wrapping_sub(1);
+    if idx >= MAX_BACKENDS {
+        return None;
+    }
+    let r = AS_ROOTS.lock()[idx];
+    (r != 0).then_some(r)
+}
+
 /// Activate an address space: load `as_id`'s root into CR3 (v0: no PCID;
 /// full TLB flush via the CR3 write). Returns false when the AS has no root.
 pub fn activate_as(as_id: u64) -> bool {
