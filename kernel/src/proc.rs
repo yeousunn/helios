@@ -76,7 +76,6 @@ pub fn destroy(pid: ProcessId) -> ProcResult<()> {
     if idx >= MAX_PROCESSES || !guard.used[idx] {
         return Err(ProcError::NoSuchProcess);
     }
-    crate::kinfo!("proc::destroy pid {}", pid.0);
     guard.used[idx] = false;
     guard.tables[idx] = CapTable::empty();
     guard.as_ids[idx] = None;
@@ -113,9 +112,6 @@ pub fn get_cap(pid: ProcessId, handle: u32) -> ProcResult<Capability> {
 pub fn install_cap(pid: ProcessId, cap: Capability) -> ProcResult<u32> {
     with_table(pid, |t| {
         let slot = t.insert(cap)?;
-        if pid.0 == 2 {
-            crate::kinfo!("PS install -> slot {} (handle {})", slot, slot + 1);
-        }
         Ok(slot as u32 + 1)
     })
 }
@@ -166,9 +162,6 @@ pub fn mint(
 /// Revoke: mode 0 = REVOKE_DERIVED (keep cap), 1 = DELETE (ADR-005 §5).
 /// Returns the number of caps removed (excluding the cap on DERIVED).
 pub fn revoke(pid: ProcessId, handle: u32, mode: u64) -> ProcResult<usize> {
-    if pid.0 == 2 {
-        crate::kinfo!("proc::revoke pid=2 handle={} mode={}", handle, mode);
-    }
     with_table(pid, |t| {
         let slot = slot_of(handle)?;
         match mode {
