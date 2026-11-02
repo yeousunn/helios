@@ -162,6 +162,12 @@ pub fn mint(
 /// Revoke: mode 0 = REVOKE_DERIVED (keep cap), 1 = DELETE (ADR-005 §5).
 /// Returns the number of caps removed (excluding the cap on DERIVED).
 pub fn revoke(pid: ProcessId, handle: u32, mode: u64) -> ProcResult<usize> {
+    let r = revoke_inner(pid, handle, mode);
+    crate::kinfo!("REVOKE pid={} h={} mode={} -> {:?}", pid.0, handle, mode, r);
+    r
+}
+
+fn revoke_inner(pid: ProcessId, handle: u32, mode: u64) -> ProcResult<usize> {
     with_table(pid, |t| {
         let slot = slot_of(handle)?;
         match mode {

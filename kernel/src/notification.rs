@@ -4,7 +4,7 @@
 use crate::sched::{self, ObjRef};
 use spin::Mutex;
 
-const MAX_NOTIFICATIONS: usize = 32;
+const MAX_NOTIFICATIONS: usize = 256;
 
 struct Engine {
     /// Pending signal mask per notification (sticky until received/cleared).

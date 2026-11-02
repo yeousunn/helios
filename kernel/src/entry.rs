@@ -556,8 +556,19 @@ fn install_ret(pid: ProcessId, obj: u64, typ: ObjType, rights: Rights, tag: Tag)
             rights,
         },
     ) {
-        Ok(h) => SyscallReturn::ok(tag, [h as u64, 0, 0, 0]),
-        Err(e) => SyscallReturn::err(map_proc(e)),
+        Ok(h) => {
+            crate::kinfo!("FACTORY: pid={} obj={:#x} handle={}", pid.0, obj, h);
+            SyscallReturn::ok(tag, [h as u64, 0, 0, 0])
+        }
+        Err(e) => {
+            crate::kinfo!(
+                "FACTORY: install FAILED pid={} obj={:#x} err={:?}",
+                pid.0,
+                obj,
+                e
+            );
+            SyscallReturn::err(map_proc(e))
+        }
     }
 }
 

@@ -426,7 +426,16 @@ pub fn sys_invoke(
     cap_handle: u32,
     msg: Message,
 ) -> SysResult<(i32, [u64; 4])> {
-    let cap = proc::get_cap(pid, cap_handle).map_err(|e| err(map_proc(e)))?;
+    let cap = proc::get_cap(pid, cap_handle).map_err(|e| {
+        if pid.0 == 1 {
+            crate::kinfo!(
+                "invoke NOCAP pid=1 h={} label={:#x}",
+                cap_handle,
+                msg.tag.label()
+            );
+        }
+        err(map_proc(e))
+    })?;
     match cap.typ {
         ObjType::Notification => match msg.tag.label() {
             1 => {

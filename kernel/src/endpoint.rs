@@ -39,7 +39,7 @@ impl Envelope {
     }
 }
 
-const MAX_ENDPOINTS: usize = 32;
+const MAX_ENDPOINTS: usize = 256;
 /// Waiter capacity; bounded by scheduler capacity.
 const MAX_WAITERS: usize = 64;
 

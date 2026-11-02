@@ -9,6 +9,7 @@
 # environment (force is false).
 [env]
 RUST_TEST_THREADS = "1"
+RUST_MIN_STACK = "16777216"
 # Pipeline convenience (path-resolution is workspace-relative in the build
 # scripts; missing files just mean "not embedded"):
 #   - kernel-boot embeds `init` as the first userspace process (M2)
