@@ -177,7 +177,7 @@ pub extern "C" fn _start() -> ! {
         };
         req = match sys.reply_recv(session_ep, &reply) {
             Ok(m) => m,
-            Err(_) => Syscalls::new(&mut raw).exit(0xE7),
+            Err(e) => Syscalls::new(&mut raw).exit(0xE7_00 | (e & 0xFF)),
         };
     }
 }
