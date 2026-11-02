@@ -245,7 +245,6 @@ fn invoke(pid: ProcessId, tid: ThreadId, args: SyscallArgs) -> SyscallReturn {
 /// AddressSpace methods (syscall-abi §7). v0: kernel-wide VMM (ADR-008/
 /// 021) — MAP/UNMAP/PROTECT/SET_FAULT_POOL; FORK/DESTROY are ENOSYS until
 /// per-process VMM objects land (board: Phase 2 kernel task).
-
 fn as_invoke(pid: ProcessId, cap: &Capability, args: &SyscallArgs) -> SyscallReturn {
     use crate::aspace::{self, MapFlags, Vaddr};
     let as_id = cap.obj;

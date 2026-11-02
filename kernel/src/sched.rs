@@ -625,12 +625,20 @@ pub fn switch_to(next: ThreadId) {
     let backend = *CTX.lock();
     // Activate the target's address space first: threads of different
     // processes must translate through their own page tables (CR3).
+    //
+    // BOTH failure modes are fatal-and-loud (clobber-hunt hardening): a
+    // user thread without a recorded AS, or an activation failure, would
+    // otherwise run under a FOREIGN CR3 — its user VAs silently resolve
+    // into another process's memory (the m44–m73 corruption class).
     if let Some(b) = backend {
-        if let Ok(t) = get(next) {
-            if let Some(as_id) = crate::proc::as_of(caps::ObjId(t.process.0)) {
-                b.activate_aspace(as_id.0);
-            }
-        }
+        let as_id = match get(next) {
+            Ok(t) => match crate::proc::as_of(caps::ObjId(t.process.0)) {
+                Some(as_id) => as_id,
+                None => switch_fatal_no_as(next),
+            },
+            Err(_) => switch_fatal_no_thread(next),
+        };
+        b.activate_aspace(as_id.0);
     }
     {
         let mut g = SCHED.lock();
@@ -642,6 +650,23 @@ pub fn switch_to(next: ThreadId) {
         b.switch(from, next);
         // Control returns here when THIS thread is scheduled again; `current`
         // was set by whoever switched back to us.
+    }
+}
+
+fn switch_fatal_no_as(next: ThreadId) -> ! {
+    crate::kerror!(
+        "switch: thread {} has no address space recorded — refusing foreign-CR3 run",
+        next.0
+    );
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+fn switch_fatal_no_thread(next: ThreadId) -> ! {
+    crate::kerror!("switch: thread {} not found in registry", next.0);
+    loop {
+        core::hint::spin_loop();
     }
 }
 
@@ -792,6 +817,12 @@ mod tests {
         *SCHED.lock() = None;
         set_context_backend(&MockCtx);
         let _ = init();
+        // switch_to now fatals on threads without a recorded AS (foreign-CR3
+        // guard): register the test process (pid 1) with the default AS.
+        crate::proc::reset_for_test();
+        let pid = crate::proc::create().unwrap();
+        assert_eq!(pid, caps::ObjId(1));
+        crate::proc::set_as(pid, super::super::aspace::DEFAULT_AS).unwrap();
     }
 
     #[test]
@@ -882,7 +913,7 @@ mod tests {
     #[test]
     fn switch_to_updates_current_via_backend() {
         setup();
-        let p = ObjRef(5);
+        let p = ObjRef(1);
         let t = spawn(p, 100).unwrap();
         assert_eq!(current(), IDLE);
         let next = pick_next();
@@ -952,7 +983,7 @@ mod tests {
     #[test]
     fn preempt_yields_and_switches() {
         setup();
-        let p = ObjRef(30);
+        let p = ObjRef(1);
         let a = spawn(p, 100).unwrap();
         let b = spawn(p, 100).unwrap();
         // a runs; a preempt tick must requeue a and run b.
