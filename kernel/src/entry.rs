@@ -531,6 +531,7 @@ fn factory_invoke(
             match crate::aspace::create() {
                 Ok(as_id) => {
                     crate::objreg::register(as_id, ObjType::AddressSpace, pid);
+                    crate::kinfo!("ASREG: as={} owner_pid={} (caller)", as_id.0, pid.0);
                     install_ret(
                         pid,
                         as_id.0,

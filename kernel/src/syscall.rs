@@ -517,6 +517,7 @@ pub fn sys_exit(tid: ThreadId, status: i32) -> SysResult<bool> {
                     let _ = endpoint::destroy_endpoint(ObjRef(obj.0));
                 }
                 ObjType::AddressSpace => {
+                    crate::kinfo!("ASDESTROY: as={} retired for pid={}", obj.0, pid.0);
                     let _ = crate::aspace::destroy(obj);
                 }
                 _ => {}
