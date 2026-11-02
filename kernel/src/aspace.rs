@@ -322,27 +322,67 @@ impl AddressSpace {
         }
     }
 
-    fn unmap(&mut self, be: &dyn PagingBackend, vaddr: Vaddr) -> Result<(), VmmError> {
-        if !vaddr.is_page_aligned() {
+    /// Page-granular unmap with region splitting (v0.1, DS anomaly fix):
+    /// removes exactly `[vaddr, vaddr + pages)` from whichever region covers
+    /// it. The pre-coalescing implementation took the WHOLE containing
+    /// region — after merging, a scratch-page UNMAP destroyed neighbouring
+    /// mappings (missing mid-stack PTEs, corrupted package data). Head/tail
+    /// splits keep the survivors; refs drop only for the unmapped pages.
+    fn unmap(&mut self, be: &dyn PagingBackend, vaddr: Vaddr, pages: u64) -> Result<(), VmmError> {
+        if !vaddr.is_page_aligned() || pages == 0 {
             return vmm_err(VmmError::BadVaddr);
         }
-        let slot = self
-            .regions
-            .iter()
-            .position(|r| matches!(r, Some(m) if m.contains(vaddr)))
-            .ok_or(VmmError::NotFound)?;
-        let m = self.regions[slot].take().unwrap();
+        let mut cur = vaddr.page_index();
+        let end_idx = cur.checked_add(pages).ok_or(VmmError::BadVaddr)?;
+        while cur < end_idx {
+            // Find the region covering `cur`; unmap its overlap and advance.
+            let Some((slot, m)) = self.regions.iter().enumerate().find_map(|(i, r)| {
+                r.as_ref()
+                    .filter(|m| m.contains(Vaddr(cur * PAGE_SIZE as u64)))
+                    .map(|m| (i, *m))
+            }) else {
+                // Hole in the span: already unmapped — skip (munmap semantics).
+                cur += 1;
+                continue;
+            };
+            let m_end = m.vaddr.page_index() + m.pages;
+            let piece_end = end_idx.min(m_end);
+            let head = cur - m.vaddr.page_index();
+            let count = piece_end - cur;
+            self.unmap_in_region(be, slot, &m, head as usize, count as usize)?;
+            cur = piece_end;
+        }
+        Ok(())
+    }
+
+    /// Remove `count` pages starting at region-relative page `head` from the
+    /// region in `slot` (splits head/tail as needed). Caller guarantees the
+    /// range is inside the region.
+    fn unmap_in_region(
+        &mut self,
+        be: &dyn PagingBackend,
+        slot: usize,
+        m: &Mapping,
+        head: usize,
+        count: usize,
+    ) -> Result<(), VmmError> {
+        let head = head as u64;
+        let count = count as u64;
+        let tail = m.pages - head - count;
+        let _ = self.regions[slot].take();
         if let Some(b) = m.base {
-            self.map_backend_unmap(be, m.vaddr, m.pages);
-            for i in 0..m.pages {
+            for i in head..(head + count) {
                 if let Some(pa) = b.checked_add(i * PAGE_SIZE as u64) {
                     FRAME_REFS.lock().release(pa);
                 }
             }
+            for i in head..(head + count) {
+                let va = Vaddr(m.vaddr.as_u64() + i * PAGE_SIZE as u64);
+                be.unmap_page(va);
+            }
         } else if m.flags.contains(MapFlags::ANON) {
-            // ANON: release every per-page frame in range.
-            let start = m.vaddr.page_index();
-            let end = start + m.pages;
+            let start = m.vaddr.page_index() + head;
+            let end = start + count;
             for i in 0..self.page_frames.len() {
                 let (p, f) = self.page_frames[i];
                 if p >= start && p < end {
@@ -352,14 +392,31 @@ impl AddressSpace {
                 }
             }
         }
-        Ok(())
-    }
-
-    fn map_backend_unmap(&self, be: &dyn PagingBackend, vaddr: Vaddr, pages: u64) {
-        for i in 0..pages {
-            let va = Vaddr(vaddr.as_u64() + i * PAGE_SIZE as u64);
-            be.unmap_page(va);
+        if head > 0 {
+            self.regions[slot] = Some(Mapping {
+                vaddr: m.vaddr,
+                pages: head,
+                base: m.base,
+                flags: m.flags,
+            });
         }
+        if tail > 0 {
+            let tail_base = m
+                .base
+                .and_then(|b| b.checked_add((head + count) * PAGE_SIZE as u64));
+            let free = self
+                .regions
+                .iter()
+                .position(|r| r.is_none())
+                .ok_or(VmmError::Overlap)?;
+            self.regions[free] = Some(Mapping {
+                vaddr: Vaddr((m.vaddr.page_index() + head + count) * PAGE_SIZE as u64),
+                pages: tail,
+                base: tail_base,
+                flags: m.flags,
+            });
+        }
+        Ok(())
     }
 
     fn protect(
@@ -603,7 +660,10 @@ impl AddressSpace {
         for i in 0..self.regions.len() {
             if let Some(m) = self.regions[i].take() {
                 if let Some(b) = m.base {
-                    self.map_backend_unmap(be, m.vaddr, m.pages);
+                    for j in 0..m.pages {
+                        let va = Vaddr(m.vaddr.as_u64() + j * PAGE_SIZE as u64);
+                        be.unmap_page(va);
+                    }
                     for j in 0..m.pages {
                         if let Some(pa) = b.checked_add(j * PAGE_SIZE as u64) {
                             FRAME_REFS.lock().release(pa);
@@ -629,70 +689,97 @@ fn vmm_err<T>(e: VmmError) -> Result<T, VmmError> {
 }
 
 /// Physical frame refcounts — kernel-global (correct for COW sharing
-/// across address spaces, ADR-022 §3).
+/// across address spaces, ADR-022 §3). Open-addressing hash keyed by frame
+/// address (v0.1: the 64-entry associative array saturated at the 4th
+/// process generation — DS anomaly 3). Tombstones keep probe chains valid.
 struct FrameRefs {
-    counts: [RefEntry; MAX_TRACKED],
+    slots: [RefEntry; REFS_CAPACITY],
 }
 
-const MAX_TRACKED: usize = 64;
+const REFS_CAPACITY: usize = 1024;
+const REF_EMPTY: u64 = u64::MAX;
+const REF_TOMBSTONE: u64 = u64::MAX - 1;
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct RefEntry {
-    addr: Option<PhysAddr>,
+    addr: u64, // REF_EMPTY = free, REF_TOMBSTONE = deleted
     count: usize,
 }
 
 impl FrameRefs {
-    fn acquire(&mut self, addr: PhysAddr) {
-        for e in self.counts.iter_mut() {
-            if e.addr == Some(addr) {
-                e.count += 1;
-                return;
-            }
-            if e.addr.is_none() {
-                *e = RefEntry {
-                    addr: Some(addr),
-                    count: 1,
-                };
-                return;
+    const fn new() -> Self {
+        FrameRefs {
+            slots: [RefEntry {
+                addr: REF_EMPTY,
+                count: 0,
+            }; REFS_CAPACITY],
+        }
+    }
+
+    fn probe_find(&self, addr: u64) -> Option<usize> {
+        let start = (addr as usize) % REFS_CAPACITY;
+        for i in 0..REFS_CAPACITY {
+            let idx = (start + i) % REFS_CAPACITY;
+            match self.slots[idx].addr {
+                REF_EMPTY => return None, // end of probe chain
+                a if a == addr => return Some(idx),
+                _ => {}
             }
         }
-        crate::kwarn!("FrameRefs table full at {}", addr);
+        None
+    }
+
+    fn probe_insert_slot(&self, addr: u64) -> Option<usize> {
+        let start = (addr as usize) % REFS_CAPACITY;
+        let mut tomb: Option<usize> = None;
+        for i in 0..REFS_CAPACITY {
+            let idx = (start + i) % REFS_CAPACITY;
+            match self.slots[idx].addr {
+                REF_EMPTY => return tomb.or(Some(idx)),
+                REF_TOMBSTONE => {
+                    if tomb.is_none() {
+                        tomb = Some(idx);
+                    }
+                }
+                a if a == addr => return Some(idx),
+                _ => {}
+            }
+        }
+        tomb
+    }
+
+    fn acquire(&mut self, addr: PhysAddr) {
+        let a = addr.as_u64();
+        match self.probe_insert_slot(a) {
+            Some(idx) => {
+                self.slots[idx].addr = a;
+                self.slots[idx].count += 1;
+            }
+            None => crate::kwarn!("FrameRefs table full at {}", addr),
+        }
     }
 
     fn release(&mut self, addr: PhysAddr) -> usize {
-        for (i, e) in self.counts.iter_mut().enumerate() {
-            if e.addr == Some(addr) {
-                e.count -= 1;
-                let remaining = e.count;
+        let a = addr.as_u64();
+        match self.probe_find(a) {
+            Some(idx) => {
+                self.slots[idx].count -= 1;
+                let remaining = self.slots[idx].count;
                 if remaining == 0 {
                     let _ = frame::free(addr);
-                    self.counts[i] = RefEntry::default();
+                    self.slots[idx].addr = REF_TOMBSTONE;
+                    self.slots[idx].count = 0;
                 }
-                return remaining;
+                remaining
             }
+            None => 0,
         }
-        0
     }
 
     fn count(&self, addr: PhysAddr) -> usize {
-        self.counts
-            .iter()
-            .find(|e| e.addr == Some(addr))
-            .map(|e| e.count)
+        self.probe_find(addr.as_u64())
+            .map(|i| self.slots[i].count)
             .unwrap_or(0)
-    }
-}
-
-impl FrameRefs {
-    /// Fully const constructor (static init never builds stack temporaries).
-    const fn new() -> Self {
-        FrameRefs {
-            counts: [RefEntry {
-                addr: None,
-                count: 0,
-            }; MAX_TRACKED],
-        }
     }
 }
 
@@ -800,8 +887,8 @@ pub fn map(
     })
 }
 
-pub fn unmap(as_id: ObjId, vaddr: Vaddr) -> Result<(), VmmError> {
-    with_as(as_id, |space, be| space.unmap(be, vaddr))
+pub fn unmap(as_id: ObjId, vaddr: Vaddr, pages: u64) -> Result<(), VmmError> {
+    with_as(as_id, |space, be| space.unmap(be, vaddr, pages))
 }
 
 pub fn protect(as_id: ObjId, vaddr: Vaddr, flags: MapFlags) -> Result<(), VmmError> {
@@ -965,7 +1052,7 @@ mod tests {
         assert!(fl.contains(MapFlags::WRITE));
         assert_eq!(frame_refs(base), 2, "owner grant + mapping ref");
 
-        unmap(as_id, v).unwrap();
+        unmap(as_id, v, 1).unwrap();
         assert!(translate(as_id, v).is_err());
         assert_eq!(frame_refs(base), 1, "mapping ref released, owner ref kept");
 
@@ -975,7 +1062,7 @@ mod tests {
             map(as_id, Vaddr(0x40_0000), 1, None, MapFlags::ANON),
             Err(VmmError::Overlap)
         );
-        unmap(as_id, v).unwrap();
+        unmap(as_id, v, 1).unwrap();
     }
 
     #[test]
@@ -1133,5 +1220,120 @@ mod tests {
             .flatten()
             .count();
         assert_eq!(count, 3, "ANON pair merged (R map + RW map + ANON pair)");
+    }
+    #[test]
+    fn unmap_is_page_granular_in_merged_regions() {
+        // DS anomaly fix: UNMAP of one page inside a coalesced region must
+        // not destroy neighbouring mappings (was region-granular: a scratch
+        // UNMAP killed the child's stack pages + package data).
+        let as_id = setup();
+        let base = PhysAddr::new(0x16_0000);
+        // Owner ref on the base frame only; pages 2–3 hold pure mapping refs
+        // (unmap releases exactly one per unmapped page).
+        track_frame(base);
+        // Three adjacent maps coalesce into one 3-page region.
+        map(
+            as_id,
+            Vaddr(0xA0_0000),
+            1,
+            Some(base),
+            MapFlags::READ.union(MapFlags::WRITE),
+        )
+        .unwrap();
+        map(
+            as_id,
+            Vaddr(0xA0_1000),
+            1,
+            Some(base.checked_add(PAGE_SIZE as u64).unwrap()),
+            MapFlags::READ.union(MapFlags::WRITE),
+        )
+        .unwrap();
+        map(
+            as_id,
+            Vaddr(0xA0_2000),
+            1,
+            Some(base.checked_add(2 * PAGE_SIZE as u64).unwrap()),
+            MapFlags::READ.union(MapFlags::WRITE),
+        )
+        .unwrap();
+        assert_eq!(frame_refs(base), 2, "owner + merged mapping");
+
+        // Unmap the MIDDLE page.
+        unmap(as_id, Vaddr(0xA0_1000), 1).unwrap();
+        assert!(translate(as_id, Vaddr(0xA0_1000)).is_err(), "middle gone");
+        assert!(translate(as_id, Vaddr(0xA0_0000)).is_ok(), "head survives");
+        assert!(translate(as_id, Vaddr(0xA0_2000)).is_ok(), "tail survives");
+        // Refs: unmapped middle page fully released; head keeps owner+mapping;
+        // tail keeps its mapping.
+        std::println!(
+            "DBG refs base={:?} mid={:?} tail={:?}",
+            frame_refs(base),
+            frame_refs(base.checked_add(PAGE_SIZE as u64).unwrap()),
+            frame_refs(base.checked_add(2 * PAGE_SIZE as u64).unwrap())
+        );
+        assert_eq!(frame_refs(base), 2, "owner + head mapping ref");
+        assert_eq!(
+            frame_refs(base.checked_add(PAGE_SIZE as u64).unwrap()),
+            0,
+            "middle released"
+        );
+        assert_eq!(
+            frame_refs(base.checked_add(2 * PAGE_SIZE as u64).unwrap()),
+            1,
+            "tail mapping ref"
+        );
+
+        // Head and tail are now separate regions (split happened).
+        let count = AS_TABLE.lock()[(as_id.0 - 1) as usize]
+            .as_ref()
+            .unwrap()
+            .space
+            .regions
+            .iter()
+            .flatten()
+            .count();
+        assert_eq!(count, 2, "split into head + tail");
+
+        // Multi-page unmap spanning head..middle (with the hole skipped,
+        // munmap semantics). The tail is outside the span and survives.
+        unmap(as_id, Vaddr(0xA0_0000), 2).unwrap();
+        assert!(translate(as_id, Vaddr(0xA0_0000)).is_err());
+        assert!(translate(as_id, Vaddr(0xA0_1000)).is_err(), "hole skipped");
+        assert!(
+            translate(as_id, Vaddr(0xA0_2000)).is_ok(),
+            "tail survives (outside span)"
+        );
+        assert_eq!(frame_refs(base), 1, "only the owner ref remains");
+        assert_eq!(frame_refs(base.checked_add(PAGE_SIZE as u64).unwrap()), 0);
+
+        // ANON page-granular unmap: resolved page freed, sibling kept.
+        set_pool(as_id, PhysAddr::new(0x18_0000), 2 * PAGE_SIZE as u64).unwrap();
+        map(
+            as_id,
+            Vaddr(0xB0_0000),
+            1,
+            None,
+            MapFlags::ANON.union(MapFlags::READ),
+        )
+        .unwrap();
+        map(
+            as_id,
+            Vaddr(0xB0_1000),
+            1,
+            None,
+            MapFlags::ANON.union(MapFlags::READ),
+        )
+        .unwrap();
+        let f0 = resolve_fault(as_id, Vaddr(0xB0_0000), false).unwrap();
+        let f1 = resolve_fault(as_id, Vaddr(0xB0_1000), false).unwrap();
+        unmap(as_id, Vaddr(0xB0_0000), 1).unwrap();
+        assert!(translate(as_id, Vaddr(0xB0_0000)).is_err());
+        assert_eq!(
+            translate(as_id, Vaddr(0xB0_1000)).unwrap().0,
+            f1,
+            "sibling ANON page survives"
+        );
+        assert_eq!(frame_refs(f0), 0, "unmapped ANON page freed");
+        assert_eq!(frame_refs(f1), 1);
     }
 }

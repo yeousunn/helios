@@ -306,7 +306,7 @@ fn as_invoke(pid: ProcessId, cap: &Capability, args: &SyscallArgs) -> SyscallRet
                 Err(_) => SyscallReturn::err(ipc::status::ENOMEM),
             }
         }
-        UNMAP => match aspace::unmap(as_id, vaddr) {
+        UNMAP => match aspace::unmap(as_id, vaddr, msg.words[1].max(1)) {
             Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
             Err(_) => SyscallReturn::err(ipc::status::EBADARG),
         },
