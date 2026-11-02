@@ -207,7 +207,7 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
         STEP_CONNECT,
         0xE6,
     )
-    .map_err(|c| c | 0x0100)?;
+    .map_err(|c| c | 0x0100 | (((info.factory as u64) & 0xFF) << 24))?;
     let arg_frame = carve_frame(raw, region).map_err(|c| c | 0x0200)?;
     let result_frame = carve_frame(raw, region).map_err(|c| c | 0x0300)?;
     let conn = {
@@ -511,6 +511,7 @@ fn spawn_server(
         return Err(fail_code(step, 0xE6_01));
     }
     SP_THREAD.store(thread_cap, SpOrdering::Relaxed);
+    walk_probe(raw, info.debug_ep, 0xA5); // post-NewThread
 
     // Bind the child's death notification to its thread (ADR-007 §6).
     {
@@ -524,6 +525,8 @@ fn spawn_server(
         sys.invoke(SP_THREAD.load(SpOrdering::Relaxed), &m)
             .map_err(|e| fail_code(step, 0xE7_00 | (e as u64 & 0xFF)))?;
     }
+
+    walk_probe(raw, info.debug_ep, 0xA6); // post-bind-death
 
     // ADR-009 package: §2.3 prefix + ADR-023 tail[0] = Factory.
     // Manual chunked delivery: values are loaded from `.data` atomics and
@@ -576,6 +579,7 @@ fn spawn_server(
         sys.send(boot, &c3)
             .map_err(|e| fail_code(step, 0xE8_03 | (e as u64 & 0xFF)))?;
     }
+    walk_probe(raw, info.debug_ep, 0xA7); // post-package
 
     Ok(pid)
 }

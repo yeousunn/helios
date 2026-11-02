@@ -123,6 +123,38 @@ pub fn init(regions: &[Region]) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Mark a physical range as permanently in use (kernel image, boot stack,
+/// boot page tables — ADR-035): frames inside a reserved range are never
+/// handed out. Call right after `init`, before any allocation. The range is
+/// rounded outward to frame boundaries.
+pub fn reserve(base: PhysAddr, len: u64) -> Result<(), &'static str> {
+    let mut guard = ALLOCATOR.lock();
+    let inner = guard.as_mut().ok_or("allocator not initialized")?;
+    let first = base.as_u64() / FRAME_SIZE as u64;
+    let count = len.div_ceil(FRAME_SIZE as u64);
+    let mut marked = 0;
+    for slot in inner.regions.iter_mut().flatten() {
+        let rbase = slot.region.base.as_u64();
+        let rframes = slot.region.frame_count() as u64;
+        let r_end = rbase + rframes * FRAME_SIZE as u64;
+        if base.as_u64() >= r_end || base.as_u64() + len <= rbase {
+            continue;
+        }
+        for f in first..(first + count) {
+            let idx = ((f * FRAME_SIZE as u64) - rbase) / FRAME_SIZE as u64;
+            if idx < rframes && !slot.get(idx as usize) {
+                slot.set(idx as usize, true);
+                slot.used += 1;
+                marked += 1;
+            }
+        }
+    }
+    if marked == 0 {
+        return Err("reserved range outside managed regions");
+    }
+    Ok(())
+}
+
 /// Allocate one frame. Returns its physical address.
 pub fn alloc() -> Option<PhysAddr> {
     let mut guard = ALLOCATOR.lock();
