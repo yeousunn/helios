@@ -36,7 +36,7 @@ Claim format: `[ ]` → `[~ GLM started 2026-10-31]` → `[x GLM done 2026-10-31
 
 ## Phase 3 — POSIX Personality (in progress)
 
-- [~ GLM started 2026-11-01] **GLM:** `kernel/` — threads, context switch, priority scheduler improvements for multi-process (in-process thread creation sharing the parent AS + cap table; preemption hook for the timer; recv-timeout groundwork)
+- [x] GLM done 2026-11-01 — **GLM:** `kernel/` — multi-process scheduler improvements (ADR-033): **`Thread::THREAD_CREATE` (invoke id 13, CONTROL-gated)** — in-process threads sharing the target's AS + capability table (pthreads-shaped; the last-thread-exit reaper already handles multi-thread death); **`sched::preempt()`** timer-tick hook (yield + round-robin switch, ready for the hal PIT IRQ); recv-timeout design filed (needs a time-source ADR first). Hermetic frame test (test-only allocator reset — kills the cross-module baseline brittleness). **51 kernel tests green; e2e unaffected (DS's VFS WIP remains the live front).**
 - [ ] DS — `servers/process/` — serve loop over IPC (currently protocol modules + server core only)
 - [ ] DS — `sdk/` — POSIX personality (Linux syscall emulation)
 - [ ] DS — `servers/vfs/` — READ_BULK + VFS binary startup once `[[bin]]` target added
