@@ -125,17 +125,21 @@ fn kstack_guard() {
     unsafe { core::arch::asm!("mov {0}, rsp", out(reg) rsp, options(nostack)) };
     // The dispatcher frame must sit within this thread's 16 KiB kernel stack.
     if rsp > top || rsp <= top - 16 * 1024 {
-        crate::uart_writer("
+        crate::uart_writer(
+            "
 [kernel] KSTACK GUARD: dispatch off-stack
-");
+",
+        );
         crate::uart_writer("  tid=");
         uart_hex(tid.0);
         crate::uart_writer(" rsp=");
         uart_hex(rsp);
         crate::uart_writer(" expected_top=");
         uart_hex(top);
-        crate::uart_writer("
-");
+        crate::uart_writer(
+            "
+",
+        );
         // Halt loudly instead of corrupting further.
         loop {
             // SAFETY: halting on a detected kernel-stack violation.

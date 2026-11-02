@@ -306,10 +306,18 @@ fn as_invoke(pid: ProcessId, cap: &Capability, args: &SyscallArgs) -> SyscallRet
                 Err(_) => SyscallReturn::err(ipc::status::ENOMEM),
             }
         }
-        UNMAP => match aspace::unmap(as_id, vaddr, msg.words[1].max(1)) {
-            Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
-            Err(_) => SyscallReturn::err(ipc::status::EBADARG),
-        },
+        UNMAP => {
+            crate::kinfo!(
+                "UNMAP: as={} vaddr={:#x} pages={}",
+                as_id.0,
+                vaddr.as_u64(),
+                msg.words[1].max(1)
+            );
+            match aspace::unmap(as_id, vaddr, msg.words[1].max(1)) {
+                Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
+                Err(_) => SyscallReturn::err(ipc::status::EBADARG),
+            }
+        }
         PROTECT => {
             let flags = MapFlags((msg.words[2] as u32) & 0b111);
             match aspace::protect(as_id, vaddr, flags) {
