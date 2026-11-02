@@ -380,3 +380,13 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 - Context: PS's `WAIT` needs the child's raw exit status; the payload was a bare `1`.
 - Decision: `sys_exit` signals bound death notifications with `1 | ((status as u32 as u64) << 32)`. OR-semantics note: a later signal cannot clear an earlier event; status 0 keeps bit 0. Consumed by PS `WAIT`; kernel test pins the convention. Single signal site.
 - Consequences: Future multi-thread process death (multi-thread reaper) must preserve the convention; POSIX personality can translate it to WEXITSTATUS-shaped data.
+
+## ADR-033: In-process thread creation (Thread::THREAD_CREATE) + preemption hook
+- Proposed: GLM 2026-11-01 (Phase 3 reshuffle task: multi-process/multi-thread scheduler improvements)
+- Status: ACCEPTED (GLM, kernel/ only)
+- Context: v0 `Factory::NEW_THREAD` always creates a NEW process — there is no way to add a thread to an EXISTING process (POSIX pthreads/fork-threads need it; the sys_exit last-thread reaper already supports multi-thread processes).
+- Decision:
+  1. **`Thread::THREAD_CREATE` (invoke id 13, CONTROL right):** spawns a thread in the TARGET thread's process — shares its AS and capability table. w0 = entry PC; new thread gets DEFAULT_PRIORITY (SET_PRIORITY refines) and is registered in `objreg` under the same owner pid. Returns the new thread-cap handle (CONTROL|GRANT) in w0, tid in w1. Death notifications stay per-thread (BIND_DEATH_NOTIFICATION), process death still fires on last-thread exit (existing reaper).
+  2. **`sched::preempt()`**: kernel-side timer-tick hook — yields the current thread to its run queue and context-switches to the best next thread. Callable from a timer IRQ once hal wires the PIT (NV/DS); no-op-safe if no timer is registered. Priority model unchanged (strict priority + round-robin).
+  3. **recv-timeout groundwork (design only, no ABI change yet):** parked threads gain an optional deadline field; the timer service (future) scans parked deadlines on tick. Filed, not implemented — timers need a time source ADR first.
+- Consequences: Multi-thread processes become creatable through ratified invoke semantics; the process server can offer pthreads-like spawns. Preemption is one hal-side IRQ registration away.

@@ -210,6 +210,12 @@ pub fn free_count() -> usize {
 }
 
 #[cfg(test)]
+pub(crate) fn reset_for_test() {
+    let mut guard = ALLOCATOR.lock();
+    *guard = None;
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -223,17 +229,13 @@ mod tests {
 
     #[test]
     fn full_lifecycle() {
+        // Hermetic: reset the allocator (test-only) so this test is
+        // independent of what earlier test modules leaked.
+        reset_for_test();
         let region = Region::new(PhysAddr::new(0x1000), 64 * FRAME_SIZE as u64).unwrap();
-        // entry-module tests may have seeded the identical region first.
-        let _ = init(&[region]);
-        // Tests run in one process; thread-creating tests before this one hold
-        // one 16 KiB kstack (4 frames) + 1 scratch frame that v0 never
-        // reclaims (exit does not free stacks yet — see TASKS.md follow-up).
-        assert!(
-            free_count() >= 59,
-            "allocator leak beyond the known kstack baseline at test start"
-        );
+        init(&[region]).expect("init once (post-reset)");
         let base = free_count();
+        assert_eq!(base, 64);
         assert!(init(&[region]).is_err(), "re-init must be rejected");
 
         let a = alloc().unwrap();

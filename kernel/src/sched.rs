@@ -717,6 +717,22 @@ fn bury_thread_kstack(id: ThreadId) {
     }
 }
 
+/// Timer-tick preemption hook (ADR-033 §2): yields the current thread to
+/// its run queue and switches to the best next thread. Callable from a
+/// timer IRQ once the hal registers one; safe to call spuriously.
+/// Returns the thread switched to (IDLE = nothing else runnable).
+pub fn preempt() -> ThreadId {
+    let cur = current();
+    if cur != IDLE {
+        let _ = yield_now(cur);
+    }
+    let next = pick_next();
+    if next != cur && next != IDLE {
+        switch_to(next);
+    }
+    next
+}
+
 /// Are there live (non-Exited) threads for this process? (ADR-026 reaper.)
 pub fn process_has_live_threads(process: ObjRef) -> bool {
     let guard = SCHED.lock();
@@ -932,5 +948,19 @@ mod tests {
             bury_thread_kstack_for_exit(tt);
         }
         assert_eq!(drain_graveyard(), 16);
+    }
+    #[test]
+    fn preempt_yields_and_switches() {
+        setup();
+        let p = ObjRef(30);
+        let a = spawn(p, 100).unwrap();
+        let b = spawn(p, 100).unwrap();
+        // a runs; a preempt tick must requeue a and run b.
+        let _ = pick_next(); // a Running
+        switch_to(a);
+        let switched = preempt();
+        assert_eq!(switched, b, "preemption round-robins within the level");
+        assert_eq!(current(), b);
+        assert_eq!(get(a).unwrap().state, State::Ready);
     }
 }

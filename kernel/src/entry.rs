@@ -378,6 +378,7 @@ fn thread_invoke(
     const RESUME: u16 = 4;
     const SET_PRIORITY: u16 = 5;
     const BIND_DEATH_NOTIFICATION: u16 = 12;
+    const THREAD_CREATE: u16 = 13;
 
     let control_ok = sched::get(target)
         .map(|t| t.process.0 == pid.0 || cap.rights.contains(Rights::CONTROL))
@@ -420,33 +421,53 @@ fn thread_invoke(
                 Err(e) => SyscallReturn::err(e),
             }
         }
+        THREAD_CREATE => {
+            // ADR-033 §1: new thread in the TARGET's process (shares AS +
+            // cap table). w0 = entry PC. CONTROL right already enforced.
+            let proc_ref = sched::get(target).map(|t| t.process).unwrap_or(ObjRef(0));
+            let child_tid = match sched::spawn_with(proc_ref, sched::DEFAULT_PRIORITY, msg.words[0])
+            {
+                Ok(t) => t,
+                Err(_) => return SyscallReturn::err(ipc::status::ENOMEM),
+            };
+            crate::objreg::register(ObjId(child_tid.0), ObjType::Thread, pid);
+            match proc::install_cap(
+                pid,
+                Capability {
+                    obj: ObjId(child_tid.0),
+                    typ: ObjType::Thread,
+                    rights: Rights::CONTROL.union(Rights::GRANT),
+                },
+            ) {
+                Ok(h) => SyscallReturn::ok(msg.tag, [h as u64, child_tid.0, 0, 0]),
+                Err(e) => SyscallReturn::err(map_proc(e)),
+            }
+        }
         _ => SyscallReturn::err(ipc::status::ENOSYS),
     }
 }
 
-/// Test hook for syscall.rs tests (thread_invoke is private).
+/// Test hook for kernel tests (thread_invoke is private); returns the full
+/// syscall return.
 #[cfg(test)]
 pub(crate) fn thread_invoke_for_test(
     pid: ProcessId,
-    tid: ThreadId,
-    cap: &Capability,
+    cap_handle: u32,
     msg: Message,
-) -> i32 {
-    match thread_invoke(
+) -> crate::entry::SyscallReturn {
+    let cap = proc::get_cap(pid, cap_handle).unwrap();
+    thread_invoke(
         pid,
-        tid,
-        cap,
+        ThreadId(1),
+        &cap,
         &SyscallArgs {
             num: crate::entry::num::INVOKE,
-            cap: 0,
+            cap: cap_handle,
             tag: msg.tag,
             w: msg.words,
             nonblock: false,
         },
-    ) {
-        r if r.status == PARKED_STATUS => 0,
-        r => r.status,
-    }
+    )
 }
 
 fn suspend(target: ThreadId) -> Result<(), i32> {
@@ -988,5 +1009,54 @@ mod tests {
         // for the frame-test module that runs after this one.
         let _ = crate::aspace::destroy(as_id);
         let _ = crate::aspace::destroy(child_id);
+    }
+    #[test]
+    fn thread_create_spawns_into_target_process() {
+        // ADR-033 §1: new thread shares the target's process (AS + table).
+        let (pid, server, _factory) = setup();
+        let tc = proc::install_cap(
+            pid,
+            Capability {
+                obj: ObjId(server.0),
+                typ: ObjType::Thread,
+                rights: Rights::CONTROL.union(Rights::GRANT),
+            },
+        )
+        .unwrap();
+        let m = Message::new(13);
+        let mut m = m;
+        m.words[0] = 0x402000; // entry PC
+        let r = thread_invoke_for_test(pid, tc, m);
+        assert_eq!(r.status, ipc::status::OK, "THREAD_CREATE must succeed");
+        let new_h = r.w[0] as u32;
+        let new_tid = ThreadId(r.w[1]);
+
+        // Same process as the target thread; distinct thread id.
+        let t = proc::get_cap(pid, new_h).unwrap();
+        assert_eq!(t.typ, ObjType::Thread);
+        assert!(t.rights.contains(Rights::CONTROL));
+        assert_ne!(new_tid, server);
+        assert_eq!(
+            sched::get(new_tid).unwrap().process,
+            sched::get(server).unwrap().process,
+            "in-process thread shares the process"
+        );
+        assert_eq!(sched::get(new_tid).unwrap().initial_pc, 0x402000);
+
+        // objreg ownership: same owner pid → process death retires it.
+        assert!(crate::objreg::is_alive(ObjId(new_tid.0)));
+
+        // Missing CONTROL → ERIGHTS.
+        let weak = proc::install_cap(
+            pid,
+            Capability {
+                obj: ObjId(server.0),
+                typ: ObjType::Thread,
+                rights: Rights::GRANT,
+            },
+        )
+        .unwrap();
+        let r = thread_invoke_for_test(pid, weak, m);
+        assert_eq!(r.status, ipc::status::ERIGHTS);
     }
 }

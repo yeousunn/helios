@@ -870,7 +870,8 @@ mod tests {
 
         // SET_PRIORITY (id 5).
         let m = msg(5, 200);
-        assert_eq!(thread_invoke_entry(pid, tc, m), 0);
+        let r = crate::entry::thread_invoke_for_test(pid, tc, m);
+        assert_eq!(r.status, 0);
         assert_eq!(sched::get(client).unwrap().priority, 200);
 
         // BIND_DEATH_NOTIFICATION (id 12): caps[0] = notification.
@@ -888,11 +889,13 @@ mod tests {
         m.tag = m.tag.with_caps(1);
         m.set_descriptor(0, ipc::CapSlot::pack(n_h, ipc::Rights::RECV))
             .unwrap();
-        assert_eq!(thread_invoke_entry(pid, tc, m), 0);
+        let r = crate::entry::thread_invoke_for_test(pid, tc, m);
+        assert_eq!(r.status, 0);
 
         // KILL (id 2) → client exits, death notification fires.
         let m = msg(2, 0);
-        assert_eq!(thread_invoke_entry(pid, tc, m), 0);
+        let r = crate::entry::thread_invoke_for_test(pid, tc, m);
+        assert_eq!(r.status, 0);
         assert!(matches!(
             sched::get(client).unwrap().state,
             crate::sched::State::Exited(-1)
@@ -904,13 +907,6 @@ mod tests {
         );
     }
 
-    /// Helper: run entry::thread_invoke via dispatch INVOKE.
-    fn thread_invoke_entry(pid: ProcessId, thread_cap: u32, m: Message) -> i32 {
-        // dispatch uses CurrentContext; entry tests set it via FixedCtx —
-        // here we call the kernel path directly for simplicity.
-        let cap = proc::get_cap(pid, thread_cap).unwrap();
-        crate::entry::thread_invoke_for_test(pid, ThreadId(1), &cap, m)
-    }
     #[test]
     fn process_death_retires_objects_and_blocks_transfer() {
         // ADR-026 end-to-end: the last thread of a process exits → its
