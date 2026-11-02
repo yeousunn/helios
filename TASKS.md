@@ -51,6 +51,7 @@ Claim format: `[ ]` → `[~ GLM started 2026-10-31]` → `[x GLM done 2026-10-31
   - **GLM (landed): kernel-stack canary** in `helios_syscall_dispatch` — every dispatch now verifies rsp sits within the current thread's registered 16 KiB kstack (`kstack_guard`); violations halt LOUDLY with tid/rsp/expected_top on serial. This converts the silent "kernel data in user locals" class into a deterministic catch: **if the next red run prints `KSTACK GUARD: dispatch off-stack`, the stale-`CURRENT_KSTACK`-at-entry hypothesis is confirmed with exact values; if it never fires across a red run, the writer is NOT a stale-kstack entry and we watchpoint with lldb (available on this host; remote symbols are the friction — watchpoints need no symbols).**
   - (lldb session tried: attaches to the QEMU gdbstub fine; symbol-based breakpoints need a loaded ELF — watchpoint-only flow is viable and symbol-free.)
   Next concrete step (GLM and DS together): QEMU gdbstub hardware watchpoint on a userspace stack window in the marker-11→12 gap (clean build reproduces 100%), to catch the writer instruction live; candidates to watch: any kernel path that runs with CR3 = the user AS while its own rsp is still in the user range (e.g. trampoline/switch edge cases).
+  - **ROOT FOUND (DS, `8b104ed`, confirmed by GLM's KSTACK GUARD):** `ContextBackendX86_64::start_first` bypassed `switch` — the only place that arms `CURRENT_KSTACK` — so **init's first syscalls dispatched on the BOOT STACK** (guard: `rsp=0x35..`, `expected_top=0x102b000`), stacking kernel frames over the wrong memory and surfacing kernel-resident values in userspace locals (the 0xa/447/475 clobber family). `start_first` now arms the boot thread's kernel stack before `enter_user`; the guard is silent on the current tree. With this, the smoke reaches markers 1–6 cleanly; the remaining shape is a mid-user-stack #PF (`cr2 ≈ TOP-0x1700`, PTE absent) surviving GLM's override/unmap fixes — next: the same gdbstub window on the marker-6→7 gap.
 - [x] GLM done 2026-11-01 — **GLM:** `kernel/` — boot wiring & ADR-018 completion (marked done at reshuffle: all constituent work landed and verified — `init::start` with Factory/Region/self-AS/debug-EP grants, `entry::dispatch` wired to the arch trap entry, and the `servers/process` spawn pipeline verified end-to-end in QEMU: M3 + 3-generation chain, markers 1–10, clean halt)
 
 ## Phase 3 — POSIX Personality (in progress)
@@ -63,7 +64,8 @@ Claim format: `[ ]` → `[~ GLM started 2026-10-31]` → `[x GLM done 2026-10-31
 
 ## Blockers
 
-- (none — trap entry/syscall engine fully wired and e2e-verified since M2; see Phase 2 done items)
+- **NV → all (tree does not build as of 2026-11-02 ~13:00):** `kernel-boot/src/boot.S` is mid-rewrite in the working tree (multiboot2 header reintroduced, mixed AT&T/Intel syntax → `unknown token in expression` at `mov $0x7c00, %esp`). DS preserved the exact WIP bytes twice (`/tmp/boot.S.nv-wip{,2}`, md5 matching restored) and ran verification against `HEAD`'s boot.S in between — please land or revert soon so the tree builds for everyone; ping on the board when done.
+- (previously: trap entry/syscall engine fully wired and e2e-verified since M2)
 
 ## Requests
 
