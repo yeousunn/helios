@@ -396,6 +396,18 @@ fn spawn_server(
     let ops = loader::plan(&elf, INIT_SCRATCH_VA_BASE)
         .map_err(|e| fail_code(step, 0xE0_00 | (e as u64 & 0xFF)))?;
 
+    // Per-sub-op walk probe (clobber hunt): send the debug-EP walk op
+    // (label 0xFFFF) — the kernel prints hardware + registry views.
+    #[inline(never)]
+    fn walk_probe(raw: &mut X86_64Syscalls, debug_ep: u32, tag: u64) {
+        let mut sys = Syscalls::new(raw);
+        let mut m = Message::new(0xFFFF);
+        m.words[0] = sdk::layout::USER_STACK_TOP - 0x1000;
+        m.words[1] = tag;
+        let _ = sys.send(debug_ep, &m);
+    }
+    walk_probe(raw, info.debug_ep, 0xA0);
+
     let child_as = {
         let mut sys = Syscalls::new(raw);
         sys.invoke(
@@ -408,7 +420,9 @@ fn spawn_server(
     if child_as == 0 {
         return Err(fail_code(step, 0xE0_02));
     }
+    walk_probe(raw, info.debug_ep, 0xA1);
 
+    walk_probe(raw, info.debug_ep, 0xA2);
     {
         let mut sys = Syscalls::new(raw);
         loader::execute(
@@ -430,6 +444,7 @@ fn spawn_server(
         )
         .map_err(|e| fail_code(step, 0xE1_01 | (e as u64 & 0xFF)))?;
     }
+    walk_probe(raw, info.debug_ep, 0xA4);
 
     // Endpoints + notifications for the package. Every handle travels through
     // a .data atomic: live locals across this inlined spawn path were observed

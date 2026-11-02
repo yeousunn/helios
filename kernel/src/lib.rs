@@ -8,6 +8,7 @@
 pub mod aspace;
 pub mod boot;
 pub mod console;
+pub mod debug;
 pub mod endpoint;
 pub mod entry;
 pub mod fault;

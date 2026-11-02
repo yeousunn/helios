@@ -186,6 +186,11 @@ pub fn sys_send(
             }
             // Debug endpoint fast path (ADR-018 §4): log, no delivery.
             if cap.obj.0 == crate::init::DEBUG_EP_ID {
+                // Label 0xFFFF = hardware/registry walk op (clobber hunt).
+                if msg.tag.label() == 0xFFFF {
+                    crate::debug::debug_walk(msg.words[0]);
+                    return Ok(ipc::status::OK);
+                }
                 crate::init::debug_ep_send(&msg);
                 return Ok(ipc::status::OK);
             }

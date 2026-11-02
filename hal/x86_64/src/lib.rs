@@ -37,5 +37,20 @@ pub use paging::{
     activate_as, enable_nx, flush_tlb_all, probe_walk, root_of, BACKEND_FACTORY_X86_64,
 };
 
+/// Live-hardware walker for `kernel::debug` (reads CR3, walks that root).
+#[cfg(target_arch = "x86_64")]
+pub fn debug_walk_live(vaddr: u64) -> Option<u64> {
+    let cr3: u64;
+    // SAFETY: reading CR3 for the diagnostics walker.
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem)) };
+    probe_walk(cr3 as usize, vaddr)
+}
+
+/// Non-x86_64 hosts (workspace builds on aarch64 macOS): no live hardware.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn debug_walk_live(_vaddr: u64) -> Option<u64> {
+    None
+}
+
 #[cfg(not(target_arch = "x86_64"))]
 pub use impl_stub::*;

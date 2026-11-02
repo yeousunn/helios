@@ -69,6 +69,9 @@ pub extern "C" fn kernel_main() -> ! {
     dump_boot_state();
     hal_x86_64::uart_writer("boot: 1 hooks\n");
     kernel::panic::set_exit_code(hal_x86_64::qemu_exit_code);
+    // Clobber-hunt debug walker: the kernel debug-EP walk op reads live
+    // hardware PTEs through the identity map (temporary; removed post-smoke).
+    kernel::debug::set_hw_walker(|va| hal_x86_64::debug_walk_live(va));
 
     // Enable NX (PTE bit 63 is reserved while EFER.NXE=0) and install fault
     // reporting stubs before any mapping/staging work.
