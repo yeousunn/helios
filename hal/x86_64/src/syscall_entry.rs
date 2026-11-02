@@ -90,6 +90,7 @@ extern "sysv64" fn helios_syscall_dispatch(
         w: [w0, w1, w2, w3],
         nonblock: t.flags() & flags::NONBLOCK != 0,
     };
+    kstack_guard();
     let ret = entry::dispatch(args);
     if ret.status == PARKED_STATUS {
         // Parked inside recv/reply_recv: the result materializes on resume.
@@ -102,6 +103,54 @@ extern "sysv64" fn helios_syscall_dispatch(
         // resumes here later (with its result re-stored) or never (exit).
         resume_loop(Some(ret));
     }
+}
+
+/// Kernel-stack canary (clobber hunt, DS m49–m64): verify the dispatch is
+/// running on the CURRENT thread's registered kernel stack. A mismatch means
+/// a syscall entered with a stale `CURRENT_KSTACK` — the entry frame then
+/// lands on another thread's (or a drained, reused) stack, which is exactly
+/// the "kernel-dispatch data in user locals" corruption shape. Loud + fatal:
+/// deterministic beats silent.
+fn kstack_guard() {
+    let tid = kernel::sched::current();
+    let Ok(t) = kernel::sched::get(tid) else {
+        return;
+    };
+    let top = t.kstack_top;
+    if top == 0 {
+        return; // boot thread before registration
+    }
+    let rsp: u64;
+    // SAFETY: reads the current stack pointer; no memory access.
+    unsafe { core::arch::asm!("mov {0}, rsp", out(reg) rsp, options(nostack)) };
+    // The dispatcher frame must sit within this thread's 16 KiB kernel stack.
+    if rsp > top || rsp <= top - 16 * 1024 {
+        crate::uart_writer("
+[kernel] KSTACK GUARD: dispatch off-stack
+");
+        crate::uart_writer("  tid=");
+        uart_hex(tid.0);
+        crate::uart_writer(" rsp=");
+        uart_hex(rsp);
+        crate::uart_writer(" expected_top=");
+        uart_hex(top);
+        crate::uart_writer("
+");
+        // Halt loudly instead of corrupting further.
+        loop {
+            // SAFETY: halting on a detected kernel-stack violation.
+            unsafe { core::arch::asm!("cli; hlt", options(nostack, nomem)) };
+        }
+    }
+}
+
+fn uart_hex(v: u64) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut buf = [0u8; 16];
+    for (i, b) in buf.iter_mut().enumerate() {
+        *b = HEX[((v >> (60 - i * 4)) & 0xF) as usize];
+    }
+    crate::uart_writer(core::str::from_utf8(&buf).unwrap_or(""));
 }
 
 fn thread_is_runnable() -> bool {
