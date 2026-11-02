@@ -98,6 +98,31 @@ pub extern "C" fn kernel_main() -> ! {
     )
     .expect("invalid frame region");
     kernel::frame::init(&[region]).expect("frame::init");
+    // ADR-035: reserve any part of the kernel image + boot stack that falls
+    // inside the frame region (the boot stack is at ~5 MiB today, BELOW the
+    // region — reserve is a no-op then, but guards future link-layout moves
+    // where the allocator handing out kernel statics as free frames was the
+    // m44–m90 corruption family).
+    {
+        extern "C" {
+            static stack_top: u8;
+        }
+        let boot_stack_top = core::ptr::addr_of!(stack_top) as u64;
+        if boot_stack_top > FRAME_REGION_BASE {
+            let reserved_len = boot_stack_top - FRAME_REGION_BASE;
+            match kernel::frame::reserve(
+                kernel::frame::PhysAddr::new(FRAME_REGION_BASE),
+                reserved_len,
+            ) {
+                Ok(()) => kernel::kinfo!(
+                    "frame::reserve kernel image [0x{:x}..{:#x})",
+                    FRAME_REGION_BASE,
+                    boot_stack_top
+                ),
+                Err(e) => kernel::kwarn!("frame::reserve: {}", e),
+            }
+        }
+    }
     hal_x86_64::uart_writer("boot: 4 frames\n");
 
     let regions = [kernel::init::BootRegion {

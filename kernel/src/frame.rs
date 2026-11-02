@@ -130,8 +130,6 @@ pub fn init(regions: &[Region]) -> Result<(), &'static str> {
 pub fn reserve(base: PhysAddr, len: u64) -> Result<(), &'static str> {
     let mut guard = ALLOCATOR.lock();
     let inner = guard.as_mut().ok_or("allocator not initialized")?;
-    let first = base.as_u64() / FRAME_SIZE as u64;
-    let count = len.div_ceil(FRAME_SIZE as u64);
     let mut marked = 0;
     for slot in inner.regions.iter_mut().flatten() {
         let rbase = slot.region.base.as_u64();
@@ -140,12 +138,19 @@ pub fn reserve(base: PhysAddr, len: u64) -> Result<(), &'static str> {
         if base.as_u64() >= r_end || base.as_u64() + len <= rbase {
             continue;
         }
-        for f in first..(first + count) {
-            let idx = ((f * FRAME_SIZE as u64) - rbase) / FRAME_SIZE as u64;
-            if idx < rframes && !slot.get(idx as usize) {
-                slot.set(idx as usize, true);
-                slot.used += 1;
-                marked += 1;
+        // Frame-relative range within THIS region (handles the absolute-
+        // vs-relative frame numbering: the bitmap is region-local).
+        let mark_start = base.as_u64().max(rbase);
+        let mark_end = (base.as_u64() + len).min(r_end);
+        if mark_end > mark_start {
+            let i0 = (mark_start - rbase) / FRAME_SIZE as u64;
+            let i1 = (mark_end - rbase).div_ceil(FRAME_SIZE as u64);
+            for idx in i0..i1.min(rframes) {
+                if !slot.get(idx as usize) {
+                    slot.set(idx as usize, true);
+                    slot.used += 1;
+                    marked += 1;
+                }
             }
         }
     }
