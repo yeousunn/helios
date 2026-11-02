@@ -476,7 +476,10 @@ mod tests {
         let (number, args) = raw.calls[0];
         assert_eq!(number, number::CAP_MINT);
         assert_eq!(args[0], 30);
-        assert_eq!(args[2], Rights::SEND.0 as u64);
+        // Raw args = [cap, tag, w0, w1, ...]: w0 = destination slot,
+        // w1 = rights (the wrapper used to shift every field).
+        assert_eq!(args[2], u32::MAX as u64, "first-free slot in w0");
+        assert_eq!(args[3], Rights::SEND.0 as u64, "rights in w1");
     }
 
     #[test]

@@ -287,6 +287,15 @@ impl CapTable {
         Ok(removed + 1)
     }
 
+    /// Kernel-diagnostics: `None` = out of range, `Some((false, _))` = free,
+    /// `Some((true, obj))` = occupied.
+    pub fn slot_debug(&self, idx: usize) -> Option<(bool, Option<u64>)> {
+        self.slots.get(idx).map(|s| match s {
+            Slot::Free { .. } => (false, None),
+            Slot::Occupied { cap, .. } => (true, Some(cap.obj.0)),
+        })
+    }
+
     /// Count of slots holding a capability for `obj` (kernel sweep support).
     pub fn count_of(&self, obj: ObjId) -> usize {
         self.slots
