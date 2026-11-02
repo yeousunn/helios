@@ -92,36 +92,6 @@ extern "sysv64" fn helios_syscall_dispatch(
     };
     kstack_guard();
     let ret = entry::dispatch(args);
-    // Loader-window bisection (TASKS.md): on every INVOKE, log the cap and a
-    // hardware walk of AS 1's top stack page; the first flip names the call.
-    if num == 5 {
-        use core::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        static LAST: AtomicU64 = AtomicU64::new(0);
-        if let Some(root) = crate::paging::root_of(1) {
-            let top: u64 = 0x0000_7FFF_FFFF_F000;
-            let present = crate::paging::probe_walk(root, top - 4096).is_some() as u64;
-            let n = N.fetch_add(1, Ordering::Relaxed);
-            let changed = LAST.swap(present, Ordering::Relaxed) != present;
-            if changed || n < 6 {
-                let mut b = [b'0'; 8];
-                let mut v = n;
-                for i in (0..8).rev() {
-                    b[i] = b'0' + (v % 10) as u8;
-                    v /= 10;
-                }
-                crate::uart_writer("inv#");
-                if let Ok(s) = core::str::from_utf8(&b) {
-                    crate::uart_writer(s);
-                }
-                crate::uart_writer(if present == 1 {
-                    " present=yes\n"
-                } else {
-                    " present=NO\n"
-                });
-            }
-        }
-    }
     if ret.status == PARKED_STATUS {
         // Parked inside recv/reply_recv: the result materializes on resume.
         resume_loop(None);
