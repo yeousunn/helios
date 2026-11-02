@@ -324,6 +324,45 @@ impl PagingBackendX86_64 {
 
         Some(pt.entry(pt_index(vaddr, PT_SHIFT)))
     }
+
+    /// Walk the 4-level tables for `vaddr` WITHOUT creating anything and
+    /// without splitting huge pages. Returns the leaf PTE only when every
+    /// level (and the leaf) is present as a 4 KiB entry. `intermediate_ok`
+    /// additionally reports whether the path down to the parent level exists
+    /// (used by unmap/protect to no-op cleanly on absent chains instead of
+    /// materializing tables — GLM's walk audit finding).
+    unsafe fn walk_existing(&self, vaddr: usize, intermediate_ok: &mut bool) -> Option<&mut Pte> {
+        *intermediate_ok = false;
+        // SAFETY: read-only walk; table memory is identity-mapped and valid.
+        unsafe {
+            let e = self.pml4_mut().entry(pt_index(vaddr, PML4_SHIFT));
+            if !e.is_present() || (e.0 & PTE_PAGE_SIZE) != 0 {
+                return None;
+            }
+            let pdpt = &mut *(e.addr() as *mut PageTable);
+            let e = pdpt.entry(pt_index(vaddr, PDPT_SHIFT));
+            if !e.is_present() || (e.0 & PTE_PAGE_SIZE) != 0 {
+                return None;
+            }
+            let pd = &mut *(e.addr() as *mut PageTable);
+            let e = pd.entry(pt_index(vaddr, PD_SHIFT));
+            if !e.is_present() {
+                return None;
+            }
+            if (e.0 & PTE_PAGE_SIZE) != 0 {
+                // Huge 2 MiB page: the parent levels exist; no leaf PTE.
+                *intermediate_ok = true;
+                return None;
+            }
+            let pt = &mut *(e.addr() as *mut PageTable);
+            *intermediate_ok = true;
+            let e = pt.entry(pt_index(vaddr, PT_SHIFT));
+            if !e.is_present() {
+                return None;
+            }
+            Some(e)
+        }
+    }
 }
 
 impl PagingBackend for PagingBackendX86_64 {
@@ -348,9 +387,12 @@ impl PagingBackend for PagingBackendX86_64 {
 
     fn unmap_page(&self, vaddr: Vaddr) {
         let va = vaddr.as_u64() as usize;
-        // SAFETY: Clear the PTE for `vaddr`.
+        // Walk-only: an unmap must never allocate tables or split huge pages
+        // (GLM's walk audit finding). Absent chain → nothing mapped → no-op.
+        let mut _ok = false;
+        // SAFETY: Clear the leaf PTE for `vaddr` when fully present.
         unsafe {
-            if let Some(pte) = self.walk_create(va) {
+            if let Some(pte) = self.walk_existing(va, &mut _ok) {
                 pte.0 = 0;
                 flush_tlb_page(va);
             }
@@ -360,9 +402,11 @@ impl PagingBackend for PagingBackendX86_64 {
     fn protect_page(&self, vaddr: Vaddr, flags: MapFlags) {
         let va = vaddr.as_u64() as usize;
         let pte_flags = map_flags_to_pte(flags);
-        // SAFETY: Update PTE flags in place.
+        // Walk-only: protecting an unmapped VA must not materialize tables.
+        let mut _ok = false;
+        // SAFETY: Update an existing leaf PTE's flags in place.
         unsafe {
-            if let Some(pte) = self.walk_create(va) {
+            if let Some(pte) = self.walk_existing(va, &mut _ok) {
                 let old = pte.0;
                 let new_flags = pte_flags | (old & PTE_ADDR_MASK);
                 pte.0 = new_flags;
@@ -449,12 +493,12 @@ impl Default for BackendFactoryX86_64 {
     }
 }
 
-/// Kernel identity window per AS: first 8 MiB (kernel image + boot stack +
-/// statics) and 16..256 MiB (frame allocator region, used for direct-map
-/// access to physical frames). Supervisor 2 MiB pages, PRIVATE to this AS —
+/// Kernel identity window per AS: first 16 MiB (kernel image + boot stack +
+/// statics + the 8..16 MiB gap, closed per GLM's walk audit) and 16..256 MiB
+/// (frame allocator region). Supervisor 2 MiB pages, PRIVATE to this AS —
 /// sharing the boot chain leaked mappings across address spaces (found when
 /// a child's segment mappings overwrote the parent's live code).
-const KERNEL_LOW_MIB: usize = 8;
+const KERNEL_LOW_MIB: usize = 16;
 const FRAME_REGION_START_MIB: usize = 16;
 const FRAME_REGION_END_MIB: usize = 256;
 
