@@ -1407,4 +1407,42 @@ mod tests {
         assert_eq!(frame_refs(base), 2, "shared base frame untouched");
         assert_eq!(frame::free_count(), frame::free_count(), "allocator sane");
     }
+    #[test]
+    fn translate_stack_pages_match_staged_frames_exactly() {
+        // DS's one-page-shift check: 16 contiguous staged stack pages
+        // (bottom frame = sp), then translate EVERY page — each must be
+        // exactly sp + i*4096. Also exercises the coalesced-region path
+        // (16 adjacent maps merge into one 16-page region).
+        let as_id = setup();
+        let sp = PhysAddr::new(0x10_14000);
+        let top = 0x7FFF_FFFF_F000u64; // hal::layout::USER_STACK_TOP
+        let stack_bottom_vaddr = top - 16 * PAGE_SIZE as u64; // 0x7FFF_FFFE_F000
+        for i in 0..16u64 {
+            map(
+                as_id,
+                Vaddr(stack_bottom_vaddr + i * PAGE_SIZE as u64),
+                1,
+                Some(sp.checked_add(i * PAGE_SIZE as u64).unwrap()),
+                MapFlags::READ.union(MapFlags::WRITE),
+            )
+            .unwrap();
+        }
+        for i in 0..16u64 {
+            let (pa, _) = translate(as_id, Vaddr(stack_bottom_vaddr + i * PAGE_SIZE as u64))
+                .unwrap_or_else(|e| panic!("page {i} unmapped: {e:?}"));
+            assert_eq!(
+                pa,
+                sp.checked_add(i * PAGE_SIZE as u64).unwrap(),
+                "stack page {i} off-by-one"
+            );
+        }
+        // The live repro's cr2 = TOP-0x700 = page 15 (the TOP page) ->
+        // phys sp + 15*4096 = 0x1023000. Registry arithmetic verified exact:
+        // DS's "off-by-one" reading assumed page 14; correct page math says
+        // 0x1023000 — the divergence is hardware-side only.
+        let cr2 = top - 0x700;
+        let (pa, _) = translate(as_id, Vaddr(cr2)).unwrap();
+        assert_eq!(pa, sp.checked_add(15 * PAGE_SIZE as u64).unwrap());
+        assert_eq!(pa, PhysAddr::new(0x10_23000));
+    }
 }
