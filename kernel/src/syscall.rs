@@ -343,7 +343,10 @@ pub fn sys_recv(pid: ProcessId, tid: ThreadId, src_handle: u32) -> SysResult<Opt
             return Ok(Some(env.msg));
         }
     }
-    let cap = proc::get_cap(pid, src_handle).map_err(|e| err(map_proc(e)))?;
+    let cap = proc::get_cap(pid, src_handle).map_err(|e| {
+        crate::kinfo!("NOCAP: pid={} handle={} err={:?}", pid.0, src_handle, e);
+        err(map_proc(e))
+    })?;
     match cap.typ {
         ObjType::Endpoint => {
             if !cap.rights.contains(Rights::RECV) {

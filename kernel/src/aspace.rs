@@ -372,9 +372,31 @@ impl AddressSpace {
         let _ = self.regions[slot].take();
         if let Some(b) = m.base {
             for i in head..(head + count) {
-                if let Some(pa) = b.checked_add(i * PAGE_SIZE as u64) {
-                    FRAME_REFS.lock().release(pa);
-                }
+                // A resolved page (COW copy / pager install) carries its own
+                // override frame — release THAT, not the region's base frame
+                // (which may be COW-shared with a sibling process). Releasing
+                // the base frame here was the "PTE lost after spawn" bug.
+                let page_idx = m.vaddr.page_index() + i;
+                let target = match self
+                    .page_frames
+                    .iter()
+                    .find(|(p, _)| *p == page_idx)
+                    .map(|(_, f)| *f)
+                {
+                    Some(override_frame) => {
+                        // Clear the override entry: the page is gone.
+                        if let Some(pf) = self.page_frames.iter_mut().find(|(p, _)| *p == page_idx)
+                        {
+                            *pf = (0, PhysAddr::new(0));
+                        }
+                        override_frame
+                    }
+                    None => match b.checked_add(i * PAGE_SIZE as u64) {
+                        Some(pa) => pa,
+                        None => continue,
+                    },
+                };
+                FRAME_REFS.lock().release(target);
             }
             for i in head..(head + count) {
                 let va = Vaddr(m.vaddr.as_u64() + i * PAGE_SIZE as u64);
@@ -655,7 +677,8 @@ impl AddressSpace {
         Ok(())
     }
 
-    /// Drop all mappings and per-page frames (AS::DESTROY).
+    /// Drop all mappings and per-page frames (AS::DESTROY). Override-aware:
+    /// resolved pages release their override frame, not the base frame.
     fn destroy(&mut self, be: &dyn PagingBackend) {
         for i in 0..self.regions.len() {
             if let Some(m) = self.regions[i].take() {
@@ -663,15 +686,32 @@ impl AddressSpace {
                     for j in 0..m.pages {
                         let va = Vaddr(m.vaddr.as_u64() + j * PAGE_SIZE as u64);
                         be.unmap_page(va);
-                    }
-                    for j in 0..m.pages {
-                        if let Some(pa) = b.checked_add(j * PAGE_SIZE as u64) {
-                            FRAME_REFS.lock().release(pa);
-                        }
+                        let page_idx = m.vaddr.page_index() + j;
+                        let target = match self
+                            .page_frames
+                            .iter()
+                            .find(|(p, _)| *p == page_idx)
+                            .map(|(_, f)| *f)
+                        {
+                            Some(ov) => {
+                                if let Some(pf) =
+                                    self.page_frames.iter_mut().find(|(p, _)| *p == page_idx)
+                                {
+                                    *pf = (0, PhysAddr::new(0));
+                                }
+                                ov
+                            }
+                            None => match b.checked_add(j * PAGE_SIZE as u64) {
+                                Some(pa) => pa,
+                                None => continue,
+                            },
+                        };
+                        FRAME_REFS.lock().release(target);
                     }
                 }
             }
         }
+        // Remaining overrides (ANON-region pages) released here.
         for i in 0..self.page_frames.len() {
             let (p, f) = self.page_frames[i];
             if p != 0 {
@@ -1335,5 +1375,36 @@ mod tests {
         );
         assert_eq!(frame_refs(f0), 0, "unmapped ANON page freed");
         assert_eq!(frame_refs(f1), 1);
+    }
+    #[test]
+    fn unmap_releases_override_frames_not_shared_base() {
+        // DS flakiness (b) root cause: a COW-resolved page inside a base-
+        // backed region holds its OWN override frame; unmapping it must
+        // release the override, not the (possibly COW-shared) base frame.
+        let as_id = setup();
+        set_pool(as_id, PhysAddr::new(0x1A_0000), 2 * PAGE_SIZE as u64).unwrap();
+        let base = PhysAddr::new(0x19_0000);
+        track_frame(base);
+        track_frame(base); // refcount 2 = "COW-shared with a sibling"
+        map(
+            as_id,
+            Vaddr(0xC0_0000),
+            1,
+            Some(base),
+            MapFlags::READ.union(MapFlags::WRITE).union(MapFlags::COW),
+        )
+        .unwrap();
+
+        // Write-fault resolves the COW: page now backed by a pool frame.
+        let resolved = resolve_fault(as_id, Vaddr(0xC0_0000), true).unwrap();
+        assert_ne!(resolved, base);
+        assert_eq!(frame_refs(base), 2, "sibling still shares the base");
+
+        // Unmap the resolved page: override frame released; base untouched.
+        unmap(as_id, Vaddr(0xC0_0000), 1).unwrap();
+        assert!(translate(as_id, Vaddr(0xC0_0000)).is_err());
+        assert_eq!(frame_refs(resolved), 0, "override frame freed");
+        assert_eq!(frame_refs(base), 2, "shared base frame untouched");
+        assert_eq!(frame::free_count(), frame::free_count(), "allocator sane");
     }
 }
