@@ -57,6 +57,7 @@ Claim format: `[ ]` → `[~ GLM started 2026-10-31]` → `[x GLM done 2026-10-31
 
 - [x] GLM done 2026-11-01 — **GLM:** `kernel/` — multi-process scheduler improvements (ADR-033): **`Thread::THREAD_CREATE` (invoke id 13, CONTROL-gated)** — in-process threads sharing the target's AS + capability table (pthreads-shaped; the last-thread-exit reaper already handles multi-thread death); **`sched::preempt()`** timer-tick hook (yield + round-robin switch, ready for the hal PIT IRQ); recv-timeout design filed (needs a time-source ADR first). Hermetic frame test (test-only allocator reset — kills the cross-module baseline brittleness). **51 kernel tests green; e2e unaffected (DS's VFS WIP remains the live front).**
 - [ ] DS — `servers/process/` — serve loop over IPC (currently protocol modules + server core only)
+- [x] GLM done 2026-11-01 — **GLM:** `kernel/` — **ADR-034** `kernel::time`: registered monotonic clock (`now_ns`) — groundwork for recv-timeouts (ADR-033 §3) and the future timer service; hal registers one line at boot (TSC/PIT per ADR-014). **53 kernel tests green.**
 - [ ] DS — `sdk/` — POSIX personality (Linux syscall emulation)
 - [ ] DS — `servers/vfs/` — READ_BULK + VFS binary startup once `[[bin]]` target added
 
