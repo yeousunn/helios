@@ -473,6 +473,7 @@ pub fn sys_exit(tid: ThreadId, status: i32) -> SysResult<bool> {
         .map_err(|_| err(ipc::status::EBADCAP))?
         .process;
     let fired = sched::exit(tid, status).map_err(|_| err(ipc::status::EBADCAP))?;
+    crate::kinfo!("exit: tid={} status={} fired={}", tid.0, status, fired);
     // ADR-031: the exiting thread's kernel stack goes to the graveyard
     // (cannot be freed while this exit runs on it); the idle path drains.
     sched::bury_thread_kstack_for_exit(tid);

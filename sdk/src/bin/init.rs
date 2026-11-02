@@ -366,6 +366,20 @@ struct ServerSpawn {
     death: Handle,
 }
 
+// Pinned spawn handles, in .data (live locals across this inlined spawn path
+// were observed clobbered — a stale value silently mis-delivers caps and
+// misbinds death notifications; atomics are immune. Same fix as PS).
+use core::sync::atomic::Ordering as SpOrdering;
+static SP_BOOT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static SP_INIT_EP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static SP_DEATH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static SP_S0: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static SP_S1: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static SP_S2: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static SP_S3: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static SP_THREAD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static SP_REGION: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// Spawn a system server from an embedded image: fresh AS + ELF load,
 /// endpoints/notifications, thread, ADR-009 package (with Factory tail),
 /// death binding. `step` tags every failure for the serial marker stream.
@@ -377,6 +391,7 @@ fn spawn_server(
     image: &[u8],
     step: u64,
 ) -> Result<ServerSpawn> {
+    SP_REGION.store(region, SpOrdering::Relaxed);
     let elf = ElfImage::parse(image).map_err(|e| fail_code(step, e as u64))?;
     let ops = loader::plan(&elf, INIT_SCRATCH_VA_BASE)
         .map_err(|e| fail_code(step, 0xE0_00 | (e as u64 & 0xFF)))?;
@@ -416,7 +431,9 @@ fn spawn_server(
         .map_err(|e| fail_code(step, 0xE1_01 | (e as u64 & 0xFF)))?;
     }
 
-    // Endpoints + notifications for the package.
+    // Endpoints + notifications for the package. Every handle travels through
+    // a .data atomic: live locals across this inlined spawn path were observed
+    // clobbered (a stale value silently misbinds/mis-delivers; same fix as PS).
     let bootstrap_ep = mint(
         raw,
         info.factory,
@@ -424,6 +441,7 @@ fn spawn_server(
         step,
         0xE2,
     )?;
+    SP_BOOT.store(bootstrap_ep, SpOrdering::Relaxed);
     let init_ep = mint(
         raw,
         info.factory,
@@ -431,6 +449,7 @@ fn spawn_server(
         step,
         0xE3,
     )?;
+    SP_INIT_EP.store(init_ep, SpOrdering::Relaxed);
     let death = mint(
         raw,
         info.factory,
@@ -438,15 +457,21 @@ fn spawn_server(
         step,
         0xE4,
     )?;
-    let mut sessions = [0 as Handle; 4];
-    for slot in sessions.iter_mut() {
-        *slot = mint(
+    SP_DEATH.store(death, SpOrdering::Relaxed);
+    for slot in 0..bootstrap::SESSION_POOL {
+        let s = mint(
             raw,
             info.factory,
             methods::factory::NEW_NOTIFICATION,
             step,
             0xE5,
         )?;
+        match slot {
+            0 => SP_S0.store(s, SpOrdering::Relaxed),
+            1 => SP_S1.store(s, SpOrdering::Relaxed),
+            2 => SP_S2.store(s, SpOrdering::Relaxed),
+            _ => SP_S3.store(s, SpOrdering::Relaxed),
+        }
     }
 
     // Child thread (ADR-017 packing): w0 = entry; caps[0] = AS (input),
@@ -458,7 +483,10 @@ fn spawn_server(
         m.words[0] = elf.entry;
         let _ = m.set_descriptor(0, CapSlot::pack(child_as, Rights::MAP.union(Rights::GRANT)));
         let _ = m.set_descriptor(1, CapSlot::NULL);
-        let _ = m.set_descriptor(2, CapSlot::pack(bootstrap_ep, Rights::RECV));
+        let _ = m.set_descriptor(
+            2,
+            CapSlot::pack(SP_BOOT.load(SpOrdering::Relaxed), Rights::RECV),
+        );
         let reply = sys
             .invoke(info.factory, &m)
             .map_err(|e| fail_code(step, 0xE6_00 | (e as u64 & 0xFF)))?;
@@ -467,40 +495,58 @@ fn spawn_server(
     if thread_cap == 0 {
         return Err(fail_code(step, 0xE6_01));
     }
+    SP_THREAD.store(thread_cap, SpOrdering::Relaxed);
 
     // Bind the child's death notification to its thread (ADR-007 §6).
     {
         let mut sys = Syscalls::new(raw);
         let mut m = Message::new(methods::thread::BIND_DEATH_NOTIFICATION);
         m.tag = m.tag.with_caps(1);
-        let _ = m.set_descriptor(0, CapSlot::pack(death, Rights::SIGNAL));
-        sys.invoke(thread_cap, &m)
+        let _ = m.set_descriptor(
+            0,
+            CapSlot::pack(SP_DEATH.load(SpOrdering::Relaxed), Rights::SIGNAL),
+        );
+        sys.invoke(SP_THREAD.load(SpOrdering::Relaxed), &m)
             .map_err(|e| fail_code(step, 0xE7_00 | (e as u64 & 0xFF)))?;
     }
 
     // ADR-009 package: §2.3 prefix + ADR-023 tail[0] = Factory.
     let mut caps: Vec<CapSlot> = Vec::with_capacity(9);
     caps.push(CapSlot::pack(child_as, Rights::MAP.union(Rights::GRANT)));
-    caps.push(CapSlot::pack(thread_cap, Rights::CONTROL));
-    caps.push(CapSlot::pack(region, Rights::GRANT));
-    for s in sessions {
+    caps.push(CapSlot::pack(
+        SP_THREAD.load(SpOrdering::Relaxed),
+        Rights::CONTROL,
+    ));
+    caps.push(CapSlot::pack(
+        SP_REGION.load(SpOrdering::Relaxed),
+        Rights::GRANT,
+    ));
+    for s in [
+        SP_S0.load(SpOrdering::Relaxed),
+        SP_S1.load(SpOrdering::Relaxed),
+        SP_S2.load(SpOrdering::Relaxed),
+        SP_S3.load(SpOrdering::Relaxed),
+    ] {
         caps.push(CapSlot::pack(
             s,
             Rights::SIGNAL.union(Rights::RECV).union(Rights::GRANT),
         ));
     }
-    caps.push(CapSlot::pack(init_ep, Rights::SEND.union(Rights::GRANT)));
+    caps.push(CapSlot::pack(
+        SP_INIT_EP.load(SpOrdering::Relaxed),
+        Rights::SEND.union(Rights::GRANT),
+    ));
     caps.push(CapSlot::pack(info.factory, Rights::ALL));
     {
         let mut sys = Syscalls::new(raw);
-        bootstrap::deliver(&mut sys, bootstrap_ep, &caps)
+        bootstrap::deliver(&mut sys, SP_BOOT.load(SpOrdering::Relaxed), &caps)
             .map_err(|e| fail_code(step, 0xE8_00 | (e as u64 & 0xFF)))?;
     }
 
     Ok(ServerSpawn {
         pid,
-        ready_ep: init_ep,
-        death,
+        ready_ep: SP_INIT_EP.load(SpOrdering::Relaxed),
+        death: SP_DEATH.load(SpOrdering::Relaxed),
     })
 }
 

@@ -51,6 +51,19 @@ static CH_S0: AtomicU32 = AtomicU32::new(0);
 static CH_S1: AtomicU32 = AtomicU32::new(0);
 static CH_S2: AtomicU32 = AtomicU32::new(0);
 static CH_S3: AtomicU32 = AtomicU32::new(0);
+/// The serve loop's current accept endpoint (service ep, then the connection
+/// endpoint). Pinned through an atomic for the same reason as the child
+/// handles: the loop local was observed mutated across the heavy inlined
+/// spawn path (foreign handle values reaching `reply_recv`).
+static SESSION_EP: AtomicU32 = AtomicU32::new(0);
+/// The last pinned spawn handle: the child's thread-control cap. Lived on the
+/// stack across the same heavy inlined path; a stale (still thread-typed)
+/// value made BIND_DEATH_NOTIFICATION silently bind the wrong thread.
+static CH_THREAD: AtomicU32 = AtomicU32::new(0);
+/// And the death notification that the BIND descriptor carries: a stale
+/// value silently turns BIND into a clear (non-notification descriptor ->
+/// bound=None -> Ok), so the child's death never fires.
+static CH_EXIT_NOTIF: AtomicU32 = AtomicU32::new(0);
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
@@ -136,13 +149,13 @@ pub extern "C" fn _start() -> ! {
         Ok(m) => m,
         Err(_) => Syscalls::new(&mut raw).exit(0xE6),
     };
-    let mut session_ep = service_ep;
+    SESSION_EP.store(service_ep, Ordering::Relaxed);
     loop {
         let reply = match req.tag.label() {
             methods::process::CONNECT => {
                 let (reply, conn_ep) = connect_reply(&mut sys, &package, &req, factory);
                 if let Some(ep) = conn_ep {
-                    session_ep = ep;
+                    SESSION_EP.store(ep, Ordering::Relaxed);
                 }
                 reply
             }
@@ -175,7 +188,7 @@ pub extern "C" fn _start() -> ! {
                 reply
             }
         };
-        req = match sys.reply_recv(session_ep, &reply) {
+        req = match sys.reply_recv(SESSION_EP.load(Ordering::Relaxed), &reply) {
             Ok(m) => m,
             Err(e) => Syscalls::new(&mut raw).exit(0xE7_00 | (e & 0xFF)),
         };
@@ -340,6 +353,7 @@ fn spawn_child(
     let s3 = invoke_w0(sys, factory, methods::factory::NEW_NOTIFICATION, [0; 4])? as u32;
     CH_S3.store(s3, Ordering::Relaxed);
     let exit_notif = invoke_w0(sys, factory, methods::factory::NEW_NOTIFICATION, [0; 4])? as u32;
+    CH_EXIT_NOTIF.store(exit_notif, Ordering::Relaxed);
     // 5. Child thread (ADR-017 packing; ADR-009 bootstrap at child handle 1).
     let mut m = Message::new(methods::factory::NEW_THREAD);
     m.tag = m.tag.with_caps(3);
@@ -353,12 +367,13 @@ fn spawn_child(
     if thread_cap == 0 {
         return Err(ipc::status::ENOMEM);
     }
+    CH_THREAD.store(thread_cap, Ordering::Relaxed);
     // 7. ADR-009 package (prefix only — no Factory for regular processes).
     //    Stack array: the Vec form was silently corrupted (heap aliasing).
     let session_rights = Rights::SIGNAL.union(Rights::RECV).union(Rights::GRANT);
     let caps: [CapSlot; bootstrap::FIXED_CAPS] = [
         CapSlot::pack(child_as, Rights::MAP.union(Rights::GRANT)),
-        CapSlot::pack(thread_cap, Rights::CONTROL),
+        CapSlot::pack(CH_THREAD.load(Ordering::Relaxed), Rights::CONTROL),
         CapSlot::pack(package.region, Rights::GRANT),
         CapSlot::pack(CH_S0.load(Ordering::Relaxed), session_rights),
         CapSlot::pack(CH_S1.load(Ordering::Relaxed), session_rights),
@@ -369,8 +384,11 @@ fn spawn_child(
     // 6. PS's death binding on the child thread.
     let mut bind = Message::new(methods::thread::BIND_DEATH_NOTIFICATION);
     bind.tag = bind.tag.with_caps(1);
-    let _ = bind.set_descriptor(0, CapSlot::pack(exit_notif, Rights::SIGNAL));
-    sys.invoke(thread_cap, &bind)?;
+    let _ = bind.set_descriptor(
+        0,
+        CapSlot::pack(CH_EXIT_NOTIF.load(Ordering::Relaxed), Rights::SIGNAL),
+    );
+    sys.invoke(CH_THREAD.load(Ordering::Relaxed), &bind)?;
 
     bootstrap::deliver(sys, CH_BOOT.load(Ordering::Relaxed), &caps)?;
     // 8. Publish for WAIT/KILL.
