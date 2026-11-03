@@ -47,8 +47,10 @@ cargo build -p sdk --bin init --features user --target x86_64-unknown-none --rel
 | 9 | `...0009` | connection id (1) | `CONNECT` round-trip over the service endpoint: init transfers session notif + arg/result frames (4 KiB each), PS maps both windows and replies with the connection endpoint (descriptor 0) |
 | 10 | `...000a` | child pid | `SPAWN` over the connection: argv blob in the arg window (`(off<<32)\|len` in `w2`); PS loads its embedded child image, crafts the stack, replies with pid + out-caps |
 | 11 | `...000b` | child exit status (42) | `WAIT`: PS parks on the child's death notification and reports the raw status (kernel payload: bit 0 = event, bits 32.. = status) |
-| 12 | `...000c` | death-notification tag | init sent `KILL` (PS acks then exits); reaped via NOTIFIED |
-| DONE | `0x494e49540000000f` | 0 | all passed |
+| 12 | `...000c` | VFS pid | init spawned the second system server (same package shape) |
+| 13 | `...000d` | VFS heap KiB | VFS ready callback (service endpoint as capability) |
+| 14 | `...000e` | bytes read (13) | `CONNECT` → `OPEN("/hello")` → `READ` over IPC; init byte-verifies `"helios-vfs-ok"` from the result window |
+| DONE | `0x494e49540000000f` | 0 | all passed (both servers reaped; clean halt) |
 
 v0 conventions this smoke pins (all design §2.4/§2.6 provisional):
 
