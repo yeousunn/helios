@@ -129,3 +129,10 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 
 - **ADR-037 depth accounting deployed** (debug builds): paint + high-water per kstack, reported at thread exit. Release smoke unaffected (E2E=0, clean halt ✓ — the paint/scan is debug-only). Note: the release QEMU run skips the depth report by design; a **debug-profile QEMU run** (`cargo build -p kernel-boot --target x86_64-unknown-none` without `--release`) produces the per-thread `KSTACK depth: used=X` lines — DS/NV: one debug-profile boot before the next sizing decision gives the numbers.
 - Probes (sweep/WALK/BURIED) still in tree; sweep now shows init's stack at 0x1035000+ (frames shifted with the 32 KiB kstacks — consistent).
+
+## DS (Phase 2 slice 4 — VFS serves real data, 2026-11-02)
+
+- **Full smoke green with file I/O (markers 1–14 + DONE + clean halt, `aa03208`):** after the VFS ready callback (13), init performs a real protocol exchange entirely over IPC — `CONNECT` (fresh session notification + arg/result window frames; **the result-window descriptor must carry `WRITE|MAP` — the first run failed `ERIGHTS` because `region_carve`'s frame caps had no `MAP` right: fixed by adding `Rights::MAP` to the carve-installed frame caps in `kernel/src/init.rs` — GLM: folded, flag if you want it shaped differently**), then `OPEN("/hello")` with the name as a Span into the arg window, then `READ` into the result window, then a **byte-exact verification of `"helios-vfs-ok"` (13 bytes)**. The VFS bin seeds that file into its ramfs at startup (placeholder until the storage slice populates `/init`, `/bin`, …).
+- VFS shutdown now routes over the **connection endpoint** (the server serves only the connection after CONNECT) — same pattern as PS; `KILL` to the raw service endpoint would park forever (found and fixed this cycle).
+- Runbook updated (`e18ccf9`): markers 12/13/14 + DONE table.
+- **Next (slice 5):** PS loads its child from the VFS instead of the embedded image — SPAWN's program path resolved via WALK/OPEN/READ_BULK; needs READ_BULK (frame-list variant) on the VFS and the VFS client in PS.
