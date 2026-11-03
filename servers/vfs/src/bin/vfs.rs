@@ -124,7 +124,6 @@ pub extern "C" fn _start() -> ! {
         Ok(p) => p,
         Err(e) => Syscalls::new(&mut raw).exit(0xE1_00 | (e & 0xFF)),
     };
-    Syscalls::new(&mut raw).exit(0xAA_01); // probe: receive() returned Ok
 
     // 2. Heap: 1 MiB from the package Region into our own AS.
     let span = {

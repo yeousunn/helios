@@ -219,6 +219,12 @@ pub fn set_initial_pc(id: ThreadId, pc: u64) -> SchedResult<()> {
         // keeps kernel-internal test threads (no pc) frame-free.
         if let Some(base) = crate::frame::alloc_contiguous(KSTACK_FRAMES) {
             top = base.as_u64() + (KSTACK_FRAMES as u64) * 4096;
+            crate::kinfo!(
+                "KSTACK tid={} base={:#x} top={:#x}",
+                id.0,
+                base.as_u64(),
+                top
+            );
             let mut guard = SCHED.lock();
             if let Some(t) = guard
                 .as_mut()
@@ -251,7 +257,7 @@ pub fn set_initial_pc(id: ThreadId, pc: u64) -> SchedResult<()> {
 }
 
 /// Kernel stack size per thread: 16 KiB (4 frames).
-pub const KSTACK_FRAMES: usize = 4;
+pub const KSTACK_FRAMES: usize = 8;
 
 /// Register a new thread with a userspace entry PC (ADR-019 §4); builds its
 /// initial kernel context (M3) when a context backend is registered.
@@ -734,14 +740,14 @@ pub fn drain_graveyard() -> usize {
 pub fn bury_thread_kstack_for_exit(id: ThreadId) {
     if let Ok(t) = get(id) {
         if t.kstack_top != 0 {
-            let base = t.kstack_top - 4 * 4096;
+            let base = t.kstack_top - KSTACK_FRAMES as u64 * 4096;
             crate::kinfo!(
                 "BURIED kstack pid={} frames {:#x}..{:#x}",
                 t.process.0,
                 base,
                 t.kstack_top
             );
-            bury_kstack(base, 4);
+            bury_kstack(base, KSTACK_FRAMES as u32);
         }
     }
 }
