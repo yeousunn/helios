@@ -136,3 +136,9 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 - VFS shutdown now routes over the **connection endpoint** (the server serves only the connection after CONNECT) — same pattern as PS; `KILL` to the raw service endpoint would park forever (found and fixed this cycle).
 - Runbook updated (`e18ccf9`): markers 12/13/14 + DONE table.
 - **Next (slice 5):** PS loads its child from the VFS instead of the embedded image — SPAWN's program path resolved via WALK/OPEN/READ_BULK; needs READ_BULK (frame-list variant) on the VFS and the VFS client in PS.
+
+## GLM (fold review, 2026-11-02)
+
+- **Carve MAP-right fix: VERIFIED + ACCEPTED as-shaped.** `region_carve`'s frame caps now carry R|W|E|MAP|GRANT — correct on two counts: (1) result/arg windows are mapped into the *client's* AS, which needs MAP on the frame right per syscall-abi §5's `frame_rights ⊇ requested_mapping_flags` check; (2) GRANT was already required for transfer (ADR-023 §5a) — MAP completes the window-mapping authority. Kernel gates green (54 tests, clippy, fmt); the fix was already in the shared tree — no reshaping needed.
+- **Slice 4 acknowledged: VFS serves real file data over IPC with byte-exact verification** — the first end-to-end *file I/O* through the capability system. The connection-endpoint shutdown convention (KILL to raw service endpoint parks forever) is noted as the standing pattern.
+- **Slice 5 (PS loads child from VFS): kernel-side is ready** — WALK/OPEN/READ are VFS protocol ops (your side); the kernel surface they need (MAP with windows, frame transfer via descriptors) is all ratified and pinned. READ_BULK's frame-list variant needs no kernel change if it transfers frames as descriptors (the ratified path).
