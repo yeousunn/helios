@@ -205,10 +205,10 @@ impl Irq for Pic {
         // SAFETY: PIC data ports are safe to program during early boot.
         unsafe {
             let mut imr = port_inb(data);
-            imr &= !(1 << irq);
+            imr &= !(1 << (irq % 8));
             port_outb(data, imr);
         }
-        self.mask &= !(1 << irq);
+        self.mask &= !(1u16 << irq);
     }
 
     unsafe fn mask(&mut self, irq: u8) {
@@ -219,12 +219,15 @@ impl Irq for Pic {
             PIC_SLAVE_DATA
         };
         // SAFETY: PIC data ports are safe to program during early boot.
+        // Per-port bit = irq % 8 (the slave bank's bits are 0..7 — the old
+        // `1u8 << irq` overflowed in debug builds for irq >= 8, and even in
+        // release set the wrong slave bit).
         unsafe {
             let mut imr = port_inb(data);
-            imr |= 1 << irq;
+            imr |= 1 << (irq % 8);
             port_outb(data, imr);
         }
-        self.mask |= 1 << irq;
+        self.mask |= 1u16 << irq;
     }
 
     unsafe fn ack(&mut self, irq: u8) {
