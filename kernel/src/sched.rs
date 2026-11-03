@@ -235,10 +235,18 @@ pub fn set_initial_pc(id: ThreadId, pc: u64) -> SchedResult<()> {
         }
     }
     let ksp = if top != 0 {
-        CTX.lock()
+        let ksp = CTX
+            .lock()
             .as_ref()
             .map(|b| b.init_context(top, pc))
-            .unwrap_or(0)
+            .unwrap_or(0);
+        // ADR-037 depth accounting: paint the unused tail below the built
+        // context (debug builds only; the context occupies the top).
+        #[cfg(debug_assertions)]
+        if ksp != 0 && top > ksp {
+            paint_kstack(top - crate::sched::KSTACK_FRAMES as u64 * 4096, ksp);
+        }
+        ksp
     } else {
         0
     };
@@ -258,6 +266,33 @@ pub fn set_initial_pc(id: ThreadId, pc: u64) -> SchedResult<()> {
 
 /// Kernel stack size per thread: 16 KiB (4 frames).
 pub const KSTACK_FRAMES: usize = 8;
+
+/// Stack-paint pattern for high-water accounting (ADR-037 follow-up):
+/// debug builds paint the unused tail of each kernel stack at thread start
+/// and measure the deepest touch at exit, so kstack sizing is measured, not
+/// guessed. Release builds skip the paint/check entirely.
+const KSTACK_PAINT: u8 = 0xA5;
+
+/// Paint the unused region of a freshly built kernel stack
+/// (`[base, used_bottom)` where `used_bottom` = the lowest byte the initial
+/// context touched). Debug builds only.
+#[cfg(debug_assertions)]
+pub fn paint_kstack(base: u64, used_bottom: u64) {
+    if used_bottom <= base {
+        return;
+    }
+    crate::mem::paint_range(base, used_bottom - base, crate::sched::KSTACK_PAINT);
+}
+
+/// High-water mark: bytes of painted tail consumed (0 = untouched).
+/// Debug builds only; called from the exit/bury path.
+#[cfg(debug_assertions)]
+pub fn kstack_high_water(base: u64, used_bottom: u64) -> u64 {
+    if used_bottom <= base {
+        return 0;
+    }
+    crate::mem::high_water(base, used_bottom - base, crate::sched::KSTACK_PAINT)
+}
 
 /// Register a new thread with a userspace entry PC (ADR-019 §4); builds its
 /// initial kernel context (M3) when a context backend is registered.

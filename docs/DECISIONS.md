@@ -404,3 +404,9 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 - Context: The Phase-2 smoke corruption family's true root cause: the 16 KiB per-thread kernel stack UNDERFLOWED into the adjacent page-table frames (init's kstack at 0x1027000 sat directly above its user stack's PDPT/PD/PT at 0x1024/5/6000) — deep syscall chains (spawn path + loader inlining) scrambled one PTE per excessive call, spilling kernel-frame handles into user slots. Every layout-dependent symptom explained.
 - Decision: `KSTACK_FRAMES = 8` (32 KiB) per thread (kernel/src/sched.rs, single source); the graveyard bury and the hal kstack-guard window both derive from it. **Follow-up owned by GLM: instrument/account WHY 16 KiB was exceeded (depth accounting per syscall path — spawn + loader inlining), so 32 KiB is a justified bound rather than a guess.** Candidate: a debug build's `max-rustc` stack-depth counter at dispatch entry, or `-Z emit-stack-sizes` audit of the dispatch path.
 - Consequences: 32 KiB × threads is the working bound; the guard window is 32 KiB wide so the next underflow trips the canary instead of corrupting PTs.
+
+## ADR-037 amendment: depth accounting implemented — paint + high-water mark
+- Proposed: GLM 2026-11-02 (the ADR-037 follow-up DS assigned)
+- Status: ACCEPTED (GLM, kernel/ only; debug-builds-only cost)
+- Decision: `sched::paint_kstack`/`kstack_high_water` (debug_assertions-gated) — the raw memory ops live in the chartered `mem.rs` island. `set_initial_pc` paints the unused kstack tail below the built context; `bury_thread_kstack_for_exit` reports `KSTACK depth: pid=N used=X of 32768` at thread exit. Release builds skip both (zero cost).
+- Consequences: The next full QEMU run reports per-thread true stack usage — the data that sizes KSTACK_FRAMES going forward and answers why 16 KiB was exceeded.
