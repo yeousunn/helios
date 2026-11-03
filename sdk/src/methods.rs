@@ -49,6 +49,25 @@ pub mod irq {
     pub const ACK: u16 = 1;
 }
 
+/// VFS server protocol labels (design §3.3, `servers/vfs/src/proto.rs`).
+/// Full wire labels for requests over a VFS connection.
+pub mod vfs {
+    pub const CONNECT: u16 = 0x0201;
+    pub const WALK: u16 = 0x0210;
+    pub const OPEN: u16 = 0x0211;
+    pub const READ: u16 = 0x0212;
+    pub const READ_BULK: u16 = 0x0213;
+    pub const WRITE: u16 = 0x0214;
+    pub const CLOSE: u16 = 0x0215;
+    pub const STAT: u16 = 0x0217;
+}
+
+/// VFS OPEN flags (`proto.rs`).
+pub mod vfs_open {
+    pub const READ: u32 = 1 << 0;
+    pub const WRITE: u32 = 1 << 1;
+}
+
 /// Process server protocol labels (design §2.6,
 /// `servers/docs/process-and-vfs-design.md`). These are full wire labels
 /// (`tag.label` of the request message), not invoke method ids.

@@ -174,11 +174,18 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
-    // 5. Serve: own recv loop (KILL intercept) + the tested VFS core.
+    // 5. Seed the v0 ramfs with a smoke file: `/hello` = "helios-vfs-ok".
+    // (A real /init + /bin population arrives with the storage slice.)
     let mut server = VfsServer::new(BinKernel { factory }, BinTransport, service_ep);
     let mut windows = BinWindows {
         windows: WindowMapper::new(package.aspace, VFS_WINDOW_VA_BASE, MAX_WINDOWS),
     };
+    {
+        let root = server.fs().root();
+        if let Ok(file) = server.fs().create_file(root, "hello", 0o644, 0) {
+            let _ = server.fs().write(file, 0, b"helios-vfs-ok", 0);
+        }
+    }
     let mut shell = BinTransport;
     let mut recv_on = service_ep;
     loop {

@@ -262,6 +262,7 @@ pub fn region_carve(pid: ProcessId, region: ObjId, w0: u64, w1: u64) -> Result<u
             rights: Rights::READ
                 .union(Rights::WRITE)
                 .union(Rights::EXEC)
+                .union(Rights::MAP)
                 .union(Rights::GRANT),
         },
     )
