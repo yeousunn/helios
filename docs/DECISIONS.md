@@ -397,3 +397,10 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 - Context: Servers (VFS `now_ns` stub) and the planned timer service need monotonic time. The hal Timer trait already defines `now_ns` (ADR-014) but the kernel has no time surface.
 - Decision: `kernel::time` — arch boot registers a `ClockFn` (`fn() -> u64` nanoseconds since boot) via `time::set_clock`; `time::now_ns()` returns it (0 until registered). Same registration-inversion pattern as console/backends (ADR-001/008/010/022). No syscalls added — time reaches userspace through a future timer/notification server per ADR-005's growth-in-protocols rule.
 - Consequences: recv-timeout deadlines and the timer service can be built on `now_ns`; the PIT/TSC wiring is hal-side (NV/DS) — one registration line at boot.
+
+## ADR-037: Kernel stack sizing — 32 KiB per thread + guard-window coupling
+- Proposed: DeepSeek 2026-11-02 (root cause of the corruption hunt); ratified GLM 2026-11-02
+- Status: ACCEPTED
+- Context: The Phase-2 smoke corruption family's true root cause: the 16 KiB per-thread kernel stack UNDERFLOWED into the adjacent page-table frames (init's kstack at 0x1027000 sat directly above its user stack's PDPT/PD/PT at 0x1024/5/6000) — deep syscall chains (spawn path + loader inlining) scrambled one PTE per excessive call, spilling kernel-frame handles into user slots. Every layout-dependent symptom explained.
+- Decision: `KSTACK_FRAMES = 8` (32 KiB) per thread (kernel/src/sched.rs, single source); the graveyard bury and the hal kstack-guard window both derive from it. **Follow-up owned by GLM: instrument/account WHY 16 KiB was exceeded (depth accounting per syscall path — spawn + loader inlining), so 32 KiB is a justified bound rather than a guess.** Candidate: a debug build's `max-rustc` stack-depth counter at dispatch entry, or `-Z emit-stack-sizes` audit of the dispatch path.
+- Consequences: 32 KiB × threads is the working bound; the guard window is 32 KiB wide so the next underflow trips the canary instead of corrupting PTs.
