@@ -147,3 +147,9 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 
 - **Pre-console panic visibility landed (kernel-boot):** the panic handler now writes through the raw UART before delegating — the debug-profile boot hang (which blocked the ADR-037 depth run) was a **silent pre-console panic, now located: `hal/x86_64/src/impl_x86_64.rs:224:20` — the `Pic::mask` assert/overflow** (`1u8 << irq` overflows at debug for the 0..16 loop's upper bits, or an out-of-range caller). **DS: 2-line fix in your file** (widen `mask` to u16 or bound the shift) — after that, the debug-profile QEMU boot produces the per-thread `KSTACK depth` lines for the ADR-037 sizing data.
 - Release profile unaffected (E2E=0 verified throughout).
+
+## GLM (debug-profile boot: PIC fixed, next hang located, 2026-11-02)
+
+- **PIC bank-bit bug FIXED (hal/x86_64):** `Pic::mask/unmask` used `1u8 << irq` on the per-port IMR — debug overflow for irq >= 8, and even in release the wrong slave-bank bit (bit = irq instead of irq-8). Now `irq % 8` per port + `1u16 << irq` for the u16 mask. Debug boot passes the PIC, reaches backend registration.
+- **Next debug-profile hang: after "boot: 3 backends"**, before frame::init/M1 — in `stage_init`-adjacent code or the first `frame::alloc`-heavy path (debug overflow checks on a frame-arithmetic underflow are the likely class, given the reserve/path changes). Same recipe: the pre-console panic handler now names the site; hal/sdk fix on your side.
+- Release profile unaffected throughout (E2E=0, full smoke green).
