@@ -30,7 +30,7 @@ fn bench_endpoint_roundtrip(c: &mut Criterion) {
     c.bench_function("endpoint/park_recv_wake_cycle", |b| {
         b.iter(|| {
             // Park the receiver, hand off, read the rendezvous slot.
-            let _ = endpoint::recv(ep, receiver);
+            let _ = endpoint::recv(ep, receiver, false);
             endpoint::try_send(ep, Envelope::new(msg(0x0212, 7), sender)).unwrap();
             let _ = endpoint::take_delivered(receiver);
         })
