@@ -28,8 +28,44 @@ include!(concat!(env!("OUT_DIR"), "/init_image.rs"));
 
 /// Final binaries own the panic handler and delegate to the kernel policy
 /// (ADR-027: log, then exit/ halt).
+/// Bounded UART formatter for the pre-console panic path.
+struct UartBuf<'a> {
+    buf: &'a mut [u8],
+    len: usize,
+}
+
+impl<'a> UartBuf<'a> {
+    fn new(buf: &'a mut [u8]) -> Self {
+        UartBuf { buf, len: 0 }
+    }
+    fn as_str(&self) -> &str {
+        match core::str::from_utf8(&self.buf[..self.len]) {
+            Ok(s) => s,
+            Err(_) => "",
+        }
+    }
+}
+
+impl<'a> core::fmt::Write for UartBuf<'a> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let rem = self.buf.len() - self.len;
+        let n = s.len().min(rem);
+        self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
+        self.len += n;
+        Ok(())
+    }
+}
+
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
+    // Pre-console visibility: write through the raw UART as well — panics
+    // that fire before `boot::early_init` registers the console previously
+    // vanished silently (the debug-profile boot hang class).
+    use core::fmt::Write;
+    let mut buf = [0u8; 512];
+    let mut w = UartBuf::new(&mut buf);
+    let _ = write!(w, "PANIC(pre-console): {}\n", info);
+    hal_x86_64::uart_writer(w.as_str());
     kernel::panic::handle_panic(info)
 }
 
