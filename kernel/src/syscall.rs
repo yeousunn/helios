@@ -245,7 +245,8 @@ pub fn sys_call(pid: ProcessId, tid: ThreadId, dst_handle: u32, msg: Message) ->
     if cap.typ != ObjType::Endpoint || !cap.rights.contains(Rights::SEND) {
         return Err(err(ipc::status::EBADARG));
     }
-    let (env, _) = resolve_transfers(pid, &msg, tid);
+    let (mut env, _) = resolve_transfers(pid, &msg, tid);
+    env.reply_requested = true;
     // Send (nonblocking park path is the same for call).
     match endpoint::try_send(ObjRef(cap.obj.0), env) {
         Ok(()) => {}
@@ -296,11 +297,15 @@ fn clear_park(tid: ThreadId) {
 /// Priority: `call` reply → bound notification (NOTIFIED + mask) → endpoint
 /// delivery (completed recv).
 pub fn park_result(tid: ThreadId) -> Option<crate::entry::SyscallReturn> {
-    // 0. A `call` reply delivered while parked → complete the call.
+    // 0. A `call` reply delivered while parked → complete the call. The
+    // thread's implicit *request* reply slot (who to answer when serving)
+    // must survive nested calls: a server that calls out mid-request
+    // (e.g. PS loading a program through the VFS) still owes its answer to
+    // the original requester. Only consuming a *request* (endpoint delivery
+    // below) rebinds the slot; consuming a reply must not clear it.
     {
         let mut d = crate::endpoint::DELIVERED_FOR_REPLY.lock();
         if let Some(env) = d.take(tid) {
-            clear_reply(tid);
             clear_park(tid);
             return Some(crate::entry::SyscallReturn::ok(env.msg.tag, env.msg.words));
         }
@@ -343,12 +348,18 @@ pub fn park_result(tid: ThreadId) -> Option<crate::entry::SyscallReturn> {
 
 /// SYS 3: `recv`. Returns (status, delivered message or none).
 /// `woken_by_notification` is surfaced via FLAG_NOTIFIED + label 0.
-pub fn sys_recv(pid: ProcessId, tid: ThreadId, src_handle: u32) -> SysResult<Option<Message>> {
+pub fn sys_recv(
+    pid: ProcessId,
+    tid: ThreadId,
+    src_handle: u32,
+    nonblock: bool,
+) -> SysResult<Option<Message>> {
     // A pending reply for a `call` takes priority (woken by reply_only).
+    // See SYS 2: the implicit request reply slot survives nested call
+    // replies; only a new request (endpoint delivery) rebinds it.
     {
         let mut d = crate::endpoint::DELIVERED_FOR_REPLY.lock();
         if let Some(env) = d.take(tid) {
-            clear_reply(tid);
             return Ok(Some(env.msg));
         }
     }
@@ -358,7 +369,7 @@ pub fn sys_recv(pid: ProcessId, tid: ThreadId, src_handle: u32) -> SysResult<Opt
             if !cap.rights.contains(Rights::RECV) {
                 return Err(err(ipc::status::ERIGHTS));
             }
-            match endpoint::recv(ObjRef(cap.obj.0), tid) {
+            match endpoint::recv(ObjRef(cap.obj.0), tid, nonblock) {
                 Ok(Some(mut env)) => {
                     // Set the implicit reply cap when the message came from a call.
                     set_reply_if_call(&env, tid);
@@ -366,6 +377,10 @@ pub fn sys_recv(pid: ProcessId, tid: ThreadId, src_handle: u32) -> SysResult<Opt
                     Ok(Some(env.msg))
                 }
                 Ok(None) => {
+                    if nonblock {
+                        // v0 polling recv (VFS accept loop): report empty.
+                        return Err(err(ipc::status::EWOULDBLOCK));
+                    }
                     // Parked; record for park_result (ADR-019 §1).
                     record_park(tid, src_handle, pid);
                     Ok(None)
@@ -392,10 +407,14 @@ pub fn sys_recv(pid: ProcessId, tid: ThreadId, src_handle: u32) -> SysResult<Opt
 }
 
 pub(crate) fn set_reply_if_call(env: &Envelope, server: ThreadId) {
-    // v0 heuristic: every endpoint delivery grants the implicit reply cap
-    // (matches `call`/`reply_recv` fast path; plain `send` receivers simply
-    // have no pending caller when they reply → EBADSTATE, per syscall-abi §4).
-    set_reply(server, env.sender);
+    // Only a `call` (reply-requesting message) rebinds the receiver's
+    // implicit reply slot. Plain sends — notably bootstrap-package
+    // deliveries — must not: a stale slot misroutes the server's next reply
+    // to the wrong process (observed: the VFS answered PS's CONNECT to the
+    // launcher, which was awaiting its SPAWN reply).
+    if env.reply_requested {
+        set_reply(server, env.sender);
+    }
 }
 
 /// SYS 4: `reply_recv` — reply through the implicit reply cap, then recv.
@@ -417,7 +436,7 @@ pub fn sys_reply_recv(
         }
         None => return Err(err(ipc::status::EBADSTATE)),
     }
-    sys_recv(pid, tid, src_handle)
+    sys_recv(pid, tid, src_handle, false)
 }
 
 /// SYS 5: `invoke` — method dispatch on kernel object caps.
@@ -597,7 +616,7 @@ mod tests {
         ));
 
         // Server receives: gets the request + implicit reply cap.
-        let req = sys_recv(pid, server, ep_h).unwrap().unwrap();
+        let req = sys_recv(pid, server, ep_h, false).unwrap().unwrap();
         assert_eq!(req.words[0], 42);
 
         // Server replies + recvs again (fast path).
@@ -633,7 +652,7 @@ mod tests {
 
         // Client calls; server replies carrying the frame cap.
         assert_eq!(sys_call(pid, client, ep_h, msg(0x0101, 1)), Ok(0));
-        let _req = sys_recv(pid, server, ep_h).unwrap().unwrap();
+        let _req = sys_recv(pid, server, ep_h, false).unwrap().unwrap();
         let mut rep = msg(0x0101, 2);
         rep.tag = rep.tag.with_caps(1);
         rep.set_descriptor(0, CapSlot::pack(frame_h, Rights::READ))
@@ -666,7 +685,7 @@ mod tests {
 
         // Establish one via recv of a call, then reply via sentinel.
         assert_eq!(sys_call(pid, server, ep_h, msg(5, 5)), Ok(0));
-        let _req = sys_recv(pid, server, ep_h).unwrap().unwrap();
+        let _req = sys_recv(pid, server, ep_h, false).unwrap().unwrap();
         assert_eq!(
             sys_send(pid, server, REPLY_CAP_SENTINEL, msg(5, 6), false),
             Ok(0)
@@ -700,7 +719,7 @@ mod tests {
         assert_eq!(sys_send(pid, client, ep_h, m, false), Ok(0));
 
         // Server receives; descriptor rewritten to its own handle.
-        let got = sys_recv(pid, server, ep_h).unwrap().unwrap();
+        let got = sys_recv(pid, server, ep_h, false).unwrap().unwrap();
         let cs = got.descriptor(0).unwrap();
         assert_ne!(cs.handle(), frame_h, "receiver handle differs");
         assert_eq!(cs.rights(), Rights::READ, "granted = sender ∩ requested");
@@ -727,12 +746,12 @@ mod tests {
         assert_eq!(sys_invoke(pid, server, n_h, m), Ok((0, [0; 4])));
 
         // recv-on-notification returns and clears the mask.
-        let got = sys_recv(pid, server, n_h).unwrap().unwrap();
+        let got = sys_recv(pid, server, n_h, false).unwrap().unwrap();
         assert_eq!(got.tag.label(), ipc::labels::kernel::NOTIFY);
         assert_eq!(got.words[0], 0b1010);
 
         // Empty → parks the thread.
-        assert_eq!(sys_recv(pid, server, n_h), Ok(None));
+        assert_eq!(sys_recv(pid, server, n_h, false), Ok(None));
         assert!(matches!(
             sched::get(server).unwrap().state,
             crate::sched::State::Blocked(BlockReason::Notification(_))
@@ -782,7 +801,7 @@ mod tests {
         }
         // Client calls so the server holds a reply target.
         assert_eq!(sys_call(pid, client, ep_h, msg(1, 1)), Ok(0));
-        let _ = sys_recv(pid, server, ep_h).unwrap();
+        let _ = sys_recv(pid, server, ep_h, false).unwrap();
         // Server exits: notification pending, reply state cleared.
         assert_eq!(sys_exit(server, 0), Ok(true));
         assert_eq!(notification::pending(n), Ok(1));
@@ -814,7 +833,7 @@ mod tests {
             .unwrap();
         assert_eq!(sys_send(pid, client, ep_h, m, false), Ok(0));
 
-        let got = sys_recv(pid, _server, ep_h).unwrap().unwrap();
+        let got = sys_recv(pid, _server, ep_h, false).unwrap().unwrap();
         assert!(
             got.tag.flags() & ipc::flags::CAP_PARTIAL != 0,
             "partial flag set"
@@ -834,7 +853,7 @@ mod tests {
         let (pid, server, _client, ep_h) = setup();
 
         // Server parks in recv (mailbox empty).
-        assert_eq!(sys_recv(pid, server, ep_h), Ok(None));
+        assert_eq!(sys_recv(pid, server, ep_h, false), Ok(None));
         assert!(matches!(
             sched::get(server).unwrap().state,
             crate::sched::State::Blocked(_)
@@ -861,7 +880,7 @@ mod tests {
                 .unwrap()
                 .bound_notification = Some(n);
         }
-        assert_eq!(sys_recv(pid, server, ep_h), Ok(None));
+        assert_eq!(sys_recv(pid, server, ep_h, false), Ok(None));
         notification::signal(n, 0b110).unwrap();
         assert_eq!(
             sched::get(server).unwrap().state,
@@ -969,7 +988,7 @@ mod tests {
         m.set_descriptor(0, ipc::CapSlot::pack(ep_h, ipc::Rights::SEND))
             .unwrap();
         assert_eq!(sys_send(pid, server, _ep, m, false), Ok(0));
-        let got = sys_recv(pid, server, _ep).unwrap().unwrap();
+        let got = sys_recv(pid, server, _ep, false).unwrap().unwrap();
         assert!(got.tag.flags() & ipc::flags::CAP_PARTIAL != 0);
         assert_eq!(got.descriptor(0).unwrap().0, 0, "dead cap -> NULL");
         // Old handles in OTHER processes surface EREVOKED at use (send on

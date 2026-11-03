@@ -43,8 +43,18 @@ static HEAP: GlobalHeap = GlobalHeap::new();
 
 const MAX_WINDOWS: usize = 128;
 
+include!(concat!(env!("OUT_DIR"), "/child_image.rs"));
+
 /// Stateless transport: one transient `Syscalls` per call.
 struct BinTransport;
+
+impl BinTransport {
+    /// Non-blocking recv for the accept loop (not part of the core
+    /// `Transport` trait; the core only needs blocking recv).
+    fn recv_nonblock(&mut self, on: KernelHandle) -> Result<Message, VfsStatus> {
+        Syscalls::new(&mut X86_64Syscalls).recv_nonblock(on)
+    }
+}
 
 impl Transport for BinTransport {
     fn recv(&mut self, on: KernelHandle) -> Result<Message, VfsStatus> {
@@ -166,7 +176,10 @@ pub extern "C" fn _start() -> ! {
         ready.words[0] = sdk::bootstrap::READY_MAGIC;
         ready.words[1] = HEAP.capacity() as u64;
         if ready
-            .set_descriptor(0, CapSlot::pack(service_ep, Rights::SEND))
+            .set_descriptor(
+                0,
+                CapSlot::pack(service_ep, Rights::SEND.union(Rights::GRANT)),
+            )
             .is_none()
             || sys.send(package.process_server_ep, &ready).is_err()
         {
@@ -174,8 +187,10 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
-    // 5. Seed the v0 ramfs with a smoke file: `/hello` = "helios-vfs-ok".
-    // (A real /init + /bin population arrives with the storage slice.)
+    // 5. Seed the v0 ramfs: `/hello` = "helios-vfs-ok" and `/child` = the
+    // spawn payload PS loads through us (root-level single-component paths are
+    // the v0 convention; a real /init + /bin population arrives with the
+    // storage slice).
     let mut server = VfsServer::new(BinKernel { factory }, BinTransport, service_ep);
     let mut windows = BinWindows {
         windows: WindowMapper::new(package.aspace, VFS_WINDOW_VA_BASE, MAX_WINDOWS),
@@ -185,28 +200,62 @@ pub extern "C" fn _start() -> ! {
         if let Ok(file) = server.fs().create_file(root, "hello", 0o644, 0) {
             let _ = server.fs().write(file, 0, b"helios-vfs-ok", 0);
         }
+        if HAS_CHILD_IMAGE {
+            if let Ok(file) = server.fs().create_file(root, "child", 0o755, 0) {
+                let _ = server.fs().write(file, 0, CHILD_IMAGE, 0);
+            }
+        }
     }
+    // v0 accept loop: the service endpoint first (new CONNECTs), then the
+    // established connections round-robin; when everything is idle, yield and
+    // poll again (cooperative spin). A proper multi-endpoint wait is the
+    // Phase-3 item; this shape serves serialized clients correctly.
     let mut shell = BinTransport;
-    let mut recv_on = service_ep;
     loop {
-        let msg = match shell.recv(recv_on) {
-            Ok(m) => m,
-            Err(_) => Syscalls::new(&mut raw).exit(0xE6),
+        let mut handled = match shell.recv_nonblock(service_ep) {
+            Ok(msg) => serve(&mut server, &mut windows, &mut shell, service_ep, &msg),
+            Err(_) => false,
         };
-        if msg.tag.label() == methods::process::KILL {
-            // v0 shutdown convention (same as PS): ack, then exit.
-            let ack = Message::new(methods::process::KILL);
-            let _ = shell.send(REPLY_CAP, &ack);
-            Syscalls::new(&mut raw).exit(msg.words[1] as i32);
+        let mut i = 0u64;
+        while !handled {
+            let Some(ep) = server.connection(i).map(|c| c.endpoint) else {
+                break;
+            };
+            if let Ok(msg) = shell.recv_nonblock(ep) {
+                handled = serve(&mut server, &mut windows, &mut shell, ep, &msg);
+            }
+            i += 1;
         }
-        if server.handle(recv_on, &msg, &mut windows).is_err() {
-            Syscalls::new(&mut raw).exit(0xE7);
-        }
-        // After CONNECT, requests arrive on the connection endpoint.
-        if let Some(c) = server.connection(0) {
-            recv_on = c.endpoint;
+        if !handled {
+            // Nothing pending anywhere: yield so a blocked peer can run (it
+            // may be about to send its next request or a new CONNECT), then
+            // poll again. v0 polling accept loop — a proper wait primitive
+            // (multi-endpoint select) is the Phase-3 item.
+            let mut sys = Syscalls::new(&mut raw);
+            let _ = sys.yield_now();
         }
     }
+}
+
+/// Serve one message: KILL acks and exits (v0 shutdown convention, same as
+/// PS); otherwise the VfsServer core handles it on the endpoint it arrived
+/// on (its `handle` resolves the connection by endpoint).
+fn serve(
+    server: &mut VfsServer<BinKernel, BinTransport>,
+    windows: &mut BinWindows,
+    shell: &mut BinTransport,
+    on: u32,
+    msg: &Message,
+) -> bool {
+    if msg.tag.label() == methods::process::KILL {
+        let ack = Message::new(methods::process::KILL);
+        let _ = shell.send(REPLY_CAP, &ack);
+        Syscalls::new(&mut X86_64Syscalls).exit(msg.words[1] as i32);
+    }
+    if server.handle(on, msg, windows).is_err() {
+        Syscalls::new(&mut X86_64Syscalls).exit(0xE7);
+    }
+    true
 }
 
 #[panic_handler]

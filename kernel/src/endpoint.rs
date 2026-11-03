@@ -27,6 +27,12 @@ pub struct Envelope {
     pub msg: Message,
     pub caps: [Option<Capability>; ipc::MAX_WORDS],
     pub sender: ThreadId,
+    /// True when the message was sent with `call` (or an explicit reply
+    /// request): the receiver's implicit reply slot rebinds to `sender`.
+    /// Plain `send`/package deliveries must NOT rebind it (v0 heuristic bug:
+    /// bootstrap-package deliveries stole the slot, misrouting later
+    /// server replies to the launcher).
+    pub reply_requested: bool,
 }
 
 impl Envelope {
@@ -35,6 +41,7 @@ impl Envelope {
             msg,
             caps: [const { None }; ipc::MAX_WORDS],
             sender,
+            reply_requested: false,
         }
     }
 }
@@ -298,15 +305,22 @@ pub fn try_recv(ep: ObjRef) -> Result<Option<Envelope>, IpcError> {
     with_ep(ep, |e| Ok(e.mailbox.take()))
 }
 
-/// Full blocking receive (syscall `recv`):
+/// Receive (syscall `recv`):
 /// 1. mailbox message → deliver it, rotate head parked sender's message into
 ///    the mailbox, wake that sender;
-/// 2. parked sender with message → direct hand-off (rendezvous), wake sender;
-/// 3. nothing → park the receiver.
+/// 2. parked sender with message → rendezvous **inline** (return the
+///    envelope). The old form deferred it via `DELIVERED_FOR_REPLY` and
+///    suspended the receiver — but a *running* receiver is off the ready
+///    queue, so nothing ever resumed it and the pending message was lost
+///    (found: VFS startup stalled on its package's tail chunks);
+/// 3. nothing → park the receiver, unless `nonblock` reports empty without
+///    registering or blocking (a registered "phantom receiver" corrupted the
+///    rendezvous engine the same way: later sends were direct-handed to a
+///    thread that was not actually parked).
 ///
-/// Returns `Ok(None)` when the receiver parked (message arrives later via
-/// `take_delivered`).
-pub fn recv(ep: ObjRef, receiver: ThreadId) -> Result<Option<Envelope>, IpcError> {
+/// Returns `Ok(None)` only when the receiver parked (message arrives later
+/// via `take_delivered`) or when `nonblock` and empty.
+pub fn recv(ep: ObjRef, receiver: ThreadId, nonblock: bool) -> Result<Option<Envelope>, IpcError> {
     with_ep(ep, |e| {
         if let Some(m) = e.mailbox.take() {
             // Rotate the next parked sender's envelope into the mailbox.
@@ -317,9 +331,10 @@ pub fn recv(ep: ObjRef, receiver: ThreadId) -> Result<Option<Envelope>, IpcError
             return Ok(Some(m));
         }
         if let Some(env2) = e.senders.pop() {
-            DELIVERED_FOR_REPLY.lock().insert(receiver, env2);
             sched::make_ready(env2.sender)?;
-            // Receiver reads via take_delivered once scheduled.
+            return Ok(Some(env2));
+        }
+        if nonblock {
             return Ok(None);
         }
         e.receivers.push(receiver)?;
@@ -398,7 +413,7 @@ mod tests {
     fn direct_handoff_wakes_receiver() {
         let (ep, a, b) = setup();
         // b parks as receiver (blocks).
-        assert_eq!(recv(ep, b), Ok(None));
+        assert_eq!(recv(ep, b, false), Ok(None));
         assert!(matches!(
             sched::get(b).unwrap().state,
             crate::sched::State::Blocked(_)
@@ -424,22 +439,21 @@ mod tests {
 
         // b drains the mailbox: gets msg 1, a wakes, msg 2 rotates into the
         // mailbox.
-        assert_eq!(recv(ep, b).unwrap().unwrap().msg.words[0], 100);
+        assert_eq!(recv(ep, b, false).unwrap().unwrap().msg.words[0], 100);
         assert_eq!(sched::get(a).unwrap().state, crate::sched::State::Ready);
         assert_eq!(try_recv(ep).unwrap().unwrap().msg.words[0], 200);
 
         // Direct hand-off path from parked sender: a parks again, b receives
-        // via rendezvous.
+        // the message inline from the rendezvous.
         park_send(ep, a, env(3, 300, a)).unwrap();
-        assert_eq!(recv(ep, b), Ok(None));
-        assert_eq!(take_delivered(b).unwrap().msg.words[0], 300);
+        assert_eq!(recv(ep, b, false).unwrap().unwrap().msg.words[0], 300);
         assert!(try_recv(ep).unwrap().is_none());
     }
 
     #[test]
     fn unqueue_cancels_and_wakes() {
         let (ep, a, _b) = setup();
-        assert_eq!(recv(ep, a), Ok(None));
+        assert_eq!(recv(ep, a, false), Ok(None));
         assert!(unqueue_waiter(ep, a).unwrap());
         assert_eq!(sched::get(a).unwrap().state, crate::sched::State::Ready);
         assert!(!unqueue_waiter(ep, a).unwrap());

@@ -47,13 +47,13 @@ const STEP_ENDPOINT: u64 = 3;
 const STEP_IPC: u64 = 4;
 const STEP_REVOKE: u64 = 5;
 const STEP_HEAP: u64 = 6;
-const STEP_SPAWNED: u64 = 7;
-const STEP_CHILD_READY: u64 = 8;
-const STEP_CONNECT: u64 = 9;
-const STEP_SPAWN_CHILD: u64 = 10;
-const STEP_WAIT: u64 = 11;
-const STEP_VFS_SPAWNED: u64 = 12;
-const STEP_VFS_READY: u64 = 13;
+const STEP_SPAWNED: u64 = 9;
+const STEP_CHILD_READY: u64 = 10;
+const STEP_CONNECT: u64 = 11;
+const STEP_SPAWN_CHILD: u64 = 12;
+const STEP_WAIT: u64 = 13;
+const STEP_VFS_SPAWNED: u64 = 7;
+const STEP_VFS_READY: u64 = 8;
 const STEP_VFS_READ: u64 = 14;
 const STEP_CHILD_EXIT: u64 = 15;
 const STEP_DONE: u64 = 0x0F;
@@ -169,7 +169,37 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
         .map_err(|e| fail_code(STEP_HEAP, e as u64))?;
     mark(raw, info.debug_ep, STEP_HEAP, (span.1 >> 10) as u64);
 
-    // Step 7: spawn the process server (embedded image, ADR-023).
+    // Steps 7–8: the first system server — spawn the VFS from its embedded
+    // image and accept its ready callback. The VFS comes first because PS
+    // loads program images through it (design §2.6: SPAWN carries the VFS
+    // service endpoint as input cap 0).
+    if !HAS_VFS_IMAGE {
+        return Err(fail_code(STEP_VFS_SPAWNED, 0xE1));
+    }
+    let vfs_pid = spawn_server(raw, info, self_as, region, VFS_IMAGE, STEP_VFS_SPAWNED)?;
+    let vfs_ready_ep = SP_INIT_EP.load(SpOrdering::Relaxed);
+    let vfs_death = SP_DEATH.load(SpOrdering::Relaxed);
+    mark(raw, info.debug_ep, STEP_VFS_SPAWNED, vfs_pid);
+    let vfs_svc = {
+        let ready = {
+            let mut sys = Syscalls::new(raw);
+            sys.recv(vfs_ready_ep)
+                .map_err(|e| fail_code(STEP_VFS_READY, e as u64))?
+        };
+        if ready.tag.label() != bootstrap::READY_LABEL || ready.words[0] != bootstrap::READY_MAGIC {
+            return Err(fail_code(STEP_VFS_READY, 0xE1));
+        }
+        let svc = ready
+            .descriptor(0)
+            .map(|cs| cs.handle())
+            .filter(|h| *h != 0)
+            .ok_or(fail_code(STEP_VFS_READY, 0xE2))?;
+        mark(raw, info.debug_ep, STEP_VFS_READY, ready.words[1]);
+        svc
+    };
+
+    // Steps 9–10: spawn the process server (embedded image, ADR-023) and
+    // accept its ready callback.
     if !HAS_PS_IMAGE {
         mark(raw, info.debug_ep, STEP_SPAWNED, SPAWN_SKIPPED);
         return Ok(());
@@ -178,25 +208,25 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
     let ps_ready_ep = SP_INIT_EP.load(SpOrdering::Relaxed);
     let ps_death = SP_DEATH.load(SpOrdering::Relaxed);
     mark(raw, info.debug_ep, STEP_SPAWNED, ps_pid);
-
-    // Step 8: ready callback — PS publishes its service endpoint as a
-    // capability (descriptor 0) over the package's service-endpoint slot.
-    let ready = {
-        let mut sys = Syscalls::new(raw);
-        sys.recv(ps_ready_ep)
-            .map_err(|e| fail_code(STEP_CHILD_READY, e as u64))?
+    let svc = {
+        let ready = {
+            let mut sys = Syscalls::new(raw);
+            sys.recv(ps_ready_ep)
+                .map_err(|e| fail_code(STEP_CHILD_READY, e as u64))?
+        };
+        if ready.tag.label() != bootstrap::READY_LABEL || ready.words[0] != bootstrap::READY_MAGIC {
+            return Err(fail_code(STEP_CHILD_READY, 0xE1));
+        }
+        let svc = ready
+            .descriptor(0)
+            .map(|cs| cs.handle())
+            .filter(|h| *h != 0)
+            .ok_or(fail_code(STEP_CHILD_READY, 0xE2))?;
+        mark(raw, info.debug_ep, STEP_CHILD_READY, ready.words[1]);
+        svc
     };
-    if ready.tag.label() != bootstrap::READY_LABEL || ready.words[0] != bootstrap::READY_MAGIC {
-        return Err(fail_code(STEP_CHILD_READY, 0xE1));
-    }
-    let svc = ready
-        .descriptor(0)
-        .map(|cs| cs.handle())
-        .filter(|h| *h != 0)
-        .ok_or(fail_code(STEP_CHILD_READY, 0xE2))?;
-    mark(raw, info.debug_ep, STEP_CHILD_READY, ready.words[1]);
 
-    // Step 9: CONNECT round-trip (design §2.6, label 0x0101). The v0 packing
+    // Step 11: CONNECT round-trip (design §2.6, label 0x0101). The v0 packing
     // keeps the version in w0; the three caps (session notification, arg
     // frame, result frame) overlay w1..w3 per the v1 message format; windows
     // are 4 KiB each (design §1.3) so no size words travel.
@@ -233,9 +263,10 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
         .ok_or(fail_code(STEP_CONNECT, 0xE2))?;
     mark(raw, info.debug_ep, STEP_CONNECT, conn.words[1]);
 
-    // Step 10: SPAWN a child through PS (design §2.6). The argv blob travels
-    // in the arg window: map it into our own AS and write "42" — the child
-    // exits with argv[0], proving window → server → child-stack data flow.
+    // Step 12: SPAWN a child through PS (design §2.6). The arg window carries
+    // the program path ("child") at offset 0 and the argv blob ("42") at
+    // offset 6; cap 0 is the VFS service endpoint, so PS resolves the program
+    // image through the VFS instead of an embedded copy.
     {
         let mut sys = Syscalls::new(raw);
         let mut m = Message::new(methods::aspace::MAP);
@@ -250,12 +281,19 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
             .map_err(|e| fail_code(STEP_SPAWN_CHILD, e as u64))?;
     }
     unsafe {
-        core::ptr::copy_nonoverlapping(b"42".as_ptr(), INIT_WINDOW_VA_BASE as *mut u8, 2);
+        core::ptr::copy_nonoverlapping(b"child".as_ptr(), INIT_WINDOW_VA_BASE as *mut u8, 5);
+        core::ptr::copy_nonoverlapping(b"42".as_ptr(), (INIT_WINDOW_VA_BASE + 6) as *mut u8, 2);
     }
     let spawned = {
         let mut sys = Syscalls::new(raw);
         let mut m = Message::new(methods::process::SPAWN);
-        m.words[2] = 2; // argv: (off = 0, len = 2)
+        m.tag = m.tag.with_caps(1);
+        m.words[1] = 5; // program path: Span { off 0, len 5 } in the arg window
+        m.words[2] = (6u64 << 32) | 2; // argv: Span { off 6, len 2 } in the arg window
+        let _ = m.set_descriptor(
+            0,
+            ipc::CapSlot::pack(vfs_svc, ipc::Rights::SEND.union(ipc::Rights::GRANT)),
+        );
         sys.call(session_ep, &m)
             .map_err(|e| fail_code(STEP_SPAWN_CHILD, e as u64))?
     };
@@ -269,7 +307,7 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
     let child_pid = spawned.words[1];
     mark(raw, info.debug_ep, STEP_SPAWN_CHILD, child_pid);
 
-    // Step 11: WAIT — blocking wait for the child's exit status (design §2.6).
+    // Step 13: WAIT — blocking wait for the child's exit status (design §2.6).
     let waited = {
         let mut sys = Syscalls::new(raw);
         let mut m = Message::new(methods::process::WAIT);
@@ -282,155 +320,129 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
     }
     mark(raw, info.debug_ep, STEP_WAIT, waited.words[1]);
 
-    // Steps 12–13: the second system server — spawn the VFS (same package
-    // shape), accept its ready callback, then shut it down through its
-    // service endpoint (v0 KILL convention) and reap it.
-    if !HAS_VFS_IMAGE {
-        mark(raw, info.debug_ep, STEP_VFS_SPAWNED, SPAWN_SKIPPED);
-    } else {
-        let vfs_pid = spawn_server(raw, info, self_as, region, VFS_IMAGE, STEP_VFS_SPAWNED)?;
-        let vfs_ready_ep = SP_INIT_EP.load(SpOrdering::Relaxed);
-        let vfs_death = SP_DEATH.load(SpOrdering::Relaxed);
-        mark(raw, info.debug_ep, STEP_VFS_SPAWNED, vfs_pid);
-        let ready = {
+    // Step 14: read `/hello` through the VFS over IPC (design §3.3):
+    // CONNECT (fresh windows) → OPEN(dir=root, name="hello", READ) →
+    // READ into the result window → verify the bytes. The protocol is
+    // hand-packed (init is an sdk bin; the vfs crate is not a dependency).
+    // Yields the connection endpoint (all later VFS ops go there).
+    let vfs_conn = {
+        let arg_va = INIT_WINDOW_VA_BASE + 0x1000;
+        let result_va = INIT_WINDOW_VA_BASE + 0x2000;
+        let session = mint(
+            raw,
+            info.factory,
+            methods::factory::NEW_NOTIFICATION,
+            STEP_VFS_READ,
+            0xE7,
+        )?;
+        let arg_frame = carve_frame(raw, region)?;
+        let result_frame = carve_frame(raw, region)?;
+        for (frame, va) in [(arg_frame, arg_va), (result_frame, result_va)] {
             let mut sys = Syscalls::new(raw);
-            sys.recv(vfs_ready_ep)
-                .map_err(|e| fail_code(STEP_VFS_READY, e as u64))?
-        };
-        if ready.tag.label() != bootstrap::READY_LABEL || ready.words[0] != bootstrap::READY_MAGIC {
-            return Err(fail_code(STEP_VFS_READY, 0xE1));
+            let mut m = Message::new(methods::aspace::MAP);
+            m.tag = m.tag.with_caps(1);
+            m.words[0] = va;
+            m.words[1] = 0b011; // R | W
+            let _ = m.set_descriptor(
+                0,
+                ipc::CapSlot::pack(frame, ipc::Rights::READ.union(ipc::Rights::WRITE)),
+            );
+            sys.invoke(self_as, &m)
+                .map_err(|e| fail_code(STEP_VFS_READ, e as u64))?;
         }
-        let vfs_svc = ready
-            .descriptor(0)
-            .map(|cs| cs.handle())
-            .filter(|h| *h != 0)
-            .ok_or(fail_code(STEP_VFS_READY, 0xE2))?;
-        mark(raw, info.debug_ep, STEP_VFS_READY, ready.words[1]);
-
-        // Step 14: read `/hello` through the VFS over IPC (design §3.3):
-        // CONNECT (fresh windows) → OPEN(dir=root, name="hello", READ) →
-        // READ into the result window → verify the bytes. The protocol is
-        // hand-packed (init is an sdk bin; the vfs crate is not a dependency).
-        // Yields the connection endpoint (all later VFS ops go there).
-        let vfs_conn = {
-            let arg_va = INIT_WINDOW_VA_BASE + 0x1000;
-            let result_va = INIT_WINDOW_VA_BASE + 0x2000;
-            let session = mint(
-                raw,
-                info.factory,
-                methods::factory::NEW_NOTIFICATION,
-                STEP_VFS_READ,
-                0xE7,
-            )?;
-            let arg_frame = carve_frame(raw, region)?;
-            let result_frame = carve_frame(raw, region)?;
-            for (frame, va) in [(arg_frame, arg_va), (result_frame, result_va)] {
-                let mut sys = Syscalls::new(raw);
-                let mut m = Message::new(methods::aspace::MAP);
-                m.tag = m.tag.with_caps(1);
-                m.words[0] = va;
-                m.words[1] = 0b011; // R | W
-                let _ = m.set_descriptor(
-                    0,
-                    ipc::CapSlot::pack(frame, ipc::Rights::READ.union(ipc::Rights::WRITE)),
-                );
-                sys.invoke(self_as, &m)
-                    .map_err(|e| fail_code(STEP_VFS_READ, e as u64))?;
+        let conn_ep = {
+            let mut sys = Syscalls::new(raw);
+            let mut connect = Message::new(methods::vfs::CONNECT);
+            connect.tag = connect.tag.with_caps(3);
+            connect.words[0] = 1; // protocol version
+            let _ = connect.set_descriptor(0, ipc::CapSlot::pack(session, ipc::Rights::SIGNAL));
+            let _ = connect.set_descriptor(
+                1,
+                ipc::CapSlot::pack(arg_frame, ipc::Rights::READ.union(ipc::Rights::WRITE)),
+            );
+            let _ = connect.set_descriptor(
+                2,
+                ipc::CapSlot::pack(
+                    result_frame,
+                    ipc::Rights::READ
+                        .union(ipc::Rights::WRITE)
+                        .union(ipc::Rights::MAP),
+                ),
+            );
+            let reply = sys
+                .call(vfs_svc, &connect)
+                .map_err(|e| fail_code(STEP_VFS_READ, 0xE1 | (e as u64 & 0xFF)))?;
+            if reply.words[0] != 0 {
+                // Encode the server status for diagnosis.
+                return Err(fail_code(
+                    STEP_VFS_READ,
+                    0xE2 | ((reply.words[0] as u64 & 0xFFFF) << 8),
+                ));
             }
-            let conn_ep = {
-                let mut sys = Syscalls::new(raw);
-                let mut connect = Message::new(methods::vfs::CONNECT);
-                connect.tag = connect.tag.with_caps(3);
-                connect.words[0] = 1; // protocol version
-                let _ = connect.set_descriptor(0, ipc::CapSlot::pack(session, ipc::Rights::SIGNAL));
-                let _ = connect.set_descriptor(
-                    1,
-                    ipc::CapSlot::pack(arg_frame, ipc::Rights::READ.union(ipc::Rights::WRITE)),
-                );
-                let _ = connect.set_descriptor(
-                    2,
-                    ipc::CapSlot::pack(
-                        result_frame,
-                        ipc::Rights::READ
-                            .union(ipc::Rights::WRITE)
-                            .union(ipc::Rights::MAP),
-                    ),
-                );
-                let reply = sys
-                    .call(vfs_svc, &connect)
-                    .map_err(|e| fail_code(STEP_VFS_READ, 0xE1 | (e as u64 & 0xFF)))?;
-                if reply.words[0] != 0 {
-                    // Encode the server status for diagnosis.
-                    return Err(fail_code(
-                        STEP_VFS_READ,
-                        0xE2 | ((reply.words[0] as u64 & 0xFFFF) << 8),
-                    ));
-                }
-                reply
-                    .descriptor(0)
-                    .map(|cs| cs.handle())
-                    .filter(|h| *h != 0)
-                    .ok_or(fail_code(STEP_VFS_READ, 0xE3))?
-            };
-            let root_handle = 1u64; // VfsServer opens the root as handle 1 (design §3.2)
-            unsafe {
-                core::ptr::copy_nonoverlapping(b"hello".as_ptr(), arg_va as *mut u8, 5);
-            }
-            let file_handle = {
-                let mut sys = Syscalls::new(raw);
-                let mut open = Message::new(methods::vfs::OPEN);
-                open.words[0] = root_handle;
-                open.words[1] = (0u64 << 32) | 5; // name: Span { off 0, len 5 } in the arg window
-                open.words[2] = methods::vfs_open::READ as u64;
-                let reply = sys
-                    .call(conn_ep, &open)
-                    .map_err(|e| fail_code(STEP_VFS_READ, 0xE4 | (e as u64 & 0xFF)))?;
-                if reply.words[0] != 0 || reply.words[1] == 0 {
-                    return Err(fail_code(STEP_VFS_READ, 0xE5));
-                }
-                reply.words[1]
-            };
-            let count = {
-                let mut sys = Syscalls::new(raw);
-                let mut read = Message::new(methods::vfs::READ);
-                read.words[0] = file_handle;
-                read.words[1] = 0;
-                read.words[2] = 64;
-                read.words[3] = 0; // result-window offset
-                let reply = sys
-                    .call(conn_ep, &read)
-                    .map_err(|e| fail_code(STEP_VFS_READ, 0xE6 | (e as u64 & 0xFF)))?;
-                if reply.words[0] != 0 {
-                    return Err(fail_code(STEP_VFS_READ, 0xE7));
-                }
-                reply.words[1]
-            };
-            let expect = b"helios-vfs-ok";
-            let got = unsafe { core::slice::from_raw_parts(result_va as *const u8, expect.len()) };
-            if count != expect.len() as u64 || got != expect {
-                return Err(fail_code(STEP_VFS_READ, 0xE8));
-            }
-            mark(raw, info.debug_ep, STEP_VFS_READ, count);
-            conn_ep
+            reply
+                .descriptor(0)
+                .map(|cs| cs.handle())
+                .filter(|h| *h != 0)
+                .ok_or(fail_code(STEP_VFS_READ, 0xE3))?
         };
-        {
-            let mut sys = Syscalls::new(raw);
-            let kill = Message::new(methods::process::KILL);
-            let ack = sys
-                .call(vfs_conn, &kill)
-                .map_err(|e| fail_code(STEP_CHILD_EXIT, e as u64))?;
-            if ack.words[0] != 0 {
-                return Err(fail_code(STEP_CHILD_EXIT, 0xE3));
-            }
+        let root_handle = 1u64; // VfsServer opens the root as handle 1 (design §3.2)
+        unsafe {
+            core::ptr::copy_nonoverlapping(b"hello".as_ptr(), arg_va as *mut u8, 5);
         }
-        {
+        let file_handle = {
             let mut sys = Syscalls::new(raw);
-            sys.recv(vfs_death)
-                .map_err(|e| fail_code(STEP_CHILD_EXIT, e as u64))?;
+            let mut open = Message::new(methods::vfs::OPEN);
+            open.words[0] = root_handle;
+            open.words[1] = (0u64 << 32) | 5; // name: Span { off 0, len 5 } in the arg window
+            open.words[2] = methods::vfs_open::READ as u64;
+            let reply = sys
+                .call(conn_ep, &open)
+                .map_err(|e| fail_code(STEP_VFS_READ, 0xE4 | (e as u64 & 0xFF)))?;
+            if reply.words[0] != 0 || reply.words[1] == 0 {
+                return Err(fail_code(STEP_VFS_READ, 0xE5));
+            }
+            reply.words[1]
+        };
+        let count = {
+            let mut sys = Syscalls::new(raw);
+            let mut read = Message::new(methods::vfs::READ);
+            read.words[0] = file_handle;
+            read.words[1] = 0;
+            read.words[2] = 64;
+            read.words[3] = 0; // result-window offset
+            let reply = sys
+                .call(conn_ep, &read)
+                .map_err(|e| fail_code(STEP_VFS_READ, 0xE6 | (e as u64 & 0xFF)))?;
+            if reply.words[0] != 0 {
+                return Err(fail_code(STEP_VFS_READ, 0xE7));
+            }
+            reply.words[1]
+        };
+        let expect = b"helios-vfs-ok";
+        let got = unsafe { core::slice::from_raw_parts(result_va as *const u8, expect.len()) };
+        if count != expect.len() as u64 || got != expect {
+            return Err(fail_code(STEP_VFS_READ, 0xE8));
+        }
+        mark(raw, info.debug_ep, STEP_VFS_READ, count);
+        conn_ep
+    };
+    {
+        let mut sys = Syscalls::new(raw);
+        let kill = Message::new(methods::process::KILL);
+        let ack = sys
+            .call(vfs_conn, &kill)
+            .map_err(|e| fail_code(STEP_CHILD_EXIT, e as u64))?;
+        if ack.words[0] != 0 {
+            return Err(fail_code(STEP_CHILD_EXIT, 0xE3));
         }
     }
+    {
+        let mut sys = Syscalls::new(raw);
+        sys.recv(vfs_death)
+            .map_err(|e| fail_code(STEP_CHILD_EXIT, e as u64))?;
+    }
 
-    // Step 14: shut PS down (KILL acks, then PS exits) and reap — the death
+    // Shutdown: PS down (KILL acks, then PS exits) and reap — the death
     // notification fires when it exits (ADR-007 §6).
     {
         let mut sys = Syscalls::new(raw);

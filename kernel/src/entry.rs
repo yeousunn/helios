@@ -119,6 +119,8 @@ fn current() -> (ProcessId, ThreadId) {
 /// this when it schedules a thread that had returned `parked()`.
 pub fn park_result(tid: ThreadId) -> Option<SyscallReturn> {
     // 1. Delivered envelope (endpoint hand-off from reply_only / send).
+    // The implicit reply slot rebinds only for reply-requesting messages
+    // (see `set_reply_if_call`), whichever completion path delivered them.
     if let Some(mut env) = crate::endpoint::take_delivered(tid) {
         let (pid, _) = current();
         syscall::install_transfers(pid, &mut env);
@@ -183,7 +185,7 @@ pub fn dispatch(args: SyscallArgs) -> SyscallReturn {
             },
             Err(e) => SyscallReturn::err(e),
         },
-        num::RECV => match syscall::sys_recv(pid, tid, args.cap) {
+        num::RECV => match syscall::sys_recv(pid, tid, args.cap, args.w[0] != 0) {
             Ok(Some(m)) => SyscallReturn::ok(m.tag, m.words),
             Ok(None) => SyscallReturn::parked(), // ADR-019 §1
             Err(e) => SyscallReturn::err(e),

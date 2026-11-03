@@ -274,10 +274,6 @@ fn spawn_reply(
     service_ep: u32,
 ) -> Message {
     let mut reply = Message::new(methods::process::SPAWN);
-    if !HAS_CHILD_IMAGE {
-        reply.words[0] = ipc::status::ENOSYS as i64 as u64;
-        return reply;
-    }
     let argv_spec = req.words[2];
     let (off, len) = (
         (argv_spec >> 32) as usize,
@@ -287,7 +283,33 @@ fn spawn_reply(
         reply.words[0] = ipc::status::EBADARG as i64 as u64;
         return reply;
     }
-    match spawn_child(sys, package, factory, service_ep, off, len) {
+    // Program image (design §2.6): with the VFS service endpoint in cap 0
+    // and a path span in w1, the image is loaded through the VFS; v0 has no
+    // filesystem-less fallback except the embedded image (dev builds).
+    let vfs_svc = req.descriptor(0).map(|cs| cs.handle()).filter(|h| *h != 0);
+    let path_spec = req.words[1];
+    let loaded: Option<Vec<u8>> = match vfs_svc {
+        Some(svc) if path_spec != 0 => {
+            let path_off = (path_spec >> 32) as usize;
+            let path_len = (path_spec & 0xFFFF_FFFF) as usize;
+            match load_via_vfs(sys, package, factory, svc, path_off, path_len) {
+                Ok(bytes) => Some(bytes),
+                Err(e) => {
+                    reply.words[0] = e as i64 as u64;
+                    return reply;
+                }
+            }
+        }
+        _ => {
+            if !HAS_CHILD_IMAGE {
+                reply.words[0] = ipc::status::ENOSYS as i64 as u64;
+                return reply;
+            }
+            None
+        }
+    };
+    let image: &[u8] = loaded.as_deref().unwrap_or(CHILD_IMAGE);
+    match spawn_child(sys, package, factory, service_ep, off, len, image) {
         Ok((pid, thread_cap, exit_notif)) => {
             reply.words[1] = pid;
             reply.tag = reply.tag.with_caps(2);
@@ -312,14 +334,15 @@ fn spawn_child(
     service_ep: u32,
     arg_off: usize,
     arg_len: usize,
+    image_bytes: &[u8],
 ) -> Result<(u64, u32, u32), i32> {
     // 1. Child address space.
     let child_as = invoke_w0(sys, factory, methods::factory::NEW_ADDRESS_SPACE, [0; 4])? as u32;
     if child_as == 0 {
         return Err(ipc::status::ENOMEM);
     }
-    // 2. Embedded ELF → segments into the child AS.
-    let image = ElfImage::parse(CHILD_IMAGE)?;
+    // 2. ELF (embedded or VFS-loaded) → segments into the child AS.
+    let image = ElfImage::parse(image_bytes)?;
     let ops = loader::plan(&image, PS_SCRATCH_VA_BASE)?;
     loader::execute(
         sys,
@@ -328,7 +351,7 @@ fn spawn_child(
         child_as,
         package.region,
         package.aspace,
-        CHILD_IMAGE,
+        image_bytes,
     )?;
     // 3. Stack: ANON pages below the crafted top page (v0 convention: the
     //    child reads [sp-8] = argc, [sp-16] = argv[0] at sp = USER_STACK_TOP).
@@ -396,6 +419,121 @@ fn spawn_child(
     CHILD_THREAD.store(thread_cap, Ordering::Relaxed);
     CHILD_NOTIF.store(exit_notif, Ordering::Relaxed);
     Ok((pid, thread_cap, exit_notif))
+}
+
+/// Load a program image through the VFS (design §2.6/§3.3): CONNECT (fresh
+/// session + arg/result windows at PS_WINDOW_VA_BASE + 0x2000/+0x3000), OPEN
+/// the path (read from the CONNECT arg window at `path_off`), then READ 4 KiB
+/// chunks into the result window until EOF, accumulating on the heap.
+fn load_via_vfs(
+    sys: &mut Syscalls<'_, X86_64Syscalls>,
+    package: &BootstrapPackage,
+    factory: u32,
+    vfs_svc: u32,
+    path_off: usize,
+    path_len: usize,
+) -> Result<Vec<u8>, i32> {
+    if path_len == 0 || path_off.checked_add(path_len).map_or(true, |e| e > 4096) {
+        return Err(ipc::status::EBADARG);
+    }
+    let arg_va = PS_WINDOW_VA_BASE + 0x2000;
+    let result_va = PS_WINDOW_VA_BASE + 0x3000;
+    let session = invoke_w0(sys, factory, methods::factory::NEW_NOTIFICATION, [0; 4])? as u32;
+    let arg_frame = invoke_w0(
+        sys,
+        package.region,
+        methods::region::CARVE,
+        [4096, 4096, 0, 0],
+    )? as u32;
+    let result_frame = invoke_w0(
+        sys,
+        package.region,
+        methods::region::CARVE,
+        [4096, 4096, 0, 0],
+    )? as u32;
+    if session == 0 || arg_frame == 0 || result_frame == 0 {
+        return Err(ipc::status::ENOMEM);
+    }
+    for (frame, va) in [(arg_frame, arg_va), (result_frame, result_va)] {
+        invoke_map(sys, package.aspace, va, 0b011, frame as u64)?;
+    }
+    let mut connect = Message::new(methods::vfs::CONNECT);
+    connect.tag = connect.tag.with_caps(3);
+    connect.words[0] = 1;
+    let _ = connect.set_descriptor(0, CapSlot::pack(session, Rights::SIGNAL));
+    let _ = connect.set_descriptor(
+        1,
+        CapSlot::pack(arg_frame, Rights::READ.union(Rights::WRITE)),
+    );
+    let _ = connect.set_descriptor(
+        2,
+        CapSlot::pack(
+            result_frame,
+            Rights::READ.union(Rights::WRITE).union(Rights::MAP),
+        ),
+    );
+    let conn = sys.call(vfs_svc, &connect)?;
+    if conn.words[0] != 0 {
+        return Err(conn.words[0] as i64 as i32);
+    }
+    let conn_ep = conn
+        .descriptor(0)
+        .map(|cs| cs.handle())
+        .filter(|h| *h != 0)
+        .ok_or(ipc::status::EBADCAP)?;
+    let root = conn.words[2];
+    if root == 0 {
+        return Err(ipc::status::EBADCAP);
+    }
+    // Copy the path into the VFS arg window (its first bytes) and OPEN it.
+    let path = unsafe {
+        core::slice::from_raw_parts((PS_WINDOW_VA_BASE + path_off as u64) as *const u8, path_len)
+    };
+    unsafe {
+        core::ptr::copy_nonoverlapping(path.as_ptr(), arg_va as *mut u8, path_len);
+    }
+    let mut open = Message::new(methods::vfs::OPEN);
+    open.words[0] = root;
+    open.words[1] = path_len as u64; // Span { off 0, len path_len }
+    open.words[2] = methods::vfs_open::READ as u64;
+    let opened = sys.call(conn_ep, &open)?;
+    if opened.words[0] != 0 {
+        return Err(opened.words[0] as i64 as i32);
+    }
+    let file = opened.words[1];
+    if file == 0 {
+        return Err(ipc::status::EBADCAP);
+    }
+    let mut out: Vec<u8> = Vec::new();
+    let mut offset = 0u64;
+    loop {
+        if out.len() > 1 << 20 {
+            return Err(ipc::status::ENOMEM); // v0 bound: 1 MiB images
+        }
+        let mut read = Message::new(methods::vfs::READ);
+        read.words[0] = file;
+        read.words[1] = offset;
+        read.words[2] = 4096;
+        read.words[3] = 0; // result-window offset
+        let reply = sys.call(conn_ep, &read)?;
+        if reply.words[0] != 0 {
+            return Err(reply.words[0] as i64 as i32);
+        }
+        let count = (reply.words[1] as usize).min(4096);
+        if count == 0 {
+            break;
+        }
+        let chunk = unsafe { core::slice::from_raw_parts(result_va as *const u8, count) };
+        out.extend_from_slice(chunk);
+        offset += count as u64;
+        if count < 4096 {
+            break;
+        }
+    }
+    if out.is_empty() {
+        return Err(ipc::status::EBADARG);
+    }
+    Ok(out)
 }
 
 /// Carve one frame, write the crafted initial stack page (argc + argv blob +

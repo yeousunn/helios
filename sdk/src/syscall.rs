@@ -100,6 +100,14 @@ impl<'a, R: RawSyscalls> Syscalls<'a, R> {
         check(r.status).map(|_| r.message())
     }
 
+    /// Non-blocking `recv`: `EWOULDBLOCK` when nothing is pending (v0
+    /// polling accept loops — the VFS serves the accept endpoint and its
+    /// established connections round-robin).
+    pub fn recv_nonblock(&mut self, cap: Handle) -> Result<Message, Status> {
+        let r = self.raw.raw(number::RECV, [cap as u64, 0, 1, 0, 0, 0]);
+        check(r.status).map(|_| r.message())
+    }
+
     /// `reply_recv`: reply through the implicit reply cap, then receive on
     /// `cap` — the server fast path.
     pub fn reply_recv(&mut self, cap: Handle, msg: &Message) -> Result<Message, Status> {

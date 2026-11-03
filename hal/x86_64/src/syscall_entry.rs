@@ -102,6 +102,16 @@ extern "sysv64" fn helios_syscall_dispatch(
         // Blocked (send/recv park) or exited: do not sysret now; the thread
         // resumes here later (with its result re-stored) or never (exit).
         resume_loop(Some(ret));
+    } else if num == 0 {
+        // `yield`: the thread stays runnable (yield_now requeues it), so the
+        // runnable check above would skip the switch and the "yield" becomes
+        // a no-op — the caller then spins on-CPU forever and starves every
+        // other thread (found: the VFS polling accept loop). Route it
+        // through the resume machinery explicitly: switch to the next
+        // thread; when this one is picked again, park_result is None, the
+        // state is Ready, and the saved (Ok) result is re-stored and
+        // returned.
+        resume_loop(Some(ret));
     }
 }
 

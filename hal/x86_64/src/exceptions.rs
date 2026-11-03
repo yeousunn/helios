@@ -79,6 +79,29 @@ extern "sysv64" fn exception_report(vector: u64, error: u64, cr2: u64, rip: u64,
         } else {
             kernel::kerror!("  pte@cr2: hw=NOT-PRESENT (cr3={:#x})", cr3);
         }
+        // Full 4-level chain dump: which level is missing and which frames
+        // are involved (soft/hardware divergence diagnosis — found the
+        // flag-only PTE write class this way).
+        {
+            let shifts = [39u64, 30, 21, 12];
+            let names = ["pml4", "pdpt", "pd", "pt"];
+            let mut tbl = cr3 & !0xFFF;
+            for (lvl, sh) in shifts.iter().enumerate() {
+                let idx = (cr2 >> sh) & 0x1FF;
+                let ent = unsafe { core::ptr::read_volatile((tbl + idx * 8) as *const u64) };
+                kernel::kerror!(
+                    "  chain {}: tbl={:#x} idx={} ent={:#x}",
+                    names[lvl],
+                    tbl,
+                    idx,
+                    ent
+                );
+                if ent & 1 == 0 {
+                    break;
+                }
+                tbl = ent & !0xFFF;
+            }
+        }
         // Root cross-check: walk AS 1's REGISTERED root for cr2 — if it is
         // present there but not under the live CR3, the activation path is
         // loading the wrong root; if both are absent, the backend install
