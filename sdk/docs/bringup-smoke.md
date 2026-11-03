@@ -47,9 +47,14 @@ cargo build -p sdk --bin init --features user --target x86_64-unknown-none --rel
 | 9 | `...0009` | connection id (1) | `CONNECT` round-trip over the service endpoint: init transfers session notif + arg/result frames (4 KiB each), PS maps both windows and replies with the connection endpoint (descriptor 0) |
 | 10 | `...000a` | child pid | `SPAWN` over the connection: argv blob in the arg window (`(off<<32)\|len` in `w2`); PS loads its embedded child image, crafts the stack, replies with pid + out-caps |
 | 11 | `...000b` | child exit status (42) | `WAIT`: PS parks on the child's death notification and reports the raw status (kernel payload: bit 0 = event, bits 32.. = status) |
-| 12 | `...000c` | VFS pid | init spawned the second system server (same package shape) |
-| 13 | `...000d` | VFS heap KiB | VFS ready callback (service endpoint as capability) |
-| 14 | `...000e` | bytes read (13) | `CONNECT` → `OPEN("/hello")` → `READ` over IPC; init byte-verifies `"helios-vfs-ok"` from the result window |
+| 7 | `...0007` | VFS pid | init spawned the **VFS first** (it serves program images) |
+| 8 | `...0008` | VFS heap KiB | VFS ready callback (service endpoint as capability, SEND\|GRANT) |
+| 9 | `...0009` | PS pid | init spawned the process server |
+| 10 | `...000a` | PS heap KiB | PS ready callback |
+| 11 | `...000b` | conn id | init `CONNECT` round-trip to PS |
+| 12 | `...000c` | child pid | `SPAWN` carries the VFS service ep + the program path span; **PS loads the child ELF through the VFS** (`CONNECT`/`OPEN("/child")`/`READ` loop → heap → ELF load) |
+| 13 | `...000d` | 42 | `WAIT`: child ran and exit-status propagated |
+| 14 | `...000e` | bytes read (13) | init `CONNECT`s to the VFS, `OPEN("/hello")`, `READ`, byte-verifies `"helios-vfs-ok"` |
 | DONE | `0x494e49540000000f` | 0 | all passed (both servers reaped; clean halt) |
 
 v0 conventions this smoke pins (all design §2.4/§2.6 provisional):
