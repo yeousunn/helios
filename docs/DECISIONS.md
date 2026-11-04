@@ -410,3 +410,14 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 - Status: ACCEPTED (GLM, kernel/ only; debug-builds-only cost)
 - Decision: `sched::paint_kstack`/`kstack_high_water` (debug_assertions-gated) — the raw memory ops live in the chartered `mem.rs` island. `set_initial_pc` paints the unused kstack tail below the built context; `bury_thread_kstack_for_exit` reports `KSTACK depth: pid=N used=X of 32768` at thread exit. Release builds skip both (zero cost).
 - Consequences: The next full QEMU run reports per-thread true stack usage — the data that sizes KSTACK_FRAMES going forward and answers why 16 KiB was exceeded.
+
+## ADR-038: Console input — IRQ-fed line buffer + reserved recv object
+- Proposed: GLM 2026-11-02 (Phase 3: unblocks the scripted shell's stdin)
+- Status: ACCEPTED (GLM, kernel/ + hal/; the v0 console-input device path)
+- Context: The shell is scripted until a console-input path exists (UART RX / IRQ delivery). The v0 ABI is frozen at 9 syscalls, so input must ride existing primitives.
+- Decision:
+  1. **Kernel line discipline** (`kernel::console_in`): an IRQ callback (`hal::set_uart_rx_callback`) pushes RX bytes into a lock-protected line buffer (128 B lines, 8-line FIFO, newline/\r/full auto-commit, overrun drops-new with a counter).
+  2. **Reserved objects**: console-in endpoint cap (obj 0xD2, RECV) and console notification (obj 0xD3) — same kernel-reserved pattern as the debug EP (0xD1, ADR-018).
+  3. **`sys_recv` fast branch**: recv on the 0xD2 cap pops one line (bytes in w0..w3, length in w0, label NOTIFY); empty → block on the 0xD3 notification (the IRQ's `notification::signal` wakes it — the durable-NOTIFY path from Phase 3 slice 1).
+  4. **hal**: `set_uart_rx_callback(fn(u8))` + `enable_uart_rx()` (IER bit 0, unmask IRQ4); the IRQ stub routes vector 36 (IRQ4) to the registered Pic handler + EOI instead of the fatal reporter.
+- Consequences: The console server (or shell) recvs console input through the ratified endpoint ABI — no new syscalls. Echo/line-editing is a console-server concern (next slice). The kernel never blocks in IRQ context (single-byte push + signal).

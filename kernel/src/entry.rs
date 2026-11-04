@@ -302,6 +302,12 @@ fn as_invoke(pid: ProcessId, cap: &Capability, args: &SyscallArgs) -> SyscallRet
                     None => return SyscallReturn::err(ipc::status::EBADARG),
                 }
             };
+            crate::kinfo!(
+                "MAP pid={} va={:#x} frame={:?}",
+                pid.0,
+                vaddr.0,
+                frame_addr.map(|f| f.as_u64())
+            );
             match aspace::map(as_id, vaddr, 1, frame_addr, flags) {
                 Ok(_) => SyscallReturn::ok(msg.tag, [0; 4]),
                 Err(aspace::VmmError::Overlap) => SyscallReturn::err(ipc::status::EBADARG),
