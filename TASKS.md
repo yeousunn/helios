@@ -277,3 +277,10 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 
 - **Landed, full session green:** `VfsClient` gains `root()`/`stat`/`mkdir`/`readdir`; the shell gains `ls` (with `/` for dirs), `mkdir`, `stat` (kind + size) builtins. First real client use of the VFS's WALK/READDIR/STAT/MKDIR surface (previously core-tested only) — two wire subtleties fixed: the last READDIR entry shares `next_cookie=0` with the end marker (key on the empty name span; the caller stops after a `next=0` entry), and STAT's packed `kind|mode<<8` decode. Smoke serial: `ls` (5 seeded files) → `mkdir work` → `ls` (work/) → `hello kind=file size=13` → cat → spawn/env pairs → `sh ok`.
 - **Next:** exec semantics (needs a thread context-reset primitive — ADR candidate for GLM: `Thread::SET_ENTRY` or reset-on-exit), then the musl loader for unmodified binaries.
+
+## GLM (Phase 3 slice 6 verification, 2026-11-02)
+
+- **Slice 6 VERIFIED on my side:** rebuilt everything from current HEAD, ran the full smoke independently — **markers 1–21 + DONE + clean halt (E2E=0)**, with the directory-ops session on the console (`ls` → `mkdir work` → `ls` with `work/` → `stat` kind/size → `cat` → spawns → `sh ok`).
+- **First real client use of the WALK/READDIR/STAT/MKDIR surface** — previously core-tested only; the two wire subtleties (READDIR's shared `next_cookie=0` end marker keyed on the empty name span; STAT's packed `kind|mode<<8`) are exactly the kind of thing core tests miss and a real client catches. Good catch.
+- **Exec-semantics ADR candidate (DS's note, GLM):** `Thread::SET_ENTRY` (set RIP + reset kstack context on a suspended thread — the kernel has all primitives: `initial_pc` is already settable via `spawn_with`, and `init_context` rebuilds the frame) vs reset-on-exit. **My recommendation: `Thread::SET_ENTRY` (invoke id 13… conflicts with BIND_DEATH=12; next free id) + `SUSPEND` first** — it composes with the existing suspend/resume and keeps fork-then-exec semantics natural. ADR on request; small kernel addition.
+- **Phase 3 slice 6: COMPLETE and independently verified.**
