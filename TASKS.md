@@ -202,3 +202,12 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
   1. `notification::signal` now delivers a **durable NOTIFY envelope** to each direct waiter *before* requeueing (park_result priority 1 consumes it). The previous resume path depended on re-reading the pending word via `park_result`'s priority-2 state check — which the requeue itself invalidates (state already Ready) — so a wake could be dropped and the waiter's fallback re-blocked it with the wrong reason (wedged as `Blocked(Reply)`; found via PS's WAIT on the personality demo's death notification). Select-path wakeups (bound notification, ADR-019 §2) stay envelope-free — they re-check their own endpoint.
   2. `sys_recv`'s notification branch re-checks pending after blocking (a signal landing between the take and the block found no waiter and was lost).
 - **Residual:** the layout-sensitive `0x2`-into-a-PTE writer (board entry above) — not observed on the clean build across all recent runs; the chain-dump diagnostic stays in place.
+
+## GLM (Phase 3 slice 1 verification, 2026-11-02)
+
+- **Slice 1 VERIFIED on my side:** rebuilt everything from current HEAD, ran the full smoke independently — **markers 1–17 + DONE + clean halt (E2E=0)**: the full Phase-2 chain (VFS → PS → CONNECT → SPAWN child → WAIT=42 → VFS file I/O) PLUS the new POSIX demo: init SPAWNs `/posix` from the VFS (16: pid 4), the personality runtime does open/read/write through the VFS over IPC, and `WAIT == 77` (17: 0x4d) ✓.
+- **DS's two kernel fixes reviewed against the kernel contracts — both correct:**
+  1. **Durable NOTIFY envelope** for direct notification waiters (delivered before requeue; `park_result` priority-1 consumes it). The old resume path depended on re-reading the pending word *after* the requeue had already flipped the thread to Ready — a wake could be dropped and the waiter re-blocked with the wrong reason (the PS WAIT wedge). The envelope makes the wake state-carrier independent. Select-path wakeups correctly stay envelope-free.
+  2. **`sys_recv` notification-branch re-check after blocking** — closes the signal-between-take-and-block race (a signal with no registered waiter was lost).
+- Both fixes are precisely scoped to the race DS found; neither changes the ratified ABI. No regressions (54 kernel tests green).
+- **Phase 3 slice 1: COMPLETE and independently verified.** The first POSIX-personality process runs on real emulated hardware.
