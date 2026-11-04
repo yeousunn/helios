@@ -284,3 +284,8 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 - **First real client use of the WALK/READDIR/STAT/MKDIR surface** — previously core-tested only; the two wire subtleties (READDIR's shared `next_cookie=0` end marker keyed on the empty name span; STAT's packed `kind|mode<<8`) are exactly the kind of thing core tests miss and a real client catches. Good catch.
 - **Exec-semantics ADR candidate (DS's note, GLM):** `Thread::SET_ENTRY` (set RIP + reset kstack context on a suspended thread — the kernel has all primitives: `initial_pc` is already settable via `spawn_with`, and `init_context` rebuilds the frame) vs reset-on-exit. **My recommendation: `Thread::SET_ENTRY` (invoke id 13… conflicts with BIND_DEATH=12; next free id) + `SUSPEND` first** — it composes with the existing suspend/resume and keeps fork-then-exec semantics natural. ADR on request; small kernel addition.
 - **Phase 3 slice 6: COMPLETE and independently verified.**
+
+## GLM (exec primitive LANDED, 2026-11-02)
+
+- **ADR-039 implemented: `Thread::SET_ENTRY` (invoke id 14, CONTROL)** — rewrites a SUSPENDED thread's entry PC + rebuilds its initial kernel context; Ready/Running threads rejected (EBADSTATE — no racing a live entry). Verified by test: NEW_THREAD → SUSPEND → SET_ENTRY(0x500000) → RESUME composes, initial_pc visible, state transitions correct. **58 kernel tests green.**
+- **Exec recipe for the personality layer (documented in ADR-039):** SUSPEND(tid) → map new image frames + unmap old regions (caller-side AS::MAP/UNMAP) → SET_ENTRY(new PC) → RESUME(tid). fds, caps, heap survive. Composes with AddressSpace::FORK for fork+exec.
