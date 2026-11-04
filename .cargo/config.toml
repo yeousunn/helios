@@ -22,6 +22,7 @@ PS_IMAGE = "target/x86_64-unknown-none/release/ps"
 CHILD_IMAGE = "target/x86_64-unknown-none/release/child"
 VFS_IMAGE = "target/x86_64-unknown-none/release/vfs"
 POSIX_IMAGE = "target/x86_64-unknown-none/release/posix"
+CONSOLE_IMAGE = "target/x86_64-unknown-none/release/console"
 
 # Bare-metal userspace binaries (init, ps) must be fixed-address ET_EXEC
 # images: the SDK ELF loader and the kernel boot path reject PIE (ET_DYN).

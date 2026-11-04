@@ -34,7 +34,7 @@ use sdk::loader;
 use sdk::methods;
 use sdk::syscall::{Handle, Syscalls, X86_64Syscalls};
 
-include!(concat!(env!("OUT_DIR"), "/ps_image.rs"));
+include!(concat!(env!("OUT_DIR"), "/ps_image.rs")); // PS + VFS + CONSOLE images
 
 #[global_allocator]
 static HEAP: GlobalHeap = GlobalHeap::new();
@@ -58,6 +58,8 @@ const STEP_VFS_READ: u64 = 14;
 const STEP_CHILD_EXIT: u64 = 15;
 const STEP_POSIX_SPAWN: u64 = 16;
 const STEP_POSIX_WAIT: u64 = 17;
+const STEP_CONSOLE_SPAWN: u64 = 18;
+const STEP_CONSOLE_READY: u64 = 19;
 const STEP_DONE: u64 = 0x0F;
 /// Failure marker family for exits: `0xDEAD_0000_00SS_EEEE` (step, errno).
 const FAIL: u64 = 0xDEAD_0000_0000_0000;
@@ -171,6 +173,44 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
         .map_err(|e| fail_code(STEP_HEAP, e as u64))?;
     mark(raw, info.debug_ep, STEP_HEAP, (span.1 >> 10) as u64);
 
+    // Steps 18–19: the console server. Spawned before everything else that
+    // might want to print: it receives the kernel debug endpoint as its
+    // package tail (`optional[1]`) — the launcher is the only process that
+    // holds it — and forwards console writes to the serial line. Later
+    // spawns hand its service endpoint to children as stdio (design §2.3).
+    let (console_svc, console_death) = {
+        if !HAS_CONSOLE_IMAGE {
+            return Err(fail_code(STEP_CONSOLE_SPAWN, 0xE1));
+        }
+        let pid = spawn_server(
+            raw,
+            info,
+            self_as,
+            region,
+            CONSOLE_IMAGE,
+            STEP_CONSOLE_SPAWN,
+            Some(CapSlot::pack(info.debug_ep, Rights::SEND)),
+        )?;
+        let ready_ep = SP_INIT_EP.load(SpOrdering::Relaxed);
+        let death = SP_DEATH.load(SpOrdering::Relaxed);
+        mark(raw, info.debug_ep, STEP_CONSOLE_SPAWN, pid);
+        let ready = {
+            let mut sys = Syscalls::new(raw);
+            sys.recv(ready_ep)
+                .map_err(|e| fail_code(STEP_CONSOLE_READY, e as u64))?
+        };
+        if ready.tag.label() != bootstrap::READY_LABEL || ready.words[0] != bootstrap::READY_MAGIC {
+            return Err(fail_code(STEP_CONSOLE_READY, 0xE1));
+        }
+        let svc = ready
+            .descriptor(0)
+            .map(|cs| cs.handle())
+            .filter(|h| *h != 0)
+            .ok_or(fail_code(STEP_CONSOLE_READY, 0xE2))?;
+        mark(raw, info.debug_ep, STEP_CONSOLE_READY, svc as u64);
+        (svc, death)
+    };
+
     // Steps 7–8: the first system server — spawn the VFS from its embedded
     // image and accept its ready callback. The VFS comes first because PS
     // loads program images through it (design §2.6: SPAWN carries the VFS
@@ -178,7 +218,15 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
     if !HAS_VFS_IMAGE {
         return Err(fail_code(STEP_VFS_SPAWNED, 0xE1));
     }
-    let vfs_pid = spawn_server(raw, info, self_as, region, VFS_IMAGE, STEP_VFS_SPAWNED)?;
+    let vfs_pid = spawn_server(
+        raw,
+        info,
+        self_as,
+        region,
+        VFS_IMAGE,
+        STEP_VFS_SPAWNED,
+        None,
+    )?;
     let vfs_ready_ep = SP_INIT_EP.load(SpOrdering::Relaxed);
     let vfs_death = SP_DEATH.load(SpOrdering::Relaxed);
     mark(raw, info.debug_ep, STEP_VFS_SPAWNED, vfs_pid);
@@ -206,7 +254,7 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
         mark(raw, info.debug_ep, STEP_SPAWNED, SPAWN_SKIPPED);
         return Ok(());
     }
-    let ps_pid = spawn_server(raw, info, self_as, region, PS_IMAGE, STEP_SPAWNED)?;
+    let ps_pid = spawn_server(raw, info, self_as, region, PS_IMAGE, STEP_SPAWNED, None)?;
     let ps_ready_ep = SP_INIT_EP.load(SpOrdering::Relaxed);
     let ps_death = SP_DEATH.load(SpOrdering::Relaxed);
     mark(raw, info.debug_ep, STEP_SPAWNED, ps_pid);
@@ -282,16 +330,11 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
         sys.invoke(self_as, &m)
             .map_err(|e| fail_code(STEP_SPAWN_CHILD, e as u64))?;
     }
-    unsafe {
-        core::ptr::copy_nonoverlapping(b"child".as_ptr(), INIT_WINDOW_VA_BASE as *mut u8, 5);
-        core::ptr::copy_nonoverlapping(b"42".as_ptr(), (INIT_WINDOW_VA_BASE + 6) as *mut u8, 2);
-    }
+    write_spawn_blob(b"child", b"42");
     let spawned = {
         let mut sys = Syscalls::new(raw);
         let mut m = Message::new(methods::process::SPAWN);
         m.tag = m.tag.with_caps(1);
-        m.words[1] = 5; // program path: Span { off 0, len 5 } in the arg window
-        m.words[2] = (6u64 << 32) | 2; // argv: Span { off 6, len 2 } in the arg window
         let _ = m.set_descriptor(
             0,
             ipc::CapSlot::pack(vfs_svc, ipc::Rights::SEND.union(ipc::Rights::GRANT)),
@@ -439,14 +482,20 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
             core::ptr::copy_nonoverlapping(b"posix".as_ptr(), INIT_WINDOW_VA_BASE as *mut u8, 5);
         }
         let spawned = {
+            write_spawn_blob(b"posix", b"42");
             let mut sys = Syscalls::new(raw);
             let mut m = Message::new(methods::process::SPAWN);
-            m.tag = m.tag.with_caps(1);
-            m.words[1] = 5; // program path: Span { off 0, len 5 } ("posix")
-            m.words[2] = (6u64 << 32) | 2; // argv span ("42"; unused by the demo)
+            m.tag = m.tag.with_caps(3);
             let _ = m.set_descriptor(
                 0,
                 ipc::CapSlot::pack(vfs_svc, ipc::Rights::SEND.union(ipc::Rights::GRANT)),
+            );
+            // SPAWN descriptor order is (vfs, stdin, stdout, stderr); the
+            // console endpoint rides as stdout so the demo can print.
+            let _ = m.set_descriptor(1, ipc::CapSlot::NULL);
+            let _ = m.set_descriptor(
+                2,
+                ipc::CapSlot::pack(console_svc, ipc::Rights::SEND.union(ipc::Rights::GRANT)),
             );
             sys.call(session_ep, &m)
                 .map_err(|e| fail_code(STEP_POSIX_SPAWN, e as u64))?
@@ -473,6 +522,22 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
         mark(raw, info.debug_ep, STEP_POSIX_WAIT, waited.words[1]);
     }
 
+    // Shutdown: console down (KILL acks, then it exits) and reap.
+    {
+        let mut sys = Syscalls::new(raw);
+        let kill = Message::new(methods::process::KILL);
+        let ack = sys
+            .call(console_svc, &kill)
+            .map_err(|e| fail_code(STEP_CHILD_EXIT, e as u64))?;
+        if ack.words[0] != 0 {
+            return Err(fail_code(STEP_CHILD_EXIT, 0xE4));
+        }
+    }
+    {
+        let mut sys = Syscalls::new(raw);
+        sys.recv(console_death)
+            .map_err(|e| fail_code(STEP_CHILD_EXIT, e as u64))?;
+    }
     {
         let mut sys = Syscalls::new(raw);
         let kill = Message::new(methods::process::KILL);
@@ -555,6 +620,7 @@ fn spawn_server(
     region: Handle,
     image: &[u8],
     step: u64,
+    extra: Option<CapSlot>,
 ) -> Result<u64> {
     SP_REGION.store(region, SpOrdering::Relaxed);
     let elf = ElfImage::parse(image).map_err(|e| fail_code(step, e as u64))?;
@@ -704,7 +770,7 @@ fn spawn_server(
     {
         let mut sys = Syscalls::new(raw);
         let mut hdr = Message::new(bootstrap::PACKAGE_LABEL);
-        hdr.words[0] = bootstrap::FIXED_CAPS as u64 + 1;
+        hdr.words[0] = bootstrap::FIXED_CAPS as u64 + if extra.is_some() { 2 } else { 1 };
         sys.send(boot, &hdr)
             .map_err(|e| fail_code(step, 0xE8_00 | (e as u64 & 0xFF)))?;
 
@@ -738,15 +804,41 @@ fn spawn_server(
         sys.send(boot, &c2)
             .map_err(|e| fail_code(step, 0xE8_02 | (e as u64 & 0xFF)))?;
 
+        let extra_count = if extra.is_some() { 2 } else { 1 };
         let mut c3 = Message::new(bootstrap::PACKAGE_LABEL);
-        c3.tag = c3.tag.with_caps(1);
+        c3.tag = c3.tag.with_caps(extra_count);
         let _ = c3.set_descriptor(0, CapSlot::pack(info.factory, Rights::ALL));
+        if let Some(x) = extra {
+            let _ = c3.set_descriptor(1, x);
+        }
         sys.send(boot, &c3)
             .map_err(|e| fail_code(step, 0xE8_03 | (e as u64 & 0xFF)))?;
     }
     walk_probe(raw, info.debug_ep, 0xA7); // post-package
 
     Ok(pid)
+}
+
+/// v0 SPAWN payload: the path/argv strings live in the **connect arg
+/// window** (design §2.6: "argv/env in the arg window"), as
+/// `[u64 path_span][u64 argv_span]` followed by the string bytes. Words are
+/// not usable for spans when the SPAWN carries 3+ capability descriptors —
+/// descriptors overlay the trailing words (`ipc::Message`), so the window is
+/// the only safe data channel.
+fn write_spawn_blob(path: &[u8], argv: &[u8]) {
+    const BASE: usize = 16;
+    let path_off = BASE;
+    let argv_off = BASE + path.len();
+    let path_span = ((path_off as u64) << 32) | path.len() as u64;
+    let argv_span = ((argv_off as u64) << 32) | argv.len() as u64;
+    // SAFETY: the window is mapped R|W into this AS (CONNECT arg frame).
+    unsafe {
+        let w = INIT_WINDOW_VA_BASE as *mut u8;
+        core::ptr::copy_nonoverlapping(path_span.to_le_bytes().as_ptr(), w, 8);
+        core::ptr::copy_nonoverlapping(argv_span.to_le_bytes().as_ptr(), w.add(8), 8);
+        core::ptr::copy_nonoverlapping(path.as_ptr(), w.add(path_off), path.len());
+        core::ptr::copy_nonoverlapping(argv.as_ptr(), w.add(argv_off), argv.len());
+    }
 }
 
 fn mint(

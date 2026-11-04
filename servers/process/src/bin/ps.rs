@@ -274,24 +274,46 @@ fn spawn_reply(
     service_ep: u32,
 ) -> Message {
     let mut reply = Message::new(methods::process::SPAWN);
-    let argv_spec = req.words[2];
-    let (off, len) = (
-        (argv_spec >> 32) as usize,
-        (argv_spec & 0xFFFF_FFFF) as usize,
-    );
-    if off.checked_add(len).map_or(true, |e| e > 4096) {
-        reply.words[0] = ipc::status::EBADARG as i64 as u64;
-        return reply;
-    }
+
     // Program image (design §2.6): with the VFS service endpoint in cap 0
     // and a path span in w1, the image is loaded through the VFS; v0 has no
     // filesystem-less fallback except the embedded image (dev builds).
-    let vfs_svc = req.descriptor(0).map(|cs| cs.handle()).filter(|h| *h != 0);
-    let path_spec = req.words[1];
+    // SPAWN input caps, positionally (design §2.6): (vfs, stdin, stdout,
+    // stderr). They ride into the child's package tail as `optional[0..4]`;
+    // absent slots stay absent (holes preserved).
+    let mut extras: [Option<u32>; 4] = [None; 4];
+    for (i, slot) in extras.iter_mut().enumerate() {
+        *slot = req.descriptor(i).map(|cs| cs.handle()).filter(|h| *h != 0);
+    }
+    let vfs_svc = extras[0];
+    // v0 SPAWN payload blob in the caller's CONNECT arg window (design §2.6
+    // "argv/env in the arg window"): `[u64 path_span][u64 argv_span]` then
+    // the string bytes. Words cannot carry spans alongside 3+ descriptors
+    // (descriptors overlay the trailing words).
+    let (path_off, path_len, arg_off, arg_len) = {
+        let f = PS_WINDOW_VA_BASE as *const u8;
+        // SAFETY: our CONNECT arg window is mapped R in this AS.
+        unsafe {
+            let rd = |o: usize| core::ptr::read_unaligned(f.add(o) as *const u64);
+            let ps = rd(0);
+            let ar = rd(8);
+            (
+                (ps >> 32) as usize,
+                (ps & 0xFFFF_FFFF) as usize,
+                (ar >> 32) as usize,
+                (ar & 0xFFFF_FFFF) as usize,
+            )
+        }
+    };
+    if path_len == 0
+        || path_off.checked_add(path_len).map_or(true, |e| e > 4096)
+        || arg_off.checked_add(arg_len).map_or(true, |e| e > 4096)
+    {
+        reply.words[0] = ipc::status::EBADARG as i64 as u64;
+        return reply;
+    }
     let loaded: Option<Vec<u8>> = match vfs_svc {
-        Some(svc) if path_spec != 0 => {
-            let path_off = (path_spec >> 32) as usize;
-            let path_len = (path_spec & 0xFFFF_FFFF) as usize;
+        Some(svc) if path_len != 0 => {
             match load_via_vfs(sys, package, factory, svc, path_off, path_len) {
                 Ok(bytes) => Some(bytes),
                 Err(e) => {
@@ -309,7 +331,9 @@ fn spawn_reply(
         }
     };
     let image: &[u8] = loaded.as_deref().unwrap_or(CHILD_IMAGE);
-    match spawn_child(sys, package, factory, service_ep, off, len, image, vfs_svc) {
+    match spawn_child(
+        sys, package, factory, service_ep, arg_off, arg_len, image, extras,
+    ) {
         Ok((pid, thread_cap, exit_notif)) => {
             reply.words[1] = pid;
             reply.tag = reply.tag.with_caps(2);
@@ -336,7 +360,7 @@ fn spawn_child(
     arg_off: usize,
     arg_len: usize,
     image_bytes: &[u8],
-    vfs_ep: Option<u32>,
+    extras: [Option<u32>; 4],
 ) -> Result<(u64, u32, u32), i32> {
     // 1. Child address space.
     let child_as = invoke_w0(sys, factory, methods::factory::NEW_ADDRESS_SPACE, [0; 4])? as u32;
@@ -393,13 +417,12 @@ fn spawn_child(
         return Err(ipc::status::ENOMEM);
     }
     CH_THREAD.store(thread_cap, Ordering::Relaxed);
-    // 7. ADR-009 package: fixed prefix + the optional tail. Regular processes
-    //    get no Factory; the SPAWN caller's VFS service endpoint (if any)
-    //    rides as `optional[0]` (design §2.3 tail order: vfs, stdin, stdout,
-    //    stderr) so the child can reach the filesystem. Stack array: the Vec
-    //    form was silently corrupted (heap aliasing).
+    // 7. ADR-009 package: fixed prefix + the optional tail (design §2.3
+    //    order: vfs, stdin, stdout, stderr), holes preserved positionally.
+    //    Regular processes get no Factory. Stack array: the Vec form was
+    //    silently corrupted (heap aliasing).
     let session_rights = Rights::SIGNAL.union(Rights::RECV).union(Rights::GRANT);
-    let mut caps = [CapSlot::NULL; bootstrap::FIXED_CAPS + 1];
+    let mut caps = [CapSlot::NULL; bootstrap::FIXED_CAPS + 4];
     caps[0] = CapSlot::pack(child_as, Rights::MAP.union(Rights::GRANT));
     caps[1] = CapSlot::pack(CH_THREAD.load(Ordering::Relaxed), Rights::CONTROL);
     caps[2] = CapSlot::pack(package.region, Rights::GRANT);
@@ -408,12 +431,14 @@ fn spawn_child(
     caps[5] = CapSlot::pack(CH_S2.load(Ordering::Relaxed), session_rights);
     caps[6] = CapSlot::pack(CH_S3.load(Ordering::Relaxed), session_rights);
     caps[7] = CapSlot::pack(service_ep, Rights::SEND.union(Rights::GRANT));
-    let total = if let Some(vfs) = vfs_ep {
-        caps[8] = CapSlot::pack(vfs, Rights::SEND.union(Rights::GRANT));
-        bootstrap::FIXED_CAPS + 1
-    } else {
-        bootstrap::FIXED_CAPS
-    };
+    let mut total = bootstrap::FIXED_CAPS;
+    for (i, extra) in extras.iter().enumerate() {
+        if let Some(handle) = extra {
+            caps[bootstrap::FIXED_CAPS + i] =
+                CapSlot::pack(*handle, Rights::SEND.union(Rights::GRANT));
+            total = bootstrap::FIXED_CAPS + 1 + i;
+        }
+    }
     // 6. PS's death binding on the child thread.
     let mut bind = Message::new(methods::thread::BIND_DEATH_NOTIFICATION);
     bind.tag = bind.tag.with_caps(1);

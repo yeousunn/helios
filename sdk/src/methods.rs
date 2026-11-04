@@ -63,6 +63,25 @@ pub mod vfs {
     pub const CREATE: u16 = 0x0219;
 }
 
+/// Console protocol labels (v0): the stdio endpoints a launcher supplies to
+/// children (design §2.3). Write-only endpoint: each message carries up to
+/// 32 bytes of text in `w0..w3` (little-endian, zero-padded).
+pub mod console {
+    pub const WRITE: u16 = 0x0301;
+    /// Text bytes per console message.
+    pub const TEXT_BYTES: usize = 32;
+}
+
+/// Pack up to [`console::TEXT_BYTES`] bytes of text into console message
+/// words (little-endian, zero-padded). Extra bytes are ignored.
+pub fn pack_console_text(text: &[u8]) -> [u64; 4] {
+    let mut words = [0u64; 4];
+    for (i, b) in text.iter().take(console::TEXT_BYTES).enumerate() {
+        words[i / 8] |= (*b as u64) << ((i % 8) * 8);
+    }
+    words
+}
+
 /// VFS OPEN flags (`proto.rs`).
 pub mod vfs_open {
     pub const READ: u32 = 1 << 0;

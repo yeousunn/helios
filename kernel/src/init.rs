@@ -105,13 +105,17 @@ pub fn start(regions: &[BootRegion]) -> Result<InitLaunch, &'static str> {
     )
     .map_err(|_| "cannot grant Factory")?;
 
-    // Debug endpoint (reserved id) with SEND only — init may write, never read.
+    // Debug endpoint (reserved id): SEND — init may write, never read — plus
+    // GRANT so the launcher can *delegate* its console authority to a
+    // designated console server (the kernel sink stays write-only; text still
+    // flows one way). DS/GLM: the one-line extension is needed for the
+    // console-server slice; flag if the containment policy should differ.
     let debug_ep = proc::install_cap(
         pid,
         Capability {
             obj: ObjId(DEBUG_EP_ID),
             typ: ObjType::Endpoint,
-            rights: Rights::SEND,
+            rights: Rights::SEND.union(Rights::GRANT),
         },
     )
     .map_err(|_| "cannot grant debug EP")?;
@@ -416,11 +420,12 @@ mod tests {
         let f = proc::get_cap(launch.pid, launch.bootinfo.factory).unwrap();
         assert_eq!(f.typ, ObjType::Factory);
         assert!(f.rights.contains(Rights::ALL));
-        // Debug EP is SEND-only on the reserved id.
+        // Debug EP is write-only + delegable on the reserved id (GRANT lets
+        // the launcher designate a console server).
         let d = proc::get_cap(launch.pid, launch.bootinfo.debug_ep).unwrap();
         assert_eq!(d.typ, ObjType::Endpoint);
         assert_eq!(d.obj, ObjId(DEBUG_EP_ID));
-        assert_eq!(d.rights, Rights::SEND);
+        assert_eq!(d.rights, Rights::SEND.union(Rights::GRANT));
         // Region cap registered.
         let (h, base, len) = launch.bootinfo.regions[0];
         let rc = proc::get_cap(launch.pid, h).unwrap();

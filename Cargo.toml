@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "kernel",
+    "kernel-boot",
     "hal",
     "hal/x86_64",
     "hal/aarch64",
@@ -10,12 +11,14 @@ members = [
     "ipc",
     "servers/process",
     "servers/vfs",
+    "servers/console",
     "servers/auth",
     "servers/net",
     "personality",
     "sdk",
     "drivers",
     "graphics",
+    "tests",
 ]
 
 [workspace.package]

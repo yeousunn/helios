@@ -104,7 +104,9 @@ pub extern "C" fn _start() -> ! {
         exit(&mut sys, 5);
     }
 
-    // 3. Done; a single byte at the O_RDONLY-flag sanity check.
+    // 3. Report on stdout (the console endpoint the launcher supplied) and
+    //    exit; the smoke verifies both the serial line and the status.
+    let _ = rt.write_stdout(&mut sys, b"helios-posix-ok\n");
     debug_assert_eq!(O_RDONLY, 0);
     exit(&mut sys, OK)
 }

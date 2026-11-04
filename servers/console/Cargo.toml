@@ -1,0 +1,18 @@
+[package]
+name = "console"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+user = []
+
+[[bin]]
+name = "console"
+path = "src/bin/console.rs"
+required-features = ["user"]
+
+[dependencies]
+ipc = { path = "../../ipc" }
+sdk = { path = "../../sdk" }

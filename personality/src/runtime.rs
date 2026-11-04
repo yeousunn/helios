@@ -6,16 +6,19 @@
 //! initialized by the binary before `Runtime::new` (the global allocator is
 //! per-binary).
 
+use ipc::Message;
 use sdk::bootstrap::BootstrapPackage;
-use sdk::syscall::{RawSyscalls, Status, Syscalls};
+use sdk::syscall::{Handle, RawSyscalls, Status, Syscalls};
 
 use crate::posix::ENOENT;
 use crate::vfs::VfsClient;
 
-/// A live personality process: its package, and a connected VFS client.
+/// A live personality process: its package, a connected VFS client, and the
+/// caller-supplied stdout endpoint (package `optional[2]`, design §2.3).
 pub struct Runtime {
     pub package: BootstrapPackage,
     pub vfs: VfsClient,
+    stdout: Option<Handle>,
 }
 
 impl Runtime {
@@ -35,7 +38,37 @@ impl Runtime {
             .ok_or(ENOENT)?;
         let session = package.session_notifications[0];
         let vfs = VfsClient::connect(sys, package.aspace, package.region, vfs_ep, session)?;
-        Ok(Self { package, vfs })
+        let stdout = package
+            .optional
+            .get(2)
+            .copied()
+            .flatten()
+            .map(|cs| cs.handle())
+            .filter(|h| *h != 0);
+        Ok(Self {
+            package,
+            vfs,
+            stdout,
+        })
+    }
+
+    /// Write text to the process's stdout (the caller-supplied console
+    /// endpoint): up to 32 bytes per message, little-endian packed
+    /// (`sdk::methods::console`). No-op when the launcher supplied none.
+    pub fn write_stdout<R: RawSyscalls>(
+        &mut self,
+        sys: &mut Syscalls<R>,
+        text: &[u8],
+    ) -> Result<(), Status> {
+        let Some(ep) = self.stdout else {
+            return Ok(());
+        };
+        for chunk in text.chunks(sdk::methods::console::TEXT_BYTES) {
+            let mut m = Message::new(sdk::methods::console::WRITE);
+            m.words = sdk::methods::pack_console_text(chunk);
+            sys.send(ep, &m)?;
+        }
+        Ok(())
     }
 }
 
