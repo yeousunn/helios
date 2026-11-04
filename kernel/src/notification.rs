@@ -53,12 +53,30 @@ pub fn signal(n: ObjRef, mask: u64) -> Result<(), crate::endpoint::IpcError> {
         .ok_or(crate::endpoint::IpcError::NoSuchEndpoint)?;
     let slot = slot_of(n).ok_or(crate::endpoint::IpcError::NoSuchEndpoint)?;
     engine.word[slot] |= mask;
-    // Wake threads blocked receiving on THIS notification...
-    let mut waiting = sched::blocked_matching(
+    // Threads blocked receiving on THIS notification: deliver the wake as a
+    // durable NOTIFY envelope (park_result priority 1 consumes it,
+    // state-independent) *and* requeue them. The envelope matters: the woken
+    // thread's resume otherwise depends on re-reading the (already consumed)
+    // pending word, a path that wedged PS's `WAIT` on the personality demo's
+    // death notification.
+    let mask_now = engine.word[slot];
+    let direct = sched::blocked_matching(
         |r| matches!(r, crate::sched::BlockReason::Notification(o) if *o == n),
     );
-    // ...and the §3.1 "select" primitive: threads blocked on ANY endpoint
-    // with this notification bound (ADR-019 §2).
+    for tid in direct {
+        if tid == sched::IDLE {
+            break;
+        }
+        let mut msg = ipc::Message::new(ipc::labels::kernel::NOTIFY);
+        msg.words[0] = mask_now;
+        let mut env = crate::endpoint::Envelope::new(msg, sched::IDLE);
+        env.reply_requested = false;
+        crate::endpoint::DELIVERED_FOR_REPLY.lock().insert(tid, env);
+        let _ = sched::make_ready(tid);
+    }
+    // The §3.1 "select" primitive (ADR-019 §2): threads blocked on ANY
+    // endpoint with this notification bound are woken to re-check their own
+    // wait — no envelope (they expect an endpoint message, not the mask).
     let bound = sched::blocked_matching(|r| {
         matches!(
             r,
@@ -71,22 +89,11 @@ pub fn signal(n: ObjRef, mask: u64) -> Result<(), crate::endpoint::IpcError> {
         if tid == sched::IDLE {
             break;
         }
-        if waiting.contains(&tid) {
-            continue;
-        }
         if let Ok(t) = sched::get(tid) {
             if t.bound_notification == Some(n) {
-                if let Some(f) = waiting.iter().position(|x| *x == sched::IDLE) {
-                    waiting[f] = tid;
-                }
+                let _ = sched::make_ready(tid);
             }
         }
-    }
-    for tid in waiting {
-        if tid == sched::IDLE {
-            break;
-        }
-        let _ = sched::make_ready(tid);
     }
     Ok(())
 }

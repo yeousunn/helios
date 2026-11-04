@@ -44,6 +44,7 @@ static HEAP: GlobalHeap = GlobalHeap::new();
 const MAX_WINDOWS: usize = 128;
 
 include!(concat!(env!("OUT_DIR"), "/child_image.rs"));
+include!(concat!(env!("OUT_DIR"), "/posix_image.rs"));
 
 /// Stateless transport: one transient `Syscalls` per call.
 struct BinTransport;
@@ -203,6 +204,11 @@ pub extern "C" fn _start() -> ! {
         if HAS_CHILD_IMAGE {
             if let Ok(file) = server.fs().create_file(root, "child", 0o755, 0) {
                 let _ = server.fs().write(file, 0, CHILD_IMAGE, 0);
+            }
+        }
+        if HAS_POSIX_IMAGE {
+            if let Ok(file) = server.fs().create_file(root, "posix", 0o755, 0) {
+                let _ = server.fs().write(file, 0, POSIX_IMAGE, 0);
             }
         }
     }

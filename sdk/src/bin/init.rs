@@ -56,6 +56,8 @@ const STEP_VFS_SPAWNED: u64 = 7;
 const STEP_VFS_READY: u64 = 8;
 const STEP_VFS_READ: u64 = 14;
 const STEP_CHILD_EXIT: u64 = 15;
+const STEP_POSIX_SPAWN: u64 = 16;
+const STEP_POSIX_WAIT: u64 = 17;
 const STEP_DONE: u64 = 0x0F;
 /// Failure marker family for exits: `0xDEAD_0000_00SS_EEEE` (step, errno).
 const FAIL: u64 = 0xDEAD_0000_0000_0000;
@@ -426,6 +428,51 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
         mark(raw, info.debug_ep, STEP_VFS_READ, count);
         conn_ep
     };
+
+    // Steps 16–17: run the POSIX personality demo (`/posix`, embedded into
+    // the VFS ramfs): a regular process whose whole I/O goes through the
+    // personality runtime (bootstrap → heap → VFS client → open/read/write).
+    // The SPAWN carries the VFS service endpoint so PS installs it as the
+    // child package's `optional[0]` (design §2.3). The demo exits 77.
+    {
+        unsafe {
+            core::ptr::copy_nonoverlapping(b"posix".as_ptr(), INIT_WINDOW_VA_BASE as *mut u8, 5);
+        }
+        let spawned = {
+            let mut sys = Syscalls::new(raw);
+            let mut m = Message::new(methods::process::SPAWN);
+            m.tag = m.tag.with_caps(1);
+            m.words[1] = 5; // program path: Span { off 0, len 5 } ("posix")
+            m.words[2] = (6u64 << 32) | 2; // argv span ("42"; unused by the demo)
+            let _ = m.set_descriptor(
+                0,
+                ipc::CapSlot::pack(vfs_svc, ipc::Rights::SEND.union(ipc::Rights::GRANT)),
+            );
+            sys.call(session_ep, &m)
+                .map_err(|e| fail_code(STEP_POSIX_SPAWN, e as u64))?
+        };
+        if spawned.words[0] != 0 || spawned.words[1] == 0 {
+            return Err(fail_code(
+                STEP_POSIX_SPAWN,
+                0xE1 | ((spawned.words[0] as u64 & 0xFFFF) << 8),
+            ));
+        }
+        let posix_pid = spawned.words[1];
+        mark(raw, info.debug_ep, STEP_POSIX_SPAWN, posix_pid);
+
+        let waited = {
+            let mut sys = Syscalls::new(raw);
+            let mut m = Message::new(methods::process::WAIT);
+            m.words[0] = posix_pid;
+            sys.call(session_ep, &m)
+                .map_err(|e| fail_code(STEP_POSIX_WAIT, e as u64))?
+        };
+        if waited.words[0] != 0 || waited.words[1] != 77 {
+            return Err(fail_code(STEP_POSIX_WAIT, 0xE1 | (waited.words[1] << 8)));
+        }
+        mark(raw, info.debug_ep, STEP_POSIX_WAIT, waited.words[1]);
+    }
+
     {
         let mut sys = Syscalls::new(raw);
         let kill = Message::new(methods::process::KILL);

@@ -396,6 +396,19 @@ pub fn sys_recv(
             if mask == 0 {
                 sched::block(tid, BlockReason::Notification(ObjRef(cap.obj.0)))
                     .map_err(|_| err(ipc::status::ENOMEM))?;
+                // Re-check: a signal that landed between the take and the
+                // block found no waiter to wake (its scan ran first) and the
+                // thread would otherwise sleep through it.
+                if let Ok(m2) = notification::pending(ObjRef(cap.obj.0)) {
+                    if m2 != 0 {
+                        let _ = sched::make_ready(tid);
+                        let m3 =
+                            notification::take(ObjRef(cap.obj.0)).map_err(|e| err(map_ipc(e)))?;
+                        let mut m = Message::new(ipc::labels::kernel::NOTIFY);
+                        m.words[0] = m3;
+                        return Ok(Some(m));
+                    }
+                }
                 return Ok(None);
             }
             let mut m = Message::new(ipc::labels::kernel::NOTIFY);

@@ -60,6 +60,7 @@ pub mod vfs {
     pub const WRITE: u16 = 0x0214;
     pub const CLOSE: u16 = 0x0215;
     pub const STAT: u16 = 0x0217;
+    pub const CREATE: u16 = 0x0219;
 }
 
 /// VFS OPEN flags (`proto.rs`).

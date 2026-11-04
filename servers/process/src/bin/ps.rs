@@ -309,7 +309,7 @@ fn spawn_reply(
         }
     };
     let image: &[u8] = loaded.as_deref().unwrap_or(CHILD_IMAGE);
-    match spawn_child(sys, package, factory, service_ep, off, len, image) {
+    match spawn_child(sys, package, factory, service_ep, off, len, image, vfs_svc) {
         Ok((pid, thread_cap, exit_notif)) => {
             reply.words[1] = pid;
             reply.tag = reply.tag.with_caps(2);
@@ -327,6 +327,7 @@ fn spawn_reply(
 /// Build the child: fresh AS, embedded ELF, crafted stack, thread with a
 /// bootstrap package, and PS's death binding (`N_dead`, design §1.5).
 /// Returns `(pid, thread_control, exit_notif)`.
+#[allow(clippy::too_many_arguments)]
 fn spawn_child(
     sys: &mut Syscalls<'_, X86_64Syscalls>,
     package: &BootstrapPackage,
@@ -335,6 +336,7 @@ fn spawn_child(
     arg_off: usize,
     arg_len: usize,
     image_bytes: &[u8],
+    vfs_ep: Option<u32>,
 ) -> Result<(u64, u32, u32), i32> {
     // 1. Child address space.
     let child_as = invoke_w0(sys, factory, methods::factory::NEW_ADDRESS_SPACE, [0; 4])? as u32;
@@ -391,19 +393,27 @@ fn spawn_child(
         return Err(ipc::status::ENOMEM);
     }
     CH_THREAD.store(thread_cap, Ordering::Relaxed);
-    // 7. ADR-009 package (prefix only — no Factory for regular processes).
-    //    Stack array: the Vec form was silently corrupted (heap aliasing).
+    // 7. ADR-009 package: fixed prefix + the optional tail. Regular processes
+    //    get no Factory; the SPAWN caller's VFS service endpoint (if any)
+    //    rides as `optional[0]` (design §2.3 tail order: vfs, stdin, stdout,
+    //    stderr) so the child can reach the filesystem. Stack array: the Vec
+    //    form was silently corrupted (heap aliasing).
     let session_rights = Rights::SIGNAL.union(Rights::RECV).union(Rights::GRANT);
-    let caps: [CapSlot; bootstrap::FIXED_CAPS] = [
-        CapSlot::pack(child_as, Rights::MAP.union(Rights::GRANT)),
-        CapSlot::pack(CH_THREAD.load(Ordering::Relaxed), Rights::CONTROL),
-        CapSlot::pack(package.region, Rights::GRANT),
-        CapSlot::pack(CH_S0.load(Ordering::Relaxed), session_rights),
-        CapSlot::pack(CH_S1.load(Ordering::Relaxed), session_rights),
-        CapSlot::pack(CH_S2.load(Ordering::Relaxed), session_rights),
-        CapSlot::pack(CH_S3.load(Ordering::Relaxed), session_rights),
-        CapSlot::pack(service_ep, Rights::SEND.union(Rights::GRANT)),
-    ];
+    let mut caps = [CapSlot::NULL; bootstrap::FIXED_CAPS + 1];
+    caps[0] = CapSlot::pack(child_as, Rights::MAP.union(Rights::GRANT));
+    caps[1] = CapSlot::pack(CH_THREAD.load(Ordering::Relaxed), Rights::CONTROL);
+    caps[2] = CapSlot::pack(package.region, Rights::GRANT);
+    caps[3] = CapSlot::pack(CH_S0.load(Ordering::Relaxed), session_rights);
+    caps[4] = CapSlot::pack(CH_S1.load(Ordering::Relaxed), session_rights);
+    caps[5] = CapSlot::pack(CH_S2.load(Ordering::Relaxed), session_rights);
+    caps[6] = CapSlot::pack(CH_S3.load(Ordering::Relaxed), session_rights);
+    caps[7] = CapSlot::pack(service_ep, Rights::SEND.union(Rights::GRANT));
+    let total = if let Some(vfs) = vfs_ep {
+        caps[8] = CapSlot::pack(vfs, Rights::SEND.union(Rights::GRANT));
+        bootstrap::FIXED_CAPS + 1
+    } else {
+        bootstrap::FIXED_CAPS
+    };
     // 6. PS's death binding on the child thread.
     let mut bind = Message::new(methods::thread::BIND_DEATH_NOTIFICATION);
     bind.tag = bind.tag.with_caps(1);
@@ -413,7 +423,7 @@ fn spawn_child(
     );
     sys.invoke(CH_THREAD.load(Ordering::Relaxed), &bind)?;
 
-    bootstrap::deliver(sys, CH_BOOT.load(Ordering::Relaxed), &caps)?;
+    bootstrap::deliver(sys, CH_BOOT.load(Ordering::Relaxed), &caps[..total])?;
     // 8. Publish for WAIT/KILL.
     CHILD_PID.store(pid, Ordering::Relaxed);
     CHILD_THREAD.store(thread_cap, Ordering::Relaxed);
@@ -530,6 +540,15 @@ fn load_via_vfs(
             break;
         }
     }
+    // Release the window VAs for the next SPAWN (the frames stay alive via
+    // our caps; the VFS's own mappings of them are unaffected). Re-mapping
+    // over an existing mapping is an overlap error — the second VFS-backed
+    // spawn hit exactly that.
+    for va in [arg_va, result_va] {
+        let mut unmap = Message::new(methods::aspace::UNMAP);
+        unmap.words[0] = va;
+        let _ = sys.invoke(package.aspace, &unmap);
+    }
     if out.is_empty() {
         return Err(ipc::status::EBADARG);
     }
@@ -592,18 +611,21 @@ fn wait_reply(sys: &mut Syscalls<'_, X86_64Syscalls>, req: &Message) -> Message 
         return reply;
     }
     let notif = CHILD_NOTIF.load(Ordering::Relaxed);
-    let notified = match sys.recv(notif) {
-        Ok(m) => m,
-        Err(e) => {
-            reply.words[0] = e as i64 as u64;
-            return reply;
+    // The death event may share the mailbox with other signals (and v0 wake
+    // paths are not perfectly quiet): keep receiving until the event bit
+    // arrives instead of failing on the first non-death wake.
+    let mask = loop {
+        let notified = match sys.recv(notif) {
+            Ok(m) => m,
+            Err(e) => {
+                reply.words[0] = e as i64 as u64;
+                return reply;
+            }
+        };
+        if notified.words[0] & 1 != 0 {
+            break notified.words[0];
         }
     };
-    let mask = notified.words[0];
-    if mask & 1 == 0 {
-        reply.words[0] = ipc::status::EBADSTATE as i64 as u64;
-        return reply;
-    }
     reply.words[1] = (mask >> 32) as u32 as i32 as i64 as u64;
     reply
 }
