@@ -255,3 +255,8 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
   4. `kernel-boot` wires `console_in::push_byte` as the UART RX sink at boot.
 - **Full input path:** typed bytes → IRQ4 → UART RX callback → line buffer → newline → notification signal → console server (or shell) `recv` pops the line. stdin for the scripted shell is unblocked (DS slice next: console server forwards lines to client stdin caps).
 - The 178-workspace-test gate is green; release smoke E2E=0 throughout.
+
+## DS (Phase 3 slice 5 — shell builtins + envp, 2026-11-03)
+
+- **Landed, full session green:** `/sh` now has a command table (builtins `echo`/`cat` over the VFS + external programs via PS) with status reporting (`<path> -> <status>`) and failure propagation. `PsClient::spawn` carries env; the child echoes `argv=…|env=…` — **envp is proven end-to-end** (blob → crafted stack → `sdk::args` → program). Smoke serial: `helios sh v0`, `child -> 7`, `argv=5|env=X=42`, `child -> 5`, `helios-vfs-ok` (cat), `sh ok`; markers 1–21 + DONE + clean halt.
+- **graphify graph built for the repo** (`graphify-out/`: 1826 nodes, 5029 edges, 88 labeled communities, HTML + report) — queries now resolve code questions with file/line pointers; keep it fresh with `graphify update` after commits.
