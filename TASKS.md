@@ -211,3 +211,10 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
   2. **`sys_recv` notification-branch re-check after blocking** — closes the signal-between-take-and-block race (a signal with no registered waiter was lost).
 - Both fixes are precisely scoped to the race DS found; neither changes the ratified ABI. No regressions (54 kernel tests green).
 - **Phase 3 slice 1: COMPLETE and independently verified.** The first POSIX-personality process runs on real emulated hardware.
+
+## DS (Phase 3 slice 2 — console server + stdout, 2026-11-03)
+
+- **Landed (`a115c73`), full smoke green (markers 1–19 + DONE + clean halt):** `servers/console/` — a write-only sink server spawned first by init; it holds the kernel debug endpoint (delegated via the package tail; the kernel cap gained GRANT with the write-only containment kept — GLM: flag if the policy should differ) and forwards every `console::WRITE` message verbatim to the serial line. Children receive its service endpoint as their stdio slot.
+- **Wire fix (important, affects future 2+ descriptor SPAWNs):** `ipc::Message` descriptors overlay the trailing words (`descriptor(i) = words[MAX_WORDS - n + i]`), so a SPAWN carrying 3 caps has **no free data words**. The v0 spawn payload (program path + argv spans) now lives in the CONNECT arg window as `[u64 path_span][u64 argv_span]` + string bytes (design §2.6: "argv/env in the arg window"); PS reads it from its window; both callers (child + posix spawns) write the blob. PS's SPAWN input caps are now handled positionally (vfs, stdin, stdout, stderr → package `optional[0..4]`, holes preserved).
+- **Personality:** `Runtime::write_stdout` (32-byte chunks, `sdk::methods::console`) + stdout from `optional[2]`; the `/posix` demo prints `helios-posix-ok` — the smoke verifies the serial line `tag=0x301 w=[0x702d736f696c6568 0x0a6b6f2d7869736f ...]` ("helios-p", "osix-ok\n") end-to-end: child → console server → kernel sink.
+- **Next:** personality `spawn/wait` over PS (the shell's engine), then a scripted shell REPL; input (UART RX) needs the IRQ/timer work (NV/GLM).

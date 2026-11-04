@@ -57,7 +57,10 @@ cargo build -p sdk --bin init --features user --target x86_64-unknown-none --rel
 | 14 | `...000e` | bytes read (13) | init `CONNECT`s to the VFS, `OPEN("/hello")`, `READ`, byte-verifies `"helios-vfs-ok"` |
 | 16 | `...0010` | posix pid | `SPAWN("/posix")` with the VFS cap: the demo runs the full personality runtime (bootstrap → heap → VFS client → open/read/write over IPC) |
 | 17 | `...0011` | 77 (`0x4d`) | `WAIT` for the demo: it byte-verified `hello`, created+verified `posix-log`, exited 77 |
-| DONE | `0x494e49540000000f` | 0 | all passed (both servers reaped; clean halt) |
+| 18 | `...0012` | console pid | console server spawned (holds the delegated debug endpoint) |
+| 19 | `...0013` | service handle | console ready: its endpoint is later supplied to children as stdio |
+| — | `tag=0x301` | text words | any `console::WRITE` line on the serial (e.g. the demo's `helios-posix-ok\n` at `w=[0x702d736f696c6568 0x0a6b6f2d7869736f ...]`) |
+| DONE | `0x494e49540000000f` | 0 | all passed (all servers reaped; clean halt) |
 
 v0 conventions this smoke pins (all design §2.4/§2.6 provisional):
 
