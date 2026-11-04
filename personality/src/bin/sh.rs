@@ -1,7 +1,8 @@
 //! Helios shell (v0, scripted — input waits on UART RX/IRQ work): drives the
-//! system through the personality runtime. The compiled-in script spawns
-//! commands through PS, reaps them, checks their exit statuses and reports on
-//! the console. Exits 0 on success; small codes identify the failing step.
+//! system through the personality runtime. A compiled-in command table mixes
+//! builtins (`echo`, `cat` — over the VFS) with external programs spawned
+//! through PS; exit statuses are checked and reported. Exits 0 on success;
+//! small codes identify the failing step.
 
 #![no_std]
 #![no_main]
@@ -34,6 +35,41 @@ global_asm!(
     "jmp {main}",
     main = sym sh_main,
 );
+
+/// One script entry.
+enum Command {
+    /// Write the text plus a newline to stdout.
+    Echo(&'static [u8]),
+    /// Read a VFS file and write it to stdout.
+    Cat(&'static [u8]),
+    /// Spawn `path` with argv/env through PS; report `<path> -> <status>`;
+    /// fail the script when the status differs from `expect`.
+    Run {
+        path: &'static [u8],
+        argv: &'static [&'static [u8]],
+        env: &'static [&'static [u8]],
+        expect: i32,
+    },
+}
+
+const SCRIPT: &[Command] = &[
+    Command::Echo(b"helios sh v0"),
+    Command::Run {
+        path: b"child",
+        argv: &[b"7"],
+        env: &[],
+        expect: 7,
+    },
+    // envp plumbing: the child echoes its environment alongside argv.
+    Command::Run {
+        path: b"child",
+        argv: &[b"5"],
+        env: &[b"X=42"],
+        expect: 5,
+    },
+    Command::Cat(b"hello"),
+    Command::Echo(b"sh ok"),
+];
 
 extern "C" fn sh_main(argc: u64, argv: *const *const u8, envp: *const *const u8) -> ! {
     let _args = unsafe { Args::new(argc, argv, envp) };
@@ -71,30 +107,73 @@ extern "C" fn sh_main(argc: u64, argv: *const *const u8, envp: *const *const u8)
         Err(e) => exit(&mut sys, e),
     };
 
-    let _ = rt.write_stdout(&mut sys, b"helios sh v0\n");
-
-    // Script: run each command, verify its exit status.
     let vfs_ep = rt.package.optional[0].map(|cs| cs.handle());
     let stdout = rt.stdout_handle();
-    let script: [(&[u8], &[&[u8]], i32); 2] = [(b"child", &[b"7"], 7), (b"child", &[b"9"], 9)];
-    let mut fail = 0x10;
-    for (path, args, expect) in script {
-        let pid = match rt.ps.spawn(&mut sys, path, args, vfs_ep, stdout) {
-            Ok(pid) => pid,
-            Err(e) => exit(&mut sys, fail | (e & 0xFF)),
-        };
-        let status = match rt.ps.wait(&mut sys, pid) {
-            Ok(s) => s,
-            Err(e) => exit(&mut sys, (fail + 1) | (e & 0xFF)),
-        };
-        if status != expect {
-            exit(&mut sys, fail + 2);
+    let mut fail = 0x10i32;
+    for cmd in SCRIPT {
+        match cmd {
+            Command::Echo(text) => {
+                let _ = rt.write_stdout(&mut sys, text);
+                let _ = rt.write_stdout(&mut sys, b"\n");
+            }
+            Command::Cat(path) => {
+                let mut buf = [0u8; 64];
+                let n = match rt.vfs.read_file(&mut sys, path, &mut buf) {
+                    Ok(n) => n,
+                    Err(e) => exit(&mut sys, fail | (e & 0xFF)),
+                };
+                let _ = rt.write_stdout(&mut sys, &buf[..n]);
+            }
+            Command::Run {
+                path,
+                argv,
+                env,
+                expect,
+            } => {
+                let pid = match rt.ps.spawn(&mut sys, path, argv, env, vfs_ep, stdout) {
+                    Ok(pid) => pid,
+                    Err(e) => exit(&mut sys, fail | (e & 0xFF)),
+                };
+                let status = match rt.ps.wait(&mut sys, pid) {
+                    Ok(s) => s,
+                    Err(e) => exit(&mut sys, (fail + 1) | (e & 0xFF)),
+                };
+                // Report "<path> -> <status>" on stdout (tiny decimal writer:
+                // no format! in a no_std bin's hot path here).
+                let _ = rt.write_stdout(&mut sys, path);
+                let _ = rt.write_stdout(&mut sys, b" -> ");
+                let mut digits = [0u8; 12];
+                let text = write_i32(status, &mut digits);
+                let _ = rt.write_stdout(&mut sys, text);
+                let _ = rt.write_stdout(&mut sys, b"\n");
+                if status != *expect {
+                    exit(&mut sys, fail + 2);
+                }
+                fail += 4;
+            }
         }
-        fail += 4;
     }
-
-    let _ = rt.write_stdout(&mut sys, b"sh ok\n");
     exit(&mut sys, 0)
+}
+
+/// Write `v` as decimal into `buf`, returning the used slice.
+fn write_i32(v: i32, buf: &mut [u8; 12]) -> &[u8] {
+    let neg = v < 0;
+    let mut n = (v as i64).unsigned_abs();
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    if neg {
+        i -= 1;
+        buf[i] = b'-';
+    }
+    &buf[i..]
 }
 
 #[panic_handler]

@@ -88,10 +88,11 @@ impl PsClient {
         sys: &mut Syscalls<R>,
         path: &[u8],
         argv: &[&[u8]],
+        env: &[&[u8]],
         vfs: Option<Handle>,
         stdout: Option<Handle>,
     ) -> Result<u64, Status> {
-        let ok = sdk::spawn::write_spawn_blob(PS_ARG_WINDOW_VA, path, argv, &[]);
+        let ok = sdk::spawn::write_spawn_blob(PS_ARG_WINDOW_VA, path, argv, env);
         if ok.is_none() {
             return Err(status::EBADARG);
         }

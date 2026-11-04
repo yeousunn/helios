@@ -86,6 +86,17 @@ extern "C" fn child_main(argc: u64, argv: *const *const u8, envp: *const *const 
                         put(a);
                     }
                 }
+                if args.envc() != 0 {
+                    put(b"|env=");
+                    for i in 0..args.envc() {
+                        if i != 0 {
+                            put(b" ");
+                        }
+                        if let Some(e) = args.env(i) {
+                            put(e);
+                        }
+                    }
+                }
                 let _ = sys.send(console.handle(), &m);
             }
         }

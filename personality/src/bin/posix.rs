@@ -108,10 +108,14 @@ pub extern "C" fn _start() -> ! {
     //    with its argv[0], so WAIT must observe 42. This exercises a full
     //    process tree (init -> posix -> child) over one process server.
     let vfs_ep = rt.package.optional[0].map(|cs| cs.handle());
-    let child = match rt
-        .ps
-        .spawn(&mut sys, b"child", &[b"42"], vfs_ep, rt.stdout_handle())
-    {
+    let child = match rt.ps.spawn(
+        &mut sys,
+        b"child",
+        &[b"42"],
+        &[],
+        vfs_ep,
+        rt.stdout_handle(),
+    ) {
         Ok(pid) => pid,
         Err(e) => exit(&mut sys, 0x200 | (e & 0xFF)),
     };
