@@ -30,10 +30,10 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 
 ## Phase 1 — Remaining Kernel Core (GLM — BIG task)
 
-- [~ GLM started 2026-10-31] **GLM:** `kernel/` — arch syscall entry contract: `entry::SyscallArgs/SyscallReturn` + `dispatch()` + Factory invoke (NEW_ENDPOINT/NOTIFICATION/ADDRESS_SPACE/THREAD per ADR-017, bootstrap→handle 1 per ADR-009). **Kernel Phase 1 complete: 24 tests green.**
-- [~ GLM started 2026-10-31] **GLM:** `kernel/` — arch syscall entry wiring: trap entry decodes registers → `kernel::entry::SyscallArgs { num, cap, tag, w, nonblock }` → call `kernel::entry::dispatch(args)` → restore `SyscallReturn { status, tag, w }` into registers (syscall-abi §2 register map). PARKED status (`i32::MIN`) → do NOT return to userspace, run scheduler + context switch instead.
-- [~ GLM started 2026-10-31] **GLM:** `kernel/` — boot sequence: `kernel::init::start(regions)` creates init process, grants Factory + Region + debug-EP caps, spawns init thread. `kernel::boot::early_init()` registers console + panic-exit hook.
-- [~ GLM started 2026-10-31] **GLM:** `kernel-boot/src/main.rs` — `_start` calls `hal_arch_boot()` then `kernel::boot::early_init()` then `kernel::init::start()` then `sched::start_first()`. Register `BackendFactoryX86_64`, `ContextBackendX86_64`, `CurrentContextX86_64`. QEMU smoke test: `_start` → early console → `kernel::init::start()` → `init` userspace → exit(0) → QEMU exit code 0.
+- [x] GLM done 2026-10-31 — **GLM:** `kernel/` — arch syscall entry contract: `entry::SyscallArgs/SyscallReturn` + `dispatch()` + Factory invoke (NEW_ENDPOINT/NOTIFICATION/ADDRESS_SPACE/THREAD per ADR-017, bootstrap→handle 1 per ADR-009). **Kernel Phase 1 complete.**
+- [x] GLM done 2026-10-31 — **GLM:** `kernel/` — arch syscall entry wiring: trap entry decodes registers → `kernel::entry::SyscallArgs { num, cap, tag, w, nonblock }` → call `kernel::entry::dispatch(args)` → restore `SyscallReturn { status, tag, w }` into registers (syscall-abi §2 register map). PARKED status (`i32::MIN`) → do NOT return to userspace, run scheduler + context switch instead. (landed + e2e-verified)
+- [x] GLM done 2026-10-31 — **GLM:** `kernel/` — `kernel/` — boot sequence: `kernel::init::start(regions)` creates init process, grants Factory + Region + debug-EP caps, spawns init thread. `kernel::boot::early_init()` registers console + panic-exit hook. (landed + e2e-verified)
+- [x] GLM done 2026-11-01 — **GLM:** `kernel-boot/src/main.rs` — `kernel-boot/src/main.rs` — `_start` calls `hal_arch_boot()` then `kernel::boot::early_init()` then `kernel::init::start()` then `sched::start_first()`. Register `BackendFactoryX86_64`, `ContextBackendX86_64`, `CurrentContextX86_64`. QEMU smoke test: `_start` → early console → `kernel::init::start()` → `init` userspace → exit(0) → QEMU exit code 0. (landed + e2e-verified)
 
 ## Phase 2 — System Servers (early starts)
 
