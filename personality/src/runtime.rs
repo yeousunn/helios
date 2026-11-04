@@ -48,6 +48,7 @@ impl Runtime {
             package.region,
             package.process_server_ep,
             package.session_notifications[1],
+            package.pid,
         )?;
         let stdout = package
             .optional

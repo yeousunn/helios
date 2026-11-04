@@ -53,7 +53,15 @@ const MAX_CHILDREN: usize = 4;
 static CH_PIDS: [AtomicU64; MAX_CHILDREN] = [const { AtomicU64::new(0) }; MAX_CHILDREN];
 static CH_CAPS: [AtomicU32; MAX_CHILDREN] = [const { AtomicU32::new(0) }; MAX_CHILDREN];
 static CH_NOTIFS: [AtomicU32; MAX_CHILDREN] = [const { AtomicU32::new(0) }; MAX_CHILDREN];
+/// The child's AS cap and the VFS service endpoint its SPAWN carried — EXEC
+/// loads the replacement image through both.
+static CH_AS: [AtomicU32; MAX_CHILDREN] = [const { AtomicU32::new(0) }; MAX_CHILDREN];
+static CH_VFS: [AtomicU32; MAX_CHILDREN] = [const { AtomicU32::new(0) }; MAX_CHILDREN];
 static NEXT_CHILD: AtomicUsize = AtomicUsize::new(0);
+
+/// Caller pid per connection (the CONNECT message carries `w1 = self pid`),
+/// so EXEC can resolve "the calling process" without extra capabilities.
+static CONN_PIDS: [AtomicU64; MAX_CONNS] = [const { AtomicU64::new(0) }; MAX_CONNS];
 
 fn child_slot(pid: u64) -> Option<usize> {
     if pid == 0 {
@@ -62,7 +70,7 @@ fn child_slot(pid: u64) -> Option<usize> {
     (0..MAX_CHILDREN).find(|&i| CH_PIDS[i].load(Ordering::Relaxed) == pid)
 }
 
-fn register_child(pid: u64, cap: u32, notif: u32) {
+fn register_child(pid: u64, cap: u32, notif: u32, as_cap: u32, vfs: u32) {
     // Reuse a slot already carrying this pid: pids are recycled once a child
     // is reaped, and a stale earlier registration would make `child_slot`
     // find the dead child's already-consumed notification (found via the
@@ -77,11 +85,14 @@ fn register_child(pid: u64, cap: u32, notif: u32) {
     CH_PIDS[i].store(pid, Ordering::Relaxed);
     CH_CAPS[i].store(cap, Ordering::Relaxed);
     CH_NOTIFS[i].store(notif, Ordering::Relaxed);
+    CH_AS[i].store(as_cap, Ordering::Relaxed);
+    CH_VFS[i].store(vfs, Ordering::Relaxed);
 }
 
-fn register_conn(ep: u32) {
+fn register_conn(ep: u32, pid: u64) {
     let i = NEXT_CONN.fetch_add(1, Ordering::Relaxed) % MAX_CONNS;
     CONNS[i].store(ep, Ordering::Relaxed);
+    CONN_PIDS[i].store(pid, Ordering::Relaxed);
 }
 
 /// Pin the child's package handles immediately at mint time: register/spill
@@ -196,7 +207,9 @@ pub extern "C" fn _start() -> ! {
                     let slot = NEXT_CONN.load(Ordering::Relaxed) % MAX_CONNS;
                     let (reply, conn_ep) = connect_reply(&mut sys, &package, &req, factory, slot);
                     if let Some(ep) = conn_ep {
-                        register_conn(ep);
+                        // Caller identity: pid in w0's upper half (the window
+                        // descriptor overlay rules out extra data words).
+                        register_conn(ep, req.words[0] >> 32);
                     }
                     reply
                 }
@@ -228,6 +241,13 @@ pub extern "C" fn _start() -> ! {
                     spawn_reply(&mut sys, &package, &req, factory, service_ep, win_base)
                 }
                 methods::process::WAIT => wait_reply(&mut sys, &req),
+                methods::process::EXEC => exec_reply(
+                    &mut sys,
+                    &package,
+                    factory,
+                    CONN_PIDS[i - 1].load(Ordering::Relaxed),
+                    PS_WINDOW_VA_BASE + ((i - 1) as u64) * 0x2000,
+                ),
                 methods::process::KILL => {
                     let target = req.words[0];
                     if let Some(slot) = child_slot(target) {
@@ -280,7 +300,7 @@ fn connect_reply(
     // `PS_WINDOW_VA_BASE + N * 0x2000` (+0x1000 for the result window).
     let win_base = PS_WINDOW_VA_BASE + (slot as u64) * 0x2000;
     let mut reply = Message::new(methods::process::CONNECT);
-    if req.words[0] != 1 {
+    if req.words[0] & 0xFFFF_FFFF != 1 {
         reply.words[0] = ipc::status::EBADARG as i64 as u64;
         return (reply, None);
     }
@@ -532,9 +552,15 @@ fn spawn_child(
     );
     sys.invoke(CH_THREAD.load(Ordering::Relaxed), &bind)?;
 
-    bootstrap::deliver(sys, CH_BOOT.load(Ordering::Relaxed), &caps[..total])?;
-    // 8. Publish for WAIT/KILL (per-client table slot; round-robin).
-    register_child(pid, thread_cap, exit_notif);
+    bootstrap::deliver(sys, CH_BOOT.load(Ordering::Relaxed), &caps[..total], pid)?;
+    // 8. Publish for WAIT/KILL/EXEC (per-client table slot; round-robin).
+    register_child(
+        pid,
+        thread_cap,
+        exit_notif,
+        child_as,
+        extras[0].unwrap_or(0),
+    );
     Ok((pid, thread_cap, exit_notif))
 }
 
@@ -772,6 +798,147 @@ fn craft_stack(
 /// `WAIT` (0x0111): v0 blocking wait on the single child's death
 /// notification (design §2.6); replies `w0 = status, w1 = child's raw exit
 /// status` (kernel payload convention: bit 0 = event, bits 32.. = status).
+/// `EXEC` (design §2.6): replace the calling process's image. v0 builds on
+/// `Thread::THREAD_CREATE` (ADR-033): load the new program into the caller's
+/// AS (through the VFS endpoint its SPAWN carried), re-craft the stack, create
+/// a fresh thread at the new entry, then reply — the caller's runtime exits
+/// its old thread, leaving the process running the new image with its
+/// capabilities (and fds) intact.
+///
+/// v0 warts (documented): the caller's exit notification (bound to the OLD
+/// thread) fires at the moment of exec rather than at process death — a
+/// `Thread::SET_ENTRY`-style primitive (board: ADR candidate) removes this.
+/// The image's segment range is unmapped wholesale before the load.
+fn exec_reply(
+    sys: &mut Syscalls<'_, X86_64Syscalls>,
+    package: &BootstrapPackage,
+    factory: u32,
+    caller_pid: u64,
+    win_base: u64,
+) -> Message {
+    let mut reply = Message::new(methods::process::EXEC);
+    let Some(slot) = child_slot(caller_pid) else {
+        reply.words[0] = ipc::status::EBADARG as i64 as u64;
+        return reply;
+    };
+    let (path_off, path_len, arg_off, arg_len, env_off, env_len) = match parse_spawn_blob(win_base)
+    {
+        Some(v) => v,
+        None => {
+            reply.words[0] = ipc::status::EBADARG as i64 as u64;
+            return reply;
+        }
+    };
+    let as_cap = CH_AS[slot].load(Ordering::Relaxed);
+    let vfs_cap = CH_VFS[slot].load(Ordering::Relaxed);
+    let thread_cap = CH_CAPS[slot].load(Ordering::Relaxed);
+    if as_cap == 0 || vfs_cap == 0 || thread_cap == 0 {
+        reply.words[0] = ipc::status::EBADCAP as i64 as u64;
+        return reply;
+    }
+    let image = match load_via_vfs(sys, package, factory, vfs_cap, path_off, path_len, win_base) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            reply.words[0] = e as i64 as u64;
+            return reply;
+        }
+    };
+    let elf = match ElfImage::parse(&image) {
+        Ok(el) => el,
+        Err(e) => {
+            reply.words[0] = ipc::status::EBADARG as i64 as u64;
+            let _ = e;
+            return reply;
+        }
+    };
+    // Unmap the old image segments + the crafted top stack page, then load the
+    // replacement into the caller's AS and re-craft the stack for the new
+    // argv/env. (64 pages covers every v0 binary; the image base is fixed by
+    // the linker flags.)
+    const IMAGE_BASE: u64 = 0x7E00_0000;
+    const IMAGE_PAGES: u64 = 64;
+    {
+        let mut m = Message::new(methods::aspace::UNMAP);
+        m.words[0] = IMAGE_BASE;
+        m.words[1] = IMAGE_PAGES;
+        let _ = sys.invoke(as_cap, &m);
+        let mut m = Message::new(methods::aspace::UNMAP);
+        m.words[0] = USER_STACK_TOP - 4096;
+        m.words[1] = 1;
+        let _ = sys.invoke(as_cap, &m);
+    }
+    let loaded = (|| -> Result<(), i32> {
+        let ops = loader::plan(&elf, PS_SCRATCH_VA_BASE)?;
+        loader::execute(
+            sys,
+            &mut loader::MemoryWriter,
+            &ops,
+            as_cap,
+            package.region,
+            package.aspace,
+            &image,
+        )?;
+        craft_stack(
+            sys,
+            package,
+            as_cap,
+            (arg_off, arg_len),
+            (env_off, env_len),
+            win_base,
+        )?;
+        Ok(())
+    })();
+    if let Err(e) = loaded {
+        reply.words[0] = e as i64 as u64;
+        return reply;
+    }
+    // Fresh thread in the SAME process at the new entry (ADR-033 §1).
+    let mut m = Message::new(methods::thread::THREAD_CREATE);
+    m.words[0] = elf.entry;
+    let tc = sys.invoke(thread_cap, &m);
+    match tc {
+        Ok(_) => {
+            // The replacement thread is live; the caller's old thread must NOT
+            // resume — its saved RIP points into the image we just replaced
+            // (resuming faults at whatever the new bytes decode to). Retire it
+            // with EXIT status 0 (KILL would force -1 and trip the parent's
+            // WAIT): exec never returns. Its death also fires the parent's
+            // notification (the documented v0 wart — `Thread::SET_ENTRY`,
+            // kernel id 14, is the clean follow-up).
+            let mut m = Message::new(methods::thread::EXIT);
+            m.words[0] = 0;
+            let _ = sys.invoke(thread_cap, &m);
+            reply.words[1] = elf.entry;
+            reply
+        }
+        Err(e) => {
+            reply.words[0] = e as i64 as u64;
+            reply
+        }
+    }
+}
+
+/// Parse the v0.2 spawn/exec payload blob from `win_base`
+/// (`[path_span][argv_span][env_span]` + areas). `None` = malformed.
+#[allow(clippy::type_complexity)]
+fn parse_spawn_blob(win_base: u64) -> Option<(usize, usize, usize, usize, usize, usize)> {
+    let f = win_base as *const u8;
+    // SAFETY: the caller's CONNECT arg window is mapped R in this AS.
+    let (path_off, path_len, arg_off, arg_len, env_off, env_len) = unsafe {
+        let rd = |o: usize| core::ptr::read_unaligned(f.add(o) as *const u64);
+        let span = |w: u64| ((w >> 32) as usize, (w & 0xFFFF_FFFF) as usize);
+        let (po, pl) = span(rd(0));
+        let (ao, al) = span(rd(8));
+        let (eo, el) = span(rd(16));
+        (po, pl, ao, al, eo, el)
+    };
+    let ok = |off: usize, len: usize| off.checked_add(len).map_or(false, |e| e <= 4096);
+    if path_len == 0 || !ok(path_off, path_len) || !ok(arg_off, arg_len) || !ok(env_off, env_len) {
+        return None;
+    }
+    Some((path_off, path_len, arg_off, arg_len, env_off, env_len))
+}
+
 /// `WAIT`: non-blocking poll of the child's death notification. A dead child
 /// yields its exit status; a live child yields `EWOULDBLOCK` and the caller
 /// polls (yielding). Deferring the reply until death would need a kernel

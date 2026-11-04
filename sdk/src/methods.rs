@@ -29,6 +29,8 @@ pub mod thread {
     pub const REGS_WRITE: u16 = 10;
     pub const SET_TLS: u16 = 11;
     pub const BIND_DEATH_NOTIFICATION: u16 = 12;
+    /// ADR-033 §1: new thread in the target's process (shares AS + cap table).
+    pub const THREAD_CREATE: u16 = 13;
 }
 
 pub mod aspace {

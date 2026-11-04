@@ -857,6 +857,7 @@ fn spawn_server(
         let mut sys = Syscalls::new(raw);
         let mut hdr = Message::new(bootstrap::PACKAGE_LABEL);
         hdr.words[0] = bootstrap::FIXED_CAPS as u64 + if extra.is_some() { 2 } else { 1 };
+        hdr.words[1] = pid;
         sys.send(boot, &hdr)
             .map_err(|e| fail_code(step, 0xE8_00 | (e as u64 & 0xFF)))?;
 

@@ -48,6 +48,11 @@ enum Command {
     Mkdir(&'static [u8]),
     /// Print the stat of a root entry.
     Stat(&'static [u8]),
+    /// Replace the shell's own image with `path` (must be the last command).
+    Exec {
+        path: &'static [u8],
+        argv: &'static [&'static [u8]],
+    },
     /// Spawn `path` with argv/env through PS; report `<path> -> <status>`;
     /// fail the script when the status differs from `expect`.
     Run {
@@ -79,6 +84,12 @@ const SCRIPT: &[Command] = &[
         expect: 5,
     },
     Command::Echo(b"sh ok"),
+    // exec: replaces this shell with the child image, which echoes its argv
+    // and exits 9. The shell's process keeps its capabilities (and its pid).
+    Command::Exec {
+        path: b"child",
+        argv: &[b"9"],
+    },
 ];
 
 extern "C" fn sh_main(argc: u64, argv: *const *const u8, envp: *const *const u8) -> ! {
@@ -178,6 +189,16 @@ extern "C" fn sh_main(argc: u64, argv: *const *const u8, envp: *const *const u8)
                 let text = write_i32(st.size as i32, &mut digits);
                 let _ = rt.write_stdout(&mut sys, text);
                 let _ = rt.write_stdout(&mut sys, b"\n");
+            }
+            Command::Exec { path, argv } => {
+                match rt.ps.exec(&mut sys, path, argv, &[]) {
+                    Ok(()) => {
+                        // The replacement thread runs the new image; retire
+                        // this thread (v0 exec convention).
+                        exit(&mut sys, 0);
+                    }
+                    Err(e) => exit(&mut sys, 0x70 | (e & 0xFF)),
+                }
             }
             Command::Run {
                 path,

@@ -46,6 +46,9 @@ pub struct BootstrapPackage {
     pub region: Handle,
     pub session_notifications: [Handle; SESSION_POOL],
     pub process_server_ep: Handle,
+    /// The process's pid (package header `w1`) — how a process learns its own
+    /// identity (POSIX `getpid`; PS's EXEC resolves the caller by pid).
+    pub pid: u64,
     /// Optional trailing caps in caller order (vfs, stdin, stdout, stderr);
     /// `None` = trimmed tail or a failed (partial) grant.
     pub optional: [Option<CapSlot>; 4],
@@ -58,12 +61,14 @@ pub fn deliver<R: RawSyscalls>(
     sys: &mut Syscalls<R>,
     bootstrap_ep: Handle,
     caps: &[ipc::CapSlot],
+    pid: u64,
 ) -> Result<(), Status> {
     if caps.len() > MAX_PACKAGE_CAPS || caps.len() < FIXED_CAPS {
         return Err(status::ETOOBIG);
     }
     let mut header = ipc::Message::new(PACKAGE_LABEL);
     header.words[0] = caps.len() as u64;
+    header.words[1] = pid;
     sys.send(bootstrap_ep, &header)?;
     for chunk in caps.chunks(ipc::MAX_WORDS) {
         let mut m = ipc::Message::new(PACKAGE_LABEL);
@@ -84,6 +89,7 @@ pub fn receive<R: RawSyscalls>(sys: &mut Syscalls<R>) -> Result<BootstrapPackage
         return Err(status::EBADARG);
     }
     let total = header.words[0] as usize;
+    let pid = header.words[1];
     if !(FIXED_CAPS..=MAX_PACKAGE_CAPS).contains(&total) {
         return Err(status::EBADARG);
     }
@@ -133,6 +139,7 @@ pub fn receive<R: RawSyscalls>(sys: &mut Syscalls<R>) -> Result<BootstrapPackage
         aspace: caps[0].handle(),
         thread: caps[1].handle(),
         region: caps[2].handle(),
+        pid,
         session_notifications,
         process_server_ep: caps[FIXED_CAPS - 1].handle(),
         optional,
@@ -367,7 +374,7 @@ mod tests {
         let package;
         {
             let mut sys = Syscalls::new(&mut raw);
-            deliver(&mut sys, BOOTSTRAP_HANDLE, &caps).unwrap();
+            deliver(&mut sys, BOOTSTRAP_HANDLE, &caps, 7).unwrap();
             package = receive(&mut sys).unwrap();
         }
         assert_eq!(raw.sends, 4, "header + 3 chunks for 10 caps");
@@ -392,11 +399,11 @@ mod tests {
         let mut raw = NoopRaw;
         let mut sys = Syscalls::new(&mut raw);
         assert_eq!(
-            deliver(&mut sys, 1, &[CapSlot::NULL; FIXED_CAPS - 1]),
+            deliver(&mut sys, 1, &[CapSlot::NULL; FIXED_CAPS - 1], 0),
             Err(status::ETOOBIG)
         );
         assert_eq!(
-            deliver(&mut sys, 1, &[CapSlot::NULL; MAX_PACKAGE_CAPS + 1]),
+            deliver(&mut sys, 1, &[CapSlot::NULL; MAX_PACKAGE_CAPS + 1], 0),
             Err(status::ETOOBIG)
         );
     }

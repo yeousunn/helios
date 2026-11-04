@@ -31,6 +31,7 @@ impl PsClient {
         region: Handle,
         ps_ep: Handle,
         session: Handle,
+        self_pid: u64,
     ) -> Result<Self, Status> {
         let mut frames = [0 as Handle; 2];
         for (i, va) in [PS_ARG_WINDOW_VA, PS_RESULT_WINDOW_VA].iter().enumerate() {
@@ -54,7 +55,10 @@ impl PsClient {
 
         let mut connect = Message::new(methods::process::CONNECT);
         connect.tag = connect.tag.with_caps(3);
-        connect.words[0] = 1; // protocol version
+        // w0 = version | caller-pid << 32: with 3 capability descriptors the
+        // trailing words belong to the descriptors (`Message` overlay), so the
+        // caller identity rides in w0's upper half (PS resolves EXEC by it).
+        connect.words[0] = 1 | (self_pid << 32);
         let _ = connect.set_descriptor(0, CapSlot::pack(session, Rights::SIGNAL));
         let _ = connect.set_descriptor(
             1,
@@ -121,6 +125,29 @@ impl PsClient {
             return Err(status::EBADARG);
         }
         Ok(reply.words[1])
+    }
+
+    /// `EXEC`: replace this process's image with `path` (argv/env in the
+    /// connection's arg window; no capabilities — PS reuses the VFS endpoint
+    /// recorded at spawn). On success the CALLER MUST exit its thread: PS has
+    /// already created the replacement thread running the new image, sharing
+    /// this process's address space and capability table.
+    pub fn exec<R: RawSyscalls>(
+        &mut self,
+        sys: &mut Syscalls<R>,
+        path: &[u8],
+        argv: &[&[u8]],
+        env: &[&[u8]],
+    ) -> Result<(), Status> {
+        if sdk::spawn::write_spawn_blob(PS_ARG_WINDOW_VA, path, argv, env).is_none() {
+            return Err(status::EBADARG);
+        }
+        let m = Message::new(methods::process::EXEC);
+        let reply = sys.call(self.conn, &m)?;
+        if reply.words[0] != 0 {
+            return Err(reply.words[0] as i64 as i32);
+        }
+        Ok(())
     }
 
     /// `WAIT` for the child, polling cooperatively (`EWOULDBLOCK` until the
