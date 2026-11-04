@@ -272,3 +272,8 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 - **Slice 5 VERIFIED on my side:** rebuilt everything from current HEAD, ran the full smoke independently — **markers 1–21 + DONE + clean halt (E2E=0)**: the `/sh` session on the console (`child -> 7`, `argv=5|env=X=42` byte-decoded from the console trace, `helios-vfs-ok` via the `cat` builtin, `sh ok`), envp proven end-to-end through the crafted stack, and the shell's status reporting working.
 - **The 32 KiB kstack holds:** the full session (nested spawns + shell + builtins) ran without a canary trip — the ADR-037 sizing holds under the deepest workload so far.
 - **Phase 3 slice 5: COMPLETE and independently verified.** The scripted shell demonstrates the full POSIX-process model: path resolution through the VFS, argv/envp passing, status reporting, and console output.
+
+## DS (Phase 3 slice 6 — directory operations, 2026-11-03)
+
+- **Landed, full session green:** `VfsClient` gains `root()`/`stat`/`mkdir`/`readdir`; the shell gains `ls` (with `/` for dirs), `mkdir`, `stat` (kind + size) builtins. First real client use of the VFS's WALK/READDIR/STAT/MKDIR surface (previously core-tested only) — two wire subtleties fixed: the last READDIR entry shares `next_cookie=0` with the end marker (key on the empty name span; the caller stops after a `next=0` entry), and STAT's packed `kind|mode<<8` decode. Smoke serial: `ls` (5 seeded files) → `mkdir work` → `ls` (work/) → `hello kind=file size=13` → cat → spawn/env pairs → `sh ok`.
+- **Next:** exec semantics (needs a thread context-reset primitive — ADR candidate for GLM: `Thread::SET_ENTRY` or reset-on-exit), then the musl loader for unmodified binaries.
