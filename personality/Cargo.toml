@@ -13,6 +13,11 @@ name = "posix"
 path = "src/bin/posix.rs"
 required-features = ["user"]
 
+[[bin]]
+name = "sh"
+path = "src/bin/sh.rs"
+required-features = ["user"]
+
 [dependencies]
 ipc = { path = "../ipc" }
 sdk = { path = "../sdk" }

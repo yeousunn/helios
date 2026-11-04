@@ -5,11 +5,10 @@
 //! non-blocking in v0 — deferred replies need a kernel reply-handle
 //! primitive).
 //!
-//! The spawn payload lives in the connection's **arg window** as
-//! `[u64 path_span][u64 argv_span]` followed by the string bytes (design
-//! §2.6: "argv/env in the arg window"): SPAWN carries 3 capability
-//! descriptors and `Message` descriptors overlay the trailing words, so no
-//! data words remain.
+//! The spawn payload lives in the connection's **arg window** (design §2.6:
+//! "argv/env in the arg window") — see `sdk::spawn` for the blob layout:
+//! SPAWN carries 3 capability descriptors and `Message` descriptors overlay
+//! the trailing words, so no data words remain.
 
 use ipc::{status, CapSlot, Message, Rights};
 use sdk::methods;
@@ -88,18 +87,14 @@ impl PsClient {
         &mut self,
         sys: &mut Syscalls<R>,
         path: &[u8],
-        argv: &[u8],
+        argv: &[&[u8]],
         vfs: Option<Handle>,
         stdout: Option<Handle>,
     ) -> Result<u64, Status> {
-        if path.is_empty()
-            || path.len() + argv.len() > WINDOW - 16
-            || path.len() > u32::MAX as usize
-            || argv.len() > u32::MAX as usize
-        {
+        let ok = sdk::spawn::write_spawn_blob(PS_ARG_WINDOW_VA, path, argv, &[]);
+        if ok.is_none() {
             return Err(status::EBADARG);
         }
-        write_spawn_blob(PS_ARG_WINDOW_VA, path, argv);
         let mut m = Message::new(methods::process::SPAWN);
         m.tag = m.tag.with_caps(3);
         let _ = m.set_descriptor(
@@ -143,22 +138,5 @@ impl PsClient {
             }
             return Err(reply.words[0] as i64 as i32);
         }
-    }
-}
-
-/// Write the v0 spawn blob (`[path_span][argv_span]` + strings) into `window_va`.
-pub fn write_spawn_blob(window_va: u64, path: &[u8], argv: &[u8]) {
-    const BASE: usize = 16;
-    let path_off = BASE;
-    let argv_off = BASE + path.len();
-    let path_span = ((path_off as u64) << 32) | path.len() as u64;
-    let argv_span = ((argv_off as u64) << 32) | argv.len() as u64;
-    // SAFETY: the window is mapped R|W into this process's AS by `connect`.
-    unsafe {
-        let w = window_va as *mut u8;
-        core::ptr::copy_nonoverlapping(path_span.to_le_bytes().as_ptr(), w, 8);
-        core::ptr::copy_nonoverlapping(argv_span.to_le_bytes().as_ptr(), w.add(8), 8);
-        core::ptr::copy_nonoverlapping(path.as_ptr(), w.add(path_off), path.len());
-        core::ptr::copy_nonoverlapping(argv.as_ptr(), w.add(argv_off), argv.len());
     }
 }

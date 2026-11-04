@@ -8,6 +8,7 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod args;
 pub mod bootinfo;
 pub mod bootstrap;
 pub mod elf;
@@ -15,6 +16,7 @@ pub mod heap;
 pub mod layout;
 pub mod loader;
 pub mod methods;
+pub mod spawn;
 pub mod syscall;
 pub mod window;
 

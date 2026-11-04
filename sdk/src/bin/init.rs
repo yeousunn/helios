@@ -60,6 +60,8 @@ const STEP_POSIX_SPAWN: u64 = 16;
 const STEP_POSIX_WAIT: u64 = 17;
 const STEP_CONSOLE_SPAWN: u64 = 18;
 const STEP_CONSOLE_READY: u64 = 19;
+const STEP_SH_SPAWN: u64 = 20;
+const STEP_SH_WAIT: u64 = 21;
 const STEP_DONE: u64 = 0x0F;
 /// Failure marker family for exits: `0xDEAD_0000_00SS_EEEE` (step, errno).
 const FAIL: u64 = 0xDEAD_0000_0000_0000;
@@ -330,7 +332,7 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
         sys.invoke(self_as, &m)
             .map_err(|e| fail_code(STEP_SPAWN_CHILD, e as u64))?;
     }
-    write_spawn_blob(b"child", b"42");
+    write_spawn_blob(b"child", &[b"42"]);
     let spawned = {
         let mut sys = Syscalls::new(raw);
         let mut m = Message::new(methods::process::SPAWN);
@@ -497,7 +499,7 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
             core::ptr::copy_nonoverlapping(b"posix".as_ptr(), INIT_WINDOW_VA_BASE as *mut u8, 5);
         }
         let spawned = {
-            write_spawn_blob(b"posix", b"42");
+            write_spawn_blob(b"posix", &[]);
             let mut sys = Syscalls::new(raw);
             let mut m = Message::new(methods::process::SPAWN);
             m.tag = m.tag.with_caps(3);
@@ -548,6 +550,62 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
             return Err(fail_code(STEP_POSIX_WAIT, 0xE2 | (waited.words[1] << 8)));
         }
         mark(raw, info.debug_ep, STEP_POSIX_WAIT, waited.words[1]);
+    }
+
+    // Steps 20–21: the shell — the userland driver (scripted in v0; input
+    // awaits UART RX/IRQ work). It spawns commands through PS, reaps them and
+    // exits 0 on success.
+    {
+        write_spawn_blob(b"sh", &[]);
+        let spawned = {
+            let mut sys = Syscalls::new(raw);
+            let mut m = Message::new(methods::process::SPAWN);
+            m.tag = m.tag.with_caps(3);
+            let _ = m.set_descriptor(
+                0,
+                ipc::CapSlot::pack(vfs_svc, ipc::Rights::SEND.union(ipc::Rights::GRANT)),
+            );
+            let _ = m.set_descriptor(1, ipc::CapSlot::NULL);
+            let _ = m.set_descriptor(
+                2,
+                ipc::CapSlot::pack(console_svc, ipc::Rights::SEND.union(ipc::Rights::GRANT)),
+            );
+            sys.call(session_ep, &m)
+                .map_err(|e| fail_code(STEP_SH_SPAWN, e as u64))?
+        };
+        if spawned.words[0] != 0 || spawned.words[1] == 0 {
+            return Err(fail_code(
+                STEP_SH_SPAWN,
+                0xE1 | ((spawned.words[0] as u64 & 0xFFFF) << 8),
+            ));
+        }
+        let sh_pid = spawned.words[1];
+        mark(raw, info.debug_ep, STEP_SH_SPAWN, sh_pid);
+
+        let waited = loop {
+            let reply = {
+                let mut sys = Syscalls::new(raw);
+                let mut m = Message::new(methods::process::WAIT);
+                m.words[0] = sh_pid;
+                sys.call(session_ep, &m)
+                    .map_err(|e| fail_code(STEP_SH_WAIT, e as u64))?
+            };
+            if reply.words[0] == 0 {
+                break reply;
+            }
+            if reply.words[0] == ipc::status::EWOULDBLOCK as i64 as u64 {
+                let _ = Syscalls::new(raw).yield_now();
+                continue;
+            }
+            return Err(fail_code(
+                STEP_SH_WAIT,
+                0xE1 | ((reply.words[0] as u64 & 0xFF) << 8),
+            ));
+        };
+        if waited.words[1] != 0 {
+            return Err(fail_code(STEP_SH_WAIT, 0xE2 | (waited.words[1] << 8)));
+        }
+        mark(raw, info.debug_ep, STEP_SH_WAIT, waited.words[1]);
     }
 
     // Shutdown: console down (KILL acks, then it exits) and reap.
@@ -847,26 +905,13 @@ fn spawn_server(
     Ok(pid)
 }
 
-/// v0 SPAWN payload: the path/argv strings live in the **connect arg
-/// window** (design §2.6: "argv/env in the arg window"), as
-/// `[u64 path_span][u64 argv_span]` followed by the string bytes. Words are
-/// not usable for spans when the SPAWN carries 3+ capability descriptors —
-/// descriptors overlay the trailing words (`ipc::Message`), so the window is
-/// the only safe data channel.
-fn write_spawn_blob(path: &[u8], argv: &[u8]) {
-    const BASE: usize = 16;
-    let path_off = BASE;
-    let argv_off = BASE + path.len();
-    let path_span = ((path_off as u64) << 32) | path.len() as u64;
-    let argv_span = ((argv_off as u64) << 32) | argv.len() as u64;
-    // SAFETY: the window is mapped R|W into this AS (CONNECT arg frame).
-    unsafe {
-        let w = INIT_WINDOW_VA_BASE as *mut u8;
-        core::ptr::copy_nonoverlapping(path_span.to_le_bytes().as_ptr(), w, 8);
-        core::ptr::copy_nonoverlapping(argv_span.to_le_bytes().as_ptr(), w.add(8), 8);
-        core::ptr::copy_nonoverlapping(path.as_ptr(), w.add(path_off), path.len());
-        core::ptr::copy_nonoverlapping(argv.as_ptr(), w.add(argv_off), argv.len());
-    }
+/// v0.2 SPAWN payload (see `sdk::spawn`): the path and argv/env areas live
+/// in the **connect arg window** — words are not usable for spans when the
+/// SPAWN carries 3+ capability descriptors (descriptors overlay the trailing
+/// words in `ipc::Message`), so the window is the only safe data channel.
+fn write_spawn_blob(path: &[u8], argv: &[&[u8]]) {
+    let ok = sdk::spawn::write_spawn_blob(INIT_WINDOW_VA_BASE, path, argv, &[]);
+    debug_assert_eq!(ok, Some(()));
 }
 
 fn mint(

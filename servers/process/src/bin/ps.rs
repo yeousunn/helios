@@ -360,28 +360,28 @@ fn spawn_reply(
         *slot = req.descriptor(i).map(|cs| cs.handle()).filter(|h| *h != 0);
     }
     let vfs_svc = extras[0];
-    // v0 SPAWN payload blob in the caller's CONNECT arg window (design §2.6
-    // "argv/env in the arg window"): `[u64 path_span][u64 argv_span]` then
-    // the string bytes. Words cannot carry spans alongside 3+ descriptors
-    // (descriptors overlay the trailing words).
-    let (path_off, path_len, arg_off, arg_len) = {
+    // v0.2 SPAWN payload blob in the caller's CONNECT arg window (design
+    // §2.6 "argv/env in the arg window"): `[u64 path_span][u64 argv_span]
+    // [u64 env_span]` then path bytes, the argv area (NUL-separated strings)
+    // and the env area. Words cannot carry spans alongside 3+ descriptors
+    // (descriptors overlay the trailing words). See `sdk::spawn`.
+    let (path_off, path_len, arg_off, arg_len, env_off, env_len) = {
         let f = win_base as *const u8;
         // SAFETY: our CONNECT arg window is mapped R in this AS.
         unsafe {
             let rd = |o: usize| core::ptr::read_unaligned(f.add(o) as *const u64);
-            let ps = rd(0);
-            let ar = rd(8);
-            (
-                (ps >> 32) as usize,
-                (ps & 0xFFFF_FFFF) as usize,
-                (ar >> 32) as usize,
-                (ar & 0xFFFF_FFFF) as usize,
-            )
+            let span = |w: u64| ((w >> 32) as usize, (w & 0xFFFF_FFFF) as usize);
+            let (po, pl) = span(rd(0));
+            let (ao, al) = span(rd(8));
+            let (eo, el) = span(rd(16));
+            (po, pl, ao, al, eo, el)
         }
     };
+    let span_ok = |off: usize, len: usize| off.checked_add(len).map_or(false, |e| e <= 4096);
     if path_len == 0
-        || path_off.checked_add(path_len).map_or(true, |e| e > 4096)
-        || arg_off.checked_add(arg_len).map_or(true, |e| e > 4096)
+        || !span_ok(path_off, path_len)
+        || !span_ok(arg_off, arg_len)
+        || !span_ok(env_off, env_len)
     {
         reply.words[0] = ipc::status::EBADARG as i64 as u64;
         return reply;
@@ -406,7 +406,15 @@ fn spawn_reply(
     };
     let image: &[u8] = loaded.as_deref().unwrap_or(CHILD_IMAGE);
     match spawn_child(
-        sys, package, factory, service_ep, arg_off, arg_len, image, extras, win_base,
+        sys,
+        package,
+        factory,
+        service_ep,
+        (arg_off, arg_len),
+        (env_off, env_len),
+        image,
+        extras,
+        win_base,
     ) {
         Ok((pid, thread_cap, exit_notif)) => {
             reply.words[1] = pid;
@@ -426,13 +434,14 @@ fn spawn_reply(
 /// bootstrap package, and PS's death binding (`N_dead`, design §1.5).
 /// Returns `(pid, thread_control, exit_notif)`.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 fn spawn_child(
     sys: &mut Syscalls<'_, X86_64Syscalls>,
     package: &BootstrapPackage,
     factory: u32,
     service_ep: u32,
-    arg_off: usize,
-    arg_len: usize,
+    argv_span: (usize, usize),
+    env_span: (usize, usize),
     image_bytes: &[u8],
     extras: [Option<u32>; 4],
     win_base: u64,
@@ -463,7 +472,7 @@ fn spawn_child(
         CHILD_STACK_PAGES - 1,
         0b011,
     )?;
-    craft_stack(sys, package, child_as, arg_off, arg_len, win_base)?;
+    craft_stack(sys, package, child_as, argv_span, env_span, win_base)?;
     // 4. Endpoints + notifications for the child's package (straight-line
     // mints; no arrays — spill-slot reuse made the old form unreliable).
     let bootstrap_ep = invoke_w0(sys, factory, methods::factory::NEW_ENDPOINT, [0; 4])? as u32;
@@ -658,14 +667,22 @@ fn load_via_vfs(
 
 /// Carve one frame, write the crafted initial stack page (argc + argv blob +
 /// string table), map it as the child's top stack page, drop the scratch.
+/// Craft the child's top stack page (v0.2 entry contract, `sdk::args`):
+/// `[TOP-8] = argc`, `[TOP-16] = argv*`, `[TOP-24] = envp*`; the pointer
+/// arrays live at page offset 0x400 (argv ptrs + NULL, envp ptrs + NULL) and
+/// the NUL-terminated strings at 0x800+ (well below any early push traffic —
+/// parking them near the header got them clobbered by the child's own
+/// frames). The argv/env areas in the spawn blob are NUL-separated string
+/// lists.
 fn craft_stack(
     sys: &mut Syscalls<'_, X86_64Syscalls>,
     package: &BootstrapPackage,
     child_as: u32,
-    arg_off: usize,
-    arg_len: usize,
+    argv_span: (usize, usize),
+    env_span: (usize, usize),
     win_base: u64,
 ) -> Result<(), i32> {
+    const MAX_ARGS: usize = 16;
     let frame = invoke_w0(
         sys,
         package.region,
@@ -677,21 +694,71 @@ fn craft_stack(
     }
     invoke_map(sys, package.aspace, PS_SCRATCH_VA_BASE, 0b011, frame)?;
     let mut page = [0u8; 4096];
-    // Header at the very top ([TOP-8] = argc, [TOP-16] = argv[0]), captured
-    // by the child's entry stub before any push. The STRING TABLE lives low
-    // in the page (offset 0x800), well below the child's early stack frames —
-    // parking it near the header got it clobbered by child_main's own frame.
-    // argv[0] is NUL-terminated by the zeroed page. (v0: single argv.)
-    let str_off = 0x800;
-    if str_off + arg_len > 4096 - 24 {
-        return Err(-103); // argv blob too large for the crafted page
+    let page_va = USER_STACK_TOP - 4096;
+
+    // Strings + pointer arrays, filled from the blob areas.
+    let mut str_cursor = 0x800usize;
+    let mut argv_ptrs = [0u64; MAX_ARGS];
+    let mut envp_ptrs = [0u64; MAX_ARGS];
+    let mut argc = 0usize;
+    let mut envc = 0usize;
+    let mut fill = |area: (usize, usize),
+                    ptrs: &mut [u64; MAX_ARGS],
+                    count: &mut usize,
+                    str_cursor: &mut usize|
+     -> Result<(), i32> {
+        let (off, len) = area;
+        let mut i = 0usize;
+        while i < len {
+            if *count == MAX_ARGS {
+                break;
+            }
+            // One NUL-terminated string; zero-padded tail = empty, skip.
+            let start = i;
+            while i < len && unsafe { *((win_base as *const u8).add(off + i)) } != 0 {
+                i += 1;
+            }
+            let slen = i - start;
+            i += 1; // skip the NUL
+            if slen == 0 {
+                continue;
+            }
+            if *str_cursor + slen + 1 > 4096 - 32 {
+                return Err(-103);
+            }
+            for k in 0..slen {
+                page[*str_cursor + k] = unsafe { *((win_base as *const u8).add(off + start + k)) };
+            }
+            ptrs[*count] = page_va + *str_cursor as u64;
+            *count += 1;
+            *str_cursor += slen + 1;
+        }
+        Ok(())
+    };
+    fill(argv_span, &mut argv_ptrs, &mut argc, &mut str_cursor)?;
+    fill(env_span, &mut envp_ptrs, &mut envc, &mut str_cursor)?;
+
+    // Pointer arrays at 0x400: argv ptrs, NULL, envp ptrs, NULL.
+    let argv_arr = 0x400usize;
+    let mut p = argv_arr;
+    for v in argv_ptrs.iter().take(argc) {
+        page[p..p + 8].copy_from_slice(&v.to_le_bytes());
+        p += 8;
     }
-    for (i, b) in page[str_off..str_off + arg_len].iter_mut().enumerate() {
-        *b = unsafe { *((win_base as *const u8).add(arg_off + i)) };
+    page[p..p + 8].copy_from_slice(&0u64.to_le_bytes());
+    p += 8;
+    let envp_arr = p;
+    for v in envp_ptrs.iter().take(envc) {
+        page[p..p + 8].copy_from_slice(&v.to_le_bytes());
+        p += 8;
     }
-    let argv0_va = (USER_STACK_TOP - 4096) + str_off as u64;
-    page[4096 - 8..4096].copy_from_slice(&1u64.to_le_bytes()); // argc = 1
-    page[4096 - 16..4096 - 8].copy_from_slice(&argv0_va.to_le_bytes());
+    page[p..p + 8].copy_from_slice(&0u64.to_le_bytes());
+
+    // Header at the very top (captured by the entry stub before any push).
+    page[4096 - 8..4096].copy_from_slice(&(argc as u64).to_le_bytes());
+    page[4096 - 16..4096 - 8].copy_from_slice(&(page_va + argv_arr as u64).to_le_bytes());
+    page[4096 - 24..4096 - 16].copy_from_slice(&(page_va + envp_arr as u64).to_le_bytes());
+
     unsafe {
         core::ptr::copy_nonoverlapping(page.as_ptr(), PS_SCRATCH_VA_BASE as *mut u8, 4096);
     }

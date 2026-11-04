@@ -58,4 +58,5 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     emit("CHILD_IMAGE", "CHILD_IMAGE", &out_dir, "child_image.rs");
     emit("POSIX_IMAGE", "POSIX_IMAGE", &out_dir, "posix_image.rs");
+    emit("SH_IMAGE", "SH_IMAGE", &out_dir, "sh_image.rs");
 }

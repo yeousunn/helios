@@ -45,6 +45,7 @@ const MAX_WINDOWS: usize = 128;
 
 include!(concat!(env!("OUT_DIR"), "/child_image.rs"));
 include!(concat!(env!("OUT_DIR"), "/posix_image.rs"));
+include!(concat!(env!("OUT_DIR"), "/sh_image.rs"));
 
 /// Stateless transport: one transient `Syscalls` per call.
 struct BinTransport;
@@ -209,6 +210,11 @@ pub extern "C" fn _start() -> ! {
         if HAS_POSIX_IMAGE {
             if let Ok(file) = server.fs().create_file(root, "posix", 0o755, 0) {
                 let _ = server.fs().write(file, 0, POSIX_IMAGE, 0);
+            }
+        }
+        if HAS_SH_IMAGE {
+            if let Ok(file) = server.fs().create_file(root, "sh", 0o755, 0) {
+                let _ = server.fs().write(file, 0, SH_IMAGE, 0);
             }
         }
     }
