@@ -393,9 +393,7 @@ pub fn sys_recv(
                     None => {
                         sched::block(
                             tid,
-                            BlockReason::Notification(ObjRef(
-                                crate::console_in::CONSOLE_NOTIFY_ID,
-                            )),
+                            BlockReason::Notification(ObjRef(crate::console_in::CONSOLE_NOTIFY_ID)),
                         )
                         .map_err(|_| err(ipc::status::ENOMEM))?;
                         return Ok(None);

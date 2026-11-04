@@ -37,6 +37,48 @@ stubs! {
     44 => exc_stub_44, 45 => exc_stub_45, 46 => exc_stub_46, 47 => exc_stub_47,
 }
 
+extern "C" {
+    fn irq_stub_32();
+    fn irq_stub_33();
+    fn irq_stub_34();
+    fn irq_stub_35();
+    fn irq_stub_36();
+    fn irq_stub_37();
+    fn irq_stub_38();
+    fn irq_stub_39();
+    fn irq_stub_40();
+    fn irq_stub_41();
+    fn irq_stub_42();
+    fn irq_stub_43();
+    fn irq_stub_44();
+    fn irq_stub_45();
+    fn irq_stub_46();
+    fn irq_stub_47();
+}
+
+/// IRQ gate stubs (vectors 32..47): iretq-capable interrupt entries.
+pub fn irq_stub_addr(vector: u8) -> Option<u64> {
+    Some(match vector {
+        32 => irq_stub_32 as *const () as u64,
+        33 => irq_stub_33 as *const () as u64,
+        34 => irq_stub_34 as *const () as u64,
+        35 => irq_stub_35 as *const () as u64,
+        36 => irq_stub_36 as *const () as u64,
+        37 => irq_stub_37 as *const () as u64,
+        38 => irq_stub_38 as *const () as u64,
+        39 => irq_stub_39 as *const () as u64,
+        40 => irq_stub_40 as *const () as u64,
+        41 => irq_stub_41 as *const () as u64,
+        42 => irq_stub_42 as *const () as u64,
+        43 => irq_stub_43 as *const () as u64,
+        44 => irq_stub_44 as *const () as u64,
+        45 => irq_stub_45 as *const () as u64,
+        46 => irq_stub_46 as *const () as u64,
+        47 => irq_stub_47 as *const () as u64,
+        _ => return None,
+    })
+}
+
 /// Called from `exc_common` (SysV64: rdi=vector, rsi=error, rdx=cr2,
 /// rcx=rip, r8=cs). Reports and halts; never returns.
 #[no_mangle]

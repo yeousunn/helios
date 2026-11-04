@@ -33,9 +33,17 @@ pub use impl_x86_64::*;
 pub use layout::*;
 
 #[cfg(target_arch = "x86_64")]
+pub use crate::impl_x86_64::{enable_uart_rx, set_uart_rx_callback};
+#[cfg(target_arch = "x86_64")]
 pub use paging::{
     activate_as, enable_nx, flush_tlb_all, probe_walk, root_of, BACKEND_FACTORY_X86_64,
 };
+
+/// Host builds (aarch64 macOS workspace gate): no UART hardware.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn set_uart_rx_callback(_f: fn(u8)) {}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn enable_uart_rx() {}
 
 /// Live-hardware walker for `kernel::debug` (reads CR3, walks that root).
 #[cfg(target_arch = "x86_64")]

@@ -81,6 +81,7 @@ pub struct InitLaunch {
     pub pid: ProcessId,
     pub thread: ThreadId,
     pub bootinfo: BootInfoV0,
+    pub console_in: u32,
 }
 
 /// The kernel main: arch code calls this after `early_init`, `frame::init`,
@@ -145,6 +146,18 @@ pub fn start(regions: &[BootRegion]) -> Result<InitLaunch, &'static str> {
         REGIONS.lock().add(region_id, r.base.as_u64(), r.len);
     }
 
+    // Console input (ADR-038): reserved recv-only cap (obj 0xD2) — the
+    // console server drains IRQ-fed lines through it.
+    let console_in = proc::install_cap(
+        pid,
+        Capability {
+            obj: ObjId(crate::console_in::CONSOLE_IN_EP_ID),
+            typ: ObjType::Endpoint,
+            rights: Rights::RECV,
+        },
+    )
+    .map_err(|_| "cannot grant console-in EP")?;
+
     // ADR-023 §1: grant init its own AS (the default AS) so it can map
     // heaps/stacks/child images. Ensure the default AS exists.
     let _ = crate::aspace::init_default();
@@ -167,6 +180,7 @@ pub fn start(regions: &[BootRegion]) -> Result<InitLaunch, &'static str> {
         pid,
         thread,
         bootinfo: info,
+        console_in,
     })
 }
 

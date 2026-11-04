@@ -8,7 +8,6 @@
 #![forbid(unsafe_code)]
 
 use crate::notification;
-use caps::ObjId;
 use crate::sched::ObjRef;
 use spin::Mutex;
 
@@ -150,7 +149,7 @@ mod tests {
                 overruns: 0,
             };
         });
-        for i in 0..LINE_MAX {
+        for _ in 0..LINE_MAX {
             push_byte(b'x');
         }
         assert_eq!(pending_lines(), 1, "full line auto-commits");

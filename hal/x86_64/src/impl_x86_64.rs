@@ -814,7 +814,13 @@ pub unsafe fn install_exception_stubs() {
     // SAFETY: boot-time exclusive access to the static IDT.
     let idt = unsafe { &mut *core::ptr::addr_of_mut!(BOOT_IDT) };
     for vector in 0..48u8 {
-        if let Some(addr) = crate::exceptions::stub_addr(vector) {
+        // Vectors 32..47 are IRQ gates (iretq-capable); 0..31 stay fatal.
+        let addr = if (32..48).contains(&vector) {
+            crate::exceptions::irq_stub_addr(vector)
+        } else {
+            crate::exceptions::stub_addr(vector)
+        };
+        if let Some(addr) = addr {
             idt.set_gate(vector, addr, SEL_CODE);
         }
     }
@@ -1004,6 +1010,63 @@ unsafe fn enter_user(entry: u64, bootinfo: u64) -> ! {
 }
 
 pub static CONTEXT_BACKEND_X86_64: ContextBackendX86_64 = ContextBackendX86_64;
+
+// ===========================================================================
+// IRQ dispatch (v0 console input): global PIC state + the IRQ gate path.
+// ===========================================================================
+
+static IRQ_PIC: spin::Mutex<Pic> = spin::Mutex::new(Pic::new());
+static UART_RX_CB: spin::Mutex<Option<fn(u8)>> = spin::Mutex::new(None);
+
+/// Register the UART RX byte sink (kernel console_in line discipline).
+pub fn set_uart_rx_callback(f: fn(u8)) {
+    *UART_RX_CB.lock() = Some(f);
+}
+
+/// Enable COM1 RX interrupts (IER bit 0) + route IRQ4 through the PIC.
+pub fn enable_uart_rx() {
+    let mut pic = IRQ_PIC.lock();
+    // SAFETY: single-threaded boot registration; raw I/O to COM1/IRQ4.
+    unsafe {
+        Irq::register_handler(&mut *pic, 4, uart_irq4);
+        Irq::unmask(&mut *pic, 4);
+        let ier = port_inb(COM1 + REG_IER);
+        port_outb(COM1 + REG_IER, ier | 0x01);
+    }
+}
+
+/// COM1 RX interrupt (IRQ4): drain every available byte into the sink.
+fn uart_irq4(_irq: u8) -> bool {
+    // SAFETY: COM1 LSR/RBR raw I/O; the interrupt means data is ready.
+    unsafe {
+        while port_inb(COM1 + 5) & 0x01 != 0 {
+            let b = port_inb(COM1);
+            if let Some(f) = UART_RX_CB.lock().as_ref() {
+                f(b);
+            }
+        }
+    }
+    false // v0: no reschedule-on-IRQ (cooperative scheduler)
+}
+
+/// IRQ gate dispatcher (called from the irq_stub_N asm for vectors 32..47):
+/// runs the registered handler, then EOI on the owning PIC bank.
+#[no_mangle]
+pub extern "sysv64" fn hal_irq_dispatcher(vector: u64) {
+    let irq = (vector - PIC_VECTOR_BASE as u64) as u8;
+    let mut pic = IRQ_PIC.lock();
+    let handler = pic.handlers[irq as usize];
+    if let Some(f) = handler {
+        f(irq);
+    }
+    // SAFETY: PIC EOI raw I/O; the dispatcher runs with the PIC lock held.
+    unsafe {
+        if irq >= 8 {
+            port_outb(PIC_SLAVE_CMD, 0x20);
+        }
+        port_outb(PIC_MASTER_CMD, 0x20);
+    }
+}
 
 // ===========================================================================
 // ADR-010/011: CurrentContext — pid/tid of the interrupted context

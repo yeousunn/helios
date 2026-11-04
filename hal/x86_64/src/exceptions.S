@@ -76,6 +76,55 @@ EXC_NOERR 44
 EXC_NOERR 45
 EXC_NOERR 46
 EXC_NOERR 47
+
+/* IRQ stubs (vectors 32..47 = IRQs 0..15): preserve the interruptee's
+ * volatile registers, dispatch through the Rust PIC layer, then iretq.
+ * Interrupts from ring 3 switch to the TSS rsp0 kernel stack (CPU pushes
+ * SS:RSP:RFLAGS:CS:RIP; IRQs carry no error code). */
+.macro IRQ vec
+.global irq_stub_\vec
+irq_stub_\vec:
+    push qword ptr \vec
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    mov rdi, \vec
+    call hal_irq_dispatcher
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    add rsp, 8
+    iretq
+.endm
+
+IRQ 32
+IRQ 33
+IRQ 34
+IRQ 35
+IRQ 36
+IRQ 37
+IRQ 38
+IRQ 39
+IRQ 40
+IRQ 41
+IRQ 42
+IRQ 43
+IRQ 44
+IRQ 45
+IRQ 46
+IRQ 47
 /* Vectors >= 48 do not occur in v0; no gates are installed past 47. */
 
 exc_common:
