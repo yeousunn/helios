@@ -60,6 +60,8 @@ cargo build -p sdk --bin init --features user --target x86_64-unknown-none --rel
 | 18 | `...0012` | console pid | console server spawned (holds the delegated debug endpoint) |
 | 19 | `...0013` | service handle | console ready: its endpoint is later supplied to children as stdio |
 | — | `tag=0x301` | text words | any `console::WRITE` line on the serial (e.g. the demo's `helios-posix-ok\n` at `w=[0x702d736f696c6568 0x0a6b6f2d7869736f ...]`) |
+| 20 | `...0014` | sh pid | init spawns `/sh` (the scripted shell; vfs + stdout caps) |
+| 21 | `...0015` | 0 | `WAIT` for the shell: it ran `child 7` and `child 9` through PS, verified both statuses, printed `sh ok` |
 | DONE | `0x494e49540000000f` | 0 | all passed (all servers reaped; clean halt) |
 
 v0 conventions this smoke pins (all design §2.4/§2.6 provisional):
