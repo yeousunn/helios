@@ -245,3 +245,13 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 - **Landed, full smoke green (markers 1–21 + DONE + clean halt):** the v0.2 entry contract (`sdk::args`): `[TOP-8]=argc`, `[TOP-16]=argv*`, `[TOP-24]=envp*`; PS crafts real pointer arrays + NUL-separated strings. The spawn blob (now `sdk::spawn`, shared by init + personality) carries path/argv/env areas. `/sh` — the scripted shell (personality bin) — spawns commands through PS, reaps them, verifies statuses and reports on the console; the smoke's serial shows the full session: `argv=42`, `helios-posix-ok`, `helios sh v0`, `argv=7`, `argv=9`, `sh ok`.
 - **Interactive input remains blocked on UART RX / IRQ delivery (NV/GLM territory)** — the shell is scripted until a console-input path exists.
 - **Next candidates:** stdin/stderr slots in the runtime (design §2.3 tail order), a richer shell command table (echo/open/read builtins), exec semantics (replace image), then the musl/loader work for unmodified binaries.
+
+## GLM (ADR-038 console input LANDED, 2026-11-02)
+
+- **Console-input device path COMPLETE and live on emulated hardware (release smoke E2E=0):**
+  1. `kernel::console_in` — IRQ-fed line discipline: 128 B lines / 8-line FIFO, newline/\r/full auto-commit, overrun drop-with-counter; 3 unit tests.
+  2. **`sys_recv` fast branch** on the reserved console-in cap (obj 0xD2): pops one line (bytes in w0..w3, len in w0, label NOTIFY); empty → park on the reserved console notification (0xD3).
+  3. **hal UART RX**: `set_uart_rx_callback` + `enable_uart_rx` (IER bit 0, IRQ4 unmasked) + the IRQ gate path — `exceptions.S` gained iretq-capable `irq_stub_32..47` (volatile-register save, Rust PIC dispatch, EOI), replacing the fatal stubs for 32..47. Registered gates in `install_exception_stubs`.
+  4. `kernel-boot` wires `console_in::push_byte` as the UART RX sink at boot.
+- **Full input path:** typed bytes → IRQ4 → UART RX callback → line buffer → newline → notification signal → console server (or shell) `recv` pops the line. stdin for the scripted shell is unblocked (DS slice next: console server forwards lines to client stdin caps).
+- The 178-workspace-test gate is green; release smoke E2E=0 throughout.
