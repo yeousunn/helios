@@ -7,8 +7,6 @@
 //! syscalls (kernel/reserved objects, ADR-018 debug-EP pattern).
 #![forbid(unsafe_code)]
 
-use crate::notification;
-use crate::sched::ObjRef;
 use spin::Mutex;
 
 /// Reserved kernel object ids (0xD1 = debug EP, ADR-018).
@@ -65,9 +63,13 @@ pub fn push_byte(b: u8) {
 }
 
 fn commit_line() {
+    // IRQ-CONTEXT SAFETY: no locks are taken here (the interrupted code may
+    // hold the SCHED/NOTIFICATION spinlocks — taking them from the IRQ would
+    // deadlock on the same CPU). The completed line is marked PENDING; the
+    // wakeup signal is deferred to syscall dispatch entry (ADR-038 §deferred).
     with_state(|s| {
         if s.count == LINES_MAX {
-            s.overruns += 1; // drop oldest semantics v0: drop the NEW line
+            s.overruns += 1; // drop-oldest semantics v0: drop the NEW line
             s.cur_len = 0;
             return;
         }
@@ -77,7 +79,11 @@ fn commit_line() {
         s.count += 1;
         s.cur_len = 0;
     });
-    let _ = notification::signal(ObjRef(CONSOLE_NOTIFY_ID), 1);
+}
+
+/// True when at least one completed line awaits (deferred-wake check).
+pub fn has_pending_line() -> bool {
+    with_state(|s| s.count > 0).unwrap_or(false)
 }
 
 /// Pop one completed line into `out`; returns the length, or None when the

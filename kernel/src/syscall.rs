@@ -396,7 +396,27 @@ pub fn sys_recv(
                             BlockReason::Notification(ObjRef(crate::console_in::CONSOLE_NOTIFY_ID)),
                         )
                         .map_err(|_| err(ipc::status::ENOMEM))?;
-                        return Ok(None);
+                        // Woken (deferred signal at dispatch entry): pop the
+                        // line that arrived while parked.
+                        return match crate::console_in::pop_line(&mut buf) {
+                            Some(len) => {
+                                let mut m = Message::new(ipc::labels::kernel::NOTIFY);
+                                m.words[0] = len as u64;
+                                let mut i = 0usize;
+                                while i + 8 <= 120 && i < len {
+                                    let mut w = 0u64;
+                                    for k in 0..8 {
+                                        if i + k < len {
+                                            w |= (buf[i + k] as u64) << (k * 8);
+                                        }
+                                    }
+                                    m.words[1 + i / 8] = w;
+                                    i += 8;
+                                }
+                                Ok(Some(m))
+                            }
+                            None => Ok(None), // spurious wake; caller re-parks
+                        };
                     }
                 }
             }

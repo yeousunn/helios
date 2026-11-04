@@ -164,6 +164,15 @@ pub fn park_result(tid: ThreadId) -> Option<SyscallReturn> {
 
 /// The single dispatch point for every syscall (arch entry calls this).
 pub fn dispatch(args: SyscallArgs) -> SyscallReturn {
+    // Deferred console-input wake (ADR-038 IRQ safety): the IRQ only marks
+    // lines pending; the signal (which takes scheduler locks) fires here in
+    // syscall context, waking any thread parked on the console notification.
+    if crate::console_in::has_pending_line() {
+        let _ = crate::notification::signal(
+            crate::sched::ObjRef(crate::console_in::CONSOLE_NOTIFY_ID),
+            1,
+        );
+    }
     let (pid, tid) = current();
     match args.num {
         num::YIELD => syscall::sys_yield(tid)
