@@ -267,4 +267,115 @@ impl VfsClient {
     }
 }
 
+/// Stat result (wire packing: `kind | mode << 8`, size, mtime).
+#[derive(Clone, Copy)]
+pub struct Stat {
+    pub kind: u8,
+    pub mode: u32,
+    pub size: u64,
+}
+
+pub const KIND_FILE: u8 = 1;
+pub const KIND_DIR: u8 = 2;
+
+const STAT_BY_NAME: u32 = 1;
+
 const EMFILE: Status = status::EMFILE;
+
+impl VfsClient {
+    /// The connection's root directory handle (v0: always 1).
+    pub fn root(&self) -> u64 {
+        self.root
+    }
+
+    /// `STAT` by name under the root.
+    pub fn stat<R: RawSyscalls>(
+        &mut self,
+        sys: &mut Syscalls<R>,
+        name: &[u8],
+    ) -> Result<Stat, Status> {
+        if name.is_empty() || name.len() > WINDOW {
+            return Err(EINVAL);
+        }
+        // SAFETY: arg window mapped R|W by `connect`.
+        unsafe {
+            core::ptr::copy_nonoverlapping(name.as_ptr(), ARG_WINDOW_VA as *mut u8, name.len());
+        }
+        let mut req = Message::new(methods::vfs::STAT);
+        req.words[0] = self.root;
+        req.words[1] = name.len() as u64; // Span { off 0, len }
+        req.words[2] = STAT_BY_NAME as u64;
+        let reply = sys.call(self.conn, &req)?;
+        if reply.words[0] != 0 {
+            return Err(reply.words[0] as i64 as i32);
+        }
+        let packed = reply.words[1];
+        Ok(Stat {
+            kind: packed as u8,
+            mode: ((packed >> 8) & 0xFF_FFFF) as u32,
+            size: reply.words[2],
+        })
+    }
+
+    /// `MKDIR` a directory under the root.
+    pub fn mkdir<R: RawSyscalls>(
+        &mut self,
+        sys: &mut Syscalls<R>,
+        name: &[u8],
+    ) -> Result<(), Status> {
+        if name.is_empty() || name.len() > WINDOW {
+            return Err(EINVAL);
+        }
+        // SAFETY: arg window mapped R|W by `connect`.
+        unsafe {
+            core::ptr::copy_nonoverlapping(name.as_ptr(), ARG_WINDOW_VA as *mut u8, name.len());
+        }
+        let mut req = Message::new(methods::vfs::MKDIR);
+        req.words[0] = self.root;
+        req.words[1] = name.len() as u64;
+        let reply = sys.call(self.conn, &req)?;
+        if reply.words[0] != 0 {
+            return Err(reply.words[0] as i64 as i32);
+        }
+        Ok(())
+    }
+
+    /// One step of `READDIR` on `dir`: `Ok(Some((next_cookie, kind, name_len)))`
+    /// with the name copied into `name_out`; `Ok(None)` at end-of-directory.
+    pub fn readdir<R: RawSyscalls>(
+        &mut self,
+        sys: &mut Syscalls<R>,
+        dir: u64,
+        cookie: u64,
+        name_out: &mut [u8],
+    ) -> Result<Option<(u64, u8, usize)>, Status> {
+        let mut req = Message::new(methods::vfs::READDIR);
+        req.words[0] = dir;
+        req.words[1] = cookie;
+        let reply = sys.call(self.conn, &req)?;
+        if reply.words[0] != 0 {
+            return Err(reply.words[0] as i64 as i32);
+        }
+        let next = reply.words[1];
+        let packed = reply.words[2]; // name Span in the result window
+        let len = (packed & 0xFFFF_FFFF) as usize;
+        // The end-of-directory reply is `next_cookie = 0` **with an empty
+        // name span**; the final *entry* also reports `next_cookie = 0` but
+        // carries its name — keying on the cookie alone drops it.
+        if next == 0 && len == 0 {
+            return Ok(None);
+        }
+        if len > WINDOW || len > name_out.len() {
+            return Err(status::ETOOBIG);
+        }
+        // SAFETY: result window mapped R|W by `connect`.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                RESULT_WINDOW_VA as *const u8,
+                name_out.as_mut_ptr(),
+                len,
+            );
+        }
+        Ok(Some((next, reply.words[3] as u8, len)))
+    }
+}

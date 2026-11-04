@@ -42,6 +42,12 @@ enum Command {
     Echo(&'static [u8]),
     /// Read a VFS file and write it to stdout.
     Cat(&'static [u8]),
+    /// List the VFS root directory.
+    Ls,
+    /// Create a directory under the root.
+    Mkdir(&'static [u8]),
+    /// Print the stat of a root entry.
+    Stat(&'static [u8]),
     /// Spawn `path` with argv/env through PS; report `<path> -> <status>`;
     /// fail the script when the status differs from `expect`.
     Run {
@@ -54,6 +60,11 @@ enum Command {
 
 const SCRIPT: &[Command] = &[
     Command::Echo(b"helios sh v0"),
+    Command::Ls,
+    Command::Mkdir(b"work"),
+    Command::Ls,
+    Command::Stat(b"hello"),
+    Command::Cat(b"hello"),
     Command::Run {
         path: b"child",
         argv: &[b"7"],
@@ -67,7 +78,6 @@ const SCRIPT: &[Command] = &[
         env: &[b"X=42"],
         expect: 5,
     },
-    Command::Cat(b"hello"),
     Command::Echo(b"sh ok"),
 ];
 
@@ -123,6 +133,51 @@ extern "C" fn sh_main(argc: u64, argv: *const *const u8, envp: *const *const u8)
                     Err(e) => exit(&mut sys, fail | (e & 0xFF)),
                 };
                 let _ = rt.write_stdout(&mut sys, &buf[..n]);
+            }
+            Command::Ls => {
+                let root = rt.vfs.root();
+                let mut cursor = 0u64;
+                let mut name = [0u8; 64];
+                loop {
+                    match rt.vfs.readdir(&mut sys, root, cursor, &mut name) {
+                        Ok(Some((next, kind, len))) => {
+                            let _ = rt.write_stdout(&mut sys, &name[..len]);
+                            if kind == personality::vfs::KIND_DIR {
+                                let _ = rt.write_stdout(&mut sys, b"/");
+                            }
+                            let _ = rt.write_stdout(&mut sys, b"\n");
+                            // `next == 0` marks the final entry: emit it, stop.
+                            if next == 0 {
+                                break;
+                            }
+                            cursor = next;
+                        }
+                        Ok(None) => break,
+                        Err(e) => exit(&mut sys, fail | (e & 0xFF)),
+                    }
+                }
+            }
+            Command::Mkdir(name) => {
+                if let Err(e) = rt.vfs.mkdir(&mut sys, name) {
+                    exit(&mut sys, fail | (e & 0xFF));
+                }
+            }
+            Command::Stat(name) => {
+                let st = match rt.vfs.stat(&mut sys, name) {
+                    Ok(st) => st,
+                    Err(e) => exit(&mut sys, fail | (e & 0xFF)),
+                };
+                let _ = rt.write_stdout(&mut sys, name);
+                if st.kind == personality::vfs::KIND_DIR {
+                    let _ = rt.write_stdout(&mut sys, b" kind=dir");
+                } else {
+                    let _ = rt.write_stdout(&mut sys, b" kind=file");
+                }
+                let _ = rt.write_stdout(&mut sys, b" size=");
+                let mut digits = [0u8; 12];
+                let text = write_i32(st.size as i32, &mut digits);
+                let _ = rt.write_stdout(&mut sys, text);
+                let _ = rt.write_stdout(&mut sys, b"\n");
             }
             Command::Run {
                 path,
