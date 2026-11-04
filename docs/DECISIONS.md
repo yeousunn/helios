@@ -421,3 +421,16 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
   3. **`sys_recv` fast branch**: recv on the 0xD2 cap pops one line (bytes in w0..w3, length in w0, label NOTIFY); empty → block on the 0xD3 notification (the IRQ's `notification::signal` wakes it — the durable-NOTIFY path from Phase 3 slice 1).
   4. **hal**: `set_uart_rx_callback(fn(u8))` + `enable_uart_rx()` (IER bit 0, unmask IRQ4); the IRQ stub routes vector 36 (IRQ4) to the registered Pic handler + EOI instead of the fatal reporter.
 - Consequences: The console server (or shell) recvs console input through the ratified endpoint ABI — no new syscalls. Echo/line-editing is a console-server concern (next slice). The kernel never blocks in IRQ context (single-byte push + signal).
+
+## ADR-039: Exec semantics — Thread::SET_ENTRY + SUSPEND composition
+- Proposed: GLM 2026-11-02 (requested by DS for the shell's exec primitive, Phase 3)
+- Status: ACCEPTED (GLM, kernel/ + caps invoke table)
+- Context: POSIX exec = replace the current program image, keep the process (pid, AS, capability table, fds). The v0 primitives compose naturally: SUSPEND stops the thread at the next kernel entry; SET_ENTRY rewrites its entry PC and rebuilds the initial kernel context so the next resume enters the new image; the caller (shell/PS) maps the new image's frames into the process AS before RESUME. Address-space contents are launcher-managed (AS::MAP/UNMAP), matching the v0 launcher-staging pattern (stage_init, loader::execute).
+- Decision:
+  1. **`Thread::SET_ENTRY` (invoke id 14 — next free after BIND_DEATH_NOTIFICATION=12 and THREAD_CREATE=13):** w0 = entry PC. CONTROL right. Requires the thread SUSPENDED (EBADSTATE otherwise — racing a running thread's entry rewrite is a v0 hazard). Kernel side: `initial_pc = w0`, ksp reset via `init_context` (fresh frame), state stays Suspended.
+  2. **Exec recipe (documented, userspace composes it):** SUSPEND(tid) → map new image frames + UNMAP old image regions (caller-side via AS::MAP/UNMAP) → SET_ENTRY(new PC) → RESUME(tid). No AS teardown (fds, caps, heap regions survive).
+  3. SET_ENTRY on a thread with live ksp (Running/Ready) is rejected — only Suspended threads may re-enter.
+- Consequences: `exec` for the personality layer becomes 4 invokes; no new syscalls. Fork+exec composes via AddressSpace::FORK (already ratified, ADR-024) then SET_ENTRY on the child's thread. STACK is launcher-managed as at spawn (ADR-017).
+
+## ADR-039 amendment: SET_ENTRY implemented + verified (id 14)
+- Landed: GLM 2026-11-02. `Thread::SET_ENTRY` (id 14, CONTROL): rewrites a **SUSPENDED** thread's entry PC + rebuilds the initial kernel context (`init_context`); Running/Ready threads are rejected (EBADSTATE). Verified by test: suspend → set_entry → resume composes; initial_pc visible; Ready after resume. (SET_ENTRY on Ready is rejected — the shell composes SUSPEND first.)

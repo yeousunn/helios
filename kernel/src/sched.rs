@@ -534,6 +534,34 @@ pub fn resume(id: ThreadId) -> SchedResult<()> {
     }
 }
 
+/// Rewrite a SUSPENDED thread's entry PC and rebuild its initial kernel
+/// context (exec semantics, ADR-039). The thread must be Suspended: racing a
+/// running thread's entry rewrite is a v0 hazard.
+pub fn set_entry(id: ThreadId, pc: u64) -> SchedResult<()> {
+    let mut guard = SCHED.lock();
+    let s = guard.as_mut().ok_or(SchedError::NoSuchThread)?;
+    let slot = find_slot(s, id)?;
+    let kstack_top = {
+        let t = s.slots.threads[slot].as_ref().unwrap();
+        if t.state != State::Suspended {
+            return Err(SchedError::NotRunnable);
+        }
+        t.kstack_top
+    };
+    if kstack_top == 0 {
+        return Err(SchedError::NoSuchThread);
+    }
+    let backend = *CTX.lock();
+    let ksp = match backend {
+        Some(b) => b.init_context(kstack_top, pc),
+        None => return Err(SchedError::NoSuchThread),
+    };
+    let t = s.slots.threads[slot].as_mut().unwrap();
+    t.initial_pc = pc;
+    t.ksp = ksp;
+    Ok(())
+}
+
 /// Rebind a thread's bound notification (Thread::BIND_DEATH_NOTIFICATION /
 /// Thread::BIND_NOTIFICATION, syscall-abi §7).
 pub fn set_bound_notification(id: ThreadId, n: Option<ObjRef>) -> SchedResult<()> {

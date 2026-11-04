@@ -396,6 +396,7 @@ fn thread_invoke(
     const SET_PRIORITY: u16 = 5;
     const BIND_DEATH_NOTIFICATION: u16 = 12;
     const THREAD_CREATE: u16 = 13;
+    const SET_ENTRY: u16 = 14;
 
     let control_ok = sched::get(target)
         .map(|t| t.process.0 == pid.0 || cap.rights.contains(Rights::CONTROL))
@@ -436,6 +437,15 @@ fn thread_invoke(
             match set_bound_notification(target, bound.map(|c| crate::sched::ObjRef(c.obj.0))) {
                 Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
                 Err(e) => SyscallReturn::err(e),
+            }
+        }
+        SET_ENTRY => {
+            // ADR-039: rewrite a SUSPENDED thread's entry PC + rebuild its
+            // initial kernel context. Racing a running thread is rejected.
+            let pc = msg.words[0];
+            match sched::set_entry(target, pc) {
+                Ok(()) => SyscallReturn::ok(msg.tag, [0, pc, 0, 0]),
+                Err(_) => SyscallReturn::err(ipc::status::EBADSTATE),
             }
         }
         THREAD_CREATE => {
@@ -1087,5 +1097,63 @@ mod tests {
         .unwrap();
         let r = thread_invoke_for_test(pid, weak, m);
         assert_eq!(r.status, ipc::status::ERIGHTS);
+    }
+    #[test]
+    fn set_entry_exec_semantics() {
+        // ADR-039: SET_ENTRY rewrites a SUSPENDED thread's entry; running
+        // threads are rejected; the rebuilt context enters the new PC.
+        let (pid, _tid, factory) = setup();
+        let r_as = dispatch(args(num::INVOKE, factory, Tag::new(3), [0; 4]));
+        let as_h = r_as.w[0] as u32;
+
+        // NEW_THREAD (creates the child suspended-entry thread).
+        let mut m = Message::new(4);
+        m.words[0] = 0x401000;
+        m.tag = m.tag.with_caps(1);
+        m.set_descriptor(0, CapSlot::pack(as_h, Rights::MAP))
+            .unwrap();
+        let r = dispatch(args(num::INVOKE, factory, m.tag, m.words));
+        assert_eq!(r.status, ipc::status::OK);
+        let thread_h = r.w[0] as u32;
+        let child_tid = ThreadId(r.w[3]);
+
+        // SET_ENTRY on the child while it is not suspended yet -> the child
+        // was spawned Ready (not Suspended), so exec-on-Ready is rejected
+        // (EBADSTATE). The shell composes SUSPEND first.
+        let r2 = dispatch(args(
+            num::INVOKE,
+            thread_h,
+            Tag::new(14),
+            [0x500000, 0, 0, 0],
+        ));
+        assert_eq!(r2.status, ipc::status::EBADSTATE);
+
+        // SUSPEND then SET_ENTRY succeeds and updates initial_pc.
+        assert_eq!(
+            dispatch(args(num::INVOKE, thread_h, Tag::new(3), [0; 4])).status,
+            ipc::status::OK
+        );
+        let r3 = dispatch(args(
+            num::INVOKE,
+            thread_h,
+            Tag::new(14),
+            [0x500000, 0, 0, 0],
+        ));
+        assert_eq!(r3.status, ipc::status::OK);
+        assert_eq!(proc::get_cap(pid, thread_h).unwrap().typ, ObjType::Thread);
+        // initial_pc is visible via sched::get.
+        let t = crate::sched::get(child_tid).unwrap();
+        assert_eq!(t.initial_pc, 0x500000);
+        assert_eq!(t.state, crate::sched::State::Suspended);
+
+        // RESUME makes it Ready again (the rebuilt context enters 0x500000).
+        assert_eq!(
+            dispatch(args(num::INVOKE, thread_h, Tag::new(4), [0; 4])).status,
+            ipc::status::OK
+        );
+        assert_eq!(
+            crate::sched::get(child_tid).unwrap().state,
+            crate::sched::State::Ready
+        );
     }
 }
