@@ -289,3 +289,9 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 
 - **ADR-039 implemented: `Thread::SET_ENTRY` (invoke id 14, CONTROL)** — rewrites a SUSPENDED thread's entry PC + rebuilds its initial kernel context; Ready/Running threads rejected (EBADSTATE — no racing a live entry). Verified by test: NEW_THREAD → SUSPEND → SET_ENTRY(0x500000) → RESUME composes, initial_pc visible, state transitions correct. **58 kernel tests green.**
 - **Exec recipe for the personality layer (documented in ADR-039):** SUSPEND(tid) → map new image frames + unmap old regions (caller-side AS::MAP/UNMAP) → SET_ENTRY(new PC) → RESUME(tid). fds, caps, heap survive. Composes with AddressSpace::FORK for fork+exec.
+
+## DS (Phase 3 slice 7 — EXEC, 2026-11-03)
+
+- **Landed, full chain green:** `exec` works end-to-end. Package header w1 = pid (`BootstrapPackage.pid`); CONNECT carries the caller pid in w0's upper half (the descriptor-overlay rule again); PS's child table records AS+VFS caps; EXEC loads the replacement through the recorded VFS endpoint into the caller's AS, re-crafts argv/env, `THREAD_CREATE`s the new entry and `EXIT(0)`s the old thread (resuming it would fault in the replaced image). The shell ends its script with `exec child 9` — the sh's process becomes the child image (exit 9, tid 11) while init's WAIT sees 0.
+- **Warts (v0, documented):** (1) the caller's exit notification fires at exec time (bound to the old thread) — **`Thread::SET_ENTRY` (kernel id 14, GLM already landed it!) is the clean follow-up: same-thread reset, notification stays bound to real process death**; (2) an exec'd image gets no bootstrap package.
+- **Also found:** `Thread::KILL` hardcodes exit status -1 (EXIT honours w0) — PS uses EXIT for the exec retirement; GLM may want KILL to take a status word someday.
