@@ -353,15 +353,30 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
     mark(raw, info.debug_ep, STEP_SPAWN_CHILD, child_pid);
 
     // Step 13: WAIT — blocking wait for the child's exit status (design §2.6).
-    let waited = {
-        let mut sys = Syscalls::new(raw);
-        let mut m = Message::new(methods::process::WAIT);
-        m.words[0] = child_pid;
-        sys.call(session_ep, &m)
-            .map_err(|e| fail_code(STEP_WAIT, e as u64))?
+    // WAIT is a non-blocking poll on PS's side (deferred replies need a
+    // kernel reply-handle primitive); the caller polls cooperatively.
+    let waited = loop {
+        let reply = {
+            let mut sys = Syscalls::new(raw);
+            let mut m = Message::new(methods::process::WAIT);
+            m.words[0] = child_pid;
+            sys.call(session_ep, &m)
+                .map_err(|e| fail_code(STEP_WAIT, e as u64))?
+        };
+        if reply.words[0] == 0 {
+            break reply;
+        }
+        if reply.words[0] == ipc::status::EWOULDBLOCK as i64 as u64 {
+            let _ = Syscalls::new(raw).yield_now();
+            continue;
+        }
+        return Err(fail_code(
+            STEP_WAIT,
+            0xE1 | ((reply.words[0] as u64 & 0xFF) << 8),
+        ));
     };
-    if waited.words[0] != 0 || waited.words[1] != 42 {
-        return Err(fail_code(STEP_WAIT, 0xE1 | (waited.words[1] << 8)));
+    if waited.words[1] != 42 {
+        return Err(fail_code(STEP_WAIT, 0xE2 | (waited.words[1] << 8)));
     }
     mark(raw, info.debug_ep, STEP_WAIT, waited.words[1]);
 
@@ -509,15 +524,28 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
         let posix_pid = spawned.words[1];
         mark(raw, info.debug_ep, STEP_POSIX_SPAWN, posix_pid);
 
-        let waited = {
-            let mut sys = Syscalls::new(raw);
-            let mut m = Message::new(methods::process::WAIT);
-            m.words[0] = posix_pid;
-            sys.call(session_ep, &m)
-                .map_err(|e| fail_code(STEP_POSIX_WAIT, e as u64))?
+        let waited = loop {
+            let reply = {
+                let mut sys = Syscalls::new(raw);
+                let mut m = Message::new(methods::process::WAIT);
+                m.words[0] = posix_pid;
+                sys.call(session_ep, &m)
+                    .map_err(|e| fail_code(STEP_POSIX_WAIT, e as u64))?
+            };
+            if reply.words[0] == 0 {
+                break reply;
+            }
+            if reply.words[0] == ipc::status::EWOULDBLOCK as i64 as u64 {
+                let _ = Syscalls::new(raw).yield_now();
+                continue;
+            }
+            return Err(fail_code(
+                STEP_POSIX_WAIT,
+                0xE1 | ((reply.words[0] as u64 & 0xFF) << 8),
+            ));
         };
-        if waited.words[0] != 0 || waited.words[1] != 77 {
-            return Err(fail_code(STEP_POSIX_WAIT, 0xE1 | (waited.words[1] << 8)));
+        if waited.words[1] != 77 {
+            return Err(fail_code(STEP_POSIX_WAIT, 0xE2 | (waited.words[1] << 8)));
         }
         mark(raw, info.debug_ep, STEP_POSIX_WAIT, waited.words[1]);
     }

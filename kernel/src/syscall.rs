@@ -394,6 +394,10 @@ pub fn sys_recv(
             }
             let mask = notification::take(ObjRef(cap.obj.0)).map_err(|e| err(map_ipc(e)))?;
             if mask == 0 {
+                if nonblock {
+                    // Polling recv on notifications (PS's nonblocking WAIT).
+                    return Err(err(ipc::status::EWOULDBLOCK));
+                }
                 sched::block(tid, BlockReason::Notification(ObjRef(cap.obj.0)))
                     .map_err(|_| err(ipc::status::ENOMEM))?;
                 // Re-check: a signal that landed between the take and the

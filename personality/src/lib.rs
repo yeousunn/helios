@@ -13,5 +13,6 @@
 
 pub mod layout;
 pub mod posix;
+pub mod ps;
 pub mod runtime;
 pub mod vfs;

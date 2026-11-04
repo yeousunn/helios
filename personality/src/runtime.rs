@@ -11,13 +11,15 @@ use sdk::bootstrap::BootstrapPackage;
 use sdk::syscall::{Handle, RawSyscalls, Status, Syscalls};
 
 use crate::posix::ENOENT;
+use crate::ps::PsClient;
 use crate::vfs::VfsClient;
 
-/// A live personality process: its package, a connected VFS client, and the
-/// caller-supplied stdout endpoint (package `optional[2]`, design §2.3).
+/// A live personality process: its package, connected VFS and PS clients, and
+/// the caller-supplied stdout endpoint (package `optional[2]`, design §2.3).
 pub struct Runtime {
     pub package: BootstrapPackage,
     pub vfs: VfsClient,
+    pub ps: PsClient,
     stdout: Option<Handle>,
 }
 
@@ -38,6 +40,15 @@ impl Runtime {
             .ok_or(ENOENT)?;
         let session = package.session_notifications[0];
         let vfs = VfsClient::connect(sys, package.aspace, package.region, vfs_ep, session)?;
+        // The process server connection uses its own session notification and
+        // its own window pair (the fixed package slot carries its endpoint).
+        let ps = PsClient::connect(
+            sys,
+            package.aspace,
+            package.region,
+            package.process_server_ep,
+            package.session_notifications[1],
+        )?;
         let stdout = package
             .optional
             .get(2)
@@ -48,8 +59,15 @@ impl Runtime {
         Ok(Self {
             package,
             vfs,
+            ps,
             stdout,
         })
+    }
+
+    /// The stdout endpoint handle (if the launcher supplied one), for passing
+    /// onward to spawned children.
+    pub fn stdout_handle(&self) -> Option<Handle> {
+        self.stdout
     }
 
     /// Write text to the process's stdout (the caller-supplied console

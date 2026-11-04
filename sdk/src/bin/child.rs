@@ -50,9 +50,41 @@ global_asm!(
 extern "C" fn child_main(argc: u64, raw_argv0: *const u8) -> ! {
     let mut raw = X86_64Syscalls;
     // Consume the bootstrap package so the spawner's `deliver` completes.
-    {
+    let package = {
         let mut sys = Syscalls::new(&mut raw);
-        let _ = sdk::bootstrap::receive(&mut sys);
+        match sdk::bootstrap::receive(&mut sys) {
+            Ok(p) => Some(p),
+            Err(_) => None,
+        }
+    };
+    // Diagnostic: echo the crafted argv through a caller-supplied console
+    // endpoint (package `optional[2]`) before exiting — makes stack-crafting
+    // bugs visible on the serial line.
+    if let Some(p) = package {
+        if let Some(console) = p.optional.get(2).copied().flatten() {
+            if argc != 0 {
+                let mut sys = Syscalls::new(&mut raw);
+                let mut m = ipc::Message::new(sdk::methods::console::WRITE);
+                let mut n = 0usize;
+                let prefix = b"argv=";
+                for b in prefix {
+                    m.words[n / 8] |= (*b as u64) << ((n % 8) * 8);
+                    n += 1;
+                }
+                // Up to 16 argv bytes, NUL/Space-safe: replace non-printables.
+                let mut i = 0isize;
+                while n < 32 && i < 16 {
+                    let c = unsafe { *raw_argv0.offset(i) };
+                    if c == 0 || !c.is_ascii_graphic() {
+                        break;
+                    }
+                    m.words[n / 8] |= (c as u64) << ((n % 8) * 8);
+                    n += 1;
+                    i += 1;
+                }
+                let _ = sys.send(console.handle(), &m);
+            }
+        }
     }
     let status = if argc == 0 {
         -1 // no argv: PS did not craft the stack (diagnostic)

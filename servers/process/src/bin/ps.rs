@@ -19,7 +19,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use ipc::{CapSlot, Message, Rights};
 use sdk::bootstrap::{self, receive, BootstrapPackage};
@@ -38,10 +38,51 @@ include!(concat!(env!("OUT_DIR"), "/child_image.rs"));
 #[global_allocator]
 static HEAP: GlobalHeap = GlobalHeap::new();
 
-/// v0 single-child bookkeeping (PS is single-threaded; atomics avoid unsafe).
-static CHILD_PID: AtomicU64 = AtomicU64::new(0);
-static CHILD_THREAD: AtomicU32 = AtomicU32::new(0);
-static CHILD_NOTIF: AtomicU32 = AtomicU32::new(0);
+/// Connection endpoints currently served (each `CONNECT` mints one and the
+/// serve loop polls them round-robin). Round-robin slots (v0 capacity 8).
+const MAX_CONNS: usize = 8;
+static CONNS: [AtomicU32; MAX_CONNS] = [const { AtomicU32::new(0) }; MAX_CONNS];
+static NEXT_CONN: AtomicUsize = AtomicUsize::new(0);
+
+/// Spawned-child table: pid -> (thread-control cap, exit notification), so
+/// `WAIT`/`KILL` work for every client (the old single-child statics broke as
+/// soon as a process tree existed: a child spawning its own child). Slots are
+/// assigned round-robin; capacity 4 (the full process table arrives with
+/// fork/exec).
+const MAX_CHILDREN: usize = 4;
+static CH_PIDS: [AtomicU64; MAX_CHILDREN] = [const { AtomicU64::new(0) }; MAX_CHILDREN];
+static CH_CAPS: [AtomicU32; MAX_CHILDREN] = [const { AtomicU32::new(0) }; MAX_CHILDREN];
+static CH_NOTIFS: [AtomicU32; MAX_CHILDREN] = [const { AtomicU32::new(0) }; MAX_CHILDREN];
+static NEXT_CHILD: AtomicUsize = AtomicUsize::new(0);
+
+fn child_slot(pid: u64) -> Option<usize> {
+    if pid == 0 {
+        return None;
+    }
+    (0..MAX_CHILDREN).find(|&i| CH_PIDS[i].load(Ordering::Relaxed) == pid)
+}
+
+fn register_child(pid: u64, cap: u32, notif: u32) {
+    // Reuse a slot already carrying this pid: pids are recycled once a child
+    // is reaped, and a stale earlier registration would make `child_slot`
+    // find the dead child's already-consumed notification (found via the
+    // demo inheriting the child's pid and WAIT polling the wrong notif).
+    let mut i = NEXT_CHILD.fetch_add(1, Ordering::Relaxed) % MAX_CHILDREN;
+    for k in 0..MAX_CHILDREN {
+        if CH_PIDS[k].load(Ordering::Relaxed) == pid {
+            i = k;
+            break;
+        }
+    }
+    CH_PIDS[i].store(pid, Ordering::Relaxed);
+    CH_CAPS[i].store(cap, Ordering::Relaxed);
+    CH_NOTIFS[i].store(notif, Ordering::Relaxed);
+}
+
+fn register_conn(ep: u32) {
+    let i = NEXT_CONN.fetch_add(1, Ordering::Relaxed) % MAX_CONNS;
+    CONNS[i].store(ep, Ordering::Relaxed);
+}
 
 /// Pin the child's package handles immediately at mint time: register/spill
 /// reuse in the inlined spawn path has proven unreliable, so every value
@@ -51,11 +92,6 @@ static CH_S0: AtomicU32 = AtomicU32::new(0);
 static CH_S1: AtomicU32 = AtomicU32::new(0);
 static CH_S2: AtomicU32 = AtomicU32::new(0);
 static CH_S3: AtomicU32 = AtomicU32::new(0);
-/// The serve loop's current accept endpoint (service ep, then the connection
-/// endpoint). Pinned through an atomic for the same reason as the child
-/// handles: the loop local was observed mutated across the heavy inlined
-/// spawn path (foreign handle values reaching `reply_recv`).
-static SESSION_EP: AtomicU32 = AtomicU32::new(0);
 /// The last pinned spawn handle: the child's thread-control cap. Lived on the
 /// stack across the same heavy inlined path; a stale (still thread-typed)
 /// value made BIND_DEATH_NOTIFICATION silently bind the wrong thread.
@@ -141,57 +177,89 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
-    // 6. Serve loop (design §1.7): one `recv` on the service endpoint, then
-    //    `reply_recv` per request. `CONNECT` publishes a connection endpoint;
-    //    all later operations are served on it (design §1.2).
+    // 6. Serve loop (design §1.7), multiplexed: the service endpoint accepts
+    //    new connections; every established connection is served round-robin;
+    //    idle iterations yield. A single-connection loop deadlocks as soon as
+    //    two clients exist (a child spawning its own child), so the loop polls
+    //    like the VFS's. `WAIT` is non-blocking (the caller polls): deferring
+    //    a reply needs a kernel reply-handle primitive the v0 ABI lacks
+    //    (board: ADR candidate).
     let mut sys = Syscalls::new(&mut raw);
-    let mut req = match sys.recv(service_ep) {
-        Ok(m) => m,
-        Err(_) => Syscalls::new(&mut raw).exit(0xE6),
-    };
-    SESSION_EP.store(service_ep, Ordering::Relaxed);
     loop {
-        let reply = match req.tag.label() {
-            methods::process::CONNECT => {
-                let (reply, conn_ep) = connect_reply(&mut sys, &package, &req, factory);
-                if let Some(ep) = conn_ep {
-                    SESSION_EP.store(ep, Ordering::Relaxed);
-                }
-                reply
-            }
-            methods::process::SPAWN => spawn_reply(&mut sys, &package, &req, factory, service_ep),
-            methods::process::WAIT => wait_reply(&mut sys, &req),
-            methods::process::KILL => {
-                let target = req.words[0];
-                let child = CHILD_PID.load(Ordering::Relaxed);
-                let thread_cap = CHILD_THREAD.load(Ordering::Relaxed);
-                if target != 0 && target == child && thread_cap != 0 {
-                    // v0: kill the spawned child via its thread-control cap.
-                    let mut r = Message::new(methods::process::KILL);
-                    let mut m = Message::new(methods::thread::KILL);
-                    m.words[0] = req.words[1];
-                    if let Err(e) = sys.invoke(thread_cap, &m) {
-                        r.words[0] = e as i64 as u64;
+        let mut served = false;
+
+        // New connections (accept endpoint).
+        if let Ok(req) = sys.recv_nonblock(service_ep) {
+            served = true;
+            let reply = match req.tag.label() {
+                methods::process::CONNECT => {
+                    let slot = NEXT_CONN.load(Ordering::Relaxed) % MAX_CONNS;
+                    let (reply, conn_ep) = connect_reply(&mut sys, &package, &req, factory, slot);
+                    if let Some(ep) = conn_ep {
+                        register_conn(ep);
                     }
-                    r
-                } else {
-                    // v0 launcher shutdown: ack, then exit with the caller's
-                    // raw status (design §2.6).
-                    let ack = Message::new(methods::process::KILL);
-                    let _ = sys.send(REPLY_CAP, &ack);
-                    Syscalls::new(&mut raw).exit(req.words[1] as i32);
+                    reply
                 }
+                label => {
+                    let mut reply = Message::new(label);
+                    reply.words[0] = ipc::status::ENOSYS as i64 as u64;
+                    reply
+                }
+            };
+            let _ = sys.reply(&reply);
+        }
+
+        // Established connections, round-robin.
+        let mut i = 0;
+        while !served && i < MAX_CONNS {
+            let c = CONNS[i].load(Ordering::Relaxed);
+            i += 1;
+            if c == 0 {
+                continue;
             }
-            label => {
-                let mut reply = Message::new(label);
-                reply.words[0] = ipc::status::ENOSYS as i64 as u64;
-                reply
-            }
-        };
-        req = match sys.reply_recv(SESSION_EP.load(Ordering::Relaxed), &reply) {
-            Ok(m) => m,
-            Err(e) => Syscalls::new(&mut raw).exit(0xE7_00 | (e & 0xFF)),
-        };
+            let Ok(req) = sys.recv_nonblock(c) else {
+                continue;
+            };
+            served = true;
+            let reply = match req.tag.label() {
+                methods::process::SPAWN => {
+                    // The caller's spawn blob sits in ITS window pair (slot i).
+                    let win_base = PS_WINDOW_VA_BASE + ((i - 1) as u64) * 0x2000;
+                    spawn_reply(&mut sys, &package, &req, factory, service_ep, win_base)
+                }
+                methods::process::WAIT => wait_reply(&mut sys, &req),
+                methods::process::KILL => {
+                    let target = req.words[0];
+                    if let Some(slot) = child_slot(target) {
+                        // Kill the spawned child via its thread-control cap.
+                        let cap = CH_CAPS[slot].load(Ordering::Relaxed);
+                        let mut r = Message::new(methods::process::KILL);
+                        let mut m = Message::new(methods::thread::KILL);
+                        m.words[0] = req.words[1];
+                        if cap == 0 || sys.invoke(cap, &m).is_err() {
+                            r.words[0] = ipc::status::EBADCAP as i64 as u64;
+                        }
+                        r
+                    } else {
+                        // v0 launcher shutdown: ack, then exit with the
+                        // caller's raw status (design §2.6).
+                        let ack = Message::new(methods::process::KILL);
+                        let _ = sys.send(REPLY_CAP, &ack);
+                        Syscalls::new(&mut raw).exit(req.words[1] as i32);
+                    }
+                }
+                label => {
+                    let mut reply = Message::new(label);
+                    reply.words[0] = ipc::status::ENOSYS as i64 as u64;
+                    reply
+                }
+            };
+            let _ = sys.reply(&reply);
+        }
+
+        if !served {
+            let _ = sys.yield_now();
+        }
     }
 }
 
@@ -205,7 +273,12 @@ fn connect_reply(
     package: &sdk::bootstrap::BootstrapPackage,
     req: &Message,
     factory: u32,
+    slot: usize,
 ) -> (Message, Option<u32>) {
+    // Each connection gets its own window pair in this AS (a single client
+    // was assumed before; a process tree broke that): slot N maps to
+    // `PS_WINDOW_VA_BASE + N * 0x2000` (+0x1000 for the result window).
+    let win_base = PS_WINDOW_VA_BASE + (slot as u64) * 0x2000;
     let mut reply = Message::new(methods::process::CONNECT);
     if req.words[0] != 1 {
         reply.words[0] = ipc::status::EBADARG as i64 as u64;
@@ -223,8 +296,8 @@ fn connect_reply(
         }
     };
     for (frame, va, flags) in [
-        (arg, PS_WINDOW_VA_BASE, methods::map_flags::R),
-        (result, PS_WINDOW_VA_BASE + 4096, methods::map_flags::W),
+        (arg, win_base, methods::map_flags::R),
+        (result, win_base + 4096, methods::map_flags::W),
     ] {
         let mut map = Message::new(methods::aspace::MAP);
         map.tag = map.tag.with_caps(1);
@@ -272,6 +345,7 @@ fn spawn_reply(
     req: &Message,
     factory: u32,
     service_ep: u32,
+    win_base: u64,
 ) -> Message {
     let mut reply = Message::new(methods::process::SPAWN);
 
@@ -291,7 +365,7 @@ fn spawn_reply(
     // the string bytes. Words cannot carry spans alongside 3+ descriptors
     // (descriptors overlay the trailing words).
     let (path_off, path_len, arg_off, arg_len) = {
-        let f = PS_WINDOW_VA_BASE as *const u8;
+        let f = win_base as *const u8;
         // SAFETY: our CONNECT arg window is mapped R in this AS.
         unsafe {
             let rd = |o: usize| core::ptr::read_unaligned(f.add(o) as *const u64);
@@ -314,7 +388,7 @@ fn spawn_reply(
     }
     let loaded: Option<Vec<u8>> = match vfs_svc {
         Some(svc) if path_len != 0 => {
-            match load_via_vfs(sys, package, factory, svc, path_off, path_len) {
+            match load_via_vfs(sys, package, factory, svc, path_off, path_len, win_base) {
                 Ok(bytes) => Some(bytes),
                 Err(e) => {
                     reply.words[0] = e as i64 as u64;
@@ -332,7 +406,7 @@ fn spawn_reply(
     };
     let image: &[u8] = loaded.as_deref().unwrap_or(CHILD_IMAGE);
     match spawn_child(
-        sys, package, factory, service_ep, arg_off, arg_len, image, extras,
+        sys, package, factory, service_ep, arg_off, arg_len, image, extras, win_base,
     ) {
         Ok((pid, thread_cap, exit_notif)) => {
             reply.words[1] = pid;
@@ -361,6 +435,7 @@ fn spawn_child(
     arg_len: usize,
     image_bytes: &[u8],
     extras: [Option<u32>; 4],
+    win_base: u64,
 ) -> Result<(u64, u32, u32), i32> {
     // 1. Child address space.
     let child_as = invoke_w0(sys, factory, methods::factory::NEW_ADDRESS_SPACE, [0; 4])? as u32;
@@ -388,7 +463,7 @@ fn spawn_child(
         CHILD_STACK_PAGES - 1,
         0b011,
     )?;
-    craft_stack(sys, package, child_as, arg_off, arg_len)?;
+    craft_stack(sys, package, child_as, arg_off, arg_len, win_base)?;
     // 4. Endpoints + notifications for the child's package (straight-line
     // mints; no arrays — spill-slot reuse made the old form unreliable).
     let bootstrap_ep = invoke_w0(sys, factory, methods::factory::NEW_ENDPOINT, [0; 4])? as u32;
@@ -449,10 +524,8 @@ fn spawn_child(
     sys.invoke(CH_THREAD.load(Ordering::Relaxed), &bind)?;
 
     bootstrap::deliver(sys, CH_BOOT.load(Ordering::Relaxed), &caps[..total])?;
-    // 8. Publish for WAIT/KILL.
-    CHILD_PID.store(pid, Ordering::Relaxed);
-    CHILD_THREAD.store(thread_cap, Ordering::Relaxed);
-    CHILD_NOTIF.store(exit_notif, Ordering::Relaxed);
+    // 8. Publish for WAIT/KILL (per-client table slot; round-robin).
+    register_child(pid, thread_cap, exit_notif);
     Ok((pid, thread_cap, exit_notif))
 }
 
@@ -467,12 +540,16 @@ fn load_via_vfs(
     vfs_svc: u32,
     path_off: usize,
     path_len: usize,
+    win_base: u64,
 ) -> Result<Vec<u8>, i32> {
     if path_len == 0 || path_off.checked_add(path_len).map_or(true, |e| e > 4096) {
         return Err(ipc::status::EBADARG);
     }
-    let arg_va = PS_WINDOW_VA_BASE + 0x2000;
-    let result_va = PS_WINDOW_VA_BASE + 0x3000;
+    // Dedicated load-window area, clear of the per-connection window pairs
+    // (`PS_WINDOW_VA_BASE + slot * 0x2000`) and unmapped after every load, so
+    // sequential spawns reuse it.
+    let arg_va = PS_WINDOW_VA_BASE + 0x10_0000;
+    let result_va = PS_WINDOW_VA_BASE + 0x10_1000;
     let session = invoke_w0(sys, factory, methods::factory::NEW_NOTIFICATION, [0; 4])? as u32;
     let arg_frame = invoke_w0(
         sys,
@@ -521,9 +598,8 @@ fn load_via_vfs(
         return Err(ipc::status::EBADCAP);
     }
     // Copy the path into the VFS arg window (its first bytes) and OPEN it.
-    let path = unsafe {
-        core::slice::from_raw_parts((PS_WINDOW_VA_BASE + path_off as u64) as *const u8, path_len)
-    };
+    let path =
+        unsafe { core::slice::from_raw_parts((win_base + path_off as u64) as *const u8, path_len) };
     unsafe {
         core::ptr::copy_nonoverlapping(path.as_ptr(), arg_va as *mut u8, path_len);
     }
@@ -588,6 +664,7 @@ fn craft_stack(
     child_as: u32,
     arg_off: usize,
     arg_len: usize,
+    win_base: u64,
 ) -> Result<(), i32> {
     let frame = invoke_w0(
         sys,
@@ -610,7 +687,7 @@ fn craft_stack(
         return Err(-103); // argv blob too large for the crafted page
     }
     for (i, b) in page[str_off..str_off + arg_len].iter_mut().enumerate() {
-        *b = unsafe { *((PS_WINDOW_VA_BASE as *const u8).add(arg_off + i)) };
+        *b = unsafe { *((win_base as *const u8).add(arg_off + i)) };
     }
     let argv0_va = (USER_STACK_TOP - 4096) + str_off as u64;
     page[4096 - 8..4096].copy_from_slice(&1u64.to_le_bytes()); // argc = 1
@@ -628,31 +705,34 @@ fn craft_stack(
 /// `WAIT` (0x0111): v0 blocking wait on the single child's death
 /// notification (design §2.6); replies `w0 = status, w1 = child's raw exit
 /// status` (kernel payload convention: bit 0 = event, bits 32.. = status).
+/// `WAIT`: non-blocking poll of the child's death notification. A dead child
+/// yields its exit status; a live child yields `EWOULDBLOCK` and the caller
+/// polls (yielding). Deferring the reply until death would need a kernel
+/// reply-handle primitive (the implicit reply slot rebinds on the next call),
+/// so v0 keeps the wait on the caller's side (cooperative polling).
 fn wait_reply(sys: &mut Syscalls<'_, X86_64Syscalls>, req: &Message) -> Message {
     let mut reply = Message::new(methods::process::WAIT);
-    let child = CHILD_PID.load(Ordering::Relaxed);
-    if child == 0 || req.words[0] != child {
+    let Some(slot) = child_slot(req.words[0]) else {
         reply.words[0] = ipc::status::EBADARG as i64 as u64;
         return reply;
-    }
-    let notif = CHILD_NOTIF.load(Ordering::Relaxed);
-    // The death event may share the mailbox with other signals (and v0 wake
-    // paths are not perfectly quiet): keep receiving until the event bit
-    // arrives instead of failing on the first non-death wake.
-    let mask = loop {
-        let notified = match sys.recv(notif) {
-            Ok(m) => m,
-            Err(e) => {
-                reply.words[0] = e as i64 as u64;
+    };
+    let notif = CH_NOTIFS[slot].load(Ordering::Relaxed);
+    loop {
+        match sys.recv_nonblock(notif) {
+            Ok(notified) => {
+                let mask = notified.words[0];
+                if mask & 1 != 0 {
+                    reply.words[1] = (mask >> 32) as u32 as i32 as i64 as u64;
+                    return reply;
+                }
+                // Spurious signal bits: drained, keep polling.
+            }
+            Err(_) => {
+                reply.words[0] = ipc::status::EWOULDBLOCK as i64 as u64;
                 return reply;
             }
-        };
-        if notified.words[0] & 1 != 0 {
-            break notified.words[0];
         }
-    };
-    reply.words[1] = (mask >> 32) as u32 as i32 as i64 as u64;
-    reply
+    }
 }
 
 /// `invoke` returning the reply's `w0`.

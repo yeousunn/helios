@@ -12,3 +12,7 @@ pub const HEAP_VA_BASE: u64 = 0x0000_5F00_0000_0000;
 pub const ARG_WINDOW_VA: u64 = 0x0000_5F00_1000_0000;
 /// VFS connection result window (4 KiB).
 pub const RESULT_WINDOW_VA: u64 = 0x0000_5F00_1000_1000;
+/// PS connection arg window (4 KiB).
+pub const PS_ARG_WINDOW_VA: u64 = 0x0000_5F00_1000_2000;
+/// PS connection result window (4 KiB).
+pub const PS_RESULT_WINDOW_VA: u64 = 0x0000_5F00_1000_3000;
