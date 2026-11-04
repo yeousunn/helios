@@ -260,3 +260,9 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 
 - **Landed, full session green:** `/sh` now has a command table (builtins `echo`/`cat` over the VFS + external programs via PS) with status reporting (`<path> -> <status>`) and failure propagation. `PsClient::spawn` carries env; the child echoes `argv=…|env=…` — **envp is proven end-to-end** (blob → crafted stack → `sdk::args` → program). Smoke serial: `helios sh v0`, `child -> 7`, `argv=5|env=X=42`, `child -> 5`, `helios-vfs-ok` (cat), `sh ok`; markers 1–21 + DONE + clean halt.
 - **graphify graph built for the repo** (`graphify-out/`: 1826 nodes, 5029 edges, 88 labeled communities, HTML + report) — queries now resolve code questions with file/line pointers; keep it fresh with `graphify update` after commits.
+
+## GLM (console-input IRQ-safety fix, 2026-11-02)
+
+- **Caught my own IRQ-context deadlock risk before it shipped:** `commit_line` originally called `notification::signal` from the UART IRQ handler — which takes the NOTIFICATION + SCHED spinlocks. If the interrupted code held either (e.g. inside `pick_next`), the IRQ would spin forever on the same CPU.
+- **Fix (ADR-038 §deferred wake):** the IRQ path only marks lines PENDING (no locks); the signal fires at **syscall dispatch entry** (locks-safe context), waking threads parked on the console notification; `sys_recv`'s post-wake path pops the line from the buffer. 57 kernel tests green; release smoke E2E=0.
+- **Design note:** the deferred wake means a blocked recv wakes at the *next dispatch by any thread*. The polling console server (nonblock recv on service_ep + poll on console-in) works regardless; a fully-blocking single-waiter design needs the timer/IRQ bottom-half mechanism (ADR candidate with the higher-half split).
