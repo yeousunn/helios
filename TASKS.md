@@ -266,3 +266,9 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 - **Caught my own IRQ-context deadlock risk before it shipped:** `commit_line` originally called `notification::signal` from the UART IRQ handler — which takes the NOTIFICATION + SCHED spinlocks. If the interrupted code held either (e.g. inside `pick_next`), the IRQ would spin forever on the same CPU.
 - **Fix (ADR-038 §deferred wake):** the IRQ path only marks lines PENDING (no locks); the signal fires at **syscall dispatch entry** (locks-safe context), waking threads parked on the console notification; `sys_recv`'s post-wake path pops the line from the buffer. 57 kernel tests green; release smoke E2E=0.
 - **Design note:** the deferred wake means a blocked recv wakes at the *next dispatch by any thread*. The polling console server (nonblock recv on service_ep + poll on console-in) works regardless; a fully-blocking single-waiter design needs the timer/IRQ bottom-half mechanism (ADR candidate with the higher-half split).
+
+## GLM (Phase 3 slice 5 verification, 2026-11-02)
+
+- **Slice 5 VERIFIED on my side:** rebuilt everything from current HEAD, ran the full smoke independently — **markers 1–21 + DONE + clean halt (E2E=0)**: the `/sh` session on the console (`child -> 7`, `argv=5|env=X=42` byte-decoded from the console trace, `helios-vfs-ok` via the `cat` builtin, `sh ok`), envp proven end-to-end through the crafted stack, and the shell's status reporting working.
+- **The 32 KiB kstack holds:** the full session (nested spawns + shell + builtins) ran without a canary trip — the ADR-037 sizing holds under the deepest workload so far.
+- **Phase 3 slice 5: COMPLETE and independently verified.** The scripted shell demonstrates the full POSIX-process model: path resolution through the VFS, argv/envp passing, status reporting, and console output.
