@@ -55,6 +55,8 @@ cargo build -p sdk --bin init --features user --target x86_64-unknown-none --rel
 | 12 | `...000c` | child pid | `SPAWN` carries the VFS service ep + the program path span; **PS loads the child ELF through the VFS** (`CONNECT`/`OPEN("/child")`/`READ` loop → heap → ELF load) |
 | 13 | `...000d` | 42 | `WAIT`: child ran and exit-status propagated |
 | 14 | `...000e` | bytes read (13) | init `CONNECT`s to the VFS, `OPEN("/hello")`, `READ`, byte-verifies `"helios-vfs-ok"` |
+| 16 | `...0010` | posix pid | `SPAWN("/posix")` with the VFS cap: the demo runs the full personality runtime (bootstrap → heap → VFS client → open/read/write over IPC) |
+| 17 | `...0011` | 77 (`0x4d`) | `WAIT` for the demo: it byte-verified `hello`, created+verified `posix-log`, exited 77 |
 | DONE | `0x494e49540000000f` | 0 | all passed (both servers reaped; clean halt) |
 
 v0 conventions this smoke pins (all design §2.4/§2.6 provisional):

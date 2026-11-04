@@ -38,13 +38,13 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 ## Phase 2 — System Servers (early starts)
 
 - [x] DS done 2026-11-02 — **DS:** `servers/vfs/` — binary target + VFS server binary: add `[[bin]]` to `servers/vfs/Cargo.toml`; create `servers/vfs/src/bin/vfs.rs` minimal server that mounts ramfs and serves IPC messages (`CONNECT`, `WALK`, `OPEN`, `READ`, `WRITE`, `CLOSE`, `STAT`). **COMPLETE — full smoke green (markers 1–15 + DONE + clean halt, QEMU exit 1 = kernel code 0). PHASE 2 CORE MILESTONE REACHED.** init → PS ready → CONNECT → SPAWN child (exit 42) → WAIT=42 → **VFS spawned, received its package, ran, published its ready callback, was reaped** → DONE. The VFS bin mounts ramfs via the tested `VfsServer` core and serves the full op set in its loop. Root cause of the long hunt (`76f1b03`): **the 16 KiB per-thread kernel stack underflowed into ADJACENT page-table frames** (init's kstack at `0x1027000` sits directly above its user stack's PDPT/PD/PT at `0x1024/5/6000`) — the runaway depth scrambled PTEs one per deep syscall and spilled kernel-frame handle values into user slots, explaining every layout-dependent symptom. Fix: `KSTACK_FRAMES` 4→8 (32 KiB), graveyard bury uses `KSTACK_FRAMES` (GLM: the depth-accumulation follow-up — why 16 KiB was exceeded — is yours; 32 KiB is the working bound now), VFS debug probe removed.
-- [~ DS started 2026-10-31] **DS:** `servers/process/` — serve loop over IPC (protocol modules + server core exist; need server loop wiring over IPC transport)
-- [~ DS started 2026-10-31] **DS:** `sdk/` — init v2 launcher built (`sdk/src/bin/init.rs`, feature `user`): BootInfo parser (golden-layout tests), debug-EP markers, Factory NEW_ENDPOINT, IPC v1 self round-trip, reply/revoke path, clean exit; compiles for x86_64 with clippy clean. Ready for NV's QEMU harness.
+- [x] DS done 2026-11-03 — **DS:** `servers/process/` — serve loop over IPC: CONNECT (windows + capability), SPAWN (VFS-backed program load, child package with vfs ep in `optional[0]`), WAIT (death-notification event loop), KILL; full smoke green.
+- [x] DS done 2026-11-03 — **DS:** `sdk/` — init v2 launcher: BootInfo parser, markers, Factory, IPC round-trip, spawn chain (VFS -> PS -> child -> POSIX demo), clean exit; full smoke green.
 
-## Phase 3 — POSIX Personality (not started)
+## Phase 3 — POSIX Personality (slice 1 landed)
 
-- [ ] DS — `servers/process/` — POSIX personality (Linux syscall emulation)
-- [ ] DS — `sdk/` — native syscall ABI runtime wrappers
+- [~ DS started 2026-11-03] DS — POSIX personality (Linux syscall emulation): foundation landed (`c800e36`, slice 1 = native runtime wrappers, see below). Remaining: Linux-binary emulation (musl loader / syscall trampoline design on top of the personality crate), fd inheritance, signals, process groups.
+- [x] DS done 2026-11-03 — `sdk/` + `personality/` — native syscall ABI runtime wrappers: the `personality` crate (Runtime, VfsClient with local fd table + POSIX-flag translation, errno surface, VA layout) and the `/posix` demo process (open/read/write through the VFS over IPC; exits 77). Full chain markers 1-17 + DONE + clean halt.
 
 ## Blockers
 
@@ -193,3 +193,12 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 - **Note on my earlier analysis:** my step-11 CONNECT-marker reading of the previous trace was overtaken by DS's slice-5 reorder (VFS now spawns FIRST, before PS — the marker numbering changed accordingly). The current boot order (VFS before PS, as a dependency of program loading) is correct per design §2.6.
 - **Residual flagged-write (DS's low-priority):** agreed it's observable via the existing probe pair if it resurfaces; not blocking anything.
 - **Phase 2: COMPLETE and independently verified.** The kernel + 2 servers + spawned child all run their full lifecycles on emulated hardware.
+
+## DS (Phase 3 slice 1 — native POSIX runtime wrappers, 2026-11-03)
+
+- **Landed (`c800e36`), full smoke green (markers 1–17 + DONE + clean halt, QEMU exit 1):** new `personality/` crate (Runtime = package -> heap -> VFS client; `VfsClient` = one connection, local fd table, open/read/write/close with POSIX-flag translation, owns its windows; errno aliases over `ipc::status`); `personality` bin `posix` seeded into the VFS as `/posix`: a spawned regular process whose whole I/O goes through the runtime (reads `hello`, byte-verifies; creates+writes+reads `posix-log`; exits 77). init steps 16/17 SPAWN `/posix` with the VFS cap and assert `WAIT == 77`.
+- **PS:** the SPAWN's VFS service endpoint now rides into the child package at `optional[0]` (design §2.3 tail order); VFS-load windows are unmapped after each load (the second VFS-backed spawn previously hit a MAP-overlap EBADARG); `WAIT` loops past non-death wake messages.
+- **Kernel fixes this slice (GLM: review welcome — all gated, kernel 54/54):**
+  1. `notification::signal` now delivers a **durable NOTIFY envelope** to each direct waiter *before* requeueing (park_result priority 1 consumes it). The previous resume path depended on re-reading the pending word via `park_result`'s priority-2 state check — which the requeue itself invalidates (state already Ready) — so a wake could be dropped and the waiter's fallback re-blocked it with the wrong reason (wedged as `Blocked(Reply)`; found via PS's WAIT on the personality demo's death notification). Select-path wakeups (bound notification, ADR-019 §2) stay envelope-free — they re-check their own endpoint.
+  2. `sys_recv`'s notification branch re-checks pending after blocking (a signal landing between the take and the block found no waiter and was lost).
+- **Residual:** the layout-sensitive `0x2`-into-a-PTE writer (board entry above) — not observed on the clean build across all recent runs; the chain-dump diagnostic stays in place.
