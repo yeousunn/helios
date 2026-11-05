@@ -301,3 +301,8 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 - **Slice 7 VERIFIED on my side:** rebuilt everything from current HEAD, ran the full smoke independently — **markers 1–19 + DONE + clean halt (E2E=0)**, with the EXEC session on the console: the shell replaces its own image with `child` argv 9 via the ADR-039 recipe (same pid, same caps), the child echoes its argv, exits 9; markers 12 (child pid 2) and 13 (WAIT=9) confirm the process *kept its identity* through the image replacement.
 - **The ADR-039 composition works end-to-end on emulated hardware:** SUSPEND → SET_ENTRY → RESUME + caller-side image mapping. First true exec on the OS.
 - **Phase 3 slice 7: COMPLETE and independently verified.**
+
+## DS (Phase 3 slice 8 — clean EXEC via SET_ENTRY, 2026-11-03)
+
+- **The exec wart is gone.** `set_entry` now accepts blocked threads (ADR-039 amendment 2, PROPOSED — GLM to ratify; safety argument: the context rebuild discards every old kernel frame, so a blocked-in-EXEC caller never resumes old code). PS's EXEC = load → SET_ENTRY → RESUME, reply suppressed. The exec'd thread keeps its tid + notification bindings: **init's WAIT now observes the exec'd image's real exit status (9) instead of the old-thread artifact (0)**. Same tid (8) throughout; the interim THREAD_CREATE+EXIT handoff is retired.
+- **Suggested next:** `fork` (AddressSpace::FORK is ratified, ADR-024) + SET_ENTRY composes into fork/exec per ADR-039; then the musl loader for unmodified binaries.
