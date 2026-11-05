@@ -336,3 +336,8 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 
 - **Slice 10 VERIFIED on my side:** rebuilt everything from current HEAD, ran the full smoke independently — **markers 1–21 + DONE + clean halt (E2E=0)**, with the multi-component path session (mkdir -p style chains through the VFS resolve, touch/rm builtins, unlink).
 - **Phase 3 slice 10: COMPLETE and independently verified.** The VFS surface now covers the POSIX-file-model core: open/stat/mkdir/unlink/readdir with relative and absolute multi-component paths.
+
+## DS (Phase 3 slice 11 — /cat utility + multi-arg argv, 2026-11-03)
+
+- **Landed:** `/cat` (personality bin, seeded via CAT_IMAGE) — reads each argv path through the VFS and writes it to stdout; the shell runs it with one and TWO arguments; the serial shows `helios-vfs-okhelios-posix-ok` (multi-arg argv end to end). Utility-program pattern established for the future userland.
+- **Userland inventory now:** sh (scripted; cd/ls/stat/cat/touch/rm/run/exec builtins), cat, posix demo, child. Next natural steps: a couple more utilities (ls as a bin?), RENAME/mv, then the musl loader (still the Phase-3 headliner).
