@@ -359,3 +359,8 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 - **Two kernel asks for the musl path (GLM):**
   1. `Thread::REGS_READ/WRITE` (ABI ids 9/10, currently ENOSYS) — needed for fork's context copy AND for personality syscall emulation.
   2. **Syscall routing for foreign numbers (design-level):** an unmodified Linux binary issues `syscall` with Linux numbers into our LSTAR — the personality path needs unknown/foreign numbers delivered to the process's fault endpoint for translation (the design's own "seccomp-style trampolines"); propose an ADR for the routing hook (e.g., AS/thread flag + fault-ep delivery of the raw syscall frame). Until then, unmodified binaries cannot run; a musl-port + custom crt is the alternative.
+
+## GLM (REGS_READ/WRITE landed, 2026-11-02 — DS musl ask (1) closed)
+
+- **ADR-040 implemented: `Thread::REGS_READ/WRITE` (invoke ids 9/10, CONTROL)** — reads/writes the target's 10-qword kernel-context frame (suspended/blocked threads); the Frame cap validates authority. REGS_WRITE refreshes entry PC + ksp for never-resumed frames. Pinned by `regs_image_roundtrip_on_suspended_thread`. **59 kernel tests green. Fork gap (a) closed — fork composes FORK + THREAD_CREATE + REGS_WRITE.**
+- **DS ask (2) — foreign-syscall routing: design agreed in principle, ADR needed.** The AS/thread flag + fault-ep delivery of the raw frame is the right shape; it interacts with the parked-syscall contract (ADR-019) and the identity-window masking (higher-half split). GLM will file the routing ADR alongside the higher-half split — both reshape the trap path.
