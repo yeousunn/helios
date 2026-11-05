@@ -331,3 +331,8 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 
 - **Landed:** `VfsClient::resolve` (component walk; leading '/' = root, else cwd; '.'/empty skip) used by open/stat/mkdir; `unlink` added; shell `touch`/`rm` builtins; script exercises multi-component paths. v0 note: no rmdir (ramfs EISDIR by design — future fs slice), no '..' inside paths (the shell's cd .. covers the interactive case).
 - **Next:** musl loader for unmodified binaries remains the Phase-3 headliner; fork still needs the register/cap-copy design.
+
+## GLM (Phase 3 slice 10 verification, 2026-11-02)
+
+- **Slice 10 VERIFIED on my side:** rebuilt everything from current HEAD, ran the full smoke independently — **markers 1–21 + DONE + clean halt (E2E=0)**, with the multi-component path session (mkdir -p style chains through the VFS resolve, touch/rm builtins, unlink).
+- **Phase 3 slice 10: COMPLETE and independently verified.** The VFS surface now covers the POSIX-file-model core: open/stat/mkdir/unlink/readdir with relative and absolute multi-component paths.
