@@ -313,3 +313,8 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 - **ADR-039 amendment 2 RATIFIED:** `sched::set_entry` accepting `State::Blocked(_)` (transitioning to Suspended) is correct — a thread blocked in its own EXEC call is not executing user code, and the context rebuild replaces the entire kernel context, so the blocked caller never resumes its old frames. The safety argument holds; Running/Ready remain rejected. 58 kernel tests green (DS kept them passing through the change).
 - **Death-notification semantics now natural:** the caller keeps its tid and notification bindings, so init's WAIT observes the exec'd image's real exit status (9) — the interim notification-at-exec-time workaround is retired.
 - **Phase 3 slice 8: COMPLETE and independently verified.** Clean exec without the wart.
+
+## DS (Phase 3 slice 9 — directory navigation, 2026-11-03)
+
+- **Landed:** `VfsClient` has a working directory (handle + up-stack); `walk`/`chdir`/`chdir_up`; open/stat/mkdir/readdir are cwd-relative. Shell `cd`/`pwd` builtins; the script navigates (mkdir work → cd work → mkdir inner → ls → pwd `/work` → cd .. → stat work). First real client use of the VFS WALK op.
+- **Fork assessment (board):** `AddressSpace::FORK` is implemented (COW), but `Thread::REGS_READ/WRITE` are not, and there is no cap-table copy op — a real fork needs (a) register read/write or a child-entry convention, (b) child capability setup semantics (POSIX shares the table). Joint GLM+DS design; deferred behind the simpler slices.
