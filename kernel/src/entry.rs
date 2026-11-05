@@ -397,6 +397,8 @@ fn thread_invoke(
     const BIND_DEATH_NOTIFICATION: u16 = 12;
     const THREAD_CREATE: u16 = 13;
     const SET_ENTRY: u16 = 14;
+    const REGS_READ: u16 = 9;
+    const REGS_WRITE: u16 = 10;
 
     let control_ok = sched::get(target)
         .map(|t| t.process.0 == pid.0 || cap.rights.contains(Rights::CONTROL))
@@ -446,6 +448,37 @@ fn thread_invoke(
             match sched::set_entry(target, pc) {
                 Ok(()) => SyscallReturn::ok(msg.tag, [0, pc, 0, 0]),
                 Err(_) => SyscallReturn::err(ipc::status::EBADSTATE),
+            }
+        }
+        REGS_READ | REGS_WRITE => {
+            // syscall-abi §7 ids 9/10: caps[0] = Frame validating the access.
+            // v0: the image lives in the TARGET's kernel-context frame (the
+            // suspended/forked child's own stack) — the Frame cap validates
+            // the caller's authority; the kernel reads/writes the target's
+            // kstack image directly.
+            let Some(cs) = msg.descriptor(0).filter(|cs| cs.handle() != 0) else {
+                return SyscallReturn::err(ipc::status::EBADARG);
+            };
+            let Ok(fc) = proc::get_cap(pid, cs.handle()) else {
+                return SyscallReturn::err(ipc::status::EBADCAP);
+            };
+            if fc.typ != ObjType::Frame {
+                return SyscallReturn::err(ipc::status::EBADARG);
+            }
+            let mut image = [0u64; crate::sched::REG_IMAGE_QWORDS];
+            if msg.tag.label() == 9 {
+                match sched::regs_read(target, &mut image) {
+                    Ok(()) => SyscallReturn::ok(msg.tag, [image[0], image[2], image[1], 0]),
+                    Err(_) => SyscallReturn::err(ipc::status::EBADSTATE),
+                }
+            } else {
+                for (dst, src) in image.iter_mut().zip(msg.words.iter()) {
+                    *dst = *src;
+                }
+                match sched::regs_write(target, &image, 2) {
+                    Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
+                    Err(_) => SyscallReturn::err(ipc::status::EBADSTATE),
+                }
             }
         }
         THREAD_CREATE => {

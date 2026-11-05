@@ -540,6 +540,60 @@ pub fn resume(id: ThreadId) -> SchedResult<()> {
 /// after the rewrite it never resumes its old frames: the fresh trampoline
 /// context replaces the whole kernel context, so the rebuilt stack IS the
 /// thread's next resume. Running/Ready threads are still rejected).
+/// Register image for a SUSPENDED thread — the initial context frame
+/// `init_context` builds (hal-x86_64 layout, ADR-039 §regs): 10 qwords
+/// below kstack_top (index 0 = [top-1] = arg, 2 = entry, 3 = trampoline,
+/// 5..10 = callee-saved). REGS_READ/WRITE transfer this image.
+pub const REG_IMAGE_QWORDS: usize = 10;
+
+/// Read a SUSPENDED thread's initial-context register image (REGS_READ,
+/// syscall-abi §7 id 9) into `out`.
+pub fn regs_read(id: ThreadId, out: &mut [u64; REG_IMAGE_QWORDS]) -> SchedResult<()> {
+    let mut guard = SCHED.lock();
+    let s = guard.as_mut().ok_or(SchedError::NoSuchThread)?;
+    let slot = find_slot(s, id)?;
+    let t = s.slots.threads[slot].as_ref().unwrap();
+    if t.state != State::Suspended && !matches!(t.state, State::Blocked(_)) {
+        return Err(SchedError::NotRunnable);
+    }
+    if t.kstack_top == 0 {
+        return Err(SchedError::NoSuchThread);
+    }
+    crate::mem::read_reg_image(t.kstack_top, out);
+    Ok(())
+}
+
+/// Write a SUSPENDED/BLOCKED thread's register image (REGS_WRITE, id 10).
+/// `pc_idx` selects the image qword that is the entry PC (hal layout: 2).
+pub fn regs_write(id: ThreadId, image: &[u64; REG_IMAGE_QWORDS], pc_idx: usize) -> SchedResult<()> {
+    let mut guard = SCHED.lock();
+    let s = guard.as_mut().ok_or(SchedError::NoSuchThread)?;
+    let slot = find_slot(s, id)?;
+    let (quiescent, kstack_top, old_ksp) = {
+        let t = s.slots.threads[slot].as_ref().unwrap();
+        (
+            matches!(t.state, State::Suspended | State::Blocked(_)),
+            t.kstack_top,
+            t.ksp,
+        )
+    };
+    if !quiescent || kstack_top == 0 {
+        return Err(SchedError::NotRunnable);
+    }
+    if pc_idx >= REG_IMAGE_QWORDS {
+        return Err(SchedError::NotRunnable);
+    }
+    crate::mem::write_reg_image(kstack_top, image);
+    let t = s.slots.threads[slot].as_mut().unwrap();
+    t.initial_pc = image[pc_idx];
+    // Only rewrite ksp for a never-resumed (init-context) frame; a blocked
+    // thread's live ksp points into its own save area and is left alone.
+    if old_ksp == kstack_top - REG_IMAGE_QWORDS as u64 * 8 || old_ksp == 0 {
+        t.ksp = kstack_top - REG_IMAGE_QWORDS as u64 * 8;
+    }
+    Ok(())
+}
+
 pub fn set_entry(id: ThreadId, pc: u64) -> SchedResult<()> {
     let mut guard = SCHED.lock();
     let s = guard.as_mut().ok_or(SchedError::NoSuchThread)?;
@@ -1074,5 +1128,31 @@ mod tests {
         assert_eq!(switched, b, "preemption round-robins within the level");
         assert_eq!(current(), b);
         assert_eq!(get(a).unwrap().state, State::Ready);
+    }
+    #[test]
+    fn regs_image_roundtrip_on_suspended_thread() {
+        setup();
+        let p = ObjRef(1);
+        let t = spawn_with(p, 100, 0x401000).unwrap();
+        // Real backing RAM for the fake kstack frame (host tests).
+        static FAKE: Mutex<[u64; 512]> = Mutex::new([0; 512]);
+        let fake = FAKE.lock();
+        let base = fake.as_ptr() as u64;
+        set_kstack(t, base, 1).unwrap();
+        // Emulate init_context: zero the 10 image qwords below the top.
+        crate::mem::paint_range(base + 4096 - 80, 80, 0);
+        drop(fake);
+        let _ = pick_next(); // t Running
+        suspend(t).unwrap();
+
+        let mut image = [0u64; REG_IMAGE_QWORDS];
+        regs_read(t, &mut image).unwrap();
+        assert_eq!(image[0], 0, "arg");
+        image[0] = 0xdead;
+        image[2] = 0x405000;
+        regs_write(t, &image, 2).unwrap();
+
+        let t2 = get(t).unwrap();
+        assert_eq!(t2.initial_pc, 0x405000);
     }
 }

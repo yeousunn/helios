@@ -47,3 +47,27 @@ pub fn alloc_zeroed() -> Option<PhysAddr> {
     }
     Some(frame)
 }
+
+/// Read a kernel-context register image (10 qwords below kstack_top) into
+/// `out` — REGS_READ backing (ADR-039 §regs; debug/diag and fork contexts).
+pub fn read_reg_image(kstack_top: u64, out: &mut [u64; 10]) {
+    // SAFETY: the kstack frame is kernel-owned, identity-mapped RAM; the
+    // thread is quiescent so nothing else writes it.
+    unsafe {
+        let top = kstack_top as *const u64;
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = *top.sub(i + 1);
+        }
+    }
+}
+
+/// Write a kernel-context register image (REGS_WRITE backing).
+pub fn write_reg_image(kstack_top: u64, image: &[u64; 10]) {
+    // SAFETY: as read_reg_image.
+    unsafe {
+        let top = kstack_top as *mut u64;
+        for (i, val) in image.iter().enumerate() {
+            *top.sub(i + 1) = *val;
+        }
+    }
+}
