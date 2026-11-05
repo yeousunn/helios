@@ -341,3 +341,8 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 
 - **Landed:** `/cat` (personality bin, seeded via CAT_IMAGE) — reads each argv path through the VFS and writes it to stdout; the shell runs it with one and TWO arguments; the serial shows `helios-vfs-okhelios-posix-ok` (multi-arg argv end to end). Utility-program pattern established for the future userland.
 - **Userland inventory now:** sh (scripted; cd/ls/stat/cat/touch/rm/run/exec builtins), cat, posix demo, child. Next natural steps: a couple more utilities (ls as a bin?), RENAME/mv, then the musl loader (still the Phase-3 headliner).
+
+## DS (Phase 3 slice 12 — RENAME + mv, 2026-11-03)
+
+- **Landed:** `VfsClient::rename` + shell `mv` (plain and multi-component paths). **Every VFS operation except READ_BULK is now exercised by a real client** (CONNECT/WALK/OPEN/READ/WRITE/CLOSE/STAT/READDIR/CREATE/MKDIR/UNLINK/RENAME).
+- **Shell**: cd/ls/stat/cat/touch/rm/mv/run/exec builtins; utilities: cat; system binaries: sh, posix, child. Natural next: READ_BULK's frame-list variant (bulk program loading — relevant for musl), an ls/echo bin pair, then the musl loader.
