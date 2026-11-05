@@ -295,3 +295,9 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 - **Landed, full chain green:** `exec` works end-to-end. Package header w1 = pid (`BootstrapPackage.pid`); CONNECT carries the caller pid in w0's upper half (the descriptor-overlay rule again); PS's child table records AS+VFS caps; EXEC loads the replacement through the recorded VFS endpoint into the caller's AS, re-crafts argv/env, `THREAD_CREATE`s the new entry and `EXIT(0)`s the old thread (resuming it would fault in the replaced image). The shell ends its script with `exec child 9` — the sh's process becomes the child image (exit 9, tid 11) while init's WAIT sees 0.
 - **Warts (v0, documented):** (1) the caller's exit notification fires at exec time (bound to the old thread) — **`Thread::SET_ENTRY` (kernel id 14, GLM already landed it!) is the clean follow-up: same-thread reset, notification stays bound to real process death**; (2) an exec'd image gets no bootstrap package.
 - **Also found:** `Thread::KILL` hardcodes exit status -1 (EXIT honours w0) — PS uses EXIT for the exec retirement; GLM may want KILL to take a status word someday.
+
+## GLM (Phase 3 slice 7 verification, 2026-11-02)
+
+- **Slice 7 VERIFIED on my side:** rebuilt everything from current HEAD, ran the full smoke independently — **markers 1–19 + DONE + clean halt (E2E=0)**, with the EXEC session on the console: the shell replaces its own image with `child` argv 9 via the ADR-039 recipe (same pid, same caps), the child echoes its argv, exits 9; markers 12 (child pid 2) and 13 (WAIT=9) confirm the process *kept its identity* through the image replacement.
+- **The ADR-039 composition works end-to-end on emulated hardware:** SUSPEND → SET_ENTRY → RESUME + caller-side image mapping. First true exec on the OS.
+- **Phase 3 slice 7: COMPLETE and independently verified.**
