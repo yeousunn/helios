@@ -238,9 +238,13 @@ pub extern "C" fn _start() -> ! {
                 methods::process::SPAWN => {
                     // The caller's spawn blob sits in ITS window pair (slot i).
                     let win_base = PS_WINDOW_VA_BASE + ((i - 1) as u64) * 0x2000;
-                    spawn_reply(&mut sys, &package, &req, factory, service_ep, win_base)
+                    Some(spawn_reply(
+                        &mut sys, &package, &req, factory, service_ep, win_base,
+                    ))
                 }
-                methods::process::WAIT => wait_reply(&mut sys, &req),
+                methods::process::WAIT => Some(wait_reply(&mut sys, &req)),
+                // `None` = exec took effect: the caller's context was replaced
+                // and must not receive the reply.
                 methods::process::EXEC => exec_reply(
                     &mut sys,
                     &package,
@@ -248,7 +252,7 @@ pub extern "C" fn _start() -> ! {
                     CONN_PIDS[i - 1].load(Ordering::Relaxed),
                     PS_WINDOW_VA_BASE + ((i - 1) as u64) * 0x2000,
                 ),
-                methods::process::KILL => {
+                methods::process::KILL => Some({
                     let target = req.words[0];
                     if let Some(slot) = child_slot(target) {
                         // Kill the spawned child via its thread-control cap.
@@ -267,14 +271,16 @@ pub extern "C" fn _start() -> ! {
                         let _ = sys.send(REPLY_CAP, &ack);
                         Syscalls::new(&mut raw).exit(req.words[1] as i32);
                     }
-                }
-                label => {
+                }),
+                label => Some({
                     let mut reply = Message::new(label);
                     reply.words[0] = ipc::status::ENOSYS as i64 as u64;
                     reply
-                }
+                }),
             };
-            let _ = sys.reply(&reply);
+            if let Some(reply) = reply {
+                let _ = sys.reply(&reply);
+            }
         }
 
         if !served {
@@ -809,24 +815,26 @@ fn craft_stack(
 /// thread) fires at the moment of exec rather than at process death — a
 /// `Thread::SET_ENTRY`-style primitive (board: ADR candidate) removes this.
 /// The image's segment range is unmapped wholesale before the load.
+/// Returns `None` when exec took effect (the caller's context was replaced —
+/// it must NOT receive a reply); `Some(reply)` carries a failure.
 fn exec_reply(
     sys: &mut Syscalls<'_, X86_64Syscalls>,
     package: &BootstrapPackage,
     factory: u32,
     caller_pid: u64,
     win_base: u64,
-) -> Message {
+) -> Option<Message> {
     let mut reply = Message::new(methods::process::EXEC);
     let Some(slot) = child_slot(caller_pid) else {
         reply.words[0] = ipc::status::EBADARG as i64 as u64;
-        return reply;
+        return Some(reply);
     };
     let (path_off, path_len, arg_off, arg_len, env_off, env_len) = match parse_spawn_blob(win_base)
     {
         Some(v) => v,
         None => {
             reply.words[0] = ipc::status::EBADARG as i64 as u64;
-            return reply;
+            return Some(reply);
         }
     };
     let as_cap = CH_AS[slot].load(Ordering::Relaxed);
@@ -834,13 +842,13 @@ fn exec_reply(
     let thread_cap = CH_CAPS[slot].load(Ordering::Relaxed);
     if as_cap == 0 || vfs_cap == 0 || thread_cap == 0 {
         reply.words[0] = ipc::status::EBADCAP as i64 as u64;
-        return reply;
+        return Some(reply);
     }
     let image = match load_via_vfs(sys, package, factory, vfs_cap, path_off, path_len, win_base) {
         Ok(bytes) => bytes,
         Err(e) => {
             reply.words[0] = e as i64 as u64;
-            return reply;
+            return Some(reply);
         }
     };
     let elf = match ElfImage::parse(&image) {
@@ -848,7 +856,7 @@ fn exec_reply(
         Err(e) => {
             reply.words[0] = ipc::status::EBADARG as i64 as u64;
             let _ = e;
-            return reply;
+            return Some(reply);
         }
     };
     // Unmap the old image segments + the crafted top stack page, then load the
@@ -890,32 +898,23 @@ fn exec_reply(
     })();
     if let Err(e) = loaded {
         reply.words[0] = e as i64 as u64;
-        return reply;
+        return Some(reply);
     }
-    // Fresh thread in the SAME process at the new entry (ADR-033 §1).
-    let mut m = Message::new(methods::thread::THREAD_CREATE);
+    // ADR-039 recipe (amended): the caller is blocked in this very call —
+    // quiescent. SET_ENTRY rewrites its entry + rebuilds the kernel context
+    // (fresh trampoline at USER_STACK_TOP) and RESUME re-queues it straight
+    // into the new image. The old thread never resumes its frames; its
+    // identity (tid, notification bindings) survives, so the parent's death
+    // notification fires at real process death with the NEW image's status.
+    let mut m = Message::new(methods::thread::SET_ENTRY);
     m.words[0] = elf.entry;
-    let tc = sys.invoke(thread_cap, &m);
-    match tc {
-        Ok(_) => {
-            // The replacement thread is live; the caller's old thread must NOT
-            // resume — its saved RIP points into the image we just replaced
-            // (resuming faults at whatever the new bytes decode to). Retire it
-            // with EXIT status 0 (KILL would force -1 and trip the parent's
-            // WAIT): exec never returns. Its death also fires the parent's
-            // notification (the documented v0 wart — `Thread::SET_ENTRY`,
-            // kernel id 14, is the clean follow-up).
-            let mut m = Message::new(methods::thread::EXIT);
-            m.words[0] = 0;
-            let _ = sys.invoke(thread_cap, &m);
-            reply.words[1] = elf.entry;
-            reply
-        }
-        Err(e) => {
-            reply.words[0] = e as i64 as u64;
-            reply
-        }
+    if let Err(e) = sys.invoke(thread_cap, &m) {
+        reply.words[0] = e as i64 as u64;
+        return Some(reply);
     }
+    let mut m = Message::new(methods::thread::RESUME);
+    let _ = sys.invoke(thread_cap, &m);
+    None
 }
 
 /// Parse the v0.2 spawn/exec payload blob from `win_base`

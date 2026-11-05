@@ -602,7 +602,11 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
                 0xE1 | ((reply.words[0] as u64 & 0xFF) << 8),
             ));
         };
-        if waited.words[1] != 0 {
+        // The shell ends its script with `exec child 9`: the process BECOMES
+        // the child image, and — because SET_ENTRY keeps the thread's
+        // identity — the parent now observes the exec'd program's real exit
+        // status (9). (Before ADR-039 composition this raced at 0.)
+        if waited.words[1] != 9 {
             return Err(fail_code(STEP_SH_WAIT, 0xE2 | (waited.words[1] << 8)));
         }
         mark(raw, info.debug_ep, STEP_SH_WAIT, waited.words[1]);

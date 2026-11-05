@@ -534,17 +534,25 @@ pub fn resume(id: ThreadId) -> SchedResult<()> {
     }
 }
 
-/// Rewrite a SUSPENDED thread's entry PC and rebuild its initial kernel
-/// context (exec semantics, ADR-039). The thread must be Suspended: racing a
-/// running thread's entry rewrite is a v0 hazard.
+/// Rewrite a quiescent thread's entry PC and rebuild its initial kernel
+/// context (exec semantics, ADR-039; amended: blocked threads are accepted —
+/// a thread blocked in its own `EXEC` call is not executing user code, and
+/// after the rewrite it never resumes its old frames: the fresh trampoline
+/// context replaces the whole kernel context, so the rebuilt stack IS the
+/// thread's next resume. Running/Ready threads are still rejected).
 pub fn set_entry(id: ThreadId, pc: u64) -> SchedResult<()> {
     let mut guard = SCHED.lock();
     let s = guard.as_mut().ok_or(SchedError::NoSuchThread)?;
     let slot = find_slot(s, id)?;
     let kstack_top = {
-        let t = s.slots.threads[slot].as_ref().unwrap();
-        if t.state != State::Suspended {
-            return Err(SchedError::NotRunnable);
+        let t = s.slots.threads[slot].as_mut().unwrap();
+        match t.state {
+            State::Suspended | State::Blocked(_) => {
+                // Blocked-in-exec-call: transition to Suspended (resume() then
+                // re-queues it straight into the rebuilt context).
+                t.state = State::Suspended;
+            }
+            _ => return Err(SchedError::NotRunnable),
         }
         t.kstack_top
     };

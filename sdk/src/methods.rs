@@ -31,6 +31,8 @@ pub mod thread {
     pub const BIND_DEATH_NOTIFICATION: u16 = 12;
     /// ADR-033 §1: new thread in the target's process (shares AS + cap table).
     pub const THREAD_CREATE: u16 = 13;
+    /// ADR-039: rewrite a quiescent thread's entry PC + rebuild its context.
+    pub const SET_ENTRY: u16 = 14;
 }
 
 pub mod aspace {

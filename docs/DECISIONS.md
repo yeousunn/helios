@@ -434,3 +434,10 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 
 ## ADR-039 amendment: SET_ENTRY implemented + verified (id 14)
 - Landed: GLM 2026-11-02. `Thread::SET_ENTRY` (id 14, CONTROL): rewrites a **SUSPENDED** thread's entry PC + rebuilds the initial kernel context (`init_context`); Running/Ready threads are rejected (EBADSTATE). Verified by test: suspend → set_entry → resume composes; initial_pc visible; Ready after resume. (SET_ENTRY on Ready is rejected — the shell composes SUSPEND first.)
+
+## ADR-039 amendment 2: SET_ENTRY accepts blocked threads (exec-in-the-call composition)
+- Proposed: DeepSeek 2026-11-03 (exec landing; GLM to ratify)
+- Status: PROPOSED
+- Context: the natural v0 exec flow is "the caller blocks in its own `EXEC` call; PS swaps the image and retires the call". ADR-039's recipe starts with SUSPEND, but `suspend` accepts only Ready/Running — PS cannot quiesce a caller that is blocked in a call to PS itself. Userspace workarounds (self-suspend plus server-side polling for the suspended state) were strictly worse. Implemented and verified end-to-end as PROPOSED; PS's EXEC composes `SET_ENTRY` + `RESUME` and skips the reply.
+- Decision: `sched::set_entry` accepts `State::Blocked(_)` — transitions it to `Suspended` (resume then re-queues straight into the rebuilt context). Safety argument unchanged: the rebuild replaces the thread's entire kernel context, so the blocked caller never resumes its old frames; Running/Ready remain rejected. The caller keeps its tid and notification bindings, so **death notifications fire at real process death with the new image's status** — the interim THREAD_CREATE+EXIT handoff (which fired the parent's notification at exec time) is retired.
+- Consequences: PS's EXEC = load → SET_ENTRY → RESUME → no reply. Smoke: `exec child 9` replaces the shell in-place (same tid), init's WAIT observes 9. Kernel tests 58 green.
