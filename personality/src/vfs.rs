@@ -468,6 +468,43 @@ impl VfsClient {
         Ok(())
     }
 
+    /// `RENAME` (move) `src` to `dst` (both cwd/parent-relative; the ramfs
+    /// replaces an existing destination file but never a directory).
+    pub fn rename<R: RawSyscalls>(
+        &mut self,
+        sys: &mut Syscalls<R>,
+        src: &[u8],
+        dst: &[u8],
+    ) -> Result<(), Status> {
+        if src.is_empty() || dst.is_empty() || src.len() > WINDOW || dst.len() > WINDOW {
+            return Err(EINVAL);
+        }
+        let mut src_last = [0u8; 64];
+        let mut dst_last = [0u8; 64];
+        let (src_dir, src_len) = self.resolve(sys, src, &mut src_last)?;
+        let (dst_dir, dst_len) = self.resolve(sys, dst, &mut dst_last)?;
+        // Both names travel in the arg window: source at 0, destination at 64.
+        // SAFETY: arg window mapped R|W by `connect` (64+64 < 4096).
+        unsafe {
+            core::ptr::copy_nonoverlapping(src_last.as_ptr(), ARG_WINDOW_VA as *mut u8, src_len);
+            core::ptr::copy_nonoverlapping(
+                dst_last.as_ptr(),
+                (ARG_WINDOW_VA + 64) as *mut u8,
+                dst_len,
+            );
+        }
+        let mut req = Message::new(methods::vfs::RENAME);
+        req.words[0] = src_dir;
+        req.words[1] = src_len as u64; // Span { off 0, len }
+        req.words[2] = dst_dir;
+        req.words[3] = (64u64 << 32) | dst_len as u64; // Span { off 64, len }
+        let reply = sys.call(self.conn, &req)?;
+        if reply.words[0] != 0 {
+            return Err(reply.words[0] as i64 as i32);
+        }
+        Ok(())
+    }
+
     /// `UNLINK` a path (a file, or an empty directory).
     pub fn unlink<R: RawSyscalls>(
         &mut self,

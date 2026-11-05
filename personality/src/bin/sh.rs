@@ -56,6 +56,8 @@ enum Command {
     Touch(&'static [u8]),
     /// Remove a file or an empty directory (UNLINK).
     Rm(&'static [u8]),
+    /// Rename/move a path (RENAME).
+    Mv(&'static [u8], &'static [u8]),
     /// Replace the shell's own image with `path` (must be the last command).
     Exec {
         path: &'static [u8],
@@ -90,6 +92,15 @@ const SCRIPT: &[Command] = &[
     Command::Stat(b"work/inner"),
     Command::Touch(b"work/gone"),
     Command::Rm(b"work/gone"),
+    // mv (RENAME): plain, then through multi-component paths.
+    Command::Touch(b"moved"),
+    Command::Mv(b"moved", b"moved2"),
+    Command::Stat(b"moved2"),
+    Command::Rm(b"moved2"),
+    Command::Touch(b"work/a"),
+    Command::Mv(b"work/a", b"work/b"),
+    Command::Stat(b"work/b"),
+    Command::Rm(b"work/b"),
     Command::Ls,
     Command::Cat(b"hello"),
     Command::Run {
@@ -224,6 +235,11 @@ extern "C" fn sh_main(argc: u64, argv: *const *const u8, envp: *const *const u8)
             }
             Command::Rm(path) => {
                 if let Err(e) = rt.vfs.unlink(&mut sys, path) {
+                    exit(&mut sys, fail | (e & 0xFF));
+                }
+            }
+            Command::Mv(src, dst) => {
+                if let Err(e) = rt.vfs.rename(&mut sys, src, dst) {
                     exit(&mut sys, fail | (e & 0xFF));
                 }
             }
