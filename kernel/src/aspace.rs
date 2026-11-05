@@ -734,6 +734,7 @@ fn vmm_err<T>(e: VmmError) -> Result<T, VmmError> {
 /// process generation — DS anomaly 3). Tombstones keep probe chains valid.
 struct FrameRefs {
     slots: [RefEntry; REFS_CAPACITY],
+    untrackable: u64,
 }
 
 const REFS_CAPACITY: usize = 1024;
@@ -753,6 +754,7 @@ impl FrameRefs {
                 addr: REF_EMPTY,
                 count: 0,
             }; REFS_CAPACITY],
+            untrackable: 0,
         }
     }
 
@@ -795,7 +797,17 @@ impl FrameRefs {
                 self.slots[idx].addr = a;
                 self.slots[idx].count += 1;
             }
-            None => crate::kwarn!("FrameRefs table full at {}", addr),
+            None => {
+                // Table full: the frame becomes implicitly immortal (release
+                // is a no-op for it). One summary warning, not one per frame.
+                self.untrackable += 1;
+                if self.untrackable == 1 {
+                    crate::kwarn!(
+                        "FrameRefs full: frames acquired beyond capacity are                          never freed ({} untrackable so far)",
+                        self.untrackable
+                    );
+                }
+            }
         }
     }
 
@@ -812,7 +824,7 @@ impl FrameRefs {
                 }
                 remaining
             }
-            None => 0,
+            None => 0, // untracked frame: release is a no-op (immortal)
         }
     }
 
