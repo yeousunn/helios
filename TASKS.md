@@ -375,3 +375,15 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
   5. **`jmp rust_start`** — the Rust entry is `kernel_main` (undefined symbol → the 33 build errors DS/I hit).
   6. Minor: stack at 0x7c00 (boot-sector convention; the image defines its own 16 KiB .bss stack and never uses it), page tables in `.rodata` at link-dependent addresses (no linker script to pin them), LGDT using the 10-byte 64-bit descriptor form in 32-bit mode.
 - **Resolution:** the M3-verified committed boot.S (PVH entry, populated 4-level tables, correct GDT, `kernel_main` entry) is the working path — NV's file stays in the stash as a reference. No action needed; the boot chain has been green since M1.
+
+## GLM (NV re-entry plan, 2026-11-02)
+
+- **Do we need to fix NV's work? No.** The post-mortem (above) shows NV's stashed boot.S is a dead-end approach (multiboot2 unsupported by QEMU `-kernel`, no 32-bit code segment, empty PT) — the working PVH boot.S replaced it and is verified green. The stash stays as a reference only; discard at will.
+- **NV's committed work is still load-bearing:** hal/ trait surfaces (UART, IRQ, trap-decode, layout, SMP/boot-protocol/driver traits), `hal/x86_64` implementations, `tools/qemu-test.sh`, `drivers/` traits. Nothing NV committed needs fixing.
+- **NV re-entry procedure (fresh session, Nemotron model, this folder):**
+  1. Paste the re-entry prompt (below) — it points at AGENTS.md, TASKS.md, the post-mortem, and a **new task that avoids NV's old failure mode** (assembly boot work, where it stalled).
+  2. NV's first task: **land its own untracked artifacts** — `.github/workflows/ci.yml` (CI is real and useful; verify the toolchain steps match current gates) and `tests/src/qemu_harness.rs` (needs updating to the current boot path: PVH kernel-boot ELF, `build/initrd.img` staging, ADR-029 exit codes — the old KERNEL_IMAGE path is stale).
+  3. Then: UART RX → interactive shell input wiring (kernel console-in path is landed, ADR-038; the console-server → client-stdin forwarding is DS's slice to coordinate).
+  4. Do NOT resume the stashed boot.S work.
+- **Re-entry prompt for the NV session:**
+  "You are Nemotron, the HAL/infrastructure agent on the Helios OS project (Rust microkernel). Read AGENTS.md, TASKS.md (especially the NV post-mortem and re-entry plan), and docs/DECISIONS.md ADR-025/029/038 first. Your previous session stalled mid-boot-bring-up; that work is superseded — the boot chain is green via the committed PVH boot.S (do NOT touch boot.S or resume the stashed approach). Your tasks now: (1) land the untracked `.github/workflows/ci.yml` after verifying its toolchain steps match the current quality gates (cargo build/clippy/fmt/test + qemu-test.sh, x86_64-unknown-none target provisioning); (2) update `tests/src/qemu_harness.rs` to the current boot path (kernel-boot PVH ELF, build/initrd.img staging, ADR-029 exit-code mapping) and wire it as `tests/` member with a `qemu` feature; (3) then implement UART RX → console-server stdin forwarding per ADR-038 (kernel side is landed). Commit with [NV] prefix; quality gates: cargo build/clippy/fmt + the QEMU smoke."
