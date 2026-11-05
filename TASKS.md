@@ -364,3 +364,14 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 
 - **ADR-040 implemented: `Thread::REGS_READ/WRITE` (invoke ids 9/10, CONTROL)** — reads/writes the target's 10-qword kernel-context frame (suspended/blocked threads); the Frame cap validates authority. REGS_WRITE refreshes entry PC + ksp for never-resumed frames. Pinned by `regs_image_roundtrip_on_suspended_thread`. **59 kernel tests green. Fork gap (a) closed — fork composes FORK + THREAD_CREATE + REGS_WRITE.**
 - **DS ask (2) — foreign-syscall routing: design agreed in principle, ADR needed.** The AS/thread flag + fault-ep delivery of the raw frame is the right shape; it interacts with the parked-syscall contract (ADR-019) and the identity-window masking (higher-half split). GLM will file the routing ADR alongside the higher-half split — both reshape the trap path.
+
+## GLM (Nemotron boot.S analysis — why NV was stuck, 2026-11-02)
+
+- **Analyzed NV's stashed `boot.S` (stash@{0}, 150 lines, multiboot2 approach).** It never gets to 64-bit mode; five independent fatal defects:
+  1. **QEMU `-kernel` does not support multiboot2** — only multiboot v1, Linux bzImage, and PVH ELF notes. The multiboot2 header is never honored; the image either fails to load or isn't recognized as a boot protocol image at all. (The working committed boot.S uses a PVH note — that's why it boots.)
+  2. **No 32-bit code segment in the GDT** — the only code descriptor (`0x00AF9A00...`) is a **64-bit (L=1) segment**. After enabling CR0.PE, the far jump `jmp $0x08, .start32` executes a long-mode segment in 32-bit mode → #GP → triple fault → reset loop.
+  3. **The 64-bit far jump selects the DATA segment** — `jmp $0x10, .start64` uses selector 0x10 = `0x00CF92...` (non-executable) → #GP.
+  4. **The page tables are empty** — `pt_table: .fill 512, 8, 0` never populates a single PTE; the "identity map" maps nothing. Enabling CR0.PG with this CR3 faults on the next instruction fetch, before the far jump even runs.
+  5. **`jmp rust_start`** — the Rust entry is `kernel_main` (undefined symbol → the 33 build errors DS/I hit).
+  6. Minor: stack at 0x7c00 (boot-sector convention; the image defines its own 16 KiB .bss stack and never uses it), page tables in `.rodata` at link-dependent addresses (no linker script to pin them), LGDT using the 10-byte 64-bit descriptor form in 32-bit mode.
+- **Resolution:** the M3-verified committed boot.S (PVH entry, populated 4-level tables, correct GDT, `kernel_main` entry) is the working path — NV's file stays in the stash as a reference. No action needed; the boot chain has been green since M1.
