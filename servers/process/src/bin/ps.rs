@@ -39,8 +39,12 @@ include!(concat!(env!("OUT_DIR"), "/child_image.rs"));
 static HEAP: GlobalHeap = GlobalHeap::new();
 
 /// Connection endpoints currently served (each `CONNECT` mints one and the
-/// serve loop polls them round-robin). Round-robin slots (v0 capacity 8).
-const MAX_CONNS: usize = 8;
+/// serve loop polls them round-robin). Must exceed the number of LIVE
+/// connections for the whole run: the ring wraps at MAX_CONNS and an early
+/// connection (init's smoke session) being evicted by a newer one silently
+/// orphans its mailbox (found via the pipeline: connection #16 overwrote
+/// init's slot mid-smoke and its final WAIT went unconsumed).
+const MAX_CONNS: usize = 32;
 static CONNS: [AtomicU32; MAX_CONNS] = [const { AtomicU32::new(0) }; MAX_CONNS];
 static NEXT_CONN: AtomicUsize = AtomicUsize::new(0);
 
@@ -243,6 +247,7 @@ pub extern "C" fn _start() -> ! {
                     ))
                 }
                 methods::process::WAIT => Some(wait_reply(&mut sys, &req)),
+                methods::process::PIPE => Some(pipe_reply(&mut sys, factory)),
                 // `None` = exec took effect: the caller's context was replaced
                 // and must not receive the reply.
                 methods::process::EXEC => exec_reply(
@@ -321,6 +326,15 @@ fn connect_reply(
             return (reply, None);
         }
     };
+    // The slot's window VAs may still carry the previous (dead) connection's
+    // mappings — slot reuse after MAX_CONNS wraps. Unmap before re-mapping
+    // (v0: the stale frames leak; bounded by MAX_CONNS * 2 pages).
+    for va in [win_base, win_base + 4096] {
+        let mut un = Message::new(methods::aspace::UNMAP);
+        un.words[0] = va;
+        un.words[1] = 1;
+        let _ = sys.invoke(package.aspace, &un);
+    }
     for (frame, va, flags) in [
         (arg, win_base, methods::map_flags::R),
         (result, win_base + 4096, methods::map_flags::W),
@@ -381,11 +395,14 @@ fn spawn_reply(
     // SPAWN input caps, positionally (design §2.6): (vfs, stdin, stdout,
     // stderr). They ride into the child's package tail as `optional[0..4]`;
     // absent slots stay absent (holes preserved).
-    let mut extras: [Option<u32>; 4] = [None; 4];
+    let mut extras: [Option<(u32, Rights)>; 4] = [None; 4];
     for (i, slot) in extras.iter_mut().enumerate() {
-        *slot = req.descriptor(i).map(|cs| cs.handle()).filter(|h| *h != 0);
+        *slot = req
+            .descriptor(i)
+            .map(|cs| (cs.handle(), cs.rights()))
+            .filter(|(h, _)| *h != 0);
     }
-    let vfs_svc = extras[0];
+    let vfs_svc = extras[0].map(|(h, _)| h);
     // v0.2 SPAWN payload blob in the caller's CONNECT arg window (design
     // §2.6 "argv/env in the arg window"): `[u64 path_span][u64 argv_span]
     // [u64 env_span]` then path bytes, the argv area (NUL-separated strings)
@@ -469,7 +486,7 @@ fn spawn_child(
     argv_span: (usize, usize),
     env_span: (usize, usize),
     image_bytes: &[u8],
-    extras: [Option<u32>; 4],
+    extras: [Option<(u32, Rights)>; 4],
     win_base: u64,
 ) -> Result<(u64, u32, u32), i32> {
     // 1. Child address space.
@@ -543,9 +560,11 @@ fn spawn_child(
     caps[7] = CapSlot::pack(service_ep, Rights::SEND.union(Rights::GRANT));
     let mut total = bootstrap::FIXED_CAPS;
     for (i, extra) in extras.iter().enumerate() {
-        if let Some(handle) = extra {
-            caps[bootstrap::FIXED_CAPS + i] =
-                CapSlot::pack(*handle, Rights::SEND.union(Rights::GRANT));
+        if let Some((handle, rights)) = extra {
+            // Forward the rights the client requested for this slot (the
+            // kernel intersects with PS's own held rights at delivery). The
+            // previous hardcoded SEND|GRANT stripped RECV from pipe inputs.
+            caps[bootstrap::FIXED_CAPS + i] = CapSlot::pack(*handle, *rights);
             total = bootstrap::FIXED_CAPS + 1 + i;
         }
     }
@@ -565,7 +584,7 @@ fn spawn_child(
         thread_cap,
         exit_notif,
         child_as,
-        extras[0].unwrap_or(0),
+        extras[0].map(|(h, _)| h).unwrap_or(0),
     );
     Ok((pid, thread_cap, exit_notif))
 }
@@ -936,6 +955,43 @@ fn parse_spawn_blob(win_base: u64) -> Option<(usize, usize, usize, usize, usize,
         return None;
     }
     Some((path_off, path_len, arg_off, arg_len, env_off, env_len))
+}
+
+/// `PIPE`: mint a fresh endpoint pair and hand both ends to the caller
+/// (descriptor 0 = read end, 1 = write end). The caller decides which ends
+/// children receive; stream EOF is the `console::EOF` message a writer's
+/// `Runtime::exit` sends before dying.
+fn pipe_reply(sys: &mut Syscalls<'_, X86_64Syscalls>, factory: u32) -> Message {
+    let mut reply = Message::new(methods::process::PIPE);
+    let mut mint = |sys: &mut Syscalls<'_, X86_64Syscalls>| -> Result<u32, i32> {
+        let r = sys.invoke(factory, &Message::new(methods::factory::NEW_ENDPOINT))?;
+        let h = r.words[0] as u32;
+        if h == 0 {
+            return Err(ipc::status::ENOMEM);
+        }
+        Ok(h)
+    };
+    // A pipe is ONE endpoint (one mailbox): a send from the writer's cap is
+    // visible to the reader's cap of the SAME object. Two separate endpoints
+    // (the previous form) have independent mailboxes — the write parked in
+    // the writer's endpoint mailbox while the reader polled its own.
+    let ep = match mint(sys) {
+        Ok(h) => h,
+        Err(e) => {
+            reply.words[0] = e as i64 as u64;
+            return reply;
+        }
+    };
+    reply.tag = reply.tag.with_caps(2);
+    let _ = reply.set_descriptor(
+        0,
+        CapSlot::pack(ep, Rights::SEND.union(Rights::RECV).union(Rights::GRANT)),
+    );
+    let _ = reply.set_descriptor(
+        1,
+        CapSlot::pack(ep, Rights::SEND.union(Rights::RECV).union(Rights::GRANT)),
+    );
+    reply
 }
 
 /// `WAIT`: non-blocking poll of the child's death notification. A dead child

@@ -114,6 +114,7 @@ pub extern "C" fn _start() -> ! {
         &[b"42"],
         &[],
         vfs_ep,
+        None,
         rt.stdout_handle(),
     ) {
         Ok(pid) => pid,

@@ -83,10 +83,34 @@ impl PsClient {
         Ok(Self { conn })
     }
 
+    /// `PIPE`: mint an endpoint pair; returns (read end, write end).
+    pub fn pipe<R: RawSyscalls>(
+        &mut self,
+        sys: &mut Syscalls<R>,
+    ) -> Result<(Handle, Handle), Status> {
+        let m = Message::new(methods::process::PIPE);
+        let reply = sys.call(self.conn, &m)?;
+        if reply.words[0] != 0 {
+            return Err(reply.words[0] as i64 as i32);
+        }
+        let read = reply
+            .descriptor(0)
+            .map(|cs| cs.handle())
+            .filter(|h| *h != 0)
+            .ok_or(status::EBADCAP)?;
+        let write = reply
+            .descriptor(1)
+            .map(|cs| cs.handle())
+            .filter(|h| *h != 0)
+            .ok_or(status::EBADCAP)?;
+        Ok((read, write))
+    }
+
     /// `SPAWN` a program by VFS path. `vfs` is the caller's VFS service
-    /// endpoint (needed by PS to load the image); `stdout` optionally gives
-    /// the child a console endpoint (installed at the package's stdio slot).
-    /// Returns the child pid.
+    /// endpoint (needed by PS to load the image); `stdin`/`stdout`
+    /// optionally give the child stream endpoints (installed at the
+    /// package's stdio slots). Returns the child pid.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn<R: RawSyscalls>(
         &mut self,
         sys: &mut Syscalls<R>,
@@ -94,6 +118,7 @@ impl PsClient {
         argv: &[&[u8]],
         env: &[&[u8]],
         vfs: Option<Handle>,
+        stdin: Option<Handle>,
         stdout: Option<Handle>,
     ) -> Result<u64, Status> {
         let ok = sdk::spawn::write_spawn_blob(PS_ARG_WINDOW_VA, path, argv, env);
@@ -109,7 +134,13 @@ impl PsClient {
                 None => CapSlot::NULL,
             },
         );
-        let _ = m.set_descriptor(1, CapSlot::NULL); // stdin
+        let _ = m.set_descriptor(
+            1,
+            match stdin {
+                Some(h) => CapSlot::pack(h, Rights::SEND.union(Rights::RECV).union(Rights::GRANT)),
+                None => CapSlot::NULL,
+            },
+        );
         let _ = m.set_descriptor(
             2,
             match stdout {

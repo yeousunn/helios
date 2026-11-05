@@ -83,7 +83,7 @@ extern "C" fn cat_main(argc: u64, argv: *const *const u8, envp: *const *const u8
         let _ = rt.write_stdout(&mut sys, &buf[..n]);
         fail += 2;
     }
-    exit(&mut sys, 0)
+    rt.exit(&mut sys, 0)
 }
 
 #[panic_handler]

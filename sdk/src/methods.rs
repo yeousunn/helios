@@ -76,6 +76,10 @@ pub mod vfs {
 /// 32 bytes of text in `w0..w3` (little-endian, zero-padded).
 pub mod console {
     pub const WRITE: u16 = 0x0301;
+    /// End-of-stream on a stream endpoint (pipes): sent by a writer's
+    /// `Runtime::exit` before it dies; readers stop there, sink-style
+    /// consumers (the console) ignore it.
+    pub const EOF: u16 = 0x0302;
     /// Text bytes per console message.
     pub const TEXT_BYTES: usize = 32;
 }
@@ -106,6 +110,9 @@ pub mod process {
     pub const WAIT: u16 = 0x0111;
     pub const KILL: u16 = 0x0112;
     pub const EXEC: u16 = 0x0113;
+    /// Mint a pipe (an endpoint pair): reply carries descriptors 0 = read
+    /// end, 1 = write end (both `SEND|RECV|GRANT` downgraded to taste).
+    pub const PIPE: u16 = 0x0117;
     pub const FORK: u16 = 0x0114;
     pub const THREAD_CREATE: u16 = 0x0115;
     pub const THREAD_EXIT: u16 = 0x0116;

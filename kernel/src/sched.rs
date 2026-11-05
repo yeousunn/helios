@@ -272,8 +272,13 @@ pub fn set_initial_pc(id: ThreadId, pc: u64) -> SchedResult<()> {
     }
 }
 
-/// Kernel stack size per thread: 16 KiB (4 frames).
-pub const KSTACK_FRAMES: usize = 8;
+/// Kernel stack size per thread: 64 KiB (16 frames). Was 8 frames (32 KiB),
+/// which `proc::create`'s LLVM-materialized `CapTable::empty()` temporary
+/// (~32 KiB stack frame) overran exactly — the "0x2-into-a-PTE" clobber
+/// family: stack probes/writes below the kstack base landed in the page
+/// tables of the stack branch directly below. Bumped for headroom; the
+/// underlying giant temporary should still be removed (TASKS.md).
+pub const KSTACK_FRAMES: usize = 16;
 
 /// Stack-paint pattern for high-water accounting (ADR-037 follow-up):
 /// debug builds paint the unused tail of each kernel stack at thread start

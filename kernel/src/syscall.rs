@@ -188,7 +188,7 @@ pub fn sys_send(
             if cap.obj.0 == crate::init::DEBUG_EP_ID {
                 // Label 0xFFFF = single walk op; 0xFFFE = full stack sweep.
                 if msg.tag.label() == 0xFFFF {
-                    crate::debug::debug_walk(msg.words[0]);
+                    crate::debug::debug_walk(msg.words[0], msg.words[1]);
                     return Ok(ipc::status::OK);
                 }
                 if msg.tag.label() == 0xFFFE {

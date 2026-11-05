@@ -63,6 +63,13 @@ enum Command {
         path: &'static [u8],
         argv: &'static [&'static [u8]],
     },
+    /// `left | right`: left's stdout becomes right's stdin.
+    Pipeline {
+        left: (&'static [u8], &'static [&'static [u8]]),
+        right: (&'static [u8], &'static [&'static [u8]]),
+        expect_left: i32,
+        expect_right: i32,
+    },
     /// Spawn `path` with argv/env through PS; report `<path> -> <status>`;
     /// fail the script when the status differs from `expect`.
     Run {
@@ -143,6 +150,13 @@ const SCRIPT: &[Command] = &[
         argv: &[b"cat", b"hello", b"posix-log"],
         env: &[],
         expect: 0,
+    },
+    // THE FIRST PIPELINE: `cat hello posix-log | wc` (28 bytes over a pipe).
+    Command::Pipeline {
+        left: (b"cat", &[b"cat", b"hello", b"posix-log"]),
+        right: (b"wc", &[b"wc"]),
+        expect_left: 0,
+        expect_right: 0,
     },
     Command::Echo(b"sh ok"),
     // exec: replaces this shell with the child image, which echoes its argv
@@ -310,6 +324,55 @@ extern "C" fn sh_main(argc: u64, argv: *const *const u8, envp: *const *const u8)
                 let _ = rt.write_stdout(&mut sys, text);
                 let _ = rt.write_stdout(&mut sys, b"\n");
             }
+            Command::Pipeline {
+                left,
+                right,
+                expect_left,
+                expect_right,
+            } => {
+                let _ = rt.write_stdout(&mut sys, b"[pipe] ");
+                let (read_end, write_end) = match rt.ps.pipe(&mut sys) {
+                    Ok(p) => {
+                        let _ = rt.write_stdout(&mut sys, b"ok ");
+                        p
+                    }
+                    Err(e) => exit(&mut sys, (fail << 8) | (e & 0xFF)),
+                };
+                let left_pid =
+                    match rt
+                        .ps
+                        .spawn(&mut sys, left.0, left.1, &[], vfs_ep, None, Some(write_end))
+                    {
+                        Ok(pid) => pid,
+                        Err(e) => exit(&mut sys, ((fail + 1) << 8) | (e & 0xFF)),
+                    };
+                let _ = rt.write_stdout(&mut sys, b"L ");
+                let right_pid = match rt.ps.spawn(
+                    &mut sys,
+                    right.0,
+                    right.1,
+                    &[],
+                    vfs_ep,
+                    Some(read_end),
+                    stdout,
+                ) {
+                    Ok(pid) => pid,
+                    Err(e) => exit(&mut sys, ((fail + 2) << 8) | (e & 0xFF)),
+                };
+                let _ = rt.write_stdout(&mut sys, b"R ");
+                let ls = match rt.ps.wait(&mut sys, left_pid) {
+                    Ok(s) => s,
+                    Err(e) => exit(&mut sys, ((fail + 3) << 8) | (e & 0xFF)),
+                };
+                let rs = match rt.ps.wait(&mut sys, right_pid) {
+                    Ok(s) => s,
+                    Err(e) => exit(&mut sys, ((fail + 3) << 8) | (e & 0xFF)),
+                };
+                if ls != *expect_left || rs != *expect_right {
+                    exit(&mut sys, ((fail + 4) << 8) | (rs & 0xFF));
+                }
+                fail += 6;
+            }
             Command::Exec { path, argv } => {
                 match rt.ps.exec(&mut sys, path, argv, &[]) {
                     Ok(()) => {
@@ -326,7 +389,7 @@ extern "C" fn sh_main(argc: u64, argv: *const *const u8, envp: *const *const u8)
                 env,
                 expect,
             } => {
-                let pid = match rt.ps.spawn(&mut sys, path, argv, env, vfs_ep, stdout) {
+                let pid = match rt.ps.spawn(&mut sys, path, argv, env, vfs_ep, None, stdout) {
                     Ok(pid) => pid,
                     Err(e) => exit(&mut sys, fail | (e & 0xFF)),
                 };

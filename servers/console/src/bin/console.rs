@@ -80,6 +80,10 @@ pub extern "C" fn _start() -> ! {
             Ok(m) => m,
             Err(_) => exit(0xE5),
         };
+        if msg.tag.label() == methods::console::EOF {
+            // Stream end marker: nothing to print.
+            continue;
+        }
         if msg.tag.label() == methods::process::KILL {
             let ack = Message::new(methods::process::KILL);
             let _ = sys.send(REPLY_CAP, &ack);

@@ -111,6 +111,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
+name = "console"
+version = "0.1.0"
+dependencies = [
+ "ipc",
+ "sdk",
+]
+
+[[package]]
 name = "criterion"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -371,6 +379,10 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 [[package]]
 name = "personality"
 version = "0.1.0"
+dependencies = [
+ "ipc",
+ "sdk",
+]
 
 [[package]]
 name = "pin-project-lite"

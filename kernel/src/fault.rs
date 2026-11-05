@@ -325,7 +325,7 @@ mod tests {
         ));
 
         // Pager receives the FAULT_PAGE call.
-        let req = endpoint::recv(ep, pager, false).unwrap().unwrap();
+        let req = endpoint::recv(ep, pager, false, 0).unwrap().unwrap();
         assert_eq!(req.msg.tag.label(), labels::kernel::FAULT_PAGE);
         assert_eq!(req.msg.words[1], vaddr);
 

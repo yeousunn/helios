@@ -71,6 +71,26 @@ impl Runtime {
         self.stdout
     }
 
+    /// The stdin endpoint handle (package `optional[1]`), if any.
+    pub fn stdin_handle(&self) -> Option<Handle> {
+        self.package
+            .optional
+            .get(1)
+            .copied()
+            .flatten()
+            .map(|cs| cs.handle())
+            .filter(|h| *h != 0)
+    }
+
+    /// Exit, first signalling end-of-stream on stdout so pipe readers stop
+    /// (`console::EOF`; sinks like the console ignore it).
+    pub fn exit<R: RawSyscalls>(&mut self, sys: &mut Syscalls<R>, status: i32) -> ! {
+        if let Some(out) = self.stdout {
+            let _ = sys.send(out, &Message::new(sdk::methods::console::EOF));
+        }
+        crate::runtime::exit(sys, status)
+    }
+
     /// Write text to the process's stdout (the caller-supplied console
     /// endpoint): up to 32 bytes per message, little-endian packed
     /// (`sdk::methods::console`). No-op when the launcher supplied none.

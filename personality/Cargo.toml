@@ -33,6 +33,11 @@ name = "echo"
 path = "src/bin/echo.rs"
 required-features = ["user"]
 
+[[bin]]
+name = "wc"
+path = "src/bin/wc.rs"
+required-features = ["user"]
+
 [dependencies]
 ipc = { path = "../ipc" }
 sdk = { path = "../sdk" }

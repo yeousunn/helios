@@ -61,14 +61,14 @@ pub fn debug_stack_sweep() {
 
 /// Debug-EP op (label `0xFFFF`): walk `w0` for the CURRENT process's AS —
 /// hardware view + kernel registry view, one line each.
-pub fn debug_walk(va: u64) {
+pub fn debug_walk(va: u64, tag: u64) {
     let (pid, _tid) = (
         crate::proc::from_ref(crate::sched::ObjRef(crate::sched::current().0)),
         (),
     );
     match HW_WALKER.lock().as_ref().map(|f| f(va)) {
-        Some(Some(pa)) => crate::kinfo!("WALK va={:#x} hw=phys {:#x}", va, pa),
-        Some(None) => crate::kinfo!("WALK va={:#x} hw=NOT-PRESENT", va),
+        Some(Some(pa)) => crate::kinfo!("WALK t={:#x} va={:#x} hw=phys {:#x}", tag, va, pa),
+        Some(None) => crate::kinfo!("WALK t={:#x} va={:#x} hw=NOT-PRESENT", tag, va),
         None => crate::kinfo!("WALK va={:#x} hw-walker: not registered", va),
     }
     match crate::proc::as_of(pid) {
