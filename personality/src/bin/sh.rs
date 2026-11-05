@@ -105,6 +105,20 @@ const SCRIPT: &[Command] = &[
         env: &[b"X=42"],
         expect: 5,
     },
+    // The `/cat` utility: a real program taking MULTIPLE argv paths (the
+    // second run concatenates two files — multi-arg argv end to end).
+    Command::Run {
+        path: b"cat",
+        argv: &[b"cat", b"hello"],
+        env: &[],
+        expect: 0,
+    },
+    Command::Run {
+        path: b"cat",
+        argv: &[b"cat", b"hello", b"posix-log"],
+        env: &[],
+        expect: 0,
+    },
     Command::Echo(b"sh ok"),
     // exec: replaces this shell with the child image, which echoes its argv
     // and exits 9. The shell's process keeps its capabilities (and its pid).

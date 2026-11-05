@@ -59,4 +59,5 @@ fn main() {
     emit("CHILD_IMAGE", "CHILD_IMAGE", &out_dir, "child_image.rs");
     emit("POSIX_IMAGE", "POSIX_IMAGE", &out_dir, "posix_image.rs");
     emit("SH_IMAGE", "SH_IMAGE", &out_dir, "sh_image.rs");
+    emit("CAT_IMAGE", "CAT_IMAGE", &out_dir, "cat_image.rs");
 }

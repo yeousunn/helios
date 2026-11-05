@@ -18,6 +18,11 @@ name = "sh"
 path = "src/bin/sh.rs"
 required-features = ["user"]
 
+[[bin]]
+name = "cat"
+path = "src/bin/cat.rs"
+required-features = ["user"]
+
 [dependencies]
 ipc = { path = "../ipc" }
 sdk = { path = "../sdk" }
