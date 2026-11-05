@@ -1,0 +1,16 @@
+[package]
+name = "tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[[test]]
+name = "qemu_harness"
+path = "src/qemu_harness.rs"
+required-features = ["qemu"]
+
+[features]
+default = []
+qemu = []

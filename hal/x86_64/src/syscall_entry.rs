@@ -48,6 +48,11 @@ const FMASK: u64 = 0x300;
 /// Enable `syscall`/`sysret`: EFER.SCE, STAR (kernel CS 0x08; sysret computes
 /// user CS/SS as STAR[63:48]+16/+8 → user code 0x23, user data 0x1B), LSTAR,
 /// FMASK. Call once at boot after the GDT is installed.
+///
+/// # Safety
+///
+/// Programs architectural MSRs (EFER, STAR, LSTAR, FMASK); must be called once
+/// at boot after the GDT is installed, before any userspace `syscall`.
 pub unsafe fn enable() {
     // SAFETY: MSR programming is IA32 architectural state; values assembled
     // from the fixed GDT layout (see `Gdt` docs).

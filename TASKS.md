@@ -26,7 +26,9 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 - [x] NV done 2026-10-30 — `hal/` — CPU topology + SMP traits (ADR-014: CpuTopology, Ipi, SecondaryBoot, Halt — x86_64 stubs)
 - [x] NV done 2026-10-30 — `hal/` — boot protocol traits (ADR-015: BootInfo, AcpiParser, DeviceTree, FramebufferInfo — x86_64 stubs)
 - [x] NV done 2026-10-30 — `drivers/` — bus interface traits (ADR-016: PciBus, Virtio, Dma, MmioRegion — x86_64 stubs)
-- [x] NV done 2026-10-30 — `tools/` — CI: build + clippy + fmt + qemu-test on every commit (`.github/workflows/ci.yml` + `tools/qemu-test.sh` with ADR-013 exit code mapping)
+- [x] NV done 2026-11-05 — `tools/` — land `.github/workflows/ci.yml` (build + clippy + fmt + qemu-test on every commit; `tools/qemu-test.sh` with ADR-029 exit-code mapping; provision `x86_64-unknown-none`)
+- [x] NV done 2026-11-05 — `tests/` — update `tests/src/qemu_harness.rs` to kernel-boot PVH ELF + `build/initrd.img` staging + ADR-029 exit-code mapping; wire `qemu` feature member
+- [x] NV done 2026-11-05 — `hal/` + `tests/` — UART RX → console-server stdin forwarding per ADR-038 (kernel side landed: `console_in` line discipline + `sys_recv` 0xD2 branch + reserved objects + HAL IRQ4→vector 36→`push_byte`, wired in `kernel-boot/src/main.rs:126-128`); QEMU smoke verifies boot chain
 
 ## Phase 1 — Remaining Kernel Core (GLM — BIG task)
 

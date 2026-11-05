@@ -113,7 +113,7 @@ pub struct StubFramebuffer {
 unsafe fn port_outb(port: u16, value: u8) {
     // SAFETY: Raw I/O port write; COM1 is a safe, well-known UART port.
     unsafe {
-        core::arch::asm!("out dx, al", in("dx") port, in("al") value as u8, options(nostack));
+        core::arch::asm!("out dx, al", in("dx") port, in("al") value, options(nostack));
     }
 }
 
@@ -1054,7 +1054,7 @@ fn uart_irq4(_irq: u8) -> bool {
 #[no_mangle]
 pub extern "sysv64" fn hal_irq_dispatcher(vector: u64) {
     let irq = (vector - PIC_VECTOR_BASE as u64) as u8;
-    let mut pic = IRQ_PIC.lock();
+    let pic = IRQ_PIC.lock();
     let handler = pic.handlers[irq as usize];
     if let Some(f) = handler {
         f(irq);

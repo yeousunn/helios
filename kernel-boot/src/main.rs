@@ -39,10 +39,7 @@ impl<'a> UartBuf<'a> {
         UartBuf { buf, len: 0 }
     }
     fn as_str(&self) -> &str {
-        match core::str::from_utf8(&self.buf[..self.len]) {
-            Ok(s) => s,
-            Err(_) => "",
-        }
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or_default()
     }
 }
 
@@ -64,7 +61,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     use core::fmt::Write;
     let mut buf = [0u8; 512];
     let mut w = UartBuf::new(&mut buf);
-    let _ = write!(w, "PANIC(pre-console): {}\n", info);
+    let _ = writeln!(w, "PANIC(pre-console): {}", info);
     hal_x86_64::uart_writer(w.as_str());
     kernel::panic::handle_panic(info)
 }
@@ -107,7 +104,7 @@ pub extern "C" fn kernel_main() -> ! {
     kernel::panic::set_exit_code(hal_x86_64::qemu_exit_code);
     // Clobber-hunt debug walker: the kernel debug-EP walk op reads live
     // hardware PTEs through the identity map (temporary; removed post-smoke).
-    kernel::debug::set_hw_walker(|va| hal_x86_64::debug_walk_live(va));
+    kernel::debug::set_hw_walker(hal_x86_64::debug_walk_live);
 
     // Enable NX (PTE bit 63 is reserved while EFER.NXE=0) and install fault
     // reporting stubs before any mapping/staging work.
@@ -122,6 +119,10 @@ pub extern "C" fn kernel_main() -> ! {
     kernel::aspace::set_backend_factory(&hal_x86_64::BACKEND_FACTORY_X86_64);
     kernel::sched::set_context_backend(&hal_x86_64::CONTEXT_BACKEND_X86_64);
     kernel::entry::set_current_context(&hal_x86_64::CURRENT_CONTEXT_X86_64);
+
+    // Console input (ADR-038): UART RX bytes feed the kernel line discipline.
+    hal_x86_64::set_uart_rx_callback(kernel::console_in::push_byte);
+    hal_x86_64::enable_uart_rx();
 
     // Scheduler must be initialized before init::start spawns the first
     // thread (found via smoke debug: spawn hit an uninitialized table).
@@ -320,7 +321,7 @@ fn dump_boot_state() {
 
 /// Print the PML4/PDPT/PD(/PT) entries covering `va` (bring-up diagnosis).
 fn dump_pte_chain(va: u64) {
-    let idx = |va: u64, sh: u32| ((va >> sh) & 0x1FF) as u64;
+    let idx = |va: u64, sh: u32| (va >> sh) & 0x1FF;
     // SAFETY: reading the current page tables through the identity map.
     unsafe {
         let cr3: u64;
