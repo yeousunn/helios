@@ -61,8 +61,22 @@ cargo build -p sdk --bin init --features user --target x86_64-unknown-none --rel
 | 19 | `...0013` | service handle | console ready: its endpoint is later supplied to children as stdio |
 | — | `tag=0x301` | text words | any `console::WRITE` line on the serial (e.g. the demo's `helios-posix-ok\n` at `w=[0x702d736f696c6568 0x0a6b6f2d7869736f ...]`) |
 | 20 | `...0014` | sh pid | init spawns `/sh` (the scripted shell; vfs + stdout caps) |
-| 21 | `...0015` | 0 | `WAIT` for the shell: it ran `child 7` and `child 9` through PS, verified both statuses, printed `sh ok` |
+| 21 | `...0015` | 0 | `WAIT` for the shell: full script — builtins, `/ls`, `/cat`, `/echo`, the pipeline `cat hello posix-log | wc` (token `bytes=28 lines=0`), then `exec child 9` (the shell process becomes the child; WAIT observes its real status 9) — printed `sh ok` |
 | DONE | `0x494e49540000000f` | 0 | all passed (all servers reaped; clean halt) |
+
+### Pipeline console sequence (slice 14)
+
+After the pre-pipeline commands the serial log shows, in order:
+
+```
+[pipe]  ok  L  R  | bytes=28 lines=0
+ | sh ok
+```
+
+`[pipe]` = PS minted the pipe (ONE endpoint, rights-split caps); `L`/`R` = the
+left (`cat`, stdout = write cap) and right (`wc`, stdin = read cap) children
+spawned; the `wc` line is the consumer's output; `sh ok` is the shell's final
+status check (pipeline statuses verified, plus the exec'd child's real exit).
 
 v0 conventions this smoke pins (all design §2.4/§2.6 provisional):
 
