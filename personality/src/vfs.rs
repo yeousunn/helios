@@ -180,6 +180,49 @@ impl VfsClient {
 
     /// Open (or create, with [`O_CREAT`]) `name` under the connection root.
     /// Returns a local fd.
+    /// Resolve a path's PARENT directory by walking intermediate components
+    /// (split on '/'; a leading '/' starts at the root, otherwise the cwd).
+    /// The final component is copied into `last`; returns (parent, len).
+    /// v0: no ".." components inside paths; "." and empty components skip.
+    pub fn resolve<R: RawSyscalls>(
+        &mut self,
+        sys: &mut Syscalls<R>,
+        path: &[u8],
+        last: &mut [u8],
+    ) -> Result<(u64, usize), Status> {
+        let mut rest = path;
+        let mut dir = self.cwd;
+        if rest.first() == Some(&b'/') {
+            dir = self.root;
+            rest = &rest[1..];
+        }
+        while rest.last() == Some(&b'/') {
+            rest = &rest[..rest.len() - 1];
+        }
+        if rest.is_empty() || rest.len() > WINDOW {
+            return Err(EINVAL);
+        }
+        let mut comps = rest.split(|&b| b == b'/').peekable();
+        while let Some(comp) = comps.next() {
+            if comps.peek().is_none() {
+                // The final component: the operation's target name.
+                if comp.is_empty() {
+                    return Err(EINVAL);
+                }
+                if comp.len() > last.len() {
+                    return Err(status::ETOOBIG);
+                }
+                last[..comp.len()].copy_from_slice(comp);
+                return Ok((dir, comp.len()));
+            }
+            if comp.is_empty() || comp == b"." {
+                continue;
+            }
+            dir = self.walk_from(sys, dir, comp)?;
+        }
+        Err(EINVAL)
+    }
+
     pub fn open<R: RawSyscalls>(
         &mut self,
         sys: &mut Syscalls<R>,
@@ -190,12 +233,13 @@ impl VfsClient {
             return Err(EINVAL);
         }
         let slot = self.fds.iter().position(|f| f.is_none()).ok_or(EMFILE)?;
+        let mut last = [0u8; 64];
+        let (dir, len) = self.resolve(sys, name, &mut last)?;
         // SAFETY: the arg window is mapped R|W into this process's AS by
         // `connect` (frames carved + MAP-invoked before use).
         unsafe {
-            core::ptr::copy_nonoverlapping(name.as_ptr(), ARG_WINDOW_VA as *mut u8, name.len());
+            core::ptr::copy_nonoverlapping(last.as_ptr(), ARG_WINDOW_VA as *mut u8, len);
         }
-        let cwd = self.cwd;
         let mut req = Message::new(if flags & O_CREAT != 0 {
             methods::vfs::CREATE
         } else {
@@ -209,8 +253,8 @@ impl VfsClient {
         } else {
             sdk::methods::vfs_open::READ
         };
-        req.words[0] = cwd;
-        req.words[1] = name.len() as u64; // Span { off 0, len }
+        req.words[0] = dir;
+        req.words[1] = len as u64; // Span { off 0, len }
         req.words[2] = vfs_flags as u64;
         let reply = sys.call(self.conn, &req)?;
         if reply.words[0] != 0 {
@@ -377,13 +421,15 @@ impl VfsClient {
         if name.is_empty() || name.len() > WINDOW {
             return Err(EINVAL);
         }
+        let mut last = [0u8; 64];
+        let (dir, len) = self.resolve(sys, name, &mut last)?;
         // SAFETY: arg window mapped R|W by `connect`.
         unsafe {
-            core::ptr::copy_nonoverlapping(name.as_ptr(), ARG_WINDOW_VA as *mut u8, name.len());
+            core::ptr::copy_nonoverlapping(last.as_ptr(), ARG_WINDOW_VA as *mut u8, len);
         }
         let mut req = Message::new(methods::vfs::STAT);
-        req.words[0] = self.cwd;
-        req.words[1] = name.len() as u64; // Span { off 0, len }
+        req.words[0] = dir;
+        req.words[1] = len as u64; // Span { off 0, len }
         req.words[2] = STAT_BY_NAME as u64;
         let reply = sys.call(self.conn, &req)?;
         if reply.words[0] != 0 {
@@ -406,13 +452,40 @@ impl VfsClient {
         if name.is_empty() || name.len() > WINDOW {
             return Err(EINVAL);
         }
+        let mut last = [0u8; 64];
+        let (dir, len) = self.resolve(sys, name, &mut last)?;
         // SAFETY: arg window mapped R|W by `connect`.
         unsafe {
-            core::ptr::copy_nonoverlapping(name.as_ptr(), ARG_WINDOW_VA as *mut u8, name.len());
+            core::ptr::copy_nonoverlapping(last.as_ptr(), ARG_WINDOW_VA as *mut u8, len);
         }
         let mut req = Message::new(methods::vfs::MKDIR);
-        req.words[0] = self.cwd;
-        req.words[1] = name.len() as u64;
+        req.words[0] = dir;
+        req.words[1] = len as u64;
+        let reply = sys.call(self.conn, &req)?;
+        if reply.words[0] != 0 {
+            return Err(reply.words[0] as i64 as i32);
+        }
+        Ok(())
+    }
+
+    /// `UNLINK` a path (a file, or an empty directory).
+    pub fn unlink<R: RawSyscalls>(
+        &mut self,
+        sys: &mut Syscalls<R>,
+        path: &[u8],
+    ) -> Result<(), Status> {
+        if path.is_empty() || path.len() > WINDOW {
+            return Err(EINVAL);
+        }
+        let mut last = [0u8; 64];
+        let (dir, len) = self.resolve(sys, path, &mut last)?;
+        // SAFETY: arg window mapped R|W by `connect`.
+        unsafe {
+            core::ptr::copy_nonoverlapping(last.as_ptr(), ARG_WINDOW_VA as *mut u8, len);
+        }
+        let mut req = Message::new(methods::vfs::UNLINK);
+        req.words[0] = dir;
+        req.words[1] = len as u64;
         let reply = sys.call(self.conn, &req)?;
         if reply.words[0] != 0 {
             return Err(reply.words[0] as i64 as i32);

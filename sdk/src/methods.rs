@@ -67,6 +67,8 @@ pub mod vfs {
     pub const READDIR: u16 = 0x0218;
     pub const CREATE: u16 = 0x0219;
     pub const MKDIR: u16 = 0x021A;
+    pub const UNLINK: u16 = 0x021B;
+    pub const RENAME: u16 = 0x021C;
 }
 
 /// Console protocol labels (v0): the stdio endpoints a launcher supplies to

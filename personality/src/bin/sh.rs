@@ -52,6 +52,10 @@ enum Command {
     Cd(&'static [u8]),
     /// Print the working directory path.
     Pwd,
+    /// Create an empty file (open with O_CREAT, close).
+    Touch(&'static [u8]),
+    /// Remove a file or an empty directory (UNLINK).
+    Rm(&'static [u8]),
     /// Replace the shell's own image with `path` (must be the last command).
     Exec {
         path: &'static [u8],
@@ -74,11 +78,19 @@ const SCRIPT: &[Command] = &[
     Command::Ls,
     Command::Cd(b"work"),
     Command::Mkdir(b"inner"),
+    Command::Touch(b"note"),
+    Command::Ls,
+    Command::Rm(b"note"),
     Command::Ls,
     Command::Pwd,
     Command::Cd(b".."),
+    // Multi-component paths: stat walks `work` then stats `inner`; touch and
+    // rm create + remove a file through the same resolution. (v0 has no
+    // rmdir: the ramfs rejects directory unlink with EISDIR by design.)
+    Command::Stat(b"work/inner"),
+    Command::Touch(b"work/gone"),
+    Command::Rm(b"work/gone"),
     Command::Ls,
-    Command::Stat(b"work"),
     Command::Cat(b"hello"),
     Command::Run {
         path: b"child",
@@ -188,6 +200,17 @@ extern "C" fn sh_main(argc: u64, argv: *const *const u8, envp: *const *const u8)
                     }
                     path[path_len..path_len + name.len()].copy_from_slice(name);
                     path_len += name.len();
+                }
+            }
+            Command::Touch(path) => {
+                // Create + close: the client's write_file with no data.
+                if let Err(e) = rt.vfs.write_file(&mut sys, path, &[]) {
+                    exit(&mut sys, fail | (e & 0xFF));
+                }
+            }
+            Command::Rm(path) => {
+                if let Err(e) = rt.vfs.unlink(&mut sys, path) {
+                    exit(&mut sys, fail | (e & 0xFF));
                 }
             }
             Command::Pwd => {
