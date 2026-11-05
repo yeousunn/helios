@@ -100,6 +100,25 @@ impl CapTable {
         Self::empty()
     }
 
+    /// Reset to empty, in place. The assignment `table = CapTable::empty()`
+    /// materializes a ~32 KiB temporary in the caller's stack frame (LLVM
+    /// builds the return value, then memcpy's it) — which exactly overran
+    /// the 32 KiB kernel stack in `proc::create` and wrote stack-probe
+    /// stores into the page tables below (the "0x2-into-a-PTE" clobber
+    /// family, DS bisect 2026-11-05). Capabilities are plain data (no
+    /// `Drop`), so an in-place reset is semantically identical.
+    pub fn clear(&mut self) {
+        let mut i = 0;
+        while i < MAX_SLOTS {
+            self.slots[i] = Slot::Free {
+                next_free: if i + 1 == MAX_SLOTS { MAX_SLOTS } else { i + 1 },
+            };
+            i += 1;
+        }
+        self.free_head = 0;
+        self.used = 0;
+    }
+
     pub fn len(&self) -> usize {
         self.used
     }

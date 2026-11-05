@@ -62,7 +62,7 @@ pub fn create() -> ProcResult<ProcessId> {
         .position(|u| !u)
         .ok_or(ProcError::TableFull)?;
     guard.used[idx] = true;
-    guard.tables[idx] = CapTable::empty();
+    guard.tables[idx].clear();
     guard.as_ids[idx] = None;
     Ok(ObjId(idx as u64 + 1))
 }
@@ -77,7 +77,7 @@ pub fn destroy(pid: ProcessId) -> ProcResult<()> {
         return Err(ProcError::NoSuchProcess);
     }
     guard.used[idx] = false;
-    guard.tables[idx] = CapTable::empty();
+    guard.tables[idx].clear();
     guard.as_ids[idx] = None;
     Ok(())
 }
@@ -208,7 +208,7 @@ pub(crate) fn reset_for_test() {
     let mut guard = REGISTRY.lock();
     for i in 0..MAX_PROCESSES {
         guard.used[i] = false;
-        guard.tables[i] = CapTable::empty();
+        guard.tables[i].clear();
         guard.as_ids[i] = None;
     }
 }

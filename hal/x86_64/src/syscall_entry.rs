@@ -139,9 +139,11 @@ fn kstack_guard() {
     // SAFETY: reads the current stack pointer; no memory access.
     unsafe { core::arch::asm!("mov {0}, rsp", out(reg) rsp, options(nostack)) };
     // The dispatcher frame must sit within this thread's kernel stack
-    // (KSTACK_FRAMES = 8 frames = 32 KiB, kernel/src/sched.rs — the old
-    // 16 KiB window missed the underflow that scrambled adjacent PTs).
-    if rsp > top || rsp <= top - 32 * 1024 {
+    // (KSTACK_FRAMES × 4 KiB, kernel/src/sched.rs — 64 KiB since the
+    // 2026-11-05 clobber fix; the window must track that constant, not a
+    // stale literal, or legitimate deep frames false-trip the guard).
+    let kstack_bytes = (kernel::sched::KSTACK_FRAMES as u64) * 4096;
+    if rsp > top || rsp <= top - kstack_bytes {
         crate::uart_writer(
             "
 [kernel] KSTACK GUARD: dispatch off-stack
