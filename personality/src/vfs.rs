@@ -25,12 +25,19 @@ struct Fd {
     offset: u64,
 }
 
-/// A connected VFS client with a local fd table.
+/// A connected VFS client with a local fd table and a working directory
+/// (a handle stack: `cd name` walks down, `cd ..` pops).
 pub struct VfsClient {
     conn: Handle,
     root: u64,
+    cwd: u64,
+    cwd_stack: [u64; MAX_CWD_DEPTH],
+    cwd_depth: usize,
     fds: [Option<Fd>; MAX_FDS],
 }
+
+/// Maximum `cd` nesting the client tracks for `cd ..`.
+pub const MAX_CWD_DEPTH: usize = 8;
 
 impl VfsClient {
     /// Connect to the VFS service endpoint: carve + map the two windows into
@@ -95,8 +102,80 @@ impl VfsClient {
         Ok(Self {
             conn,
             root,
+            cwd: root,
+            cwd_stack: [0; MAX_CWD_DEPTH],
+            cwd_depth: 0,
             fds: [None; MAX_FDS],
         })
+    }
+
+    /// The current working directory handle.
+    pub fn cwd(&self) -> u64 {
+        self.cwd
+    }
+
+    /// `WALK` from the cwd into `name`; returns the child dir handle without
+    /// changing the cwd (the shell's `cd` uses [`Self::chdir`]).
+    pub fn walk<R: RawSyscalls>(
+        &mut self,
+        sys: &mut Syscalls<R>,
+        name: &[u8],
+    ) -> Result<u64, Status> {
+        let dir = self.cwd;
+        self.walk_from(sys, dir, name)
+    }
+
+    fn walk_from<R: RawSyscalls>(
+        &mut self,
+        sys: &mut Syscalls<R>,
+        dir: u64,
+        name: &[u8],
+    ) -> Result<u64, Status> {
+        if name.is_empty() || name.len() > WINDOW {
+            return Err(EINVAL);
+        }
+        // SAFETY: arg window mapped R|W by `connect`.
+        unsafe {
+            core::ptr::copy_nonoverlapping(name.as_ptr(), ARG_WINDOW_VA as *mut u8, name.len());
+        }
+        let mut req = Message::new(methods::vfs::WALK);
+        req.words[0] = dir;
+        req.words[1] = name.len() as u64;
+        let reply = sys.call(self.conn, &req)?;
+        if reply.words[0] != 0 {
+            return Err(reply.words[0] as i64 as i32);
+        }
+        let handle = reply.words[1];
+        if handle == 0 {
+            return Err(status::EBADCAP);
+        }
+        Ok(handle)
+    }
+
+    /// `cd name`: walk into `name` from the cwd (pushes the old cwd).
+    pub fn chdir<R: RawSyscalls>(
+        &mut self,
+        sys: &mut Syscalls<R>,
+        name: &[u8],
+    ) -> Result<(), Status> {
+        if self.cwd_depth == MAX_CWD_DEPTH {
+            return Err(status::ENOMEM);
+        }
+        let next = self.walk(sys, name)?;
+        self.cwd_stack[self.cwd_depth] = self.cwd;
+        self.cwd_depth += 1;
+        self.cwd = next;
+        Ok(())
+    }
+
+    /// `cd ..`: pop to the previous cwd.
+    pub fn chdir_up(&mut self) -> Result<(), Status> {
+        if self.cwd_depth == 0 {
+            return Err(status::EBADCAP);
+        }
+        self.cwd_depth -= 1;
+        self.cwd = self.cwd_stack[self.cwd_depth];
+        Ok(())
     }
 
     /// Open (or create, with [`O_CREAT`]) `name` under the connection root.
@@ -116,6 +195,7 @@ impl VfsClient {
         unsafe {
             core::ptr::copy_nonoverlapping(name.as_ptr(), ARG_WINDOW_VA as *mut u8, name.len());
         }
+        let cwd = self.cwd;
         let mut req = Message::new(if flags & O_CREAT != 0 {
             methods::vfs::CREATE
         } else {
@@ -129,7 +209,7 @@ impl VfsClient {
         } else {
             sdk::methods::vfs_open::READ
         };
-        req.words[0] = self.root;
+        req.words[0] = cwd;
         req.words[1] = name.len() as u64; // Span { off 0, len }
         req.words[2] = vfs_flags as u64;
         let reply = sys.call(self.conn, &req)?;
@@ -302,7 +382,7 @@ impl VfsClient {
             core::ptr::copy_nonoverlapping(name.as_ptr(), ARG_WINDOW_VA as *mut u8, name.len());
         }
         let mut req = Message::new(methods::vfs::STAT);
-        req.words[0] = self.root;
+        req.words[0] = self.cwd;
         req.words[1] = name.len() as u64; // Span { off 0, len }
         req.words[2] = STAT_BY_NAME as u64;
         let reply = sys.call(self.conn, &req)?;
@@ -331,7 +411,7 @@ impl VfsClient {
             core::ptr::copy_nonoverlapping(name.as_ptr(), ARG_WINDOW_VA as *mut u8, name.len());
         }
         let mut req = Message::new(methods::vfs::MKDIR);
-        req.words[0] = self.root;
+        req.words[0] = self.cwd;
         req.words[1] = name.len() as u64;
         let reply = sys.call(self.conn, &req)?;
         if reply.words[0] != 0 {

@@ -42,12 +42,16 @@ enum Command {
     Echo(&'static [u8]),
     /// Read a VFS file and write it to stdout.
     Cat(&'static [u8]),
-    /// List the VFS root directory.
+    /// List the current working directory.
     Ls,
-    /// Create a directory under the root.
+    /// Create a directory in the cwd.
     Mkdir(&'static [u8]),
-    /// Print the stat of a root entry.
+    /// Print the stat of a cwd entry.
     Stat(&'static [u8]),
+    /// Change the working directory (`..` pops).
+    Cd(&'static [u8]),
+    /// Print the working directory path.
+    Pwd,
     /// Replace the shell's own image with `path` (must be the last command).
     Exec {
         path: &'static [u8],
@@ -68,7 +72,13 @@ const SCRIPT: &[Command] = &[
     Command::Ls,
     Command::Mkdir(b"work"),
     Command::Ls,
-    Command::Stat(b"hello"),
+    Command::Cd(b"work"),
+    Command::Mkdir(b"inner"),
+    Command::Ls,
+    Command::Pwd,
+    Command::Cd(b".."),
+    Command::Ls,
+    Command::Stat(b"work"),
     Command::Cat(b"hello"),
     Command::Run {
         path: b"child",
@@ -130,6 +140,8 @@ extern "C" fn sh_main(argc: u64, argv: *const *const u8, envp: *const *const u8)
 
     let vfs_ep = rt.package.optional[0].map(|cs| cs.handle());
     let stdout = rt.stdout_handle();
+    let mut path = [0u8; 64];
+    let mut path_len = 0usize;
     let mut fail = 0x10i32;
     for cmd in SCRIPT {
         match cmd {
@@ -145,8 +157,49 @@ extern "C" fn sh_main(argc: u64, argv: *const *const u8, envp: *const *const u8)
                 };
                 let _ = rt.write_stdout(&mut sys, &buf[..n]);
             }
+            Command::Cd(name) => {
+                let res = if name == b".." {
+                    rt.vfs.chdir_up()
+                } else {
+                    rt.vfs.chdir(&mut sys, name)
+                };
+                if let Err(e) = res {
+                    exit(&mut sys, fail | (e & 0xFF));
+                }
+                // Mirror the move in the display path.
+                if name == b".." {
+                    while path_len > 0 && path[path_len - 1] != b'/' {
+                        path_len -= 1;
+                    }
+                    if path_len > 0 {
+                        path_len -= 1; // drop the '/'
+                    }
+                    if path_len == 0 {
+                        path[0] = b'/';
+                        path_len = 1;
+                    }
+                } else if name.len() + path_len + 2 <= path.len() {
+                    if path_len == 0 {
+                        path[0] = b'/';
+                        path_len = 1;
+                    } else {
+                        path[path_len] = b'/';
+                        path_len += 1;
+                    }
+                    path[path_len..path_len + name.len()].copy_from_slice(name);
+                    path_len += name.len();
+                }
+            }
+            Command::Pwd => {
+                if path_len == 0 {
+                    path[0] = b'/';
+                    path_len = 1;
+                }
+                let _ = rt.write_stdout(&mut sys, &path[..path_len]);
+                let _ = rt.write_stdout(&mut sys, b"\n");
+            }
             Command::Ls => {
-                let root = rt.vfs.root();
+                let root = rt.vfs.cwd();
                 let mut cursor = 0u64;
                 let mut name = [0u8; 64];
                 loop {
