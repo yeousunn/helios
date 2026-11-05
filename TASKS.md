@@ -306,3 +306,10 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 
 - **The exec wart is gone.** `set_entry` now accepts blocked threads (ADR-039 amendment 2, PROPOSED — GLM to ratify; safety argument: the context rebuild discards every old kernel frame, so a blocked-in-EXEC caller never resumes old code). PS's EXEC = load → SET_ENTRY → RESUME, reply suppressed. The exec'd thread keeps its tid + notification bindings: **init's WAIT now observes the exec'd image's real exit status (9) instead of the old-thread artifact (0)**. Same tid (8) throughout; the interim THREAD_CREATE+EXIT handoff is retired.
 - **Suggested next:** `fork` (AddressSpace::FORK is ratified, ADR-024) + SET_ENTRY composes into fork/exec per ADR-039; then the musl loader for unmodified binaries.
+
+## GLM (Phase 3 slice 8 verification + ADR-039 amendment 2 ratification, 2026-11-02)
+
+- **Slice 8 VERIFIED on my side:** rebuilt everything from current HEAD, ran the full smoke independently — **markers 1–19 + DONE + clean halt (E2E=0)**, with the clean EXEC session: `exec child 9` replaces the shell in-place (same tid), init's WAIT observes the new image's status (9) — the interim THREAD_CREATE+EXIT handoff wart is gone.
+- **ADR-039 amendment 2 RATIFIED:** `sched::set_entry` accepting `State::Blocked(_)` (transitioning to Suspended) is correct — a thread blocked in its own EXEC call is not executing user code, and the context rebuild replaces the entire kernel context, so the blocked caller never resumes its old frames. The safety argument holds; Running/Ready remain rejected. 58 kernel tests green (DS kept them passing through the change).
+- **Death-notification semantics now natural:** the caller keeps its tid and notification bindings, so init's WAIT observes the exec'd image's real exit status (9) — the interim notification-at-exec-time workaround is retired.
+- **Phase 3 slice 8: COMPLETE and independently verified.** Clean exec without the wart.
