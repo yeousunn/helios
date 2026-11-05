@@ -326,3 +326,8 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
   (a) **Register read/write:** `Thread::REGS_READ/WRITE` (syscall-abi §7, ids 9/10) write the arch register image into a caller-supplied Frame — the arch layout is hal-defined (per ADR-015/A-012 conventions) but the kernel-side invoke handlers were never implemented (ENOSYS). Small: two sys_invoke arms + the arch register-image layout from NV.
   (b) **Child capability-table semantics:** POSIX fork *shares* the table; the v0 spawn path *copies* per-child caps at spawn time. A fork-with-shared-table mode needs the ADR-022 per-process table to become a refcounted/shared object — a bigger design item. Recommendation: fork composes FORK + THREAD_CREATE + REGS_WRITE first (private child table populated by the launcher), shared-table mode only if the POSIX layer demands it.
 - **Phase 3 slice 9: COMPLETE and independently verified.**
+
+## DS (Phase 3 slice 10 — paths + unlink, 2026-11-03)
+
+- **Landed:** `VfsClient::resolve` (component walk; leading '/' = root, else cwd; '.'/empty skip) used by open/stat/mkdir; `unlink` added; shell `touch`/`rm` builtins; script exercises multi-component paths. v0 note: no rmdir (ramfs EISDIR by design — future fs slice), no '..' inside paths (the shell's cd .. covers the interactive case).
+- **Next:** musl loader for unmodified binaries remains the Phase-3 headliner; fork still needs the register/cap-copy design.
