@@ -152,6 +152,40 @@ impl VfsClient {
         Ok(handle)
     }
 
+    /// Walk the FULL path to its final component (which must be a directory)
+    /// and return that dir's handle. A leading '/' starts at the root;
+    /// '.'/empty components skip; ".." is unsupported inside paths.
+    pub fn walk_path<R: RawSyscalls>(
+        &mut self,
+        sys: &mut Syscalls<R>,
+        path: &[u8],
+    ) -> Result<u64, Status> {
+        let mut rest = path;
+        let mut dir = self.cwd;
+        if rest.first() == Some(&b'/') {
+            dir = self.root;
+            rest = &rest[1..];
+        }
+        while rest.last() == Some(&b'/') {
+            rest = &rest[..rest.len() - 1];
+        }
+        if rest.is_empty() {
+            // "/" or "" (with a leading slash) = the root.
+            return if path.first() == Some(&b'/') {
+                Ok(dir)
+            } else {
+                Err(EINVAL)
+            };
+        }
+        for comp in rest.split(|&b| b == b'/') {
+            if comp.is_empty() || comp == b"." {
+                continue;
+            }
+            dir = self.walk_from(sys, dir, comp)?;
+        }
+        Ok(dir)
+    }
+
     /// `cd name`: walk into `name` from the cwd (pushes the old cwd).
     pub fn chdir<R: RawSyscalls>(
         &mut self,

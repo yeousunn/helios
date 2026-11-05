@@ -116,6 +116,20 @@ const SCRIPT: &[Command] = &[
         env: &[b"X=42"],
         expect: 5,
     },
+    // The utility set: ls (argv path listing; default cwd) and echo
+    // (argv -> stdout).
+    Command::Run {
+        path: b"ls",
+        argv: &[b"ls", b"work"],
+        env: &[],
+        expect: 0,
+    },
+    Command::Run {
+        path: b"echo",
+        argv: &[b"echo", b"helios", b"utils"],
+        env: &[],
+        expect: 0,
+    },
     // The `/cat` utility: a real program taking MULTIPLE argv paths (the
     // second run concatenates two files — multi-arg argv end to end).
     Command::Run {
