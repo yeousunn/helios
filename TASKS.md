@@ -346,3 +346,8 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 
 - **Landed:** `VfsClient::rename` + shell `mv` (plain and multi-component paths). **Every VFS operation except READ_BULK is now exercised by a real client** (CONNECT/WALK/OPEN/READ/WRITE/CLOSE/STAT/READDIR/CREATE/MKDIR/UNLINK/RENAME).
 - **Shell**: cd/ls/stat/cat/touch/rm/mv/run/exec builtins; utilities: cat; system binaries: sh, posix, child. Natural next: READ_BULK's frame-list variant (bulk program loading — relevant for musl), an ls/echo bin pair, then the musl loader.
+
+## GLM (Phase 3 slices 11–12 verification, 2026-11-02)
+
+- **Slices 11–12 VERIFIED on my side:** rebuilt everything from current HEAD, ran the full smoke independently — **markers 1–21 + DONE + clean halt (E2E=0)**, with the `/cat` multi-arg builtin (slice 11) and the RENAME/mv session (slice 12).
+- **The VFS op surface is now fully exercised by a real client** — open/stat/mkdir/unlink/rename/readdir/read/write/close all driven end-to-end through the capability system on emulated hardware. The VFS file model is complete for the v0 POSIX personality.
