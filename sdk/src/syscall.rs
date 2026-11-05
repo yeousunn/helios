@@ -88,10 +88,19 @@ impl<'a, R: RawSyscalls> Syscalls<'a, R> {
         check(self.raw.raw(number::SEND, Self::pack_args(cap, msg)).status)
     }
 
-    /// `call`: send and wait for the reply.
+    /// `call`: send and wait for the reply. A full destination mailbox reports
+    /// `EWOULDBLOCK` (calls never sender-park: the rotation wake would resume
+    /// the caller before its request is served); retry cooperatively — the
+    /// server's loop is draining the mailbox concurrently.
     pub fn call(&mut self, cap: Handle, msg: &Message) -> Result<Message, Status> {
-        let r = self.raw.raw(number::CALL, Self::pack_args(cap, msg));
-        check(r.status).map(|_| r.message())
+        loop {
+            let r = self.raw.raw(number::CALL, Self::pack_args(cap, msg));
+            if r.status == ipc::status::EWOULDBLOCK {
+                let _ = self.raw.raw(number::YIELD, [0; 6]);
+                continue;
+            }
+            return check(r.status).map(|_| r.message());
+        }
     }
 
     /// `recv` on an endpoint, notification, or IRQ capability.

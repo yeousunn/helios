@@ -247,12 +247,15 @@ pub fn sys_call(pid: ProcessId, tid: ThreadId, dst_handle: u32, msg: Message) ->
     }
     let (mut env, _) = resolve_transfers(pid, &msg, tid);
     env.reply_requested = true;
-    // Send (nonblocking park path is the same for call).
+    // A full mailbox must NOT sender-park a call: the rotation that moves a
+    // parked sender's message into the mailbox wakes it *before its request
+    // is served*, and the caller then resumes without its reply (the later
+    // real reply finds it awake -> EDEAD at the server). Report EWOULDBLOCK
+    // instead; the SDK's `call` retries with a yield (the server's loop is
+    // draining concurrently).
     match endpoint::try_send(ObjRef(cap.obj.0), env) {
         Ok(()) => {}
-        Err(IpcError::EndpointFull) => {
-            endpoint::park_send(ObjRef(cap.obj.0), tid, env).map_err(|e| err(map_ipc(e)))?;
-        }
+        Err(IpcError::EndpointFull) => return Err(err(ipc::status::EWOULDBLOCK)),
         Err(e) => return Err(err(map_ipc(e))),
     }
     // Park awaiting reply.
