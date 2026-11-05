@@ -12,7 +12,7 @@ use crate::syscall;
 use caps::{Capability, ObjId, ObjType, Rights};
 #[allow(unused_imports)]
 use ipc::CapSlot;
-use ipc::{flags, Message, Tag};
+use ipc::{flags, status, Message, Tag};
 use spin::Mutex;
 
 /// Decoded register arguments from the arch trap entry (syscall-abi §2).
@@ -145,20 +145,33 @@ pub fn park_result(tid: ThreadId) -> Option<SyscallReturn> {
     }
 
     // 3. Bound notification that fired.
-    let n = thread.bound_notification?;
-    let mask = match crate::notification::pending(n) {
-        Ok(m) => m,
-        Err(_) => return None,
-    };
-    if mask > 0 {
-        let _ = crate::notification::clear(n, mask);
-        return Some(SyscallReturn::ok(
-            Tag::new(0).with_flags(flags::NOTIFIED),
-            [mask as u64, 0, 0, 0],
-        ));
+    if let Some(n) = thread.bound_notification {
+        let mask = match crate::notification::pending(n) {
+            Ok(m) => m,
+            Err(_) => return None,
+        };
+        if mask > 0 {
+            let _ = crate::notification::clear(n, mask);
+            return Some(SyscallReturn::ok(
+                Tag::new(0).with_flags(flags::NOTIFIED),
+                [mask, 0, 0, 0],
+            ));
+        }
     }
 
-    // 4. Still parked.
+    // 4. Deadline expiry (ADR-041): the parked syscall timed out. Delivery
+    //    checks above win on a race (clear_park clears the stale flag).
+    if thread.timed_out {
+        sched::clear_timed_out(tid);
+        syscall::clear_park_entry(tid);
+        return Some(SyscallReturn {
+            status: status::ETIMEDOUT,
+            tag: Tag(0),
+            w: [0; 4],
+        });
+    }
+
+    // 5. Still parked.
     None
 }
 
@@ -174,6 +187,9 @@ pub fn dispatch(args: SyscallArgs) -> SyscallReturn {
         );
     }
     let (pid, tid) = current();
+    // Cooperative timer tick (ADR-041): expire parked deadlines on every
+    // dispatch so timeouts fire even while other threads keep the CPU busy.
+    crate::sched::expire_timeouts(crate::time::now_ns());
     match args.num {
         num::YIELD => syscall::sys_yield(tid)
             .map(|_| SyscallReturn::ok(Tag(0), [0; 4]))
@@ -194,16 +210,18 @@ pub fn dispatch(args: SyscallArgs) -> SyscallReturn {
             },
             Err(e) => SyscallReturn::err(e),
         },
-        num::RECV => match syscall::sys_recv(pid, tid, args.cap, args.w[0] != 0) {
+        num::RECV => match syscall::sys_recv(pid, tid, args.cap, args.w[0] != 0, args.w[1]) {
             Ok(Some(m)) => SyscallReturn::ok(m.tag, m.words),
             Ok(None) => SyscallReturn::parked(), // ADR-019 §1
             Err(e) => SyscallReturn::err(e),
         },
-        num::REPLY_RECV => match syscall::sys_reply_recv(pid, tid, args.cap, args.message()) {
-            Ok(Some(m)) => SyscallReturn::ok(m.tag, m.words),
-            Ok(None) => SyscallReturn::parked(), // ADR-019 §1
-            Err(e) => SyscallReturn::err(e),
-        },
+        num::REPLY_RECV => {
+            match syscall::sys_reply_recv(pid, tid, args.cap, args.message(), args.w[1]) {
+                Ok(Some(m)) => SyscallReturn::ok(m.tag, m.words),
+                Ok(None) => SyscallReturn::parked(), // ADR-019 §1
+                Err(e) => SyscallReturn::err(e),
+            }
+        }
         num::INVOKE => invoke(pid, tid, args),
         num::CAP_MINT => {
             let rights = ipc::Rights(u32::try_from(args.w[1]).unwrap_or(0) & Rights::ALL.0);

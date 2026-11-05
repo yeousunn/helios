@@ -60,6 +60,12 @@ pub struct Thread {
     /// Saved kernel stack pointer while the thread is not running (M3).
     /// Written by the arch context switch; 0 until first use.
     pub ksp: u64,
+    /// Absolute monotonic deadline (now_ns) for the current block, 0 = none
+    /// (ADR-041). Cleared on wake.
+    pub(crate) deadline_ns: u64,
+    /// Set by `expire_timeouts` when the deadline fired; consumed by
+    /// `park_result` (returns ETIMEDOUT).
+    pub(crate) timed_out: bool,
 }
 
 impl Thread {
@@ -74,6 +80,8 @@ impl Thread {
             initial_pc: 0,
             kstack_top: 0,
             ksp: 0,
+            deadline_ns: 0,
+            timed_out: false,
         }
     }
 
@@ -440,6 +448,95 @@ pub fn block(id: ThreadId, reason: BlockReason) -> SchedResult<()> {
     Ok(())
 }
 
+/// Block with a monotonic deadline (ADR-041). `deadline_ns` 0 = no timeout
+/// (plain [`block`]). The deadline fires via [`expire_timeouts`].
+pub fn block_with_deadline(id: ThreadId, reason: BlockReason, deadline_ns: u64) -> SchedResult<()> {
+    {
+        let mut guard = SCHED.lock();
+        let s = guard.as_mut().ok_or(SchedError::NoSuchThread)?;
+        let slot = find_slot(s, id)?;
+        let t = s.slots.threads[slot].as_mut().unwrap();
+        t.deadline_ns = deadline_ns;
+        t.timed_out = false;
+    }
+    block(id, reason)
+}
+
+/// Clear the ADR-041 timeout flag (normal completion raced an expiry).
+pub fn clear_timed_out(id: ThreadId) {
+    let mut guard = SCHED.lock();
+    let Some(s) = guard.as_mut() else { return };
+    if let Ok(slot) = find_slot(s, id) {
+        s.slots.threads[slot].as_mut().unwrap().timed_out = false;
+    }
+}
+
+/// Expire every Blocked thread whose deadline has passed (ADR-041). Two
+/// phase, no nested locks: collect expired tids under the sched lock, then
+/// unqueue each from its endpoint (endpoint lock → sched lock, the same
+/// order as `park_recv`) and mark Ready + timed_out. Returns how many
+/// threads were woken. Called from the dispatch-entry tick and the
+/// `pick_next` idle retry.
+pub fn expire_timeouts(now_ns: u64) -> usize {
+    let expired: [Option<(ThreadId, BlockReason)>; MAX_THREADS] = {
+        let mut guard = SCHED.lock();
+        let Some(s) = guard.as_mut() else { return 0 };
+        let mut out = [None; MAX_THREADS];
+        for (i, slot) in s.slots.threads.iter().enumerate() {
+            let Some(t) = slot else { continue };
+            let State::Blocked(reason) = t.state else {
+                continue;
+            };
+            if t.deadline_ns != 0 && now_ns >= t.deadline_ns {
+                out[i] = Some((t.id, reason));
+            }
+        }
+        out
+    };
+    let mut woke = 0usize;
+    for entry in expired.into_iter().flatten() {
+        let (id, reason) = entry;
+        // Unqueue from the block structure before waking, or a later
+        // delivery would complete a recv the timeout already finished.
+        match reason {
+            BlockReason::Recv(ep) | BlockReason::Send(ep) => {
+                let _ = crate::endpoint::unqueue_waiter(ep, id);
+            }
+            // Notification/Fault/Reply waiters have no queue to leave
+            // (signals re-scan Blocked state; park_result consults the
+            // flag first). v0: just wake them.
+            _ => {}
+        }
+        // make_ready may have run inside unqueue_waiter; mark the flag
+        // either way (park_result consumes it on resume).
+        let mut guard = SCHED.lock();
+        if let Some(s) = guard.as_mut() {
+            if let Ok(slot) = find_slot(s, id) {
+                let mut wake = false;
+                let mut prio = 0u8;
+                {
+                    let t = s.slots.threads[slot].as_mut().unwrap();
+                    if matches!(t.state, State::Blocked(_) | State::Ready) {
+                        if matches!(t.state, State::Blocked(_)) {
+                            t.state = State::Ready;
+                        }
+                        prio = t.priority;
+                        wake = true;
+                    }
+                }
+                if wake {
+                    queue_push(s, slot, prio);
+                    let t = s.slots.threads[slot].as_mut().unwrap();
+                    t.timed_out = true;
+                    t.deadline_ns = 0;
+                    woke += 1;
+                }
+            }
+        }
+    }
+    woke
+}
+
 /// Change a thread's priority; requeues it if it is on a run queue.
 pub fn set_priority(id: ThreadId, priority: u8) -> SchedResult<()> {
     let mut guard = SCHED.lock();
@@ -668,6 +765,22 @@ pub fn exit(id: ThreadId, status: i32) -> SchedResult<bool> {
 /// switch the current pointer, and return its id. Returns IDLE when nothing
 /// is ready.
 pub fn pick_next() -> ThreadId {
+    let next = pick_scan();
+    if next != IDLE {
+        return next;
+    }
+    // Idle retry (ADR-041): nothing runnable — run one cooperative timeout
+    // expiry pass and re-scan before reporting IDLE. "Cooperative deadlock"
+    // then only fires when nothing is runnable even after expiring parked
+    // deadlines (e.g. sh's console-input wait keeps the system alive).
+    let woke = expire_timeouts(crate::time::now_ns());
+    if woke > 0 {
+        return pick_scan();
+    }
+    IDLE
+}
+
+fn pick_scan() -> ThreadId {
     let mut guard = SCHED.lock();
     let Some(s) = guard.as_mut() else {
         return IDLE;

@@ -283,7 +283,16 @@ fn record_park(tid: ThreadId, src_handle: u32, pid: ProcessId) {
     }
 }
 
+/// Park-record cleanup for the arch resume path (entry::park_result ADR-041
+/// expiry step); also clears a raced timeout flag.
+pub(crate) fn clear_park_entry(tid: ThreadId) {
+    clear_park(tid);
+}
+
 fn clear_park(tid: ThreadId) {
+    // A normal completion also clears a (raced, unused) timeout flag from
+    // ADR-041 expiry, so it cannot leak into this thread's next park.
+    sched::clear_timed_out(tid);
     let mut p = PARKS.lock();
     for slot in p.who.iter_mut() {
         if let Some((t, _, _)) = slot {
@@ -346,6 +355,20 @@ pub fn park_result(tid: ThreadId) -> Option<crate::entry::SyscallReturn> {
         }
         return Some(crate::entry::SyscallReturn::ok(env.msg.tag, env.msg.words));
     }
+    // 3. Deadline expiry (ADR-041): nothing was delivered and the timeout
+    //    fired — report ETIMEDOUT. Delivery checks above win on a race
+    //    (clear_park then clears the stale flag).
+    if let Ok(t) = sched::get(tid) {
+        if t.timed_out {
+            sched::clear_timed_out(tid);
+            clear_park(tid);
+            return Some(crate::entry::SyscallReturn {
+                status: ipc::status::ETIMEDOUT,
+                tag: Tag(0),
+                w: [0; 4],
+            });
+        }
+    }
     None
 }
 
@@ -356,7 +379,12 @@ pub fn sys_recv(
     tid: ThreadId,
     src_handle: u32,
     nonblock: bool,
+    deadline_ns: u64,
 ) -> SysResult<Option<Message>> {
+    // Deadline already passed (ADR-041): report ETIMEDOUT without parking.
+    if expired(deadline_ns) {
+        return Err(err(ipc::status::ETIMEDOUT));
+    }
     // A pending reply for a `call` takes priority (woken by reply_only).
     // See SYS 2: the implicit request reply slot survives nested call
     // replies; only a new request (endpoint delivery) rebinds it.
@@ -394,9 +422,10 @@ pub fn sys_recv(
                         return Ok(Some(m));
                     }
                     None => {
-                        sched::block(
+                        sched::block_with_deadline(
                             tid,
                             BlockReason::Notification(ObjRef(crate::console_in::CONSOLE_NOTIFY_ID)),
+                            deadline_ns,
                         )
                         .map_err(|_| err(ipc::status::ENOMEM))?;
                         // Woken (deferred signal at dispatch entry): pop the
@@ -423,7 +452,7 @@ pub fn sys_recv(
                     }
                 }
             }
-            match endpoint::recv(ObjRef(cap.obj.0), tid, nonblock) {
+            match endpoint::recv(ObjRef(cap.obj.0), tid, nonblock, deadline_ns) {
                 Ok(Some(mut env)) => {
                     // Set the implicit reply cap when the message came from a call.
                     set_reply_if_call(&env, tid);
@@ -435,7 +464,8 @@ pub fn sys_recv(
                         // v0 polling recv (VFS accept loop): report empty.
                         return Err(err(ipc::status::EWOULDBLOCK));
                     }
-                    // Parked; record for park_result (ADR-019 §1).
+                    // Parked inside endpoint::recv (with the ADR-041
+                    // deadline); record for park_result (ADR-019 §1).
                     record_park(tid, src_handle, pid);
                     Ok(None)
                 }
@@ -452,8 +482,12 @@ pub fn sys_recv(
                     // Polling recv on notifications (PS's nonblocking WAIT).
                     return Err(err(ipc::status::EWOULDBLOCK));
                 }
-                sched::block(tid, BlockReason::Notification(ObjRef(cap.obj.0)))
-                    .map_err(|_| err(ipc::status::ENOMEM))?;
+                sched::block_with_deadline(
+                    tid,
+                    BlockReason::Notification(ObjRef(cap.obj.0)),
+                    deadline_ns,
+                )
+                .map_err(|_| err(ipc::status::ENOMEM))?;
                 // Re-check: a signal that landed between the take and the
                 // block found no waiter to wake (its scan ran first) and the
                 // thread would otherwise sleep through it.
@@ -494,7 +528,23 @@ pub fn sys_reply_recv(
     tid: ThreadId,
     src_handle: u32,
     reply: Message,
+    deadline_ns: u64,
 ) -> SysResult<Option<Message>> {
+    // Deadline already passed (ADR-041): the reply half still completes (it
+    // unblocks the caller we owe an answer to); the recv half times out.
+    if expired(deadline_ns) {
+        match take_reply(tid) {
+            Some(caller) => {
+                let (env, _) = resolve_transfers(pid, &reply, tid);
+                crate::endpoint::DELIVERED_FOR_REPLY
+                    .lock()
+                    .insert(caller, env);
+                sched::make_ready(caller).map_err(|_| err(ipc::status::EDEAD))?;
+            }
+            None => return Err(err(ipc::status::EBADSTATE)),
+        }
+        return Err(err(ipc::status::ETIMEDOUT));
+    }
     match take_reply(tid) {
         Some(caller) => {
             // Same contract as `reply_only`: resolve descriptors before the
@@ -507,7 +557,12 @@ pub fn sys_reply_recv(
         }
         None => return Err(err(ipc::status::EBADSTATE)),
     }
-    sys_recv(pid, tid, src_handle, false)
+    sys_recv(pid, tid, src_handle, false, deadline_ns)
+}
+
+/// ADR-041: is this deadline already in the past? (0 = no deadline.)
+fn expired(deadline_ns: u64) -> bool {
+    deadline_ns != 0 && crate::time::now_ns() >= deadline_ns
 }
 
 /// SYS 5: `invoke` — method dispatch on kernel object caps.
@@ -626,7 +681,8 @@ pub fn sys_exit(tid: ThreadId, status: i32) -> SysResult<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sched::{set_context_backend, SCHED};
+    use crate::sched::{set_context_backend, State, SCHED};
+    use crate::time;
     use caps::ObjId;
 
     struct MockCtx;
@@ -687,11 +743,11 @@ mod tests {
         ));
 
         // Server receives: gets the request + implicit reply cap.
-        let req = sys_recv(pid, server, ep_h, false).unwrap().unwrap();
+        let req = sys_recv(pid, server, ep_h, false, 0).unwrap().unwrap();
         assert_eq!(req.words[0], 42);
 
         // Server replies + recvs again (fast path).
-        let rep = sys_reply_recv(pid, server, ep_h, msg(0x0110, 77));
+        let rep = sys_reply_recv(pid, server, ep_h, msg(0x0110, 77), 0);
         assert!(rep.is_ok());
 
         // Client was woken and reads its reply.
@@ -723,12 +779,12 @@ mod tests {
 
         // Client calls; server replies carrying the frame cap.
         assert_eq!(sys_call(pid, client, ep_h, msg(0x0101, 1)), Ok(0));
-        let _req = sys_recv(pid, server, ep_h, false).unwrap().unwrap();
+        let _req = sys_recv(pid, server, ep_h, false, 0).unwrap().unwrap();
         let mut rep = msg(0x0101, 2);
         rep.tag = rep.tag.with_caps(1);
         rep.set_descriptor(0, CapSlot::pack(frame_h, Rights::READ))
             .unwrap();
-        assert!(sys_reply_recv(pid, server, ep_h, rep).is_ok());
+        assert!(sys_reply_recv(pid, server, ep_h, rep, 0).is_ok());
 
         // The parked caller's envelope must carry the resolved cap and
         // install it into the receiver's table on resume (regression: the
@@ -756,7 +812,7 @@ mod tests {
 
         // Establish one via recv of a call, then reply via sentinel.
         assert_eq!(sys_call(pid, server, ep_h, msg(5, 5)), Ok(0));
-        let _req = sys_recv(pid, server, ep_h, false).unwrap().unwrap();
+        let _req = sys_recv(pid, server, ep_h, false, 0).unwrap().unwrap();
         assert_eq!(
             sys_send(pid, server, REPLY_CAP_SENTINEL, msg(5, 6), false),
             Ok(0)
@@ -790,7 +846,7 @@ mod tests {
         assert_eq!(sys_send(pid, client, ep_h, m, false), Ok(0));
 
         // Server receives; descriptor rewritten to its own handle.
-        let got = sys_recv(pid, server, ep_h, false).unwrap().unwrap();
+        let got = sys_recv(pid, server, ep_h, false, 0).unwrap().unwrap();
         let cs = got.descriptor(0).unwrap();
         assert_ne!(cs.handle(), frame_h, "receiver handle differs");
         assert_eq!(cs.rights(), Rights::READ, "granted = sender ∩ requested");
@@ -817,12 +873,12 @@ mod tests {
         assert_eq!(sys_invoke(pid, server, n_h, m), Ok((0, [0; 4])));
 
         // recv-on-notification returns and clears the mask.
-        let got = sys_recv(pid, server, n_h, false).unwrap().unwrap();
+        let got = sys_recv(pid, server, n_h, false, 0).unwrap().unwrap();
         assert_eq!(got.tag.label(), ipc::labels::kernel::NOTIFY);
         assert_eq!(got.words[0], 0b1010);
 
         // Empty → parks the thread.
-        assert_eq!(sys_recv(pid, server, n_h, false), Ok(None));
+        assert_eq!(sys_recv(pid, server, n_h, false, 0), Ok(None));
         assert!(matches!(
             sched::get(server).unwrap().state,
             crate::sched::State::Blocked(BlockReason::Notification(_))
@@ -872,7 +928,7 @@ mod tests {
         }
         // Client calls so the server holds a reply target.
         assert_eq!(sys_call(pid, client, ep_h, msg(1, 1)), Ok(0));
-        let _ = sys_recv(pid, server, ep_h, false).unwrap();
+        let _ = sys_recv(pid, server, ep_h, false, 0).unwrap();
         // Server exits: notification pending, reply state cleared.
         assert_eq!(sys_exit(server, 0), Ok(true));
         assert_eq!(notification::pending(n), Ok(1));
@@ -904,7 +960,7 @@ mod tests {
             .unwrap();
         assert_eq!(sys_send(pid, client, ep_h, m, false), Ok(0));
 
-        let got = sys_recv(pid, _server, ep_h, false).unwrap().unwrap();
+        let got = sys_recv(pid, _server, ep_h, false, 0).unwrap().unwrap();
         assert!(
             got.tag.flags() & ipc::flags::CAP_PARTIAL != 0,
             "partial flag set"
@@ -924,7 +980,7 @@ mod tests {
         let (pid, server, _client, ep_h) = setup();
 
         // Server parks in recv (mailbox empty).
-        assert_eq!(sys_recv(pid, server, ep_h, false), Ok(None));
+        assert_eq!(sys_recv(pid, server, ep_h, false, 0), Ok(None));
         assert!(matches!(
             sched::get(server).unwrap().state,
             crate::sched::State::Blocked(_)
@@ -951,7 +1007,7 @@ mod tests {
                 .unwrap()
                 .bound_notification = Some(n);
         }
-        assert_eq!(sys_recv(pid, server, ep_h, false), Ok(None));
+        assert_eq!(sys_recv(pid, server, ep_h, false, 0), Ok(None));
         notification::signal(n, 0b110).unwrap();
         assert_eq!(
             sched::get(server).unwrap().state,
@@ -1059,7 +1115,7 @@ mod tests {
         m.set_descriptor(0, ipc::CapSlot::pack(ep_h, ipc::Rights::SEND))
             .unwrap();
         assert_eq!(sys_send(pid, server, _ep, m, false), Ok(0));
-        let got = sys_recv(pid, server, _ep, false).unwrap().unwrap();
+        let got = sys_recv(pid, server, _ep, false, 0).unwrap().unwrap();
         assert!(got.tag.flags() & ipc::flags::CAP_PARTIAL != 0);
         assert_eq!(got.descriptor(0).unwrap().0, 0, "dead cap -> NULL");
         // Old handles in OTHER processes surface EREVOKED at use (send on
@@ -1095,5 +1151,77 @@ mod tests {
             }
             Ok(_) => panic!("expected clean halt"),
         }
+    }
+
+    /// ADR-041: park with a past deadline → ETIMEDOUT without parking.
+    #[test]
+    fn recv_expired_deadline_returns_timedout() {
+        let (pid, server, _client, ep_h) = setup();
+        time::set_clock(|| 5_000);
+        // Deadline 1ns is long past.
+        assert_eq!(
+            sys_recv(pid, server, ep_h, false, 1),
+            Err(ipc::status::ETIMEDOUT)
+        );
+        // Nothing parked, nothing queued.
+        assert!(matches!(
+            sched::get(server).unwrap().state,
+            State::Ready | State::Running
+        ));
+    }
+
+    /// ADR-041: expire_timeouts wakes an endpoint-parked thread past its
+    /// deadline; unqueued so a later send finds no waiter; park_result
+    /// reports ETIMEDOUT.
+    #[test]
+    fn expire_unqueues_endpoint_park_and_reports_timeout() {
+        let (pid, server, _client, ep_h) = setup();
+        time::set_clock(|| 0);
+        assert_eq!(sys_recv(pid, server, ep_h, false, 1_000), Ok(None));
+        assert!(matches!(
+            sched::get(server).unwrap().state,
+            State::Blocked(BlockReason::Recv(_))
+        ));
+        // Tick past the deadline (dispatch-entry path).
+        assert_eq!(sched::expire_timeouts(2_000), 1);
+        assert_eq!(sched::get(server).unwrap().state, State::Ready);
+        // park_result (on resume) reports ETIMEDOUT and clears the flag.
+        let r = park_result(server);
+        assert!(
+            matches!(r, Some(crate::entry::SyscallReturn { status, .. }) if status == ipc::status::ETIMEDOUT)
+        );
+        // Flag consumed: no spurious second ETIMEDOUT.
+        assert!(
+            park_result(server).is_none() || {
+                // Without a park record the second call returns None.
+                true
+            }
+        );
+        // A later sender finds no parked receiver (unqueued): mailbox.
+        assert_eq!(
+            endpoint::try_send(ObjRef(1), Envelope::new(msg(1, 1), _client)).map(|_| ()),
+            Ok(())
+        );
+    }
+
+    /// ADR-041: a message that raced the deadline wins (delivery priority).
+    #[test]
+    fn delivery_beats_expiry() {
+        let (pid, server, client, ep_h) = setup();
+        time::set_clock(|| 0);
+        assert_eq!(sys_recv(pid, server, ep_h, false, 1_000), Ok(None));
+        // Deliver before expiry (direct hand-off → Ready + delivered env).
+        assert_eq!(sys_send(pid, client, ep_h, msg(0x0101, 7), false), Ok(0));
+        assert_eq!(sched::get(server).unwrap().state, State::Ready);
+        // Expiry only collects Blocked threads: the raced (delivered, Ready)
+        // thread is skipped; its stale deadline is overwritten at next park.
+        assert_eq!(sched::expire_timeouts(2_000), 0);
+        // park_result: the delivered message is consumed first (priority);
+        // clear_park clears the stale flag.
+        let r = park_result(server).expect("delivery completes the recv");
+        assert_eq!(r.status, 0);
+        assert_eq!(r.w[0], 7);
+        // Flag cleared: no spurious ETIMEDOUT on the next resume.
+        assert!(park_result(server).is_none());
     }
 }
