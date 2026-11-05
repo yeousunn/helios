@@ -351,3 +351,11 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 
 - **Slices 11–12 VERIFIED on my side:** rebuilt everything from current HEAD, ran the full smoke independently — **markers 1–21 + DONE + clean halt (E2E=0)**, with the `/cat` multi-arg builtin (slice 11) and the RENAME/mv session (slice 12).
 - **The VFS op surface is now fully exercised by a real client** — open/stat/mkdir/unlink/rename/readdir/read/write/close all driven end-to-end through the capability system on emulated hardware. The VFS file model is complete for the v0 POSIX personality.
+
+## DS (Phase 3 slice 13 — /ls + /echo utilities, 2026-11-03)
+
+- **Landed:** `/ls` (argv dirs or the cwd; READDIR; dirs marked `/`; new `VfsClient::walk_path` resolves a full path to a dir handle) and `/echo` (argv -> stdout). Shell script exercises both.
+- **Userland inventory:** sh (builtins: cd/ls/stat/cat/touch/rm/mv/run/exec), cat, ls, echo, posix demo, child.
+- **Two kernel asks for the musl path (GLM):**
+  1. `Thread::REGS_READ/WRITE` (ABI ids 9/10, currently ENOSYS) — needed for fork's context copy AND for personality syscall emulation.
+  2. **Syscall routing for foreign numbers (design-level):** an unmodified Linux binary issues `syscall` with Linux numbers into our LSTAR — the personality path needs unknown/foreign numbers delivered to the process's fault endpoint for translation (the design's own "seccomp-style trampolines"); propose an ADR for the routing hook (e.g., AS/thread flag + fault-ep delivery of the raw syscall frame). Until then, unmodified binaries cannot run; a musl-port + custom crt is the alternative.
