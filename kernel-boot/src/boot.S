@@ -76,6 +76,25 @@ _start32:
     mov [edi], eax
     mov dword ptr [edi + 4], 0
 
+    /* Higher-half alias (ADR-045 slice 1): PML4[511] -> PDPT, and
+     * PDPT[510] -> PD — VA 0xFFFFFFFF_80000000 + X maps via PML4[511],
+     * PDPT[510], PD[X >> 21] to physical X (the canonical top-2-GiB kernel
+     * half is PML4[511]/PDPT[510], NOT PDPT[511]). The Rust kernel, linked
+     * at 0xFFFFFFFF_80100000, is mapped the moment paging starts. */
+    mov edi, offset pml4_table
+    add edi, 511 * 8
+    mov eax, offset pdpt_table
+    or eax, 0x3
+    mov [edi], eax
+    mov dword ptr [edi + 4], 0
+
+    mov edi, offset pdpt_table
+    add edi, 510 * 8
+    mov eax, offset pd_table
+    or eax, 0x3
+    mov [edi], eax
+    mov dword ptr [edi + 4], 0
+
     /* PDPT[0] -> PD (present|rw) */
     mov edi, offset pdpt_table
     mov eax, offset pd_table
@@ -128,10 +147,14 @@ _start64:
     mov rsp, offset stack_top
     xor rbp, rbp
 
-    jmp kernel_main
+    /* kernel_main is linked at the higher-half VMA (ADR-045): beyond rel32
+     * range from the low trampoline — 64-bit immediate, jump through a
+     * register. */
+    movabs rax, offset kernel_main
+    jmp rax
 
 /* ---- GDT: null | 32-bit code | data | 64-bit code | user code | user data ---- */
-.section .rodata
+.section .boot.rodata,"a",@progbits
 .align 16
 gdt_start:
     .quad 0x0000000000000000
@@ -146,8 +169,10 @@ gdt_ptr32:
     .word gdt_end - gdt_start - 1
     .long gdt_start              /* 32-bit base (low 4 GiB load address) */
 
-/* ---- page tables + boot stack in .bss (zero-filled by the loader) ---- */
-.section .bss
+/* ---- page tables + boot stack in .boot.bss (LOW VMA: the 32-bit
+ * trampoline programs these tables by address; the kernel's `stack_top`
+ * extern still resolves — the identity map covers the low half) ---- */
+.section .boot.bss,"aw",@nobits
 .align 4096
 pml4_table:
     .skip 4096

@@ -502,8 +502,41 @@ const KERNEL_LOW_MIB: usize = 16;
 const FRAME_REGION_START_MIB: usize = 16;
 const FRAME_REGION_END_MIB: usize = 256;
 
+/// ADR-045: the shared higher-half kernel window (PDPT phys, PD phys).
+/// Built once from the frame allocator; every AS's PML4[511] points here.
+static SHARED_HIGH: Mutex<Option<(kernel::frame::PhysAddr, kernel::frame::PhysAddr)>> =
+    Mutex::new(None);
+
+fn shared_high_window() -> Option<(kernel::frame::PhysAddr, kernel::frame::PhysAddr)> {
+    let mut guard = SHARED_HIGH.lock();
+    if let Some(s) = *guard {
+        return Some(s);
+    }
+    let pdpt = frame::alloc()?;
+    let pd = frame::alloc()?;
+    // SAFETY: freshly allocated frames, written through the boot identity
+    // map (the builder runs on the boot CR3 where VA == PA for < 1 GiB).
+    unsafe {
+        core::ptr::write_bytes(pdpt.as_u64() as *mut u8, 0, PAGE_SIZE);
+        core::ptr::write_bytes(pd.as_u64() as *mut u8, 0, PAGE_SIZE);
+        let entries = pd.as_u64() as *mut u64;
+        let huge = PTE_PRESENT | PTE_WRITABLE | PTE_PAGE_SIZE;
+        for i in 0..512u64 {
+            *entries.add(i as usize) = (i * 0x20_0000) | huge;
+        }
+    }
+    *guard = Some((pdpt, pd));
+    Some((pdpt, pd))
+}
+
 impl BackendFactory for BackendFactoryX86_64 {
     fn create(&self, as_id: u64) -> Option<&'static dyn PagingBackend> {
+        // ADR-045 slice 1: every AS shares the higher-half kernel window
+        // (PML4[511] -> PDPT[510] -> 2 MiB identity pages, VA
+        // 0xFFFFFFFF80000000 + PA) — the kernel's own code/statics must be
+        // reachable under every CR3 it ever executes under. One PDPT+PD,
+        // built once, referenced by every PML4.
+        let shared = shared_high_window()?;
         // Allocate a PML4 page from the kernel frame allocator.
         let paddr = frame::alloc()?;
         let pml4 = paddr.as_u64() as usize;
@@ -524,6 +557,11 @@ impl BackendFactory for BackendFactoryX86_64 {
             *pml4e = (pdpt.as_u64() & PTE_ADDR_MASK) | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
             let pdpte = (pdpt.as_u64() as *mut u64).add(0);
             *pdpte = (pd.as_u64() & PTE_ADDR_MASK) | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+            // Higher-half kernel window (shared; see above).
+            let pml4e511 = (pml4 as *mut u64).add(511);
+            *pml4e511 = (shared.0.as_u64() & PTE_ADDR_MASK) | PTE_PRESENT | PTE_WRITABLE;
+            let pdpte510 = (shared.0.as_u64() as *mut u64).add(510);
+            *pdpte510 = (shared.1.as_u64() & PTE_ADDR_MASK) | PTE_PRESENT | PTE_WRITABLE;
 
             let pd_entries = pd.as_u64() as *mut u64;
             let huge = PTE_PRESENT | PTE_WRITABLE | PTE_PAGE_SIZE;
