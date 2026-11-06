@@ -462,6 +462,7 @@ pub fn sys_recv(
                 match crate::console_in::pop_line(&mut buf) {
                     Some(len) => {
                         let mut m = Message::new(ipc::labels::kernel::NOTIFY);
+                        let len = len.min((ipc::MAX_WORDS - 1) * 8); // bytes live in words[1..]; cap to avoid OOB (was a >24-byte-line panic)
                         m.words[0] = len as u64;
                         let mut i = 0usize;
                         while i + 8 <= 120 && i < len {
@@ -494,6 +495,7 @@ pub fn sys_recv(
                         return match crate::console_in::pop_line(&mut buf) {
                             Some(len) => {
                                 let mut m = Message::new(ipc::labels::kernel::NOTIFY);
+                                let len = len.min((ipc::MAX_WORDS - 1) * 8); // bytes live in words[1..]; cap to avoid OOB (was a >24-byte-line panic)
                                 m.words[0] = len as u64;
                                 let mut i = 0usize;
                                 while i + 8 <= 120 && i < len {
