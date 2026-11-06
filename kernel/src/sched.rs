@@ -984,6 +984,21 @@ pub fn bury_thread_kstack_for_exit(id: ThreadId) {
     if let Ok(t) = get(id) {
         if t.kstack_top != 0 {
             let base = t.kstack_top - KSTACK_FRAMES as u64 * 4096;
+            // ADR-037 am1 depth report (debug builds): the paint measures
+            // the deepest touch at exit, so kstack sizing is measured, not
+            // guessed. This is the sizing input for the next ADR-037 round.
+            #[cfg(debug_assertions)]
+            {
+                let used =
+                    crate::mem::high_water(base, t.kstack_top - base, crate::sched::KSTACK_PAINT);
+                crate::kinfo!(
+                    "KSTACK depth: tid={} used={} of {} KiB ({}% of window)",
+                    id.0,
+                    used,
+                    (t.kstack_top - base) / 1024,
+                    (used * 100) / (t.kstack_top - base)
+                );
+            }
             crate::kinfo!(
                 "BURIED kstack pid={} frames {:#x}..{:#x}",
                 t.process.0,

@@ -177,14 +177,22 @@ struct Engine {
     endpoints: [Option<Endpoint>; MAX_ENDPOINTS],
 }
 
-static ENGINE: Mutex<Option<Engine>> = Mutex::new(None);
+/// Global endpoint engine, **const-staged in .bss**: the virgin state
+/// (all slots free) is exactly `Engine { endpoints: [None; _] }`, so the
+/// static is const-initialized and `create_endpoint` never materializes a
+/// by-value `Engine` — the closure form built a ~2.27 MB temporary on the
+/// boot stack in debug builds (LLVM const-folds it in release only),
+/// overflowing the stack and crashing `Factory::mint`'s first endpoint
+/// creation. Same landmine class as `CapTable::empty` / `frame::init`
+/// (ADR-037 am2): large tables are const statics, never stack values.
+static ENGINE: Mutex<Option<Engine>> = Mutex::new(Some(Engine {
+    endpoints: [const { None }; MAX_ENDPOINTS],
+}));
 
 /// Create a kernel endpoint object; returns its ObjRef (0 is never returned).
 pub fn create_endpoint() -> Result<ObjRef, IpcError> {
     let mut guard = ENGINE.lock();
-    let e = guard.get_or_insert_with(|| Engine {
-        endpoints: [const { None }; MAX_ENDPOINTS],
-    });
+    let e = guard.as_mut().ok_or(IpcError::NoWaiterSlot)?;
     let slot = e
         .endpoints
         .iter()
@@ -268,13 +276,18 @@ pub fn take_delivered(id: ThreadId) -> Option<Envelope> {
 
 /// Bench hook: clear the engine table (criterion benches run on host).
 pub fn reset_for_bench() {
-    *ENGINE.lock() = None;
+    let mut guard = ENGINE.lock();
+    if let Some(e) = guard.as_mut() {
+        e.endpoints = [const { None }; MAX_ENDPOINTS];
+    }
 }
 
 /// Test hook: clear the engine + rendezvous table.
 #[cfg(test)]
 pub(crate) fn reset_engine_for_test() {
-    *ENGINE.lock() = None;
+    if let Some(e) = ENGINE.lock().as_mut() {
+        e.endpoints = [const { None }; MAX_ENDPOINTS];
+    }
     *DELIVERED_FOR_REPLY.lock() = Delivered {
         who: [sched::IDLE; MAX_WAITERS],
         msg: [const { None }; MAX_WAITERS],
@@ -400,7 +413,9 @@ mod tests {
     }
 
     fn setup() -> (ObjRef, ThreadId, ThreadId) {
-        *ENGINE.lock() = None;
+        if let Some(e) = ENGINE.lock().as_mut() {
+            e.endpoints = [const { None }; MAX_ENDPOINTS];
+        }
         *sched::SCHED.lock() = None;
         sched::set_context_backend(&MockCtx);
         let _ = sched::init();
