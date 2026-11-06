@@ -67,6 +67,13 @@ static NEXT_CHILD: AtomicUsize = AtomicUsize::new(0);
 /// so EXEC can resolve "the calling process" without extra capabilities.
 static CONN_PIDS: [AtomicU64; MAX_CONNS] = [const { AtomicU64::new(0) }; MAX_CONNS];
 
+/// PS's one persistent VFS connection for program loads (lazily created on
+/// the first load). Was one connection + two window frames + a notification
+/// PER load: the VFS never reclaims a connection's windows (no disconnect),
+/// so per-load connections exhausted the VFS's window mapper after ~60 loads.
+static LOAD_CONN: AtomicU32 = AtomicU32::new(0);
+static LOAD_ROOT: AtomicU64 = AtomicU64::new(0);
+
 fn child_slot(pid: u64) -> Option<usize> {
     if pid == 0 {
         return None;
@@ -606,56 +613,62 @@ fn load_via_vfs(
         return Err(ipc::status::EBADARG);
     }
     // Dedicated load-window area, clear of the per-connection window pairs
-    // (`PS_WINDOW_VA_BASE + slot * 0x2000`) and unmapped after every load, so
-    // sequential spawns reuse it.
+    // (`PS_WINDOW_VA_BASE + slot * 0x2000`). Mapped once and kept for the
+    // whole run (the connection and its windows are cached).
     let arg_va = PS_WINDOW_VA_BASE + 0x10_0000;
     let result_va = PS_WINDOW_VA_BASE + 0x10_1000;
-    let session = invoke_w0(sys, factory, methods::factory::NEW_NOTIFICATION, [0; 4])? as u32;
-    let arg_frame = invoke_w0(
-        sys,
-        package.region,
-        methods::region::CARVE,
-        [4096, 4096, 0, 0],
-    )? as u32;
-    let result_frame = invoke_w0(
-        sys,
-        package.region,
-        methods::region::CARVE,
-        [4096, 4096, 0, 0],
-    )? as u32;
-    if session == 0 || arg_frame == 0 || result_frame == 0 {
-        return Err(ipc::status::ENOMEM);
-    }
-    for (frame, va) in [(arg_frame, arg_va), (result_frame, result_va)] {
-        invoke_map(sys, package.aspace, va, 0b011, frame as u64)?;
-    }
-    let mut connect = Message::new(methods::vfs::CONNECT);
-    connect.tag = connect.tag.with_caps(3);
-    connect.words[0] = 1;
-    let _ = connect.set_descriptor(0, CapSlot::pack(session, Rights::SIGNAL));
-    let _ = connect.set_descriptor(
-        1,
-        CapSlot::pack(arg_frame, Rights::READ.union(Rights::WRITE)),
-    );
-    let _ = connect.set_descriptor(
-        2,
-        CapSlot::pack(
-            result_frame,
-            Rights::READ.union(Rights::WRITE).union(Rights::MAP),
-        ),
-    );
-    let conn = sys.call(vfs_svc, &connect)?;
-    if conn.words[0] != 0 {
-        return Err(conn.words[0] as i64 as i32);
-    }
-    let conn_ep = conn
-        .descriptor(0)
-        .map(|cs| cs.handle())
-        .filter(|h| *h != 0)
-        .ok_or(ipc::status::EBADCAP)?;
-    let root = conn.words[2];
-    if root == 0 {
-        return Err(ipc::status::EBADCAP);
+    let mut conn_ep = LOAD_CONN.load(Ordering::Relaxed);
+    let mut root = LOAD_ROOT.load(Ordering::Relaxed);
+    if conn_ep == 0 {
+        let session = invoke_w0(sys, factory, methods::factory::NEW_NOTIFICATION, [0; 4])? as u32;
+        let arg_frame = invoke_w0(
+            sys,
+            package.region,
+            methods::region::CARVE,
+            [4096, 4096, 0, 0],
+        )? as u32;
+        let result_frame = invoke_w0(
+            sys,
+            package.region,
+            methods::region::CARVE,
+            [4096, 4096, 0, 0],
+        )? as u32;
+        if session == 0 || arg_frame == 0 || result_frame == 0 {
+            return Err(ipc::status::ENOMEM);
+        }
+        for (frame, va) in [(arg_frame, arg_va), (result_frame, result_va)] {
+            invoke_map(sys, package.aspace, va, 0b011, frame as u64)?;
+        }
+        let mut connect = Message::new(methods::vfs::CONNECT);
+        connect.tag = connect.tag.with_caps(3);
+        connect.words[0] = 1;
+        let _ = connect.set_descriptor(0, CapSlot::pack(session, Rights::SIGNAL));
+        let _ = connect.set_descriptor(
+            1,
+            CapSlot::pack(arg_frame, Rights::READ.union(Rights::WRITE)),
+        );
+        let _ = connect.set_descriptor(
+            2,
+            CapSlot::pack(
+                result_frame,
+                Rights::READ.union(Rights::WRITE).union(Rights::MAP),
+            ),
+        );
+        let conn = sys.call(vfs_svc, &connect)?;
+        if conn.words[0] != 0 {
+            return Err(conn.words[0] as i64 as i32);
+        }
+        conn_ep = conn
+            .descriptor(0)
+            .map(|cs| cs.handle())
+            .filter(|h| *h != 0)
+            .ok_or(ipc::status::EBADCAP)?;
+        root = conn.words[2];
+        if root == 0 {
+            return Err(ipc::status::EBADCAP);
+        }
+        LOAD_CONN.store(conn_ep, Ordering::Relaxed);
+        LOAD_ROOT.store(root, Ordering::Relaxed);
     }
     // Copy the path into the VFS arg window (its first bytes) and OPEN it.
     let path =
@@ -700,15 +713,6 @@ fn load_via_vfs(
         if count < 4096 {
             break;
         }
-    }
-    // Release the window VAs for the next SPAWN (the frames stay alive via
-    // our caps; the VFS's own mappings of them are unaffected). Re-mapping
-    // over an existing mapping is an overlap error — the second VFS-backed
-    // spawn hit exactly that.
-    for va in [arg_va, result_va] {
-        let mut unmap = Message::new(methods::aspace::UNMAP);
-        unmap.words[0] = va;
-        let _ = sys.invoke(package.aspace, &unmap);
     }
     if out.is_empty() {
         return Err(ipc::status::EBADARG);
