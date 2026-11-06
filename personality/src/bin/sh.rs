@@ -107,6 +107,11 @@ enum Command {
         src: &'static [u8],
         dst: &'static [u8],
     },
+    /// `export KEY=VAL`: add an entry to the shell environment inherited by
+    /// every subsequently spawned program.
+    Export(&'static [u8]),
+    /// `unset KEY`: drop an environment entry by name.
+    Unset(&'static [u8]),
 }
 
 const SCRIPT: &[Command] = &[
@@ -235,6 +240,17 @@ const SCRIPT: &[Command] = &[
     // '..' inside a path: `work/../hello` resolves to the root's `hello`
     // (the server's walk clamps at the root).
     Command::Cat(b"work/../hello"),
+    // Environment: `export` adds an entry inherited by every later spawn; the
+    // `child` echo utility reports the env it received (`argv=..|env=..`).
+    Command::Export(b"HELIOS=1"),
+    Command::Export(b"TARGET=helios"),
+    Command::Run {
+        path: b"child",
+        argv: &[b"5"],
+        env: &[],
+        expect: 5,
+    },
+    Command::Unset(b"TARGET"),
     Command::Echo(b"sh ok"),
     // exec: replaces this shell with the child image, which echoes its argv
     // and exits 9. The shell's process keeps its capabilities (and its pid).
@@ -295,6 +311,9 @@ extern "C" fn sh_main(argc: u64, argv: *const *const u8, envp: *const *const u8)
 
     let mut path = [0u8; 64];
     let mut path_len = 0usize;
+    // Shell environment (export/unset); every spawn inherits this table.
+    let mut senv: [&[u8]; 16] = [b""; 16];
+    let mut senv_len = 0usize;
     let mut fail = 0x10i32;
     for cmd in SCRIPT {
         match cmd {
@@ -429,10 +448,15 @@ extern "C" fn sh_main(argc: u64, argv: *const *const u8, envp: *const *const u8)
                 for (i, (path, argv, _)) in stages.iter().enumerate() {
                     let stdin_h = if i == 0 { None } else { Some(pipes[i - 1].0) };
                     let stdout_h = if i == n - 1 { stdout } else { Some(pipes[i].1) };
-                    match rt
-                        .ps
-                        .spawn(&mut sys, path, argv, &[], vfs_ep, stdin_h, stdout_h)
-                    {
+                    match rt.ps.spawn(
+                        &mut sys,
+                        path,
+                        argv,
+                        &senv[..senv_len],
+                        vfs_ep,
+                        stdin_h,
+                        stdout_h,
+                    ) {
                         Ok(pid) => pids.push(pid),
                         Err(e) => exit(&mut sys, ((fail + 1) << 8) | (e & 0xFF)),
                     }
@@ -469,7 +493,14 @@ extern "C" fn sh_main(argc: u64, argv: *const *const u8, envp: *const *const u8)
                 env,
                 expect,
             } => {
-                let pid = match rt.ps.spawn(&mut sys, path, argv, env, vfs_ep, None, stdout) {
+                // The command's explicit env plus the shell environment.
+                let mut cmd_env: Vec<&[u8]> = Vec::new();
+                cmd_env.extend_from_slice(env);
+                cmd_env.extend_from_slice(&senv[..senv_len]);
+                let pid = match rt
+                    .ps
+                    .spawn(&mut sys, path, argv, &cmd_env, vfs_ep, None, stdout)
+                {
                     Ok(pid) => pid,
                     Err(e) => exit(&mut sys, fail | (e & 0xFF)),
                 };
@@ -514,14 +545,18 @@ extern "C" fn sh_main(argc: u64, argv: *const *const u8, envp: *const *const u8)
                     Ok(p) => p,
                     Err(e) => exit(&mut sys, (fail << 8) | (e & 0xFF)),
                 };
-                let pid =
-                    match rt
-                        .ps
-                        .spawn(&mut sys, path, argv, &[], vfs_ep, None, Some(write_end))
-                    {
-                        Ok(pid) => pid,
-                        Err(e) => exit(&mut sys, ((fail + 1) << 8) | (e & 0xFF)),
-                    };
+                let pid = match rt.ps.spawn(
+                    &mut sys,
+                    path,
+                    argv,
+                    &senv[..senv_len],
+                    vfs_ep,
+                    None,
+                    Some(write_end),
+                ) {
+                    Ok(pid) => pid,
+                    Err(e) => exit(&mut sys, ((fail + 1) << 8) | (e & 0xFF)),
+                };
                 // Drain the child's stdout (console::WRITE chunks) until EOF.
                 let mut buf: Vec<u8> = Vec::new();
                 loop {
@@ -575,14 +610,18 @@ extern "C" fn sh_main(argc: u64, argv: *const *const u8, envp: *const *const u8)
                     Ok(p) => p,
                     Err(e) => exit(&mut sys, ((fail + 1) << 8) | (e & 0xFF)),
                 };
-                let pid =
-                    match rt
-                        .ps
-                        .spawn(&mut sys, path, argv, &[], vfs_ep, Some(read_end), stdout)
-                    {
-                        Ok(pid) => pid,
-                        Err(e) => exit(&mut sys, ((fail + 2) << 8) | (e & 0xFF)),
-                    };
+                let pid = match rt.ps.spawn(
+                    &mut sys,
+                    path,
+                    argv,
+                    &senv[..senv_len],
+                    vfs_ep,
+                    Some(read_end),
+                    stdout,
+                ) {
+                    Ok(pid) => pid,
+                    Err(e) => exit(&mut sys, ((fail + 2) << 8) | (e & 0xFF)),
+                };
                 // Feed the file, then close the write end with `EOF`.
                 for chunk in data[..n].chunks(sdk::methods::console::TEXT_BYTES) {
                     let mut m = Message::new(sdk::methods::console::WRITE);
@@ -632,6 +671,33 @@ extern "C" fn sh_main(argc: u64, argv: *const *const u8, envp: *const *const u8)
                 let _ = rt.write_stdout(&mut sys, dst);
                 let _ = rt.write_stdout(&mut sys, b"\n");
                 fail += 4;
+            }
+            Command::Export(entry) => {
+                if senv_len < senv.len() {
+                    senv[senv_len] = entry;
+                    senv_len += 1;
+                }
+                let _ = rt.write_stdout(&mut sys, b"export ");
+                let _ = rt.write_stdout(&mut sys, entry);
+                let _ = rt.write_stdout(&mut sys, b"\n");
+                fail += 2;
+            }
+            Command::Unset(key) => {
+                let mut w = 0usize;
+                for r in 0..senv_len {
+                    let e = senv[r];
+                    let klen = e.iter().position(|&b| b == b'=').unwrap_or(e.len());
+                    if &e[..klen] == *key {
+                        continue; // drop
+                    }
+                    senv[w] = e;
+                    w += 1;
+                }
+                senv_len = w;
+                let _ = rt.write_stdout(&mut sys, b"unset ");
+                let _ = rt.write_stdout(&mut sys, key);
+                let _ = rt.write_stdout(&mut sys, b"\n");
+                fail += 2;
             }
         }
     }
