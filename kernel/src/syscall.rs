@@ -185,16 +185,10 @@ pub fn sys_send(
                 return Err(err(ipc::status::ERIGHTS));
             }
             // Debug endpoint fast path (ADR-018 §4): log, no delivery.
+            // (The clobber-hunt WALK/SWEEP ops were removed with their root
+            // cause: the enter_user asm clobber + frame::init stack
+            // temporary, ADR-037 am2 + ebd4489.)
             if cap.obj.0 == crate::init::DEBUG_EP_ID {
-                // Label 0xFFFF = single walk op; 0xFFFE = full stack sweep.
-                if msg.tag.label() == 0xFFFF {
-                    crate::debug::debug_walk(msg.words[0], msg.words[1]);
-                    return Ok(ipc::status::OK);
-                }
-                if msg.tag.label() == 0xFFFE {
-                    crate::debug::debug_stack_sweep();
-                    return Ok(ipc::status::OK);
-                }
                 crate::init::debug_ep_send(&msg);
                 return Ok(ipc::status::OK);
             }

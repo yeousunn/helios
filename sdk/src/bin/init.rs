@@ -717,18 +717,6 @@ fn spawn_server(
     let ops = loader::plan(&elf, INIT_SCRATCH_VA_BASE)
         .map_err(|e| fail_code(step, 0xE0_00 | (e as u64 & 0xFF)))?;
 
-    // Per-sub-op walk probe (clobber hunt): send the debug-EP walk op
-    // (label 0xFFFF) — the kernel prints hardware + registry views.
-    #[inline(never)]
-    fn walk_probe(raw: &mut X86_64Syscalls, debug_ep: u32, tag: u64) {
-        let mut sys = Syscalls::new(raw);
-        let mut m = Message::new(0xFFFE);
-        m.words[0] = sdk::layout::USER_STACK_TOP - 0x1000;
-        m.words[1] = tag;
-        let _ = sys.send(debug_ep, &m);
-    }
-    walk_probe(raw, info.debug_ep, 0xA0);
-
     let child_as = {
         let mut sys = Syscalls::new(raw);
         sys.invoke(
@@ -741,9 +729,7 @@ fn spawn_server(
     if child_as == 0 {
         return Err(fail_code(step, 0xE0_02));
     }
-    walk_probe(raw, info.debug_ep, 0xA1);
 
-    walk_probe(raw, info.debug_ep, 0xA2);
     {
         let mut sys = Syscalls::new(raw);
         loader::execute(
@@ -765,7 +751,6 @@ fn spawn_server(
         )
         .map_err(|e| fail_code(step, 0xE1_01 | (e as u64 & 0xFF)))?;
     }
-    walk_probe(raw, info.debug_ep, 0xA4);
 
     // Endpoints + notifications for the package. Every handle travels through
     // a .data atomic: live locals across this inlined spawn path were observed
@@ -832,7 +817,6 @@ fn spawn_server(
         return Err(fail_code(step, 0xE6_01));
     }
     SP_THREAD.store(thread_cap, SpOrdering::Relaxed);
-    walk_probe(raw, info.debug_ep, 0xA5); // post-NewThread
 
     // Bind the child's death notification to its thread (ADR-007 §6).
     {
@@ -846,8 +830,6 @@ fn spawn_server(
         sys.invoke(SP_THREAD.load(SpOrdering::Relaxed), &m)
             .map_err(|e| fail_code(step, 0xE7_00 | (e as u64 & 0xFF)))?;
     }
-
-    walk_probe(raw, info.debug_ep, 0xA6); // post-bind-death
 
     // ADR-009 package: §2.3 prefix + ADR-023 tail[0] = Factory.
     // Manual chunked delivery: values are loaded from `.data` atomics and
@@ -905,7 +887,6 @@ fn spawn_server(
         sys.send(boot, &c3)
             .map_err(|e| fail_code(step, 0xE8_03 | (e as u64 & 0xFF)))?;
     }
-    walk_probe(raw, info.debug_ep, 0xA7); // post-package
 
     Ok(pid)
 }
