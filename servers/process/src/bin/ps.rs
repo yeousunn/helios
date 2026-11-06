@@ -1011,6 +1011,16 @@ fn wait_reply(sys: &mut Syscalls<'_, X86_64Syscalls>, req: &Message) -> Message 
             Ok(notified) => {
                 let mask = notified.words[0];
                 if mask & 1 != 0 {
+                    // Reap the child's address space now that it is dead.
+                    // AS ids live in a fixed kernel table (MAX_AS); leaking
+                    // one per spawn exhausted it after ~16 children and every
+                    // later NEW_ADDRESS_SPACE failed with ENOMEM (hit as soon
+                    // as the smoke passed 15 total spawns).
+                    let as_cap = CH_AS[slot].load(Ordering::Relaxed);
+                    if as_cap != 0 {
+                        let _ = sys.invoke(as_cap, &Message::new(methods::aspace::DESTROY));
+                        CH_AS[slot].store(0, Ordering::Relaxed);
+                    }
                     reply.words[1] = (mask >> 32) as u32 as i32 as i64 as u64;
                     return reply;
                 }

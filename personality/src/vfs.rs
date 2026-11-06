@@ -274,19 +274,24 @@ impl VfsClient {
         unsafe {
             core::ptr::copy_nonoverlapping(last.as_ptr(), ARG_WINDOW_VA as *mut u8, len);
         }
-        let mut req = Message::new(if flags & O_CREAT != 0 {
-            methods::vfs::CREATE
-        } else {
-            methods::vfs::OPEN
-        });
+        // Both create-if-missing and truncate are open *flags* (the server's
+        // OPEN path handles them); a dedicated CREATE label would EEXIST on an
+        // existing file and could not truncate, which `>` redirection needs.
+        let mut req = Message::new(methods::vfs::OPEN);
         // POSIX convention: O_RDONLY == 0 means "read", not "no access" —
         // translate to the VFS's explicit access flags (the server rejects a
         // request with neither READ nor WRITE).
-        let vfs_flags = if flags & crate::posix::O_WRONLY != 0 {
+        let mut vfs_flags = if flags & crate::posix::O_WRONLY != 0 {
             sdk::methods::vfs_open::WRITE
         } else {
             sdk::methods::vfs_open::READ
         };
+        if flags & O_CREAT != 0 {
+            vfs_flags |= sdk::methods::vfs_open::CREATE;
+        }
+        if flags & crate::posix::O_TRUNC != 0 {
+            vfs_flags |= sdk::methods::vfs_open::TRUNC;
+        }
         req.words[0] = dir;
         req.words[1] = len as u64; // Span { off 0, len }
         req.words[2] = vfs_flags as u64;
@@ -411,14 +416,18 @@ impl VfsClient {
         n
     }
 
-    /// Convenience: create + write + close.
+    /// Convenience: create/truncate + write + close (`>` semantics).
     pub fn write_file<R: RawSyscalls>(
         &mut self,
         sys: &mut Syscalls<R>,
         path: &[u8],
         data: &[u8],
     ) -> Result<usize, Status> {
-        let fd = self.open(sys, path, O_CREAT)?;
+        let fd = self.open(
+            sys,
+            path,
+            crate::posix::O_WRONLY | O_CREAT | crate::posix::O_TRUNC,
+        )?;
         let n = self.write(sys, fd, data);
         let _ = self.close(sys, fd);
         n

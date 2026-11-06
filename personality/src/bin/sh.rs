@@ -13,6 +13,8 @@ extern crate alloc;
 use core::arch::global_asm;
 use core::panic::PanicInfo;
 
+use alloc::vec::Vec;
+use ipc::Message;
 use personality::layout::HEAP_VA_BASE;
 use personality::runtime::{exit, Runtime};
 use sdk::args::Args;
@@ -77,6 +79,28 @@ enum Command {
         argv: &'static [&'static [u8]],
         env: &'static [&'static [u8]],
         expect: i32,
+    },
+    /// `cmd args > file`: run through PS with stdout captured into a VFS
+    /// file (create/truncate). The shell drains the pipe while the child
+    /// runs, then writes the result.
+    RunTo {
+        path: &'static [u8],
+        argv: &'static [&'static [u8]],
+        expect: i32,
+        file: &'static [u8],
+    },
+    /// `cmd args < file`: run through PS with stdin fed from a VFS file.
+    /// The shell writes the file into the pipe then closes it (`EOF`).
+    RunFrom {
+        path: &'static [u8],
+        argv: &'static [&'static [u8]],
+        expect: i32,
+        file: &'static [u8],
+    },
+    /// Shell builtin `echo` with `> file` redirection (no child).
+    EchoTo {
+        text: &'static [u8],
+        file: &'static [u8],
     },
 }
 
@@ -158,6 +182,30 @@ const SCRIPT: &[Command] = &[
         expect_left: 0,
         expect_right: 0,
     },
+    // OUTPUT REDIRECTION (`>`): the echo builtin writes a file directly, and
+    // an external command's stdout is drained through a pipe into a file.
+    Command::EchoTo {
+        text: b"redirection works",
+        file: b"note.txt",
+    },
+    Command::Cat(b"note.txt"),
+    Command::RunTo {
+        path: b"cat",
+        argv: &[b"cat", b"hello"],
+        expect: 0,
+        file: b"copy",
+    },
+    Command::Cat(b"copy"),
+    // INPUT REDIRECTION (`<`): the shell feeds a VFS file into the child's
+    // stdin pipe (`wc < hello` counts the file's bytes).
+    Command::RunFrom {
+        path: b"wc",
+        argv: &[b"wc"],
+        expect: 0,
+        file: b"hello",
+    },
+    Command::Rm(b"note.txt"),
+    Command::Rm(b"copy"),
     Command::Echo(b"sh ok"),
     // exec: replaces this shell with the child image, which echoes its argv
     // and exits 9. The shell's process keeps its capabilities (and its pid).
@@ -409,6 +457,124 @@ extern "C" fn sh_main(argc: u64, argv: *const *const u8, envp: *const *const u8)
                     exit(&mut sys, fail + 2);
                 }
                 fail += 4;
+            }
+            Command::EchoTo { text, file } => {
+                // Builtin `echo text > file`: shell-side capture.
+                let mut buf = [0u8; 96];
+                let n = text.len().min(95);
+                buf[..n].copy_from_slice(&text[..n]);
+                buf[n] = b'\n';
+                if let Err(e) = rt.vfs.write_file(&mut sys, file, &buf[..n + 1]) {
+                    exit(&mut sys, fail | (e & 0xFF));
+                }
+                let _ = rt.write_stdout(&mut sys, b"echo > ");
+                let _ = rt.write_stdout(&mut sys, file);
+                let _ = rt.write_stdout(&mut sys, b"\n");
+                fail += 2;
+            }
+            Command::RunTo {
+                path,
+                argv,
+                expect,
+                file,
+            } => {
+                let (read_end, write_end) = match rt.ps.pipe(&mut sys) {
+                    Ok(p) => p,
+                    Err(e) => exit(&mut sys, (fail << 8) | (e & 0xFF)),
+                };
+                let pid =
+                    match rt
+                        .ps
+                        .spawn(&mut sys, path, argv, &[], vfs_ep, None, Some(write_end))
+                    {
+                        Ok(pid) => pid,
+                        Err(e) => exit(&mut sys, ((fail + 1) << 8) | (e & 0xFF)),
+                    };
+                // Drain the child's stdout (console::WRITE chunks) until EOF.
+                let mut buf: Vec<u8> = Vec::new();
+                loop {
+                    match sys.recv(read_end) {
+                        Ok(m) => {
+                            if m.tag.label() == sdk::methods::console::EOF {
+                                break;
+                            }
+                            for w in m.words {
+                                for b in w.to_le_bytes() {
+                                    if b != 0 {
+                                        buf.push(b);
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let status = match rt.ps.wait(&mut sys, pid) {
+                    Ok(s) => s,
+                    Err(e) => exit(&mut sys, ((fail + 2) << 8) | (e & 0xFF)),
+                };
+                if let Err(e) = rt.vfs.write_file(&mut sys, file, &buf) {
+                    exit(&mut sys, ((fail + 3) << 8) | (e & 0xFF));
+                }
+                let _ = rt.write_stdout(&mut sys, path);
+                let _ = rt.write_stdout(&mut sys, b" > ");
+                let _ = rt.write_stdout(&mut sys, file);
+                let _ = rt.write_stdout(&mut sys, b" -> ");
+                let mut digits = [0u8; 12];
+                let _ = rt.write_stdout(&mut sys, write_i32(status, &mut digits));
+                let _ = rt.write_stdout(&mut sys, b"\n");
+                if status != *expect {
+                    exit(&mut sys, fail + 4);
+                }
+                fail += 6;
+            }
+            Command::RunFrom {
+                path,
+                argv,
+                expect,
+                file,
+            } => {
+                let mut data = [0u8; 256];
+                let n = match rt.vfs.read_file(&mut sys, file, &mut data) {
+                    Ok(n) => n,
+                    Err(e) => exit(&mut sys, (fail << 8) | (e & 0xFF)),
+                };
+                let (read_end, write_end) = match rt.ps.pipe(&mut sys) {
+                    Ok(p) => p,
+                    Err(e) => exit(&mut sys, ((fail + 1) << 8) | (e & 0xFF)),
+                };
+                let pid =
+                    match rt
+                        .ps
+                        .spawn(&mut sys, path, argv, &[], vfs_ep, Some(read_end), stdout)
+                    {
+                        Ok(pid) => pid,
+                        Err(e) => exit(&mut sys, ((fail + 2) << 8) | (e & 0xFF)),
+                    };
+                // Feed the file, then close the write end with `EOF`.
+                for chunk in data[..n].chunks(sdk::methods::console::TEXT_BYTES) {
+                    let mut m = Message::new(sdk::methods::console::WRITE);
+                    m.words = sdk::methods::pack_console_text(chunk);
+                    if sys.send(write_end, &m).is_err() {
+                        exit(&mut sys, ((fail + 3) << 8) | 0x01);
+                    }
+                }
+                let _ = sys.send(write_end, &Message::new(sdk::methods::console::EOF));
+                let status = match rt.ps.wait(&mut sys, pid) {
+                    Ok(s) => s,
+                    Err(e) => exit(&mut sys, ((fail + 4) << 8) | (e & 0xFF)),
+                };
+                let _ = rt.write_stdout(&mut sys, path);
+                let _ = rt.write_stdout(&mut sys, b" < ");
+                let _ = rt.write_stdout(&mut sys, file);
+                let _ = rt.write_stdout(&mut sys, b" -> ");
+                let mut digits = [0u8; 12];
+                let _ = rt.write_stdout(&mut sys, write_i32(status, &mut digits));
+                let _ = rt.write_stdout(&mut sys, b"\n");
+                if status != *expect {
+                    exit(&mut sys, fail + 5);
+                }
+                fail += 6;
             }
         }
     }

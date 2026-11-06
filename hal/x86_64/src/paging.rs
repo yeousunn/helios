@@ -535,19 +535,20 @@ impl BackendFactory for BackendFactoryX86_64 {
             }
         }
 
-        // Allocate a slot in the static pool.
-        let mut slots = BACKEND_POOL.lock();
-        let idx = slots.iter().position(|s| s.is_none())?;
-        slots[idx] = Some(PagingBackendX86_64::new(paddr.as_u64() as usize));
-
-        // Record the root for `activate_as` (indexed by AS id).
+        // Slot in the static pool, keyed by AS id. AS ids are recycled
+        // (`aspace::destroy` frees the table slot and `create` reuses it), so
+        // re-creating an id overwrites its own dead backend. A flat
+        // first-free scan leaked one pool slot per address space EVER created
+        // and exhausted MAX_BACKENDS mid-run (every later NEW_ADDRESS_SPACE
+        // returned ENOMEM — hit once the smoke passed ~16 total spawns).
         let as_idx = (as_id as usize).wrapping_sub(1);
-        if as_idx < MAX_BACKENDS {
-            AS_ROOTS.lock()[as_idx] = paddr.as_u64() as usize;
+        if as_idx >= MAX_BACKENDS {
+            return None;
         }
-
-        // Get a &'static reference into the static pool array.
-        let slot_ptr = &slots[idx] as *const Option<PagingBackendX86_64>;
+        let mut slots = BACKEND_POOL.lock();
+        slots[as_idx] = Some(PagingBackendX86_64::new(paddr.as_u64() as usize));
+        AS_ROOTS.lock()[as_idx] = paddr.as_u64() as usize;
+        let slot_ptr = &slots[as_idx] as *const Option<PagingBackendX86_64>;
         drop(slots);
 
         unsafe { Some((*slot_ptr).as_ref().unwrap() as &dyn PagingBackend) }

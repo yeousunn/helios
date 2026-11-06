@@ -41,7 +41,14 @@ use vfs::server::VfsServer;
 #[global_allocator]
 static HEAP: GlobalHeap = GlobalHeap::new();
 
-const MAX_WINDOWS: usize = 128;
+/// Upper bound on lazily-mapped caller windows. Each client connection maps
+/// its arg + result frames once and never releases them (v0 has no
+/// disconnect), so this must exceed the total across the whole run —
+/// exhausting it returns ENOMEM from the window mapper and every later
+/// `CONNECT`/load fails. The VA gap to `VFS_HEAP_VA_BASE` is 256 MiB, so a
+/// few thousand 4 KiB windows are safe; the real fix is connection-close
+/// window reclamation (future lifecycle slice).
+const MAX_WINDOWS: usize = 1024;
 
 include!(concat!(env!("OUT_DIR"), "/child_image.rs"));
 include!(concat!(env!("OUT_DIR"), "/posix_image.rs"));

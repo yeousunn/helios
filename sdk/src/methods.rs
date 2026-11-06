@@ -98,6 +98,10 @@ pub fn pack_console_text(text: &[u8]) -> [u64; 4] {
 pub mod vfs_open {
     pub const READ: u32 = 1 << 0;
     pub const WRITE: u32 = 1 << 1;
+    /// Truncate an existing file on open (O_TRUNC).
+    pub const TRUNC: u32 = 1 << 3;
+    /// Create the file if it does not exist (O_CREAT).
+    pub const CREATE: u32 = 1 << 4;
 }
 
 /// Process server protocol labels (design §2.6,
