@@ -53,7 +53,11 @@ static NEXT_CONN: AtomicUsize = AtomicUsize::new(0);
 /// soon as a process tree existed: a child spawning its own child). Slots are
 /// assigned round-robin; capacity 4 (the full process table arrives with
 /// fork/exec).
-const MAX_CHILDREN: usize = 4;
+/// Child registrations (WAIT/KILL/EXEC lookup). Must hold every child that
+/// can be live at once: a pipeline spawns N concurrent children and the
+/// launcher's smoke keeps a few alive, so 4 collided (round-robin reuse of a
+/// slot still holding a live pid made `child_slot` miss → WAIT EBADARG).
+const MAX_CHILDREN: usize = 16;
 static CH_PIDS: [AtomicU64; MAX_CHILDREN] = [const { AtomicU64::new(0) }; MAX_CHILDREN];
 static CH_CAPS: [AtomicU32; MAX_CHILDREN] = [const { AtomicU32::new(0) }; MAX_CHILDREN];
 static CH_NOTIFS: [AtomicU32; MAX_CHILDREN] = [const { AtomicU32::new(0) }; MAX_CHILDREN];
@@ -1025,6 +1029,11 @@ fn wait_reply(sys: &mut Syscalls<'_, X86_64Syscalls>, req: &Message) -> Message 
                         let _ = sys.invoke(as_cap, &Message::new(methods::aspace::DESTROY));
                         CH_AS[slot].store(0, Ordering::Relaxed);
                     }
+                    // Free the registration so the slot can be reused for a
+                    // different pid (pids recycle; a stale entry would shadow
+                    // the new child).
+                    CH_PIDS[slot].store(0, Ordering::Relaxed);
+                    CH_VFS[slot].store(0, Ordering::Relaxed);
                     reply.words[1] = (mask >> 32) as u32 as i32 as i64 as u64;
                     return reply;
                 }

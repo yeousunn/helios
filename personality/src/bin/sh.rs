@@ -65,12 +65,10 @@ enum Command {
         path: &'static [u8],
         argv: &'static [&'static [u8]],
     },
-    /// `left | right`: left's stdout becomes right's stdin.
+    /// `s0 | s1 | ... | sN`: each stage's stdout becomes the next stage's
+    /// stdin. Each stage = `(path, argv, expected status)`.
     Pipeline {
-        left: (&'static [u8], &'static [&'static [u8]]),
-        right: (&'static [u8], &'static [&'static [u8]]),
-        expect_left: i32,
-        expect_right: i32,
+        stages: &'static [(&'static [u8], &'static [&'static [u8]], i32)],
     },
     /// Spawn `path` with argv/env through PS; report `<path> -> <status>`;
     /// fail the script when the status differs from `expect`.
@@ -182,12 +180,21 @@ const SCRIPT: &[Command] = &[
         env: &[],
         expect: 0,
     },
-    // THE FIRST PIPELINE: `cat hello posix-log | wc` (28 bytes over a pipe).
+    // THE FIRST PIPELINE: `cat hello posix-log | wc` (28 bytes over a pipe),
+    // then a three-stage line where the middle `cat` relays stdin
+    // (POSIX no-arg cat): `cat hello posix-log | cat | wc` (still 28 bytes).
     Command::Pipeline {
-        left: (b"cat", &[b"cat", b"hello", b"posix-log"]),
-        right: (b"wc", &[b"wc"]),
-        expect_left: 0,
-        expect_right: 0,
+        stages: &[
+            (b"cat", &[b"cat", b"hello", b"posix-log"], 0),
+            (b"wc", &[b"wc"], 0),
+        ],
+    },
+    Command::Pipeline {
+        stages: &[
+            (b"cat", &[b"cat", b"hello", b"posix-log"], 0),
+            (b"cat", &[b"cat"], 0),
+            (b"wc", &[b"wc"], 0),
+        ],
     },
     // OUTPUT REDIRECTION (`>`): the echo builtin writes a file directly, and
     // an external command's stdout is drained through a pipe into a file.
@@ -394,52 +401,44 @@ extern "C" fn sh_main(argc: u64, argv: *const *const u8, envp: *const *const u8)
                 let _ = rt.write_stdout(&mut sys, text);
                 let _ = rt.write_stdout(&mut sys, b"\n");
             }
-            Command::Pipeline {
-                left,
-                right,
-                expect_left,
-                expect_right,
-            } => {
-                let _ = rt.write_stdout(&mut sys, b"[pipe] ");
-                let (read_end, write_end) = match rt.ps.pipe(&mut sys) {
-                    Ok(p) => {
-                        let _ = rt.write_stdout(&mut sys, b"ok ");
-                        p
+            Command::Pipeline { stages } => {
+                let n = stages.len();
+                if n < 2 {
+                    exit(&mut sys, 0x0E);
+                }
+                // N-1 pipes connecting consecutive stages.
+                let mut pipes: Vec<(u32, u32)> = Vec::with_capacity(n - 1);
+                for _ in 0..(n - 1) {
+                    match rt.ps.pipe(&mut sys) {
+                        Ok(p) => pipes.push(p),
+                        Err(e) => exit(&mut sys, (fail << 8) | (e & 0xFF)),
                     }
-                    Err(e) => exit(&mut sys, (fail << 8) | (e & 0xFF)),
-                };
-                let left_pid =
+                }
+                let mut pids: Vec<u64> = Vec::with_capacity(n);
+                for (i, (path, argv, _)) in stages.iter().enumerate() {
+                    let stdin_h = if i == 0 { None } else { Some(pipes[i - 1].0) };
+                    let stdout_h = if i == n - 1 { stdout } else { Some(pipes[i].1) };
                     match rt
                         .ps
-                        .spawn(&mut sys, left.0, left.1, &[], vfs_ep, None, Some(write_end))
+                        .spawn(&mut sys, path, argv, &[], vfs_ep, stdin_h, stdout_h)
                     {
-                        Ok(pid) => pid,
+                        Ok(pid) => pids.push(pid),
                         Err(e) => exit(&mut sys, ((fail + 1) << 8) | (e & 0xFF)),
+                    }
+                }
+                let _ = rt.write_stdout(&mut sys, b"[pipe");
+                for _ in 0..(n - 1) {
+                    let _ = rt.write_stdout(&mut sys, b"|");
+                }
+                let _ = rt.write_stdout(&mut sys, b"] ");
+                for (i, (_, _, expect)) in stages.iter().enumerate() {
+                    let s = match rt.ps.wait(&mut sys, pids[i]) {
+                        Ok(s) => s,
+                        Err(e) => exit(&mut sys, ((fail + 3) << 8) | (e & 0xFF)),
                     };
-                let _ = rt.write_stdout(&mut sys, b"L ");
-                let right_pid = match rt.ps.spawn(
-                    &mut sys,
-                    right.0,
-                    right.1,
-                    &[],
-                    vfs_ep,
-                    Some(read_end),
-                    stdout,
-                ) {
-                    Ok(pid) => pid,
-                    Err(e) => exit(&mut sys, ((fail + 2) << 8) | (e & 0xFF)),
-                };
-                let _ = rt.write_stdout(&mut sys, b"R ");
-                let ls = match rt.ps.wait(&mut sys, left_pid) {
-                    Ok(s) => s,
-                    Err(e) => exit(&mut sys, ((fail + 3) << 8) | (e & 0xFF)),
-                };
-                let rs = match rt.ps.wait(&mut sys, right_pid) {
-                    Ok(s) => s,
-                    Err(e) => exit(&mut sys, ((fail + 3) << 8) | (e & 0xFF)),
-                };
-                if ls != *expect_left || rs != *expect_right {
-                    exit(&mut sys, ((fail + 4) << 8) | (rs & 0xFF));
+                    if s != *expect {
+                        exit(&mut sys, ((fail + 4) << 8) | (s & 0xFF));
+                    }
                 }
                 fail += 6;
             }

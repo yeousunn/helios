@@ -71,7 +71,36 @@ extern "C" fn cat_main(argc: u64, argv: *const *const u8, envp: *const *const u8
         Err(e) => exit(&mut sys, e),
     };
 
-    // argv[0] is the program name; every other argument is a file to print.
+    // With no file arguments, `cat` is a stdin->stdout relay (POSIX): read
+    // console::WRITE chunks until the writer's EOF, stripping the chunk NUL
+    // padding. This makes `cmd | cat | ...` and `cat < file` work.
+    if args.argc() <= 1 {
+        if let Some(stdin) = rt.stdin_handle() {
+            loop {
+                match sys.recv(stdin) {
+                    Ok(m) => {
+                        if m.tag.label() == sdk::methods::console::EOF {
+                            break;
+                        }
+                        for w in m.words {
+                            let bytes = w.to_le_bytes();
+                            let mut end = 8;
+                            while end > 0 && bytes[end - 1] == 0 {
+                                end -= 1;
+                            }
+                            if end > 0 {
+                                let _ = rt.write_stdout(&mut sys, &bytes[..end]);
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        rt.exit(&mut sys, 0)
+    }
+
+    // Otherwise argv[0] is the program name; every other argument is a file.
     let mut fail = 0x10i32;
     for i in 1..args.argc() {
         let Some(path) = args.arg(i) else { break };
