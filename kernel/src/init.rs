@@ -14,7 +14,9 @@ pub const DEBUG_EP_ID: u64 = 0xD1;
 
 /// BootInfo magic: "HELI" little-endian.
 pub const BOOTINFO_MAGIC: u32 = 0x4845_4C49;
-pub const BOOTINFO_VERSION: u32 = 0;
+/// v1 (ADR-043): console_in u32 added at offset 24 (header 24 → 28 bytes);
+/// regions shift to offset 28. v0 readers reject via the version check.
+pub const BOOTINFO_VERSION: u32 = 1;
 
 /// One usable physical memory region handed to init.
 #[derive(Clone, Copy, Debug)]
@@ -32,6 +34,9 @@ pub struct BootInfoV0 {
     /// ADR-023 §1: the caller's own AS cap handle (0 = none). Occupies the
     /// formerly-reserved u32 at offset 20.
     pub self_as: u32,
+    /// ADR-043: console-in endpoint cap handle (0 = none). Offset 24 (v1);
+    /// init may delegate it (GRANT) to a server or the interactive shell.
+    pub console_in: u32,
     /// (handle, base, len) triples, in grant order.
     pub regions: [(u32, u64, u64); MAX_BOOT_REGIONS],
     pub region_count: u32,
@@ -39,17 +44,18 @@ pub struct BootInfoV0 {
 
 pub const MAX_BOOT_REGIONS: usize = 8;
 
-/// Serialize BootInfo v0 into `buf` (little-endian, repr(C) layout):
+/// Serialize BootInfo into `buf` (little-endian, repr(C) layout):
 /// ```text
-/// u32 magic; u32 version; u32 debug_ep; u32 factory;
-/// u32 region_count; u32 reserved;
+/// u32 magic; u32 version(1); u32 debug_ep; u32 factory;
+/// u32 region_count; u32 self_as;
+/// u32 console_in; u32 reserved;
 /// then region_count × { u32 handle; u32 reserved; u64 base; u64 len }
 /// ```
 /// Returns the number of bytes written. Regions beyond `MAX_BOOT_REGIONS`
 /// are dropped (truncated to region_count).
 pub fn write_bootinfo(buf: &mut [u8], info: &BootInfoV0) -> usize {
     let count = (info.region_count as usize).min(MAX_BOOT_REGIONS);
-    let need = 24 + count * 24;
+    let need = 32 + count * 24;
     if buf.len() < need {
         return 0;
     }
@@ -64,8 +70,10 @@ pub fn write_bootinfo(buf: &mut [u8], info: &BootInfoV0) -> usize {
     w(12, info.factory as u64, 4);
     w(16, count as u64, 4);
     w(20, info.self_as as u64, 4);
+    w(24, info.console_in as u64, 4);
+    w(28, 0, 4);
     for (i, &(handle, base, len)) in info.regions[..count].iter().enumerate() {
-        let off = 24 + i * 24;
+        let off = 32 + i * 24;
         w(off, handle as u64, 4);
         w(off + 4, 0, 4);
         w(off + 8, base, 8);
@@ -126,6 +134,7 @@ pub fn start(regions: &[BootRegion]) -> Result<InitLaunch, &'static str> {
         debug_ep,
         factory,
         self_as: 0,
+        console_in: 0,
         regions: [(0, 0, 0); MAX_BOOT_REGIONS],
         region_count: regions.len() as u32,
     };
@@ -147,13 +156,14 @@ pub fn start(regions: &[BootRegion]) -> Result<InitLaunch, &'static str> {
     }
 
     // Console input (ADR-038): reserved recv-only cap (obj 0xD2) — the
-    // console server drains IRQ-fed lines through it.
+    // console server drains IRQ-fed lines through it. GRANT (ADR-043): init
+    // delegates it to the interactive shell / servers as their stdin.
     let console_in = proc::install_cap(
         pid,
         Capability {
             obj: ObjId(crate::console_in::CONSOLE_IN_EP_ID),
             typ: ObjType::Endpoint,
-            rights: Rights::RECV,
+            rights: Rights::RECV.union(Rights::GRANT),
         },
     )
     .map_err(|_| "cannot grant console-in EP")?;
@@ -172,6 +182,7 @@ pub fn start(regions: &[BootRegion]) -> Result<InitLaunch, &'static str> {
     .map_err(|_| "cannot grant self-AS")?;
     proc::set_as(pid, crate::aspace::DEFAULT_AS).map_err(|_| "cannot link init AS")?;
     info.self_as = self_as;
+    info.console_in = console_in;
 
     let thread = sched::spawn(ObjRef(pid.0), sched::DEFAULT_PRIORITY)
         .map_err(|_| "cannot spawn init thread")?;
@@ -382,11 +393,12 @@ mod tests {
             debug_ep: 2,
             factory: 3,
             self_as: 9,
+            console_in: 7,
             regions,
             region_count: 2,
         };
         let n = write_bootinfo(&mut buf, &info);
-        assert_eq!(n, 24 + 2 * 24);
+        assert_eq!(n, 32 + 2 * 24);
         let rd = |o: usize| -> u64 {
             u64::from_le_bytes(buf[o..o + 8].try_into().unwrap())
                 & ((1u128 << (8 * 4)) as u64 - 1)
@@ -394,15 +406,16 @@ mod tests {
         };
         let rd32 = |o: usize| -> u32 { u32::from_le_bytes(buf[o..o + 4].try_into().unwrap()) };
         assert_eq!(rd32(0), BOOTINFO_MAGIC);
-        assert_eq!(rd32(4), 0);
+        assert_eq!(rd32(4), 1);
         assert_eq!(rd32(8), 2);
         assert_eq!(rd32(12), 3);
         assert_eq!(rd32(16), 2);
         assert_eq!(rd32(20), 9, "self_as at offset 20 (ADR-023)");
-        assert_eq!(rd32(24), 4);
+        assert_eq!(rd32(24), 7, "console_in at offset 24 (ADR-043)");
+        assert_eq!(rd32(28), 0, "reserved");
         // base/len are u64 fields.
-        let base0 = u64::from_le_bytes(buf[32..40].try_into().unwrap());
-        let len0 = u64::from_le_bytes(buf[40..48].try_into().unwrap());
+        let base0 = u64::from_le_bytes(buf[40..48].try_into().unwrap());
+        let len0 = u64::from_le_bytes(buf[48..56].try_into().unwrap());
         assert_eq!(base0, 0x100000);
         assert_eq!(len0, 0x40000);
         let _ = rd(0);
@@ -415,6 +428,7 @@ mod tests {
             debug_ep: 0,
             factory: 0,
             self_as: 0,
+            console_in: 0,
             regions: [(0, 0, 0); MAX_BOOT_REGIONS],
             region_count: 0,
         };
@@ -440,6 +454,12 @@ mod tests {
         assert_eq!(d.typ, ObjType::Endpoint);
         assert_eq!(d.obj, ObjId(DEBUG_EP_ID));
         assert_eq!(d.rights, Rights::SEND.union(Rights::GRANT));
+        // Console-in cap: recv-only + delegable (ADR-043 — init passes it to
+        // the interactive shell as stdin).
+        let ci = proc::get_cap(launch.pid, launch.bootinfo.console_in).unwrap();
+        assert_eq!(ci.typ, ObjType::Endpoint);
+        assert_eq!(ci.obj, ObjId(crate::console_in::CONSOLE_IN_EP_ID));
+        assert_eq!(ci.rights, Rights::RECV.union(Rights::GRANT));
         // Region cap registered.
         let (h, base, len) = launch.bootinfo.regions[0];
         let rc = proc::get_cap(launch.pid, h).unwrap();

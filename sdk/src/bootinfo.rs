@@ -10,17 +10,24 @@
 //! o 12: u32 factory handle
 //! o 16: u32 region_count
 //! o 20: u32 self_as handle (v0.1, ADR-023; formerly reserved — 0 = none)
-//! o 24: region_count × { u32 handle; u32 reserved; u64 base; u64 len }
+//! o 24: region_count × { u32 handle; u32 reserved; u64 base; u64 len }   (v0)
+//!
+//! v1 (ADR-043, interactive-shell prerequisites; GLM kernel side 2026-11-06):
+//! o 24: u32 console_in handle (0 = none) — GRANT-carrying recv cap
+//! o 28: u32 reserved
+//! o 32: region_count × { u32 handle; u32 reserved; u64 base; u64 len }
 //! ```
 
 use ipc::status;
 
 /// "HELI" little-endian.
 pub const MAGIC: u32 = 0x4845_4C49;
-pub const VERSION: u32 = 0;
+pub const VERSION_V0: u32 = 0;
+pub const VERSION_V1: u32 = 1;
 pub const MAX_REGIONS: usize = 8;
-/// Header size in bytes.
-pub const HEADER_LEN: usize = 24;
+/// Header size in bytes: 24 for v0, 32 for v1 (console_in + reserved
+/// added — ADR-043; regions start at o32).
+pub const HEADER_LEN: usize = 32;
 /// One region record in bytes.
 pub const REGION_LEN: usize = 24;
 /// Bytes a parser may read at most (header + all regions).
@@ -40,6 +47,9 @@ pub struct BootInfo {
     /// Capability to the caller's own address space (ADR-023; v0 images that
     /// predate the grant read as `None`).
     pub self_as: Option<u32>,
+    /// Console-in endpoint handle (ADR-043; recv + GRANT — delegable as
+    /// stdin). `None` for v0 images and for kernels without console input.
+    pub console_in: Option<u32>,
     pub regions: [Option<BootRegion>; MAX_REGIONS],
     pub region_count: u32,
 }
@@ -63,20 +73,24 @@ impl BootInfo {
             return Err(status::EBADARG);
         }
         let version = rd32(bytes, 4);
-        if version != VERSION {
-            return Err(status::ENOSYS);
-        }
+        // v0 (24-byte header) and v1 (28-byte header, console_in — ADR-043).
+        let v1 = match version {
+            VERSION_V0 => false,
+            VERSION_V1 => true,
+            _ => return Err(status::ENOSYS),
+        };
+        let header_len = if v1 { HEADER_LEN } else { 24 };
         let region_count = rd32(bytes, 16);
         if region_count as usize > MAX_REGIONS {
             return Err(status::EBADARG);
         }
-        let need = HEADER_LEN + region_count as usize * REGION_LEN;
+        let need = header_len + region_count as usize * REGION_LEN;
         if bytes.len() < need {
             return Err(status::EBADARG);
         }
         let mut regions = [None; MAX_REGIONS];
         for (i, slot) in regions.iter_mut().enumerate().take(region_count as usize) {
-            let off = HEADER_LEN + i * REGION_LEN;
+            let off = header_len + i * REGION_LEN;
             *slot = Some(BootRegion {
                 handle: rd32(bytes, off),
                 base: rd64(bytes, off + 8),
@@ -84,10 +98,16 @@ impl BootInfo {
             });
         }
         let self_as = rd32(bytes, 20);
+        let console_in = if v1 {
+            (rd32(bytes, 24) != 0).then_some(rd32(bytes, 24))
+        } else {
+            None
+        };
         Ok(Self {
             debug_ep: rd32(bytes, 8),
             factory: rd32(bytes, 12),
             self_as: (self_as != 0).then_some(self_as),
+            console_in,
             regions,
             region_count,
         })
@@ -107,13 +127,16 @@ mod tests {
     /// Mirror of the kernel writer (ADR-018), built by hand so either side
     /// drifting from the documented layout breaks exactly one test.
     fn encode(info: &BootInfo) -> Vec<u8> {
+        // v1 mirror of the kernel writer (ADR-043).
         let mut out = Vec::new();
         out.extend_from_slice(&MAGIC.to_le_bytes());
-        out.extend_from_slice(&VERSION.to_le_bytes());
+        out.extend_from_slice(&VERSION_V1.to_le_bytes());
         out.extend_from_slice(&info.debug_ep.to_le_bytes());
         out.extend_from_slice(&info.factory.to_le_bytes());
         out.extend_from_slice(&info.region_count.to_le_bytes());
         out.extend_from_slice(&info.self_as.unwrap_or(0).to_le_bytes());
+        out.extend_from_slice(&info.console_in.unwrap_or(0).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
         for r in info.regions.iter().flatten() {
             out.extend_from_slice(&r.handle.to_le_bytes());
             out.extend_from_slice(&0u32.to_le_bytes());
@@ -139,9 +162,32 @@ mod tests {
             debug_ep: 2,
             factory: 3,
             self_as: Some(9),
+            console_in: Some(7),
             regions,
             region_count: 2,
         }
+    }
+
+    /// A v0 image (24-byte header, no console_in) still parses; console_in
+    /// reads as `None` (back-compat for pre-ADR-043 kernels).
+    #[test]
+    fn parses_v0_without_console_in() {
+        let mut out = Vec::new();
+        out.extend_from_slice(&MAGIC.to_le_bytes());
+        out.extend_from_slice(&VERSION_V0.to_le_bytes());
+        out.extend_from_slice(&2u32.to_le_bytes());
+        out.extend_from_slice(&3u32.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&9u32.to_le_bytes());
+        out.extend_from_slice(&4u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0x10_0000u64.to_le_bytes());
+        out.extend_from_slice(&0x40_0000u64.to_le_bytes());
+        let parsed = BootInfo::parse(&out).unwrap();
+        assert_eq!(parsed.debug_ep, 2);
+        assert_eq!(parsed.self_as, Some(9));
+        assert_eq!(parsed.console_in, None);
+        assert_eq!(parsed.region(0).unwrap().base, 0x10_0000);
     }
 
     #[test]
@@ -160,12 +206,15 @@ mod tests {
     fn field_offsets_are_pinned() {
         let bytes = encode(&sample());
         assert_eq!(rd32(&bytes, 0), MAGIC);
+        assert_eq!(rd32(&bytes, 4), VERSION_V1);
         assert_eq!(rd32(&bytes, 8), 2, "debug_ep at o8");
         assert_eq!(rd32(&bytes, 12), 3, "factory at o12");
         assert_eq!(rd32(&bytes, 20), 9, "self_as at o20 (ADR-023)");
-        assert_eq!(rd32(&bytes, 24), 4, "first region handle at o24");
-        assert_eq!(rd64(&bytes, 32), 0x10_0000, "first region base at o32");
-        assert_eq!(rd64(&bytes, 40), 0x40_0000, "first region len at o40");
+        assert_eq!(rd32(&bytes, 24), 7, "console_in at o24 (ADR-043)");
+        assert_eq!(rd32(&bytes, 28), 0, "reserved at o28");
+        assert_eq!(rd32(&bytes, 32), 4, "first region handle at o32");
+        assert_eq!(rd64(&bytes, 40), 0x10_0000, "first region base at o40");
+        assert_eq!(rd64(&bytes, 48), 0x40_0000, "first region len at o48");
     }
 
     #[test]
@@ -187,7 +236,7 @@ mod tests {
         assert_eq!(BootInfo::parse(&wrong_magic), Err(status::EBADARG));
 
         let mut wrong_version = encode(&sample());
-        wrong_version[4] = 1;
+        wrong_version[4] = 99;
         assert_eq!(BootInfo::parse(&wrong_version), Err(status::ENOSYS));
 
         let mut too_many = encode(&sample());
