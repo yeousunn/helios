@@ -565,7 +565,17 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
                 0,
                 ipc::CapSlot::pack(vfs_svc, ipc::Rights::SEND.union(ipc::Rights::GRANT)),
             );
-            let _ = m.set_descriptor(1, ipc::CapSlot::NULL);
+            // stdin = the console-input endpoint (ADR-043/ADR-038): the shell
+            // peeks it for interactive input and falls back to its compiled
+            // script when nothing is pending. NULL when the kernel image
+            // predates BootInfo v1.
+            let _ = m.set_descriptor(
+                1,
+                match info.console_in {
+                    Some(h) if h != 0 => ipc::CapSlot::pack(h, ipc::Rights::RECV),
+                    _ => ipc::CapSlot::NULL,
+                },
+            );
             let _ = m.set_descriptor(
                 2,
                 ipc::CapSlot::pack(console_svc, ipc::Rights::SEND.union(ipc::Rights::GRANT)),

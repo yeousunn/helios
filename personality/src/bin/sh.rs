@@ -21,7 +21,7 @@ use sdk::args::Args;
 use sdk::bootstrap::receive;
 use sdk::heap::{GlobalHeap, RegionSource};
 use sdk::layout::{HEAP_CHUNK, HEAP_CHUNKS};
-use sdk::syscall::{Syscalls, X86_64Syscalls};
+use sdk::syscall::{RawSyscalls, Syscalls, X86_64Syscalls};
 
 #[global_allocator]
 static HEAP: GlobalHeap = GlobalHeap::new();
@@ -282,6 +282,17 @@ extern "C" fn sh_main(argc: u64, argv: *const *const u8, envp: *const *const u8)
 
     let vfs_ep = rt.package.optional[0].map(|cs| cs.handle());
     let stdout = rt.stdout_handle();
+
+    // Interactive mode (ADR-043): init passes the console-input endpoint as
+    // optional[1]. If a line is already pending the harness/user wants a
+    // REPL; with no input the shell runs its compiled script (the automated
+    // smoke). The nonblocking peek returns EWOULDBLOCK on an empty buffer.
+    if let Some(console_in) = rt.stdin_handle() {
+        if let Ok(first) = sys.recv_nonblock(console_in) {
+            repl(&mut sys, &mut rt, console_in, first, vfs_ep, stdout);
+        }
+    }
+
     let mut path = [0u8; 64];
     let mut path_len = 0usize;
     let mut fail = 0x10i32;
@@ -625,6 +636,248 @@ extern "C" fn sh_main(argc: u64, argv: *const *const u8, envp: *const *const u8)
         }
     }
     exit(&mut sys, 0)
+}
+
+// ---------------------------------------------------------------------------
+// Interactive REPL (used only when console input is pending at startup).
+// ---------------------------------------------------------------------------
+
+/// Unpack a console-input line message (`words[0]` = len, bytes from
+/// `words[1]`) into `buf`.
+fn console_line<'a>(m: &Message, buf: &'a mut [u8; 128]) -> &'a [u8] {
+    let len = (m.words[0] as usize).min(120).min(buf.len());
+    for (i, slot) in buf.iter_mut().enumerate().take(len) {
+        let w = m.words[1 + i / 8];
+        *slot = ((w >> ((i % 8) * 8)) & 0xFF) as u8;
+    }
+    &buf[..len]
+}
+
+fn repl<R: RawSyscalls>(
+    sys: &mut Syscalls<R>,
+    rt: &mut Runtime,
+    console_in: u32,
+    first: Message,
+    vfs_ep: Option<u32>,
+    stdout: Option<u32>,
+) -> ! {
+    let _ = rt.write_stdout(
+        sys,
+        b"helios sh - interactive (type 'help'; Ctrl-D / 'exit' quits)\n",
+    );
+    let mut path = [0u8; 64];
+    path[0] = b'/';
+    let mut path_len = 1usize;
+    let mut pending = Some(first);
+    loop {
+        let _ = rt.write_stdout(sys, &path[..path_len]);
+        let _ = rt.write_stdout(sys, b"> ");
+        let line = match pending.take() {
+            Some(m) => m,
+            None => match sys.recv(console_in) {
+                Ok(m) => m,
+                Err(_) => break, // endpoint gone / EOF
+            },
+        };
+        let mut buf = [0u8; 128];
+        let text = console_line(&line, &mut buf);
+        repl_line(sys, rt, text, &mut path, &mut path_len, vfs_ep, stdout);
+    }
+    rt.exit(sys, 0)
+}
+
+fn repl_line<R: RawSyscalls>(
+    sys: &mut Syscalls<R>,
+    rt: &mut Runtime,
+    text: &[u8],
+    path: &mut [u8; 64],
+    path_len: &mut usize,
+    vfs_ep: Option<u32>,
+    stdout: Option<u32>,
+) {
+    let mut toks: [&[u8]; 16] = [b""; 16];
+    let mut n = 0usize;
+    for t in text.split(|&b| b == b' ').filter(|t| !t.is_empty()) {
+        if n < toks.len() {
+            toks[n] = t;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        return;
+    }
+    let args = &toks[1..n];
+    let mut line = [0u8; 64];
+    match toks[0] {
+        b"exit" | b"quit" => rt.exit(sys, 0),
+        b"help" => {
+            let _ = rt.write_stdout(
+                sys,
+                b"builtins: echo pwd ls cd mkdir rmdir rm touch cat cp run <prog> [args]; 'exit'\n",
+            );
+        }
+        b"echo" => {
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 {
+                    let _ = rt.write_stdout(sys, b" ");
+                }
+                let _ = rt.write_stdout(sys, a);
+            }
+            let _ = rt.write_stdout(sys, b"\n");
+        }
+        b"pwd" => {
+            let _ = rt.write_stdout(sys, &path[..*path_len]);
+            let _ = rt.write_stdout(sys, b"\n");
+        }
+        b"ls" => repl_ls(sys, rt),
+        b"cd" => {
+            let Some(name) = args.first() else { return };
+            let res = if *name == b".." {
+                rt.vfs.chdir_up()
+            } else {
+                rt.vfs.chdir(sys, name)
+            };
+            if res.is_err() {
+                let _ = rt.write_stdout(sys, b"cd: no such directory\n");
+                return;
+            }
+            // Mirror the move in the display path.
+            if *name == b".." {
+                while *path_len > 0 && path[*path_len - 1] != b'/' {
+                    *path_len -= 1;
+                }
+                if *path_len > 0 {
+                    *path_len -= 1;
+                }
+                if *path_len == 0 {
+                    path[0] = b'/';
+                    *path_len = 1;
+                }
+            } else {
+                if path[*path_len - 1] != b'/' {
+                    path[*path_len] = b'/';
+                    *path_len += 1;
+                }
+                let room = 63usize.saturating_sub(*path_len).min(name.len());
+                path[*path_len..*path_len + room].copy_from_slice(&name[..room]);
+                *path_len += room;
+            }
+        }
+        b"mkdir" => {
+            if let Some(p) = args.first() {
+                let _ = rt.vfs.mkdir(sys, p);
+            }
+        }
+        b"rmdir" => {
+            if let Some(p) = args.first() {
+                let _ = rt.vfs.rmdir(sys, p);
+            }
+        }
+        b"rm" => {
+            if let Some(p) = args.first() {
+                let _ = rt.vfs.unlink(sys, p);
+            }
+        }
+        b"touch" => {
+            if let Some(p) = args.first() {
+                let _ = rt.vfs.write_file(sys, p, b"");
+            }
+        }
+        b"cat" => {
+            if let Some(p) = args.first() {
+                let mut cb = [0u8; 512];
+                if let Ok(k) = rt.vfs.read_file(sys, p, &mut cb) {
+                    let _ = rt.write_stdout(sys, &cb[..k]);
+                } else {
+                    let _ = rt.write_stdout(sys, b"cat: cannot read\n");
+                }
+            }
+        }
+        b"cp" => {
+            if args.len() >= 2 {
+                let mut cb = [0u8; 512];
+                match rt.vfs.read_file(sys, args[0], &mut cb) {
+                    Ok(k) => {
+                        let _ = rt.vfs.write_file(sys, args[1], &cb[..k]);
+                    }
+                    Err(_) => {
+                        let _ = rt.write_stdout(sys, b"cp: cannot read\n");
+                    }
+                }
+            }
+        }
+        b"run" => {
+            // `run <prog> [args...]`: spawn through PS.
+            if args.is_empty() {
+                let _ = rt.write_stdout(sys, b"run: usage: run <prog> [args]\n");
+                return;
+            }
+            repl_spawn(sys, rt, args, vfs_ep, stdout, &mut line);
+        }
+        _ => {
+            // Bare command = external program (`cat`, `ls`, `wc`, `child`, ...).
+            repl_spawn(sys, rt, &toks[..n], vfs_ep, stdout, &mut line);
+        }
+    }
+}
+
+/// Spawn `argv[0]` with the given argv/env through PS and print its status.
+fn repl_spawn<R: RawSyscalls>(
+    sys: &mut Syscalls<R>,
+    rt: &mut Runtime,
+    argv: &[&[u8]],
+    vfs_ep: Option<u32>,
+    stdout: Option<u32>,
+    _scratch: &mut [u8; 64],
+) {
+    let path = argv[0];
+    let pid = match rt.ps.spawn(sys, path, argv, &[], vfs_ep, None, stdout) {
+        Ok(pid) => pid,
+        Err(e) => {
+            let _ = rt.write_stdout(sys, b"cannot run ");
+            let _ = rt.write_stdout(sys, path);
+            let _ = rt.write_stdout(sys, b"\n");
+            let _ = e;
+            return;
+        }
+    };
+    match rt.ps.wait(sys, pid) {
+        Ok(s) => {
+            let _ = rt.write_stdout(sys, b"[");
+            let _ = rt.write_stdout(sys, path);
+            let _ = rt.write_stdout(sys, b"] exit ");
+            let mut d = [0u8; 12];
+            let _ = rt.write_stdout(sys, write_i32(s, &mut d));
+            let _ = rt.write_stdout(sys, b"\n");
+        }
+        Err(e) => {
+            let _ = e;
+        }
+    }
+}
+
+/// `ls`: list the cwd through the VFS client.
+fn repl_ls<R: RawSyscalls>(sys: &mut Syscalls<R>, rt: &mut Runtime) {
+    let dir = rt.vfs.cwd();
+    let mut cursor = 0u64;
+    let mut name = [0u8; 64];
+    loop {
+        match rt.vfs.readdir(sys, dir, cursor, &mut name) {
+            Ok(Some((next, kind, len))) => {
+                let _ = rt.write_stdout(sys, &name[..len]);
+                if kind == personality::vfs::KIND_DIR {
+                    let _ = rt.write_stdout(sys, b"/");
+                }
+                let _ = rt.write_stdout(sys, b"\n");
+                if next == 0 {
+                    break;
+                }
+                cursor = next;
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
 }
 
 /// Write `v` as decimal into `buf`, returning the used slice.
