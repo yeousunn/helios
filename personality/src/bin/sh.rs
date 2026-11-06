@@ -735,6 +735,8 @@ fn repl<R: RawSyscalls>(
     path[0] = b'/';
     let mut path_len = 1usize;
     let mut pending = Some(first);
+    // REPL environment (owned: `export` copies the typed line).
+    let mut renv: Vec<Vec<u8>> = Vec::new();
     loop {
         let _ = rt.write_stdout(sys, &path[..path_len]);
         let _ = rt.write_stdout(sys, b"> ");
@@ -747,11 +749,21 @@ fn repl<R: RawSyscalls>(
         };
         let mut buf = [0u8; 128];
         let text = console_line(&line, &mut buf);
-        repl_line(sys, rt, text, &mut path, &mut path_len, vfs_ep, stdout);
+        repl_line(
+            sys,
+            rt,
+            text,
+            &mut path,
+            &mut path_len,
+            vfs_ep,
+            stdout,
+            &mut renv,
+        );
     }
     rt.exit(sys, 0)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn repl_line<R: RawSyscalls>(
     sys: &mut Syscalls<R>,
     rt: &mut Runtime,
@@ -760,7 +772,12 @@ fn repl_line<R: RawSyscalls>(
     path_len: &mut usize,
     vfs_ep: Option<u32>,
     stdout: Option<u32>,
+    renv: &mut Vec<Vec<u8>>,
 ) {
+    // `a | b | ...`: interactive pipelines reuse the pipe machinery.
+    if repl_pipeline(sys, rt, text, vfs_ep, stdout, renv) {
+        return;
+    }
     let mut toks: [&[u8]; 16] = [b""; 16];
     let mut n = 0usize;
     for t in text.split(|&b| b == b' ').filter(|t| !t.is_empty()) {
@@ -872,19 +889,101 @@ fn repl_line<R: RawSyscalls>(
                 }
             }
         }
+        b"export" => {
+            if let Some(e) = args.first() {
+                if let Some(k) = renv.iter().position(|v| {
+                    v.iter().position(|&b| b == b'=').map(|i| &v[..i])
+                        == Some(&e[..e.iter().position(|&b| b == b'=').unwrap_or(e.len())])
+                }) {
+                    renv[k] = e.to_vec();
+                } else {
+                    renv.push(e.to_vec());
+                }
+            }
+        }
+        b"unset" => {
+            if let Some(key) = args.first() {
+                renv.retain(|v| {
+                    let klen = v.iter().position(|&b| b == b'=').unwrap_or(v.len());
+                    &v[..klen] != *key
+                });
+            }
+        }
         b"run" => {
             // `run <prog> [args...]`: spawn through PS.
             if args.is_empty() {
                 let _ = rt.write_stdout(sys, b"run: usage: run <prog> [args]\n");
                 return;
             }
-            repl_spawn(sys, rt, args, vfs_ep, stdout, &mut line);
+            repl_spawn(sys, rt, args, vfs_ep, stdout, renv, &mut line);
         }
         _ => {
             // Bare command = external program (`cat`, `ls`, `wc`, `child`, ...).
-            repl_spawn(sys, rt, &toks[..n], vfs_ep, stdout, &mut line);
+            repl_spawn(sys, rt, &toks[..n], vfs_ep, stdout, renv, &mut line);
         }
     }
+}
+
+/// If `text` contains `|`, run it as a pipeline (up to 4 stages) and return
+/// true; otherwise return false so the caller handles a single command.
+fn repl_pipeline<R: RawSyscalls>(
+    sys: &mut Syscalls<R>,
+    rt: &mut Runtime,
+    text: &[u8],
+    vfs_ep: Option<u32>,
+    stdout: Option<u32>,
+    renv: &[Vec<u8>],
+) -> bool {
+    let stages: Vec<&[u8]> = text.split(|&b| b == b'|').collect();
+    if stages.len() < 2 {
+        return false;
+    }
+    let n = stages.len().min(4);
+    let mut toks: [[&[u8]; 16]; 4] = [[b""; 16]; 4];
+    let mut nt = [0usize; 4];
+    for (s, st) in stages.iter().enumerate().take(n) {
+        for t in st.split(|&b| b == b' ').filter(|t| !t.is_empty()) {
+            if nt[s] < 16 {
+                toks[s][nt[s]] = t;
+                nt[s] += 1;
+            }
+        }
+        if nt[s] == 0 {
+            let _ = rt.write_stdout(sys, b"pipeline: empty stage\n");
+            return true;
+        }
+    }
+    let ev: Vec<&[u8]> = renv.iter().map(|v| v.as_slice()).collect();
+    let mut pipes: Vec<(u32, u32)> = Vec::new();
+    for _ in 0..(n - 1) {
+        match rt.ps.pipe(sys) {
+            Ok(p) => pipes.push(p),
+            Err(_) => {
+                let _ = rt.write_stdout(sys, b"pipeline: pipe failed\n");
+                return true;
+            }
+        }
+    }
+    let mut pids: Vec<u64> = Vec::new();
+    for s in 0..n {
+        let argv = &toks[s][..nt[s]];
+        let stdin_h = if s == 0 { None } else { Some(pipes[s - 1].0) };
+        let stdout_h = if s == n - 1 { stdout } else { Some(pipes[s].1) };
+        match rt
+            .ps
+            .spawn(sys, argv[0], argv, &ev, vfs_ep, stdin_h, stdout_h)
+        {
+            Ok(pid) => pids.push(pid),
+            Err(_) => {
+                let _ = rt.write_stdout(sys, b"pipeline: spawn failed\n");
+                return true;
+            }
+        }
+    }
+    for p in pids {
+        let _ = rt.ps.wait(sys, p);
+    }
+    true
 }
 
 /// Spawn `argv[0]` with the given argv/env through PS and print its status.
@@ -894,10 +993,12 @@ fn repl_spawn<R: RawSyscalls>(
     argv: &[&[u8]],
     vfs_ep: Option<u32>,
     stdout: Option<u32>,
+    renv: &[Vec<u8>],
     _scratch: &mut [u8; 64],
 ) {
     let path = argv[0];
-    let pid = match rt.ps.spawn(sys, path, argv, &[], vfs_ep, None, stdout) {
+    let ev: Vec<&[u8]> = renv.iter().map(|v| v.as_slice()).collect();
+    let pid = match rt.ps.spawn(sys, path, argv, &ev, vfs_ep, None, stdout) {
         Ok(pid) => pid,
         Err(e) => {
             let _ = rt.write_stdout(sys, b"cannot run ");
