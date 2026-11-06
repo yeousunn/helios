@@ -737,7 +737,13 @@ struct FrameRefs {
     untrackable: u64,
 }
 
-const REFS_CAPACITY: usize = 1024;
+/// 4096 slots (64 KiB, const-staged in .bss — the ADR-037 am2 pattern):
+/// the dev-profile nested-spawn tree saturated the previous 1024-slot table
+/// at ~2031 simultaneously-tracked frames; 4096 gives ~2.9x headroom at a
+/// 0.7 open-addressing load factor. A dynamically growable table (boxed into
+/// allocated frames) lands with the ADR-045 higher-half kernel-VA work; the
+/// immortal-untrackable degradation below remains the final safety net.
+const REFS_CAPACITY: usize = 4096;
 const REF_EMPTY: u64 = u64::MAX;
 const REF_TOMBSTONE: u64 = u64::MAX - 1;
 
@@ -803,7 +809,7 @@ impl FrameRefs {
                 self.untrackable += 1;
                 if self.untrackable == 1 {
                     crate::kwarn!(
-                        "FrameRefs full: frames acquired beyond capacity are                          never freed ({} untrackable so far)",
+                        "FrameRefs full: frames acquired beyond capacity are never freed (immortal) - {} untrackable so far",
                         self.untrackable
                     );
                 }
