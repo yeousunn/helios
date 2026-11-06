@@ -987,7 +987,9 @@ pub fn bury_thread_kstack_for_exit(id: ThreadId) {
             // ADR-037 am1 depth report (debug builds): the paint measures
             // the deepest touch at exit, so kstack sizing is measured, not
             // guessed. This is the sizing input for the next ADR-037 round.
-            #[cfg(debug_assertions)]
+            // Host tests use fake stack addresses (never mapped) — the read
+            // would fault; real measurement only on the bare-metal build.
+            #[cfg(all(debug_assertions, not(test)))]
             {
                 let used =
                     crate::mem::high_water(base, t.kstack_top - base, crate::sched::KSTACK_PAINT);

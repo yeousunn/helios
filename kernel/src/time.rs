@@ -21,6 +21,31 @@ pub fn now_ns() -> u64 {
     }
 }
 
+/// IRQ-safe tick marker (ADR-042): the PIT handler runs on the interrupt
+/// stack with scheduler locks potentially held by the interrupted syscall
+/// context on this CPU — taking them there would self-deadlock the spin
+/// locks (the ADR-038 deferred-wake pattern). The handler only sets this
+/// flag; `drain_tick` (dispatch entry / pre-idle) performs the expiry.
+static TICK_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Record a timer tick. IRQ-context safe: lock-free, no reentry.
+pub fn tick_pending() {
+    TICK_PENDING.store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// Consume a pending tick: expire parked recv/send deadlines (ADR-041).
+/// Returns true if a tick was pending. Called from dispatch entry (syscall
+/// context) and from the pre-idle drain (before `hlt`), never from IRQ
+/// context.
+pub fn drain_tick() -> bool {
+    if TICK_PENDING.swap(false, core::sync::atomic::Ordering::AcqRel) {
+        crate::sched::expire_timeouts(now_ns());
+        true
+    } else {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -189,6 +189,9 @@ pub fn dispatch(args: SyscallArgs) -> SyscallReturn {
     let (pid, tid) = current();
     // Cooperative timer tick (ADR-041): expire parked deadlines on every
     // dispatch so timeouts fire even while other threads keep the CPU busy.
+    // ADR-042: drain a pending hardware tick first (the IRQ itself is
+    // lock-free and only marks).
+    crate::time::drain_tick();
     crate::sched::expire_timeouts(crate::time::now_ns());
     match args.num {
         num::YIELD => syscall::sys_yield(tid)
