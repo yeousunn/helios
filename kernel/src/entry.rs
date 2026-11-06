@@ -193,6 +193,13 @@ pub fn dispatch(args: SyscallArgs) -> SyscallReturn {
     // lock-free and only marks).
     crate::time::drain_tick();
     crate::sched::expire_timeouts(crate::time::now_ns());
+    // ADR-044: foreign-syscall routing — a flagged thread's traps go raw to
+    // its emulator endpoint. The num is OPAQUE (a Linux number, not ours):
+    // route everything unconditionally; the emulator maps conventions like
+    // exit → its own cleanup + Thread::EXIT.
+    if let Some(route) = syscall::foreign_route(pid, tid, &args) {
+        return route;
+    }
     match args.num {
         num::YIELD => syscall::sys_yield(tid)
             .map(|_| SyscallReturn::ok(Tag(0), [0; 4]))
@@ -418,6 +425,8 @@ fn thread_invoke(
     const BIND_DEATH_NOTIFICATION: u16 = 12;
     const THREAD_CREATE: u16 = 13;
     const SET_ENTRY: u16 = 14;
+    const SET_FOREIGN: u16 = 15;
+    const TRAP_READ: u16 = 16;
     const REGS_READ: u16 = 9;
     const REGS_WRITE: u16 = 10;
 
@@ -469,6 +478,25 @@ fn thread_invoke(
             match sched::set_entry(target, pc) {
                 Ok(()) => SyscallReturn::ok(msg.tag, [0, pc, 0, 0]),
                 Err(_) => SyscallReturn::err(ipc::status::EBADSTATE),
+            }
+        }
+        SET_FOREIGN => {
+            // ADR-044: flag the thread so its syscall traps route raw to the
+            // emulator's endpoint. w0 = endpoint ObjId (0 = clear).
+            let ep = msg.words[0];
+            match sched::set_foreign(target, (ep != 0).then_some(crate::sched::ObjRef(ep))) {
+                Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
+                Err(_) => SyscallReturn::err(ipc::status::EBADSTATE),
+            }
+        }
+        TRAP_READ => {
+            // ADR-044: the emulator fetches the routed syscall frame's
+            // remaining words [tag.0, w0, w1, w2] (the routing message
+            // itself carried [num, cap, w3, 0]). Only a foreign-parked
+            // thread exposes its frame.
+            match sched::trap_read(target) {
+                Some([tag, w0, w1, w2]) => SyscallReturn::ok(msg.tag, [tag, w0, w1, w2]),
+                None => SyscallReturn::err(ipc::status::EBADSTATE),
             }
         }
         REGS_READ | REGS_WRITE => {
@@ -1209,5 +1237,156 @@ mod tests {
             crate::sched::get(child_tid).unwrap().state,
             crate::sched::State::Ready
         );
+    }
+
+    /// ADR-044: a foreign-flagged thread's syscall routes to the emulator
+    /// endpoint as a FOREIGN_SYSCALL call; the emulator sees the message,
+    /// reads the frame via TRAP_READ, and its reply completes the syscall.
+    #[test]
+    fn foreign_route_parks_and_reply_completes() {
+        let (pid, emu, fgn, ep, ep_h) = {
+            // Two threads in one process: the emulated thread + the emulator.
+            crate::aspace::set_backend_factory(&MockFactory);
+            let _ = crate::aspace::init_default();
+            let _ = crate::frame::init(&[crate::frame::Region::new(
+                crate::frame::PhysAddr::new(0x1000),
+                64 * crate::frame::FRAME_SIZE as u64,
+            )
+            .unwrap()]);
+            crate::init::reset_regions_for_test();
+            crate::proc::reset_for_test();
+            crate::endpoint::reset_engine_for_test();
+            crate::notification::reset_for_test();
+            syscall::reset_reply_for_test();
+            *sched::SCHED.lock() = None;
+            set_context_backend(&MockCtx);
+            let _ = sched::init();
+            let pid = proc::create().unwrap();
+            let emu = sched::spawn(ObjRef(1), 100).unwrap();
+            let fgn = sched::spawn(ObjRef(1), 100).unwrap();
+            let ctx: &'static FixedCtx = Box::leak(Box::new(FixedCtx(pid, fgn)));
+            set_current_context(ctx);
+            // Emulator holds a SEND cap on the route endpoint.
+            let ep = crate::endpoint::create_endpoint().unwrap();
+            let h = proc::install_cap(
+                pid,
+                Capability {
+                    obj: ObjId(ep.0),
+                    typ: ObjType::Endpoint,
+                    rights: Rights::SEND.union(Rights::RECV),
+                },
+            )
+            .unwrap();
+            // Flag the emulated thread (SET_FOREIGN via CONTROL invoke).
+            sched::make_ready(fgn).ok();
+            let ctl = proc::install_cap(
+                pid,
+                Capability {
+                    obj: ObjId(fgn.0),
+                    typ: ObjType::Thread,
+                    rights: Rights::CONTROL,
+                },
+            )
+            .unwrap();
+            let ret = invoke(
+                pid,
+                emu,
+                SyscallArgs {
+                    num: num::INVOKE,
+                    cap: ctl,
+                    tag: Tag::new(15), // SET_FOREIGN
+                    w: [ep.0, 0, 0, 0],
+                    nonblock: false,
+                },
+            );
+            assert_eq!(ret.status, 0, "SET_FOREIGN ok");
+            (pid, emu, fgn, ep, h)
+        };
+
+        // The emulated thread traps a "foreign" syscall (num = a Linux
+        // number, opaque to the kernel): dispatch must route, not execute.
+        let args = SyscallArgs {
+            num: 999, // opaque foreign number
+            cap: 0,
+            tag: Tag::new(0x1234),
+            w: [0xAAAA, 0xBBBB, 0xCCCC, 0xDDDD],
+            nonblock: false,
+        };
+        let ret = dispatch(args);
+        assert!(
+            ret.status == crate::entry::PARKED_STATUS,
+            "foreign route parks the thread"
+        );
+        // The thread is parked Blocked(Reply) on the route call; the
+        // emulator has a delivered FOREIGN_SYSCALL message.
+        assert!(matches!(
+            sched::get(fgn).unwrap().state,
+            sched::State::Blocked(sched::BlockReason::Reply)
+        ));
+        // The emulator recv's the route like any request — via sys_recv, so
+        // the implicit reply slot binds (set_reply_if_call) and the reply
+        // completes the parked foreign syscall.
+        let env = syscall::sys_recv(pid, emu, ep_h, false, 0)
+            .expect("emulator recv route")
+            .expect("route message delivered");
+        let _ = ep;
+        assert_eq!(env.tag.label(), ipc::labels::kernel::FOREIGN_SYSCALL);
+        assert_eq!(env.words[0], 999, "opaque num");
+        assert_eq!(env.words[2], 0xDDDD, "w3 rides the message");
+        // Emulator fetches the rest of the frame via TRAP_READ.
+        let ctl = proc::install_cap(
+            pid,
+            Capability {
+                obj: ObjId(fgn.0),
+                typ: ObjType::Thread,
+                rights: Rights::CONTROL,
+            },
+        )
+        .unwrap();
+        let ret = invoke(
+            pid,
+            emu,
+            SyscallArgs {
+                num: num::INVOKE,
+                cap: ctl,
+                tag: Tag::new(16), // TRAP_READ
+                w: [0, 0, 0, 0],
+                nonblock: false,
+            },
+        );
+        assert_eq!(ret.status, 0);
+        assert_eq!(
+            ret.w[0],
+            Tag::new(0x1234).0,
+            "original tag (incl. default flags)"
+        );
+        assert_eq!(ret.w[1], 0xAAAA, "w0");
+        assert_eq!(ret.w[2], 0xBBBB, "w1");
+        assert_eq!(ret.w[3], 0xCCCC, "w2");
+        // Emulator replies → the parked syscall completes with the reply.
+        syscall::reply_only_for_test(emu, {
+            let mut m = ipc::Message::new(0x77);
+            m.words[0] = 0x4242;
+            let mut env = crate::endpoint::Envelope::new(m, emu);
+            env.sender = emu;
+            env
+        })
+        .unwrap();
+        let r = syscall::park_result(fgn).expect("reply completes the foreign syscall");
+        assert_eq!(r.status, 0);
+        assert_eq!(r.w[0], 0x4242, "the emulator's reply words are the result");
+        // TRAP_READ after completion → EBADSTATE (frame no longer exposed).
+        let ret = invoke(
+            pid,
+            emu,
+            SyscallArgs {
+                num: num::INVOKE,
+                cap: ctl,
+                tag: Tag::new(16),
+                w: [0, 0, 0, 0],
+                nonblock: false,
+            },
+        );
+        assert_eq!(ret.status, ipc::status::EBADSTATE);
     }
 }

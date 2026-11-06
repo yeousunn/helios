@@ -66,6 +66,13 @@ pub struct Thread {
     /// Set by `expire_timeouts` when the deadline fired; consumed by
     /// `park_result` (returns ETIMEDOUT).
     pub(crate) timed_out: bool,
+    /// ADR-044: foreign-syscall endpoint — when set, every syscall trap from
+    /// this thread (except exit) routes there as a FOREIGN_SYSCALL call.
+    pub(crate) foreign_ep: Option<ObjRef>,
+    /// ADR-044: the trapped syscall's raw frame at route time
+    /// [num, cap, tag, w0, w1, w2, w3]; read by the emulator via
+    /// Thread::TRAP_READ while the thread is parked on the route call.
+    pub(crate) trap_frame: [u64; 7],
 }
 
 impl Thread {
@@ -82,6 +89,8 @@ impl Thread {
             ksp: 0,
             deadline_ns: 0,
             timed_out: false,
+            foreign_ep: None,
+            trap_frame: [0; 7],
         }
     }
 
@@ -1012,8 +1021,47 @@ pub fn bury_thread_kstack_for_exit(id: ThreadId) {
     }
 }
 
-/// Timer-tick preemption hook (ADR-033 §2): yields the current thread to
-/// its run queue and switches to the best next thread. Callable from a
+/// ADR-044: record the trapped syscall's raw frame (route-time save).
+pub fn set_trap_frame(id: ThreadId, frame: [u64; 7]) {
+    let mut guard = SCHED.lock();
+    let Some(s) = guard.as_mut() else { return };
+    if let Ok(slot) = find_slot(s, id) {
+        s.slots.threads[slot].as_mut().unwrap().trap_frame = frame;
+    }
+}
+
+/// ADR-044: set/clear the foreign-syscall endpoint (emulator route).
+pub fn set_foreign(id: ThreadId, ep: Option<ObjRef>) -> SchedResult<()> {
+    let mut guard = SCHED.lock();
+    let s = guard.as_mut().ok_or(SchedError::NoSuchThread)?;
+    let slot = find_slot(s, id)?;
+    let t = s.slots.threads[slot].as_mut().unwrap();
+    t.foreign_ep = ep;
+    Ok(())
+}
+
+/// ADR-044: read the routed syscall frame of a thread parked on a foreign
+/// route call. Returns `[tag, w0, w1, w2]` (the routing message carried
+/// `[num, cap, w3, 0]`), or None if the thread is not foreign-parked.
+pub fn trap_read(id: ThreadId) -> Option<[u64; 4]> {
+    let guard = SCHED.lock();
+    let s = guard.as_ref()?;
+    let slot = find_slot(s, id).ok()?;
+    let t = s.slots.threads[slot].as_ref().unwrap();
+    // Expose the frame only while the thread is parked on the route call
+    // (Blocked(Reply) with the flag set) — not for arbitrary reads.
+    if t.foreign_ep.is_none() || !matches!(t.state, State::Blocked(BlockReason::Reply)) {
+        return None;
+    }
+    Some([
+        t.trap_frame[2],
+        t.trap_frame[3],
+        t.trap_frame[4],
+        t.trap_frame[5],
+    ])
+}
+
+/// Timer-tick preemption hook (ADR-033 §2): yields the current thread to/// its run queue and switches to the best next thread. Callable from a
 /// timer IRQ once the hal registers one; safe to call spuriously.
 /// Returns the thread switched to (IDLE = nothing else runnable).
 pub fn preempt() -> ThreadId {

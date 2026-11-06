@@ -7,6 +7,8 @@ pub mod kernel {
     pub const FAULT_RESOLVE: u16 = 0x0002;
     pub const NOTIFY: u16 = 0x0003;
     pub const IRQ: u16 = 0x0004;
+    /// ADR-044: a foreign thread's raw syscall trap, routed to the emulator.
+    pub const FOREIGN_SYSCALL: u16 = 0x0005;
 }
 
 pub mod process {

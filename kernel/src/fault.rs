@@ -148,6 +148,11 @@ fn route_to_pager(
     Ok(FaultOutcome::Routed)
 }
 
+/// ADR-044: public for the foreign-syscall route (same scan, SEND cap).
+pub(crate) fn find_ep_cap_for(pid: ProcessId, ep: ObjRef) -> Option<u32> {
+    find_ep_cap(pid, ep)
+}
+
 fn find_ep_cap(pid: ProcessId, ep: ObjRef) -> Option<u32> {
     // Scan the process table for a SEND cap on this endpoint (kernel-side;
     // the fault EP is usually handle 2 from NEW_THREAD caps[1]).

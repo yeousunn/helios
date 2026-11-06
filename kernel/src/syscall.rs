@@ -219,6 +219,13 @@ pub fn sys_send(
     }
 }
 
+/// Test hook: deliver a reply envelope as if the server answered (ADR-044
+/// foreign-route tests).
+#[cfg(test)]
+pub(crate) fn reply_only_for_test(tid: ThreadId, env: Envelope) -> SysResult<i32> {
+    reply_only(tid, env)
+}
+
 fn reply_only(tid: ThreadId, env: Envelope) -> SysResult<i32> {
     match take_reply(tid) {
         Some(caller) => {
@@ -366,6 +373,60 @@ pub fn park_result(tid: ThreadId) -> Option<crate::entry::SyscallReturn> {
     None
 }
 
+/// ADR-044: is this thread's syscall a foreign trap? If so, save the raw
+/// frame, deliver it to the emulator endpoint as a CALL (FAULT_PAGE-as-call
+/// pattern), and return the parked return for the dispatcher. The num is
+/// opaque (a foreign ABI number) — the emulator translates everything.
+pub(crate) fn foreign_route(
+    pid: ProcessId,
+    tid: ThreadId,
+    args: &crate::entry::SyscallArgs,
+) -> Option<crate::entry::SyscallReturn> {
+    let ep = sched::get(tid).ok()?.foreign_ep?;
+    // Save the raw frame for the emulator's TRAP_READ while parked.
+    sched::set_trap_frame(
+        tid,
+        [
+            args.num,
+            args.cap as u64,
+            args.tag.0,
+            args.w[0],
+            args.w[1],
+            args.w[2],
+            args.w[3],
+        ],
+    );
+    // The emulator must hold a SEND cap on the route endpoint in the trapped
+    // process's table (kernel-side scan — the fault-EP pattern).
+    let handle = crate::fault::find_ep_cap_for(pid, ep);
+    let Some(handle) = handle else {
+        // No route cap: kill like an unroutable fault (ADR-007 §1).
+        let _ = sys_exit(tid, -1);
+        return Some(crate::entry::SyscallReturn {
+            status: ipc::status::EDEAD,
+            tag: Tag(0),
+            w: [0; 4],
+        });
+    };
+    let mut m = Message::new(ipc::labels::kernel::FOREIGN_SYSCALL);
+    m.words[0] = args.num;
+    m.words[1] = args.cap as u64;
+    m.words[2] = args.w[3];
+    // sys_call parks the thread Blocked(Reply); the emulator's reply becomes
+    // the syscall's SyscallReturn via park_result (ADR-019 §1).
+    match sys_call(pid, tid, handle, m) {
+        Ok(_) => Some(crate::entry::SyscallReturn::parked()),
+        Err(_) => {
+            let _ = sys_exit(tid, -1);
+            Some(crate::entry::SyscallReturn {
+                status: ipc::status::EDEAD,
+                tag: Tag(0),
+                w: [0; 4],
+            })
+        }
+    }
+}
+
 /// SYS 3: `recv`. Returns (status, delivered message or none).
 /// `woken_by_notification` is surfaced via FLAG_NOTIFIED + label 0.
 pub fn sys_recv(
@@ -416,6 +477,12 @@ pub fn sys_recv(
                         return Ok(Some(m));
                     }
                     None => {
+                        // Nonblocking poll (the shell peeks for input before
+                        // falling back to its compiled script): report empty
+                        // rather than parking, matching the endpoint branch.
+                        if nonblock {
+                            return Err(err(ipc::status::EWOULDBLOCK));
+                        }
                         sched::block_with_deadline(
                             tid,
                             BlockReason::Notification(ObjRef(crate::console_in::CONSOLE_NOTIFY_ID)),
