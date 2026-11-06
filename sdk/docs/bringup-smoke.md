@@ -78,6 +78,18 @@ left (`cat`, stdout = write cap) and right (`wc`, stdin = read cap) children
 spawned; the `wc` line is the consumer's output; `sh ok` is the shell's final
 status check (pipeline statuses verified, plus the exec'd child's real exit).
 
+### Redirection console sequence (slice 15)
+
+```
+echo >  note.txt | redirection works | cat > copy -> 0 | wc  <  hello  ->  0
+bytes=13 lines=0 | sh ok
+```
+
+`echo > note.txt` = builtin write through the shell's VFS connection;
+`redirection works` = `cat note.txt` reading it back; `cat > copy -> 0` =
+external `cat hello` drained through a pipe into a file; `wc < hello -> 0` =
+`hello` fed as the child's stdin (`bytes=13 lines=0`).
+
 v0 conventions this smoke pins (all design §2.4/§2.6 provisional):
 
 - **`SPAWN` packing:** `w1` = program `(off,len)` — ignored v0 (PS loads the image
