@@ -1017,21 +1017,16 @@ fn repl_run_to<R: RawSyscalls>(
         }
     };
     let mut buf: Vec<u8> = Vec::new();
-    loop {
-        match sys.recv(read_end) {
-            Ok(m) => {
-                if m.tag.label() == sdk::methods::console::EOF {
-                    break;
-                }
-                for w in m.words {
-                    for b in w.to_le_bytes() {
-                        if b != 0 {
-                            buf.push(b);
-                        }
-                    }
+    while let Ok(m) = sys.recv(read_end) {
+        if m.tag.label() == sdk::methods::console::EOF {
+            break;
+        }
+        for w in m.words {
+            for b in w.to_le_bytes() {
+                if b != 0 {
+                    buf.push(b);
                 }
             }
-            Err(_) => break,
         }
     }
     let _ = rt.ps.wait(sys, pid);
