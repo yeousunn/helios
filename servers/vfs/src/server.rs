@@ -156,6 +156,7 @@ impl<K: VfsKernel, T: Transport> VfsServer<K, T> {
             label::READDIR => self.op_readdir(cap, msg, windows),
             label::STAT => self.op_stat(cap, msg, windows),
             label::UNLINK => self.op_unlink(cap, msg, windows),
+            label::RMDIR => self.op_rmdir(cap, msg, windows),
             label::RENAME => self.op_rename(cap, msg, windows),
             label::CLOSE | label::FSYNC | label::TRUNCATE | label::DUP => {
                 self.op_handle_only(cap, msg)
@@ -561,6 +562,24 @@ impl<K: VfsKernel, T: Transport> VfsServer<K, T> {
             }
             .encode()
         })
+    }
+
+    fn op_rmdir(
+        &mut self,
+        cap: KernelHandle,
+        msg: &Message,
+        windows: &mut impl Windows,
+    ) -> Message {
+        let label = label::RMDIR;
+        let reply = (|| {
+            let conn = self.conn(cap)?;
+            let req = NameRequest::decode(msg, label)?;
+            let dir = self.dir_of(conn, cap, req.dir)?;
+            let name = self.read_name(conn, req.name, windows)?;
+            self.fs.rmdir(dir, &name)?;
+            Ok::<_, Status>(StatusReply { status: status::OK }.encode(label))
+        })();
+        reply.unwrap_or_else(|e| StatusReply { status: e }.encode(label))
     }
 
     fn op_unlink(

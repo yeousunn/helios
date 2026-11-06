@@ -226,6 +226,37 @@ impl RamFs {
         Ok(())
     }
 
+    /// Remove an **empty** subdirectory. Mirrors `unlink`'s pending-delete /
+    /// refs discipline: an open handle keeps the node alive (marked deleted)
+    /// until it is closed.
+    pub fn rmdir(&mut self, dir: NodeId, name: &str) -> Result<(), Status> {
+        if name.is_empty() || name == "." || name == ".." {
+            return Err(status::EBADARG);
+        }
+        let id = {
+            let entries = self.dir_entries(dir)?;
+            *entries.get(name).ok_or(vstatus::ENOENT)?
+        };
+        match &self.get(id)?.data {
+            NodeData::File(_) => return Err(vstatus::ENOTDIR),
+            NodeData::Dir(entries) => {
+                if !entries.is_empty() {
+                    return Err(vstatus::ENOTEMPTY);
+                }
+            }
+        }
+        let refs = self.get(id)?.refs;
+        if let Ok(NodeData::Dir(entries)) = self.get_mut(dir).map(|n| &mut n.data) {
+            entries.remove(name);
+        }
+        if refs == 0 {
+            self.free_slot(id);
+        } else {
+            self.get_mut(id)?.deleted = true;
+        }
+        Ok(())
+    }
+
     /// Renames within the tree. v0 rules: source must exist; destination may
     /// be absent (rename) or an existing *file* (replace); directories are
     /// never replaced; a directory cannot move into its own subtree.
@@ -522,6 +553,25 @@ mod tests {
         assert_eq!(fs.unlink(root, "d"), Err(vstatus::EISDIR));
         assert_eq!(fs.unlink(root, "."), Err(status::EBADARG));
         assert_eq!(fs.unlink(root, "nope"), Err(vstatus::ENOENT));
+    }
+
+    #[test]
+    fn rmdir_rules() {
+        let mut fs = fs();
+        let root = fs.root();
+        let d = fs.mkdir(root, "d", MODE_DIR_DEFAULT, 0).unwrap();
+        // A file target is ENOTDIR; a non-empty dir is ENOTEMPTY.
+        fs.create_file(root, "f", MODE_FILE_DEFAULT, 0).unwrap();
+        assert_eq!(fs.rmdir(root, "f"), Err(vstatus::ENOTDIR));
+        fs.create_file(d, "inner", MODE_FILE_DEFAULT, 0).unwrap();
+        assert_eq!(fs.rmdir(root, "d"), Err(vstatus::ENOTEMPTY));
+        // Empty it, then remove it; "." / ".." / missing are rejected.
+        fs.unlink(d, "inner").unwrap();
+        assert_eq!(fs.rmdir(root, "."), Err(status::EBADARG));
+        assert_eq!(fs.rmdir(root, ".."), Err(status::EBADARG));
+        assert_eq!(fs.rmdir(root, "nope"), Err(vstatus::ENOENT));
+        fs.rmdir(root, "d").unwrap();
+        assert_eq!(fs.walk(root, "d"), Err(vstatus::ENOENT));
     }
 
     #[test]

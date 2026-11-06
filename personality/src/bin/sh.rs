@@ -102,6 +102,13 @@ enum Command {
         text: &'static [u8],
         file: &'static [u8],
     },
+    /// Remove an empty directory (RMDIR).
+    Rmdir(&'static [u8]),
+    /// Copy a file (`cp src dst`) through the VFS.
+    Cp {
+        src: &'static [u8],
+        dst: &'static [u8],
+    },
 }
 
 const SCRIPT: &[Command] = &[
@@ -206,6 +213,21 @@ const SCRIPT: &[Command] = &[
     },
     Command::Rm(b"note.txt"),
     Command::Rm(b"copy"),
+    // rmdir: create a directory, remove it (empty); cp: copy a file and read
+    // the copy back.
+    Command::Mkdir(b"trash"),
+    Command::Ls,
+    Command::Rmdir(b"trash"),
+    Command::Cp {
+        src: b"hello",
+        dst: b"hello2",
+    },
+    Command::Cat(b"hello2"),
+    Command::Stat(b"hello2"),
+    Command::Rm(b"hello2"),
+    // '..' inside a path: `work/../hello` resolves to the root's `hello`
+    // (the server's walk clamps at the root).
+    Command::Cat(b"work/../hello"),
     Command::Echo(b"sh ok"),
     // exec: replaces this shell with the child image, which echoes its argv
     // and exits 9. The shell's process keeps its capabilities (and its pid).
@@ -575,6 +597,31 @@ extern "C" fn sh_main(argc: u64, argv: *const *const u8, envp: *const *const u8)
                     exit(&mut sys, fail + 5);
                 }
                 fail += 6;
+            }
+            Command::Rmdir(path) => {
+                if let Err(e) = rt.vfs.rmdir(&mut sys, path) {
+                    exit(&mut sys, fail | (e & 0xFF));
+                }
+                let _ = rt.write_stdout(&mut sys, b"rmdir ");
+                let _ = rt.write_stdout(&mut sys, path);
+                let _ = rt.write_stdout(&mut sys, b"\n");
+                fail += 2;
+            }
+            Command::Cp { src: s, dst } => {
+                let mut buf = [0u8; 512];
+                let n = match rt.vfs.read_file(&mut sys, s, &mut buf) {
+                    Ok(n) => n,
+                    Err(e) => exit(&mut sys, fail | (e & 0xFF)),
+                };
+                if let Err(e) = rt.vfs.write_file(&mut sys, dst, &buf[..n]) {
+                    exit(&mut sys, ((fail + 1) << 8) | (e & 0xFF));
+                }
+                let _ = rt.write_stdout(&mut sys, b"cp ");
+                let _ = rt.write_stdout(&mut sys, s);
+                let _ = rt.write_stdout(&mut sys, b" ");
+                let _ = rt.write_stdout(&mut sys, dst);
+                let _ = rt.write_stdout(&mut sys, b"\n");
+                fail += 4;
             }
         }
     }

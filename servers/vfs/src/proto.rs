@@ -37,6 +37,7 @@ pub mod label {
     pub const RENAME: u16 = 0x021C;
     pub const TRUNCATE: u16 = 0x021D;
     pub const DUP: u16 = 0x021E;
+    pub const RMDIR: u16 = 0x021F;
 }
 
 pub type Status = i32;

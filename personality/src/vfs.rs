@@ -154,7 +154,8 @@ impl VfsClient {
 
     /// Walk the FULL path to its final component (which must be a directory)
     /// and return that dir's handle. A leading '/' starts at the root;
-    /// '.'/empty components skip; ".." is unsupported inside paths.
+    /// '.'/empty components skip; ".." is passed through to the server, whose
+    /// walk clamps at the root.
     pub fn walk_path<R: RawSyscalls>(
         &mut self,
         sys: &mut Syscalls<R>,
@@ -541,6 +542,31 @@ impl VfsClient {
         req.words[1] = src_len as u64; // Span { off 0, len }
         req.words[2] = dst_dir;
         req.words[3] = (64u64 << 32) | dst_len as u64; // Span { off 64, len }
+        let reply = sys.call(self.conn, &req)?;
+        if reply.words[0] != 0 {
+            return Err(reply.words[0] as i64 as i32);
+        }
+        Ok(())
+    }
+
+    /// `RMDIR` a path (must be an empty directory).
+    pub fn rmdir<R: RawSyscalls>(
+        &mut self,
+        sys: &mut Syscalls<R>,
+        path: &[u8],
+    ) -> Result<(), Status> {
+        if path.is_empty() || path.len() > WINDOW {
+            return Err(EINVAL);
+        }
+        let mut last = [0u8; 64];
+        let (dir, len) = self.resolve(sys, path, &mut last)?;
+        // SAFETY: arg window mapped R|W by `connect`.
+        unsafe {
+            core::ptr::copy_nonoverlapping(last.as_ptr(), ARG_WINDOW_VA as *mut u8, len);
+        }
+        let mut req = Message::new(methods::vfs::RMDIR);
+        req.words[0] = dir;
+        req.words[1] = len as u64;
         let reply = sys.call(self.conn, &req)?;
         if reply.words[0] != 0 {
             return Err(reply.words[0] as i64 as i32);
