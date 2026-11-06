@@ -572,7 +572,12 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
             let _ = m.set_descriptor(
                 1,
                 match info.console_in {
-                    Some(h) if h != 0 => ipc::CapSlot::pack(h, ipc::Rights::RECV),
+                    // GRANT so PS can forward it on to the child package; the
+                    // granted rights become PS's held rights, and a transfer
+                    // requires GRANT on the sender's cap (init -> PS -> child).
+                    Some(h) if h != 0 => {
+                        ipc::CapSlot::pack(h, ipc::Rights::RECV.union(ipc::Rights::GRANT))
+                    }
                     _ => ipc::CapSlot::NULL,
                 },
             );
