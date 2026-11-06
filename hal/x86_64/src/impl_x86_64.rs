@@ -1041,6 +1041,23 @@ pub fn enable_uart_rx() {
     }
 }
 
+/// Enable the PIT timer tick (ADR-042): register the IRQ0 handler, unmask it,
+/// and arm the initial 10 ms oneshot. Mirrors `enable_uart_rx`.
+pub fn enable_timer_tick() {
+    let mut pic = IRQ_PIC.lock();
+    // SAFETY: single-threaded boot registration; raw I/O to PIC/PIT ch0.
+    unsafe {
+        Irq::register_handler(&mut *pic, 0, timer_irq0);
+        Irq::unmask(&mut *pic, 0);
+        // Initial arm: 10 ms oneshot (PIT ch0, mode 0, binary).
+        let ticks = 10_000_000 * PIT_BASE_HZ / 1_000_000_000;
+        let ticks = ticks.clamp(1, 0xFFFF);
+        port_outb(PIT_MODE, 0x30); // ch0, lobyte/hibyte, mode 0, binary
+        port_outb(PIT_CH0, (ticks & 0xFF) as u8);
+        port_outb(PIT_CH0, ((ticks >> 8) & 0xFF) as u8);
+    }
+}
+
 /// COM1 RX interrupt (IRQ4): drain every available byte into the sink.
 fn uart_irq4(_irq: u8) -> bool {
     // SAFETY: COM1 LSR/RBR raw I/O; the interrupt means data is ready.
@@ -1051,6 +1068,24 @@ fn uart_irq4(_irq: u8) -> bool {
                 f(b);
             }
         }
+    }
+    false // v0: no reschedule-on-IRQ (cooperative scheduler)
+}
+
+/// PIT channel 0 / IRQ0 timer tick (ADR-042): lock-free mark + deferred drain.
+/// Sets `kernel::time::TICK_PENDING` and re-arms the 10 ms oneshot. No locks
+/// are taken (the interrupted syscall context may hold scheduler locks on this
+/// CPU — the ADR-038 deferred-wake pattern; `drain_tick` runs in dispatch).
+fn timer_irq0(_irq: u8) -> bool {
+    // SAFETY: PIT ch0 raw I/O; IRQ-context safe (mark only + port writes).
+    unsafe {
+        kernel::time::tick_pending();
+        // Re-arm PIT channel 0 oneshot for the next 10 ms tick.
+        let ticks = 10_000_000 * PIT_BASE_HZ / 1_000_000_000;
+        let ticks = ticks.clamp(1, 0xFFFF);
+        port_outb(PIT_MODE, 0x30); // ch0, lobyte/hibyte, mode 0, binary
+        port_outb(PIT_CH0, (ticks & 0xFF) as u8);
+        port_outb(PIT_CH0, ((ticks >> 8) & 0xFF) as u8);
     }
     false // v0: no reschedule-on-IRQ (cooperative scheduler)
 }

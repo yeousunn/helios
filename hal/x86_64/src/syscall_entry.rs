@@ -193,16 +193,30 @@ fn resume_loop(saved: Option<SyscallReturn>) {
         if kernel::sched::thread_count() == 0 {
             kernel::panic::clean_exit();
         }
-        let next = kernel::sched::pick_next();
+        let mut next = kernel::sched::pick_next();
         if next.0 == 0 {
             // Idle: nothing runnable. Drain the kstack graveyard first
             // (ADR-031): this context is provably not on any buried stack.
-            // Draining frees frames but wakes no threads — halt after.
             kernel::sched::drain_graveyard();
-            crate::uart_writer("\n[kernel] no runnable thread (cooperative deadlock)\n");
+            crate::uart_writer("\n[kernel] idle: no runnable thread\n");
+            // (ADR-042): `sti; hlt; cli` lets a pending IRQ wake the CPU —
+            // pending IRQs do NOT wake `hlt` at IF=0. `drain_tick` runs
+            // lock-free before re-picking to expire parked recv/send
+            // deadlines. Re-pick until a thread is runnable.
             loop {
-                // SAFETY: halting the CPU with nothing to run.
-                unsafe { asm!("cli; hlt", options(nostack, nomem)) };
+                // SAFETY: `sti; hlt; cli` briefly enables interrupts so a
+                // pending IRQ wakes `hlt`, then re-disables for dispatch.
+                unsafe {
+                    asm!("sti", options(nostack));
+                    asm!("hlt", options(nostack));
+                    asm!("cli", options(nostack));
+                }
+                kernel::time::drain_tick();
+                let picked = kernel::sched::pick_next();
+                if picked.0 != 0 {
+                    next = picked;
+                    break;
+                }
             }
         }
         kernel::sched::switch_to(next);

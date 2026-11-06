@@ -119,6 +119,8 @@ pub extern "C" fn kernel_main() -> ! {
     // Console input (ADR-038): UART RX bytes feed the kernel line discipline.
     hal_x86_64::set_uart_rx_callback(kernel::console_in::push_byte);
     hal_x86_64::enable_uart_rx();
+    // Timer tick (ADR-042): PIT IRQ0 marks pending ticks; drain in dispatch.
+    hal_x86_64::enable_timer_tick();
 
     // Scheduler must be initialized before init::start spawns the first
     // thread (found via smoke debug: spawn hit an uninitialized table).
