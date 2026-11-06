@@ -992,18 +992,24 @@ unsafe fn enter_user(entry: u64, bootinfo: u64) -> ! {
     let stack = crate::layout::USER_STACK_TOP as u64;
     // SAFETY: pushes the iretq frame (SS,RSP,RFLAGS,CS,RIP) on the current
     // kernel stack and transfers control to ring 3; never returns.
+    //
+    // `bootinfo` is bound with `in("rdi")` (the SysV `_start` argument
+    // register) instead of a free `in(reg)` + `mov rdi`: a free operand can
+    // be ALLOCATED to RDI, and the explicit `mov rdi, {bi}` then clobbers it
+    // (undeclared to the compiler) — found in the dev profile, where the
+    // allocator picked RDI for the entry operand and iretq jumped to the
+    // bootinfo address instead of the entry PC.
     unsafe {
         core::arch::asm!(
-            "mov rdi, {bi}",
             "push 0x1B",        // SS: user data
             "push {sp}",        // RSP
             "push 0x202",       // RFLAGS: IF | reserved
             "push 0x23",        // CS: user code
             "push {ip}",        // RIP
             "iretq",
-            bi = in(reg) bootinfo,
             sp = in(reg) stack,
             ip = in(reg) entry,
+            in("rdi") bootinfo,
             options(noreturn)
         );
     }

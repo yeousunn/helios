@@ -43,6 +43,13 @@ pub struct Region {
 }
 
 impl Region {
+    /// The all-zero region (const initializer for staging slots; `len == 0`
+    /// means "no region configured"). Never handed out by `alloc`.
+    pub const EMPTY: Region = Region {
+        base: PhysAddr(0),
+        len: 0,
+    };
+
     /// Creates a region, rounding `base` up and `len` down to frame
     /// boundaries. Returns `None` when rounding overflows or the region is
     /// empty.
@@ -91,10 +98,31 @@ impl RegionState {
 
 struct Inner {
     regions: [Option<RegionState>; MAX_REGIONS],
+    /// False until `init` configures the regions (the slots are const-zeroed
+    /// in .bss — see ALLOCATOR — and carry EMPTY regions until then).
+    initialized: bool,
 }
 
 /// Global allocator; initialized exactly once from boot code (ADR-003).
-static ALLOCATOR: Mutex<Option<Inner>> = Mutex::new(None);
+///
+/// The region slots are **const-evaluated into .bss** (256 KiB of zeroed
+/// bitmaps) instead of built on the stack in `init`: the stack-built version
+/// materialized an ~262 KiB temporary that overflowed the 1 MiB boot stack
+/// in debug builds and zeroed boot.S's identity page tables sitting directly
+/// below `stack_bottom` (triple fault between "boot: 3 backends" and
+/// "boot: 4 frames", silent under `-no-reboot`). Same landmine class as the
+/// `CapTable::empty()` temporary (ADR-037 am2): large tables are const
+/// statics, never by-value stack values.
+static ALLOCATOR: Mutex<Option<Inner>> = Mutex::new(Some(Inner {
+    regions: [const {
+        Some(RegionState {
+            region: Region::EMPTY,
+            bitmap: [0; WORDS],
+            used: 0,
+        })
+    }; MAX_REGIONS],
+    initialized: false,
+}));
 
 /// Register the usable physical memory regions. Call once from boot.
 pub fn init(regions: &[Region]) -> Result<(), &'static str> {
@@ -104,22 +132,27 @@ pub fn init(regions: &[Region]) -> Result<(), &'static str> {
     if regions.len() > MAX_REGIONS {
         return Err("too many regions");
     }
-    let mut slots: [Option<RegionState>; MAX_REGIONS] = [const { None }; MAX_REGIONS];
-    for (i, r) in regions.iter().enumerate() {
+    for r in regions {
         if r.frame_count() > MAX_FRAMES_PER_REGION {
             return Err("region exceeds allocator capacity");
         }
-        slots[i] = Some(RegionState {
-            region: *r,
-            bitmap: [0; WORDS],
-            used: 0,
-        });
     }
     let mut guard = ALLOCATOR.lock();
-    if guard.is_some() {
+    let Some(inner) = guard.as_mut() else {
+        return Err("allocator missing");
+    };
+    if inner.initialized {
         return Err("frame allocator already initialized");
     }
-    *guard = Some(Inner { regions: slots });
+    // Configure the pre-staged slots in place — no per-slot temporaries.
+    // The bitmaps are already zero (const .bss; init runs exactly once and
+    // nothing allocates before it).
+    for (i, r) in regions.iter().enumerate() {
+        let slot = inner.regions[i].as_mut().expect("staged slot");
+        slot.region = *r;
+        slot.used = 0;
+    }
+    inner.initialized = true;
     Ok(())
 }
 
@@ -249,7 +282,16 @@ pub fn free_count() -> usize {
 #[cfg(test)]
 pub(crate) fn reset_for_test() {
     let mut guard = ALLOCATOR.lock();
-    *guard = None;
+    // De-configure in place: slots are const-staged; only the flag and the
+    // region/used fields ever change (bitmaps re-zeroed per slot).
+    if let Some(inner) = guard.as_mut() {
+        inner.initialized = false;
+        for slot in inner.regions.iter_mut().flatten() {
+            slot.region = Region::EMPTY;
+            slot.used = 0;
+            slot.bitmap = [0; WORDS];
+        }
+    }
 }
 
 #[cfg(test)]

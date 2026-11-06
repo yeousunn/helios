@@ -159,6 +159,11 @@ pd_table:
 .align 16
 .global stack_top
 stack_bottom:
-    .skip 1048576               /* 1 MiB: kernel init_frame builds ~256 KiB
-                                   tables on the stack (frame allocator) */
+    .skip 2097152               /* 2 MiB: frame::init and boot-path frames
+                                   materialize large tables (the 256 KiB
+                                   allocator staging lived on the stack until
+                                   it was moved to const .bss; debug-profile
+                                   frames are ~2x release — 1 MiB overflowed
+                                   into the page tables below stack_bottom
+                                   and self-zeroed the identity map) */
 stack_top:
