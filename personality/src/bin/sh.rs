@@ -778,6 +778,10 @@ fn repl_line<R: RawSyscalls>(
     if repl_pipeline(sys, rt, text, vfs_ep, stdout, renv) {
         return;
     }
+    // `cmd > file` / `cmd < file`: redirection (one per line).
+    if repl_redirect(sys, rt, text, vfs_ep, stdout, renv) {
+        return;
+    }
     let mut toks: [&[u8]; 16] = [b""; 16];
     let mut n = 0usize;
     for t in text.split(|&b| b == b' ').filter(|t| !t.is_empty()) {
@@ -922,6 +926,165 @@ fn repl_line<R: RawSyscalls>(
             repl_spawn(sys, rt, &toks[..n], vfs_ep, stdout, renv, &mut line);
         }
     }
+}
+
+/// Trim ASCII spaces from both ends.
+fn trim(mut s: &[u8]) -> &[u8] {
+    while s.first() == Some(&b' ') {
+        s = &s[1..];
+    }
+    while s.last() == Some(&b' ') {
+        s = &s[..s.len() - 1];
+    }
+    s
+}
+
+/// Tokenize a command line into up to 16 words.
+fn tokenize(text: &[u8]) -> ([&[u8]; 16], usize) {
+    let mut toks: [&[u8]; 16] = [b""; 16];
+    let mut n = 0usize;
+    for t in text.split(|&b| b == b' ').filter(|t| !t.is_empty()) {
+        if n < toks.len() {
+            toks[n] = t;
+            n += 1;
+        }
+    }
+    (toks, n)
+}
+
+/// `cmd > file` / `cmd < file` in the REPL. Returns true if handled.
+fn repl_redirect<R: RawSyscalls>(
+    sys: &mut Syscalls<R>,
+    rt: &mut Runtime,
+    text: &[u8],
+    vfs_ep: Option<u32>,
+    stdout: Option<u32>,
+    renv: &[Vec<u8>],
+) -> bool {
+    if let Some(pos) = text.iter().position(|&b| b == b'>') {
+        repl_run_to(
+            sys,
+            rt,
+            trim(&text[..pos]),
+            trim(&text[pos + 1..]),
+            vfs_ep,
+            renv,
+        );
+        return true;
+    }
+    if let Some(pos) = text.iter().position(|&b| b == b'<') {
+        repl_run_from(
+            sys,
+            rt,
+            trim(&text[..pos]),
+            trim(&text[pos + 1..]),
+            vfs_ep,
+            stdout,
+            renv,
+        );
+        return true;
+    }
+    false
+}
+
+/// `cmd > file`: spawn `cmd` with stdout captured into a VFS file.
+fn repl_run_to<R: RawSyscalls>(
+    sys: &mut Syscalls<R>,
+    rt: &mut Runtime,
+    left: &[u8],
+    file: &[u8],
+    vfs_ep: Option<u32>,
+    renv: &[Vec<u8>],
+) {
+    let (toks, n) = tokenize(left);
+    if n == 0 || file.is_empty() {
+        return;
+    }
+    let argv = &toks[..n];
+    let ev: Vec<&[u8]> = renv.iter().map(|v| v.as_slice()).collect();
+    let (read_end, write_end) = match rt.ps.pipe(sys) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let pid = match rt
+        .ps
+        .spawn(sys, argv[0], argv, &ev, vfs_ep, None, Some(write_end))
+    {
+        Ok(p) => p,
+        Err(_) => {
+            let _ = rt.write_stdout(sys, b"run: spawn failed\n");
+            return;
+        }
+    };
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        match sys.recv(read_end) {
+            Ok(m) => {
+                if m.tag.label() == sdk::methods::console::EOF {
+                    break;
+                }
+                for w in m.words {
+                    for b in w.to_le_bytes() {
+                        if b != 0 {
+                            buf.push(b);
+                        }
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let _ = rt.ps.wait(sys, pid);
+    let _ = rt.vfs.write_file(sys, file, &buf);
+}
+
+/// `cmd < file`: feed a VFS file into the child's stdin.
+fn repl_run_from<R: RawSyscalls>(
+    sys: &mut Syscalls<R>,
+    rt: &mut Runtime,
+    left: &[u8],
+    file: &[u8],
+    vfs_ep: Option<u32>,
+    stdout: Option<u32>,
+    renv: &[Vec<u8>],
+) {
+    let (toks, n) = tokenize(left);
+    if n == 0 || file.is_empty() {
+        return;
+    }
+    let argv = &toks[..n];
+    let ev: Vec<&[u8]> = renv.iter().map(|v| v.as_slice()).collect();
+    let mut data = [0u8; 256];
+    let k = match rt.vfs.read_file(sys, file, &mut data) {
+        Ok(k) => k,
+        Err(_) => {
+            let _ = rt.write_stdout(sys, b"cannot read file\n");
+            return;
+        }
+    };
+    let (read_end, write_end) = match rt.ps.pipe(sys) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let pid = match rt
+        .ps
+        .spawn(sys, argv[0], argv, &ev, vfs_ep, Some(read_end), stdout)
+    {
+        Ok(p) => p,
+        Err(_) => {
+            let _ = rt.write_stdout(sys, b"run: spawn failed\n");
+            return;
+        }
+    };
+    for chunk in data[..k].chunks(sdk::methods::console::TEXT_BYTES) {
+        let mut m = Message::new(sdk::methods::console::WRITE);
+        m.words = sdk::methods::pack_console_text(chunk);
+        if sys.send(write_end, &m).is_err() {
+            break;
+        }
+    }
+    let _ = sys.send(write_end, &Message::new(sdk::methods::console::EOF));
+    let _ = rt.ps.wait(sys, pid);
 }
 
 /// If `text` contains `|`, run it as a pipeline (up to 4 stages) and return
