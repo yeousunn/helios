@@ -11,6 +11,7 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod foreign;
 pub mod layout;
 pub mod posix;
 pub mod ps;
