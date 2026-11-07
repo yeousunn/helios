@@ -73,7 +73,13 @@ pub trait Host {
     fn gettid(&mut self) -> i64;
     /// Adjust the program break; returns the (possibly unchanged) break.
     fn brk(&mut self, requested: u64) -> i64;
+    /// Map `len` anonymous zeroed bytes; returns the base address or a
+    /// negative errno (libc uses this for the heap/TLS/thread stacks).
+    fn mmap_anon(&mut self, len: usize) -> i64;
 }
+
+/// `mmap` `flags` bit: anonymous (not file-backed).
+pub const MAP_ANONYMOUS: u64 = 0x20;
 
 /// Decode one foreign syscall and act via `host`. `args` are the six integer
 /// arguments in Linux order (rdi, rsi, rdx, r10, r8, r9).
@@ -139,10 +145,19 @@ pub fn dispatch<H: Host>(num: u64, args: [u64; 6], host: &mut H) -> Action {
         // succeed or libc bails before main.
         linux::RT_SIGACTION | linux::RT_SIGPROCMASK | linux::MPROTECT => Action::Return(0),
         linux::SET_ROBUST_LIST | linux::RSEQ => Action::Return(0),
-        // Deliberately unimplemented: a real implementation needs the AS
-        // allocator (mmap) / device fds (ioctl) — refuse cleanly so the
-        // emulated program sees a normal error rather than garbage.
-        linux::MMAP | linux::IOCTL => Action::Return(ENOSYS),
+        linux::MMAP => {
+            // Anonymous mappings (libc heap/TLS/stacks) are backed by the
+            // Host allocator; file/device mappings are not supported yet.
+            let flags = args[3];
+            if flags & MAP_ANONYMOUS != 0 {
+                Action::Return(host.mmap_anon(args[1] as usize))
+            } else {
+                Action::Return(ENOSYS)
+            }
+        }
+        // Deliberately unimplemented: device fds need a device layer — refuse
+        // cleanly so the emulated program sees a normal error, not garbage.
+        linux::IOCTL => Action::Return(ENOSYS),
         _ => Action::Return(ENOSYS),
     }
 }
@@ -158,6 +173,7 @@ mod tests {
         out_len: usize,
         closed: i32,
         break_: u64,
+        mmap_bump: u64,
     }
     impl Mock {
         fn new() -> Self {
@@ -167,6 +183,7 @@ mod tests {
                 out_len: 0,
                 closed: -1,
                 break_: 0x1000,
+                mmap_bump: 0x1000_0000,
             }
         }
     }
@@ -214,6 +231,11 @@ mod tests {
                 self.break_ = requested;
             }
             self.break_ as i64
+        }
+        fn mmap_anon(&mut self, len: usize) -> i64 {
+            let base = self.mmap_bump;
+            self.mmap_bump += (len as u64).max(4096);
+            base as i64
         }
     }
 
@@ -283,11 +305,22 @@ mod tests {
             Action::Return(0)
         );
         assert_eq!(dispatch(linux::MPROTECT, [0; 6], &mut m), Action::Return(0));
-        assert_eq!(
-            dispatch(linux::MMAP, [0; 6], &mut m),
-            Action::Return(ENOSYS)
-        );
         assert_eq!(dispatch(0xDEAD, [0; 6], &mut m), Action::Return(ENOSYS));
+    }
+
+    #[test]
+    fn mmap_anonymous_allocates_file_returns_enosys() {
+        let mut m = Mock::new();
+        // mmap(0, len, prot, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) -> an address.
+        let flags = MAP_ANONYMOUS | 0x02;
+        let a = dispatch(linux::MMAP, [0, 8192, 3, flags, u64::MAX, 0], &mut m);
+        assert_eq!(a, Action::Return(0x1000_0000));
+        // A second mapping advances the bump allocator.
+        let b = dispatch(linux::MMAP, [0, 4096, 3, flags, u64::MAX, 0], &mut m);
+        assert_eq!(b, Action::Return(0x1000_2000));
+        // Non-anonymous (file) mappings are not supported yet.
+        let f = dispatch(linux::MMAP, [0, 4096, 3, 0x02, 3, 0], &mut m);
+        assert_eq!(f, Action::Return(ENOSYS));
     }
 
     #[test]
