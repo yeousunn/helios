@@ -21,6 +21,7 @@ use core::sync::atomic::Ordering;
 
 use hal::EarlyBoot;
 use kernel::console::Level;
+use kernel::mem::phys_to_virt;
 
 global_asm!(include_str!("boot.S"));
 
@@ -208,17 +209,24 @@ pub extern "C" fn kernel_main() -> ! {
 /// `phys` must point to allocated RAM below the identity-mapped range and
 /// `offset + bytes.len()` must stay inside the allocation.
 unsafe fn write_phys(phys: u64, offset: u64, bytes: &[u8]) {
-    // SAFETY: caller contract above.
+    // SAFETY: caller contract above; phys_to_virt reaches the frame through the
+    // shared higher-half window (ADR-045 slice 2), not the per-AS PML4[0]
+    // identity window that no longer exists for user address spaces.
     unsafe {
-        core::ptr::copy_nonoverlapping(bytes.as_ptr(), (phys + offset) as *mut u8, bytes.len());
+        core::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            phys_to_virt(phys + offset) as *mut u8,
+            bytes.len(),
+        );
     }
 }
 
 /// # Safety
 /// `phys..phys+len` must be allocated, identity-mapped RAM.
 unsafe fn zero_phys(phys: u64, len: u64) {
-    // SAFETY: caller contract above.
-    unsafe { core::ptr::write_bytes(phys as *mut u8, 0, len as usize) };
+    // SAFETY: caller contract above; phys_to_virt reaches the frame through
+    // the shared higher-half window (ADR-045 slice 2).
+    unsafe { core::ptr::write_bytes(phys_to_virt(phys) as *mut u8, 0, len as usize) };
 }
 
 /// Map the embedded init ELF into the default AS, map its stack, and write
@@ -263,8 +271,10 @@ fn stage_init(launch: &kernel::init::InitLaunch, image: &[u8]) -> (u64, u64) {
     const STACK_PAGES: u64 = 16;
     let stack_bottom = hal_x86_64::USER_STACK_TOP as u64 - STACK_PAGES * 4096;
     let sp = kernel::frame::alloc_contiguous(STACK_PAGES as usize).expect("frames for init stack");
+    kernel::kinfo!("stage: stack alloc={:#x}", sp.as_u64());
     // SAFETY: freshly allocated, identity-mapped frames.
     unsafe { zero_phys(sp.as_u64(), STACK_PAGES * 4096) };
+    kernel::kinfo!("stage: stack zeroed");
     aspace::map(
         DEFAULT_AS,
         Vaddr(stack_bottom),
@@ -273,20 +283,27 @@ fn stage_init(launch: &kernel::init::InitLaunch, image: &[u8]) -> (u64, u64) {
         MapFlags(0b011), // R | W
     )
     .expect("map init stack");
+    kernel::kinfo!("stage: stack mapped");
 
     // BootInfo lands in the first (lowest) stack page; userspace receives the
     // pointer in `rdi` and reads it through its own mapping.
     let n = {
         // SAFETY: identity-mapped stack frames; the ADR-018 writer bounds-checks.
-        let buf = unsafe { core::slice::from_raw_parts_mut(sp.as_u64() as *mut u8, 4096) };
+        // phys_to_virt reaches the frame through the shared higher-half window
+        // (ADR-045 slice 2), not the per-AS PML4[0] identity window.
+        let buf =
+            unsafe { core::slice::from_raw_parts_mut(phys_to_virt(sp.as_u64()) as *mut u8, 4096) };
         kernel::init::write_bootinfo(buf, &launch.bootinfo)
     };
     assert!(n > 0, "bootinfo write failed");
+    kernel::kinfo!("stage: bootinfo written");
 
     // Switch the CPU to the staged address space (DEFAULT_AS = id 1) — the
     // mappings above went into its tables; running on the boot root would
     // leave top-level branches (e.g. the stack's PML4 entry) invisible.
+    kernel::kinfo!("stage: before activate_as");
     assert!(hal_x86_64::activate_as(1), "DEFAULT_AS has no paging root");
+    kernel::kinfo!("stage: after activate_as");
     // Post-staging TLB invalidate (covers huge-page splits done by the maps).
     hal_x86_64::flush_tlb_all();
 
@@ -320,11 +337,13 @@ fn dump_boot_state() {
 /// Print the PML4/PDPT/PD(/PT) entries covering `va` (bring-up diagnosis).
 fn dump_pte_chain(va: u64) {
     let idx = |va: u64, sh: u32| (va >> sh) & 0x1FF;
-    // SAFETY: reading the current page tables through the identity map.
+    // SAFETY: reading the current page tables through the shared higher-half
+    // window (ADR-045 slice 2); phys_to_virt maps the PML4 physical address
+    // into the high half where it is present under every CR3.
     unsafe {
         let cr3: u64;
         core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem));
-        let rd = |p: u64| core::ptr::read_volatile(p as *const u64);
+        let rd = |p: u64| core::ptr::read_volatile(phys_to_virt(p) as *const u64);
         let pml4e = rd(cr3 + idx(va, 39) * 8);
         let pdpte = rd((pml4e & !0xFFF) + idx(va, 30) * 8);
         let pde = rd((pdpte & !0xFFF) + idx(va, 21) * 8);

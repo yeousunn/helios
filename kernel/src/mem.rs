@@ -9,10 +9,11 @@ use crate::frame::{self, PhysAddr};
 /// accounting, ADR-037 follow-up; debug builds only).
 #[cfg(debug_assertions)]
 pub fn paint_range(base: u64, len: u64, pattern: u8) {
-    // SAFETY: the range is kernel-allocated, identity-mapped RAM, not yet in
-    // use below the built context.
+    // SAFETY: the range is kernel-allocated RAM, reached through the shared
+    // higher-half window (phys_to_virt), not yet in use below the built
+    // context.
     unsafe {
-        core::ptr::write_bytes(base as *mut u8, pattern, len as usize);
+        core::ptr::write_bytes(phys_to_virt(base) as *mut u8, pattern, len as usize);
     }
 }
 
@@ -22,7 +23,7 @@ pub fn paint_range(base: u64, len: u64, pattern: u8) {
 pub fn high_water(base: u64, len: u64, pattern: u8) -> u64 {
     // SAFETY: as paint_range — kernel-owned identity-mapped RAM.
     unsafe {
-        let p = base as *const u8;
+        let p = phys_to_virt(base) as *const u8;
         let mut i = 0usize;
         while i < len as usize && p.add(i).read_volatile() == pattern {
             i += 1;
@@ -42,7 +43,11 @@ pub fn alloc_zeroed() -> Option<PhysAddr> {
         // allocator-managed RAM, so writing through the physical address is
         // valid and exclusively ours until mapped elsewhere.
         unsafe {
-            core::ptr::write_bytes(frame.as_u64() as *mut u8, 0, frame::FRAME_SIZE);
+            core::ptr::write_bytes(
+                phys_to_virt(frame.as_u64()) as *mut u8,
+                0,
+                frame::FRAME_SIZE,
+            );
         }
     }
     Some(frame)
@@ -54,7 +59,7 @@ pub fn read_reg_image(kstack_top: u64, out: &mut [u64; 10]) {
     // SAFETY: the kstack frame is kernel-owned, identity-mapped RAM; the
     // thread is quiescent so nothing else writes it.
     unsafe {
-        let top = kstack_top as *const u64;
+        let top = phys_to_virt(kstack_top) as *const u64;
         for (i, slot) in out.iter_mut().enumerate() {
             *slot = *top.sub(i + 1);
         }
@@ -65,9 +70,27 @@ pub fn read_reg_image(kstack_top: u64, out: &mut [u64; 10]) {
 pub fn write_reg_image(kstack_top: u64, image: &[u64; 10]) {
     // SAFETY: as read_reg_image.
     unsafe {
-        let top = kstack_top as *mut u64;
+        let top = phys_to_virt(kstack_top) as *mut u64;
         for (i, val) in image.iter().enumerate() {
             *top.sub(i + 1) = *val;
         }
     }
+}
+
+/// ADR-045 slice 2: the shared higher-half window maps every physical page
+/// below 1 GiB at `0xFFFFFFFF80000000 + PA` in every address space (boot.S
+/// alias for the boot CR3, the shared PML4[511] window for user ASes) — the
+/// kernel's frame/table access path. Host tests use fake addresses that are
+/// never dereferenced through real mappings — pass through unchanged there.
+#[cfg(not(test))]
+pub const HIGH_HALF_BASE: u64 = 0xFFFF_FFFF_8000_0000;
+#[cfg(test)]
+pub const HIGH_HALF_BASE: u64 = 0;
+
+pub fn phys_to_virt(pa: u64) -> u64 {
+    HIGH_HALF_BASE + pa
+}
+
+pub fn virt_to_phys(va: u64) -> u64 {
+    va - HIGH_HALF_BASE
 }

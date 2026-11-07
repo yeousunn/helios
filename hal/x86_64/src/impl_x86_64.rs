@@ -940,9 +940,10 @@ impl sched::ContextBackend for ContextBackendX86_64 {
         //   [top-32] trampoline | [top-40..top-80] rbx,rbp,r12..r15
         // `switch` pops the six callee-saved regs and `ret`s into the
         // trampoline, which iretqs to ring 3.
-        let top = kstack_top as *mut u64;
+        let top = kernel::mem::phys_to_virt(kstack_top) as *mut u64;
         // SAFETY: `kstack_top` is the top of a freshly allocated kernel stack
-        // (identity-mapped RAM); the writes stay within that stack.
+        // (reached through the shared higher-half window, ADR-045 slice 2);
+        // the writes stay within that stack.
         unsafe {
             *top.sub(1) = 0; // arg: v0 children take none
             *top.sub(2) = crate::layout::USER_STACK_TOP as u64;

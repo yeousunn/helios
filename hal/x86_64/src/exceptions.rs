@@ -130,7 +130,8 @@ extern "sysv64" fn exception_report(vector: u64, error: u64, cr2: u64, rip: u64,
             let mut tbl = cr3 & !0xFFF;
             for (lvl, sh) in shifts.iter().enumerate() {
                 let idx = (cr2 >> sh) & 0x1FF;
-                let ent = unsafe { core::ptr::read_volatile((tbl + idx * 8) as *const u64) };
+                let va = kernel::mem::phys_to_virt(tbl) + idx * 8;
+                let ent = unsafe { core::ptr::read_volatile(va as *const u64) };
                 kernel::kerror!(
                     "  chain {}: tbl={:#x} idx={} ent={:#x}",
                     names[lvl],

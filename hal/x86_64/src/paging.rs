@@ -45,6 +45,12 @@ const PTE_ACCESSED: u64 = 1 << 5;
 const PTE_DIRTY: u64 = 1 << 6;
 /// PTE flag: Page Size (1 = huge page, only valid in PD/PDPT entries).
 const PTE_PAGE_SIZE: u64 = 1 << 7;
+
+/// ADR-045 slice 2: table pages are reached through the shared higher-half
+/// window (works under every CR3), not the low identity map.
+fn pt_va(pa: usize) -> usize {
+    kernel::mem::phys_to_virt(pa as u64) as usize
+}
 /// PTE flag: Global (not flushed on CR3 write).
 const PTE_GLOBAL: u64 = 1 << 8;
 /// PTE flag: No Execute (NX bit, requires EFER.NXE).
@@ -235,7 +241,7 @@ impl PagingBackendX86_64 {
     ///
     /// Assumes `pml4_paddr` is a valid, mapped, writable page table page.
     unsafe fn pml4_mut(&self) -> &mut PageTable {
-        &mut *(self.pml4_paddr as *mut PageTable)
+        &mut *(pt_va(self.pml4_paddr) as *mut PageTable)
     }
 
     /// Allocate and zero one page-table page from the frame allocator.
@@ -247,7 +253,11 @@ impl PagingBackendX86_64 {
         let paddr = frame::alloc()?;
         // SAFETY: fresh frame; identity direct map covers allocated RAM.
         unsafe {
-            core::ptr::write_bytes(paddr.as_u64() as *mut u8, 0, PAGE_SIZE);
+            core::ptr::write_bytes(
+                kernel::mem::phys_to_virt(paddr.as_u64()) as *mut u8,
+                0,
+                PAGE_SIZE,
+            );
         }
         Some(paddr.as_u64() as usize)
     }
@@ -279,7 +289,7 @@ impl PagingBackendX86_64 {
         // permissions (x86 requires U/S=1 on all levels; leaves still govern).
         e.0 |= PTE_USER;
         // SAFETY: entry holds a valid page-table physical address per above.
-        let pdpt = unsafe { &mut *(e.addr() as *mut PageTable) };
+        let pdpt = unsafe { &mut *(pt_va(e.addr()) as *mut PageTable) };
 
         // PDPT -> PD
         let e = pdpt.entry(pt_index(vaddr, PDPT_SHIFT));
@@ -289,7 +299,7 @@ impl PagingBackendX86_64 {
         }
         e.0 |= PTE_USER;
         // SAFETY: as above.
-        let pd = unsafe { &mut *(e.addr() as *mut PageTable) };
+        let pd = unsafe { &mut *(pt_va(e.addr()) as *mut PageTable) };
 
         // PD -> PT (splitting 2 MiB huge pages if the boot map used them)
         let pd_idx = pt_index(vaddr, PD_SHIFT);
@@ -301,7 +311,7 @@ impl PagingBackendX86_64 {
             let base = e.addr();
             let old = e.0;
             let t = unsafe { Self::new_table() }?;
-            let pt = unsafe { &mut *(t as *mut PageTable) };
+            let pt = unsafe { &mut *(pt_va(t) as *mut PageTable) };
             let keep = old & (PTE_USER | PTE_WRITABLE | PTE_NX | PTE_GLOBAL);
             for i in 0..512 {
                 pt.entry(i).0 = ((base as u64 + (i as u64) * PAGE_SIZE as u64) & PTE_ADDR_MASK)
@@ -320,7 +330,7 @@ impl PagingBackendX86_64 {
             e.0 |= PTE_USER;
         }
         // SAFETY: entry holds a valid page-table physical address per above.
-        let pt = unsafe { &mut *(e.addr() as *mut PageTable) };
+        let pt = unsafe { &mut *(pt_va(e.addr()) as *mut PageTable) };
 
         Some(pt.entry(pt_index(vaddr, PT_SHIFT)))
     }
@@ -339,12 +349,12 @@ impl PagingBackendX86_64 {
             if !e.is_present() || (e.0 & PTE_PAGE_SIZE) != 0 {
                 return None;
             }
-            let pdpt = &mut *(e.addr() as *mut PageTable);
+            let pdpt = &mut *(pt_va(e.addr()) as *mut PageTable);
             let e = pdpt.entry(pt_index(vaddr, PDPT_SHIFT));
             if !e.is_present() || (e.0 & PTE_PAGE_SIZE) != 0 {
                 return None;
             }
-            let pd = &mut *(e.addr() as *mut PageTable);
+            let pd = &mut *(pt_va(e.addr()) as *mut PageTable);
             let e = pd.entry(pt_index(vaddr, PD_SHIFT));
             if !e.is_present() {
                 return None;
@@ -354,7 +364,7 @@ impl PagingBackendX86_64 {
                 *intermediate_ok = true;
                 return None;
             }
-            let pt = &mut *(e.addr() as *mut PageTable);
+            let pt = &mut *(pt_va(e.addr()) as *mut PageTable);
             *intermediate_ok = true;
             let e = pt.entry(pt_index(vaddr, PT_SHIFT));
             if !e.is_present() {
@@ -429,12 +439,12 @@ pub fn probe_walk(pml4_paddr: usize, vaddr: u64) -> Option<u64> {
     // SAFETY: physical addresses are identity-map readable in kernel context;
     // this is a read-only diagnostics walk.
     unsafe {
-        let e4 = *((pml4_paddr as *const u64).add(((vaddr >> 39) & 0x1FF) as usize));
+        let e4 = *((pt_va(pml4_paddr) as *const u64).add(((vaddr >> 39) & 0x1FF) as usize));
         if e4 & P == 0 {
             return None;
         }
         let pdpt = (e4 & ADDR) as usize;
-        let e3 = *((pdpt as *const u64).add(((vaddr >> 30) & 0x1FF) as usize));
+        let e3 = *((pt_va(pdpt) as *const u64).add(((vaddr >> 30) & 0x1FF) as usize));
         if e3 & P == 0 {
             return None;
         }
@@ -442,7 +452,7 @@ pub fn probe_walk(pml4_paddr: usize, vaddr: u64) -> Option<u64> {
             return Some(e3 & 0x000F_FFFF_C000_0000);
         }
         let pd = (e3 & ADDR) as usize;
-        let e2 = *((pd as *const u64).add(((vaddr >> 21) & 0x1FF) as usize));
+        let e2 = *((pt_va(pd) as *const u64).add(((vaddr >> 21) & 0x1FF) as usize));
         if e2 & P == 0 {
             return None;
         }
@@ -450,7 +460,7 @@ pub fn probe_walk(pml4_paddr: usize, vaddr: u64) -> Option<u64> {
             return Some(e2 & 0x000F_FFFF_FFE0_0000);
         }
         let pt = (e2 & ADDR) as usize;
-        let e1 = *((pt as *const u64).add(((vaddr >> 12) & 0x1FF) as usize));
+        let e1 = *((pt_va(pt) as *const u64).add(((vaddr >> 12) & 0x1FF) as usize));
         if e1 & P == 0 {
             return None;
         }
@@ -547,23 +557,35 @@ impl BackendFactory for BackendFactoryX86_64 {
         //
         // SAFETY: freshly allocated frames; identity direct map covers them.
         unsafe {
-            core::ptr::write_bytes(pml4 as *mut u8, 0, PAGE_SIZE);
+            core::ptr::write_bytes(
+                kernel::mem::phys_to_virt(pml4 as u64) as *mut u8,
+                0,
+                PAGE_SIZE,
+            );
             let pdpt = frame::alloc()?;
             let pd = frame::alloc()?;
-            core::ptr::write_bytes(pdpt.as_u64() as *mut u8, 0, PAGE_SIZE);
-            core::ptr::write_bytes(pd.as_u64() as *mut u8, 0, PAGE_SIZE);
+            core::ptr::write_bytes(
+                kernel::mem::phys_to_virt(pdpt.as_u64()) as *mut u8,
+                0,
+                PAGE_SIZE,
+            );
+            core::ptr::write_bytes(
+                kernel::mem::phys_to_virt(pd.as_u64()) as *mut u8,
+                0,
+                PAGE_SIZE,
+            );
 
-            let pml4e = (pml4 as *mut u64).add(0);
+            let pml4e = (kernel::mem::phys_to_virt(pml4 as u64) as *mut u64).add(0);
             *pml4e = (pdpt.as_u64() & PTE_ADDR_MASK) | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
-            let pdpte = (pdpt.as_u64() as *mut u64).add(0);
+            let pdpte = (kernel::mem::phys_to_virt(pdpt.as_u64()) as *mut u64).add(0);
             *pdpte = (pd.as_u64() & PTE_ADDR_MASK) | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
             // Higher-half kernel window (shared; see above).
-            let pml4e511 = (pml4 as *mut u64).add(511);
+            let pml4e511 = (kernel::mem::phys_to_virt(pml4 as u64) as *mut u64).add(511);
             *pml4e511 = (shared.0.as_u64() & PTE_ADDR_MASK) | PTE_PRESENT | PTE_WRITABLE;
-            let pdpte510 = (shared.0.as_u64() as *mut u64).add(510);
+            let pdpte510 = (kernel::mem::phys_to_virt(shared.0.as_u64()) as *mut u64).add(510);
             *pdpte510 = (shared.1.as_u64() & PTE_ADDR_MASK) | PTE_PRESENT | PTE_WRITABLE;
 
-            let pd_entries = pd.as_u64() as *mut u64;
+            let pd_entries = kernel::mem::phys_to_virt(pd.as_u64()) as *mut u64;
             let huge = PTE_PRESENT | PTE_WRITABLE | PTE_PAGE_SIZE;
             for i in 0..(KERNEL_LOW_MIB / 2) {
                 *pd_entries.add(i) = ((i as u64) * 0x20_0000) | huge;
