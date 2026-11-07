@@ -251,6 +251,8 @@ const SCRIPT: &[Command] = &[
         expect: 5,
     },
     Command::Unset(b"TARGET"),
+    // Variable expansion ($NAME) against the environment table.
+    Command::Echo(b"helios=$HELIOS target=$TARGET done"),
     Command::Echo(b"sh ok"),
     // exec: replaces this shell with the child image, which echoes its argv
     // and exits 9. The shell's process keeps its capabilities (and its pid).
@@ -318,7 +320,9 @@ extern "C" fn sh_main(argc: u64, argv: *const *const u8, envp: *const *const u8)
     for cmd in SCRIPT {
         match cmd {
             Command::Echo(text) => {
-                let _ = rt.write_stdout(&mut sys, text);
+                let mut ebuf = [0u8; 128];
+                let n = expand(text, &senv[..senv_len], &mut ebuf);
+                let _ = rt.write_stdout(&mut sys, &ebuf[..n]);
                 let _ = rt.write_stdout(&mut sys, b"\n");
             }
             Command::Cat(path) => {
@@ -804,12 +808,21 @@ fn repl_line<R: RawSyscalls>(
             );
         }
         b"echo" => {
+            let ev: Vec<&[u8]> = renv.iter().map(|v| v.as_slice()).collect();
+            let mut ebuf = [0u8; 256];
+            let mut en = 0usize;
             for (i, a) in args.iter().enumerate() {
-                if i > 0 {
-                    let _ = rt.write_stdout(sys, b" ");
+                if i > 0 && en < ebuf.len() {
+                    ebuf[en] = b' ';
+                    en += 1;
                 }
-                let _ = rt.write_stdout(sys, a);
+                let mut one = [0u8; 128];
+                let k = expand(a, &ev, &mut one);
+                let room = (ebuf.len() - en).min(k);
+                ebuf[en..en + room].copy_from_slice(&one[..room]);
+                en += room;
             }
+            let _ = rt.write_stdout(sys, &ebuf[..en]);
             let _ = rt.write_stdout(sys, b"\n");
         }
         b"pwd" => {
@@ -926,6 +939,52 @@ fn repl_line<R: RawSyscalls>(
             repl_spawn(sys, rt, &toks[..n], vfs_ep, stdout, renv, &mut line);
         }
     }
+}
+
+/// Expand `$NAME` references in `text` against `env` (`KEY=VAL` entries)
+/// into `out`, returning the length. An unset name expands to empty; `$$` is
+/// not special. Names are `[A-Za-z_][A-Za-z0-9_]*`.
+fn expand(text: &[u8], env: &[&[u8]], out: &mut [u8]) -> usize {
+    let mut n = 0usize;
+    let mut i = 0usize;
+    while i < text.len() && n < out.len() {
+        if text[i] != b'$' {
+            out[n] = text[i];
+            n += 1;
+            i += 1;
+            continue;
+        }
+        // Read the name.
+        let start = i + 1;
+        let mut j = start;
+        while j < text.len() && (text[j].is_ascii_alphanumeric() || text[j] == b'_') {
+            j += 1;
+        }
+        if j == start {
+            // A lone '$' — emit it verbatim.
+            out[n] = b'$';
+            n += 1;
+            i = start;
+            continue;
+        }
+        let name = &text[start..j];
+        let mut val: &[u8] = b"";
+        for e in env {
+            let eq = e.iter().position(|&b| b == b'=').unwrap_or(e.len());
+            if &e[..eq] == name {
+                val = &e[eq + 1..];
+                break;
+            }
+        }
+        for &b in val {
+            if n < out.len() {
+                out[n] = b;
+                n += 1;
+            }
+        }
+        i = j;
+    }
+    n
 }
 
 /// Trim ASCII spaces from both ends.
