@@ -202,9 +202,14 @@ pub fn alloc() -> Option<PhysAddr> {
             if !slot.get(i) {
                 slot.set(i, true);
                 slot.used += 1;
-                return Some(PhysAddr::new(
-                    slot.region.base.as_u64() + i as u64 * FRAME_SIZE as u64,
-                ));
+                let pa = PhysAddr::new(slot.region.base.as_u64() + i as u64 * FRAME_SIZE as u64);
+                // ADR-045 slice-2 bring-up: the first allocations' order pins
+                // where the per-AS table frames land relative to the staged
+                // init image (the 0x1043007 pdpt anomaly).
+                if pa.as_u64() < 0x110_0000 {
+                    crate::kinfo!("frame::alloc {:#x}", pa.as_u64());
+                }
+                return Some(pa);
             }
         }
     }
