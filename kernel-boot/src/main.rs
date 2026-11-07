@@ -235,10 +235,11 @@ fn stage_init(launch: &kernel::init::InitLaunch, image: &[u8]) -> (u64, u64) {
     use kernel::aspace::{self, MapFlags, Vaddr, DEFAULT_AS};
 
     let elf = sdk::elf::ElfImage::parse(image).expect("init ELF parse");
+    let entry = elf.entry;
     kernel::kinfo!(
         "stage: init image {} bytes, entry={:#x}, {} segments",
         image.len(),
-        elf.entry,
+        entry,
         elf.segment_count
     );
 
@@ -309,10 +310,10 @@ fn stage_init(launch: &kernel::init::InitLaunch, image: &[u8]) -> (u64, u64) {
 
     // Bring-up aid: show the permission chain for the entry page (bit 2 =
     // USER must be set at EVERY level for ring 3 to fetch the entry).
-    dump_pte_chain(elf.entry);
+    dump_pte_chain(entry);
     dump_boot_state();
 
-    (elf.entry, stack_bottom)
+    (entry, stack_bottom)
 }
 
 /// Print GDTR/IDTR (bring-up diagnosis: exception delivery in ring 3 needs a
