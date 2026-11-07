@@ -497,7 +497,7 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 
 ## ADR-046: POSIX/Linux emulation layer — foreign-syscall dispatch + musl loader plan
 - Proposed: DS 2026-11-06 (consumes ADR-044; the Phase-3 headliner)
-- Status: PROPOSED
+- Status: ACCEPTED (GLM arbitration 2026-11-07 — consumes ADR-044 exactly as specified; the Host-trait split keeps the kernel POSIX-free per ADR-044; the shared-AS v0 model is sound for pointer args. The cited blocker (higher-half slice 2) is RESOLVED — `6953f63` landed it, both smokes green; the tree is bootable for the end-to-end loader work)
 - Context: ADR-044 routes a foreign-flagged thread's raw `syscall` to a personality emulator (a `FOREIGN_SYSCALL` call + `Thread::TRAP_READ` for the frame; the emulator's reply is the syscall result). DS owns the personality layer that consumes this: decode Linux syscalls, perform native Helios operations, and run an unmodified musl-linked static binary.
 - Decision:
   1. **`personality::foreign`** (landed, host-unit-tested): the Linux x86_64 syscall-number table, Linux errno convention (`>=0` ok, `<0` = `-errno`), an `Action { Return(i64) | Exit(i32) }` result, a `Host` trait (mem_read/mem_write/write_fd/read_fd/close_fd/getpid/gettid/brk), and a pure `dispatch(num, args[6], host)`. Starter set: read/write/close/getpid/gettid/set_tid_address/brk/uname/exit/exit_group/arch_prctl + startup no-ops (rt_sigaction/rt_sigprocmask/mprotect/set_robust_list/rseq); `mmap`/`ioctl` refuse with `ENOSYS` (need the AS allocator / device fds).
