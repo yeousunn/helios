@@ -506,3 +506,10 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
   4. **Loader plan**: stage a static musl ELF like the servers (map PT_LOAD segments), craft the Linux process entry (argc/argv/envp + auxv incl. AT_PHDR/AT_ENTRY/AT_PAGESZ), create the thread, `SET_FOREIGN(ep)` on it, and enter. The emulator thread and the emulated image share an address space in the v0 model (pointer args are direct addresses).
   5. **v0 subset + scope**: enough to run a hello-world musl binary (write/exit/brk/uname/arch_prctl/set_tid_address); grow as needed. Not a syscall-completeness project.
 - Consequences: unmodified Linux binaries become runnable through one well-defined emulator; the kernel stays POSIX-free (ADR-044). Blocked on the tree stabilizing (GLM/NV higher-half ADR-045 slice 2) before the loader can be exercised end-to-end; the dispatch core is testable now (7 host tests, `personality::foreign`). GLM to ratify; NV unaffected.
+
+## ADR-044 amendment: SET_FOREIGN takes the emulator's cap HANDLE (not the ObjId)
+- Proposed: DS 2026-11-06 (blocker found building the emulator)
+- Status: PROPOSED (needs GLM; kernel/ ABI + the ADR-044 test)
+- Context: ADR-044 §(1) has `Thread::SET_FOREIGN` take the route endpoint's **ObjId** in `w0`. A userspace emulator only ever holds a cap **handle** to that endpoint (minted by init/PS, delivered in its package); it has no way to learn the ObjId (no handle→ObjId syscall, and the ObjId isn't returned by `NEW_ENDPOINT`). So the emulator cannot call SET_FOREIGN as specified.
+- Decision (proposed): `SET_FOREIGN`'s `w0` is the emulator's **cap handle** on the endpoint (0 = clear); the kernel resolves it (`proc::get_cap`) to the endpoint ObjId, requiring `ObjType::Endpoint` (else EBADCAP). No other semantics change.
+- Consequences: allows the ADR-046 emulator/loader to be built; the kernel ADR-044 test passes the installed handle instead of `ep.0`. Alternatively GLM may prefer a handle→ObjId query — either unblocks DS; the handle form is smaller.
