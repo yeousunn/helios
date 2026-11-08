@@ -796,6 +796,15 @@ impl FrameRefs {
         tomb
     }
 
+    /// Live (non-empty, non-tombstone) slot count — the occupancy diagnostic
+    /// input for the growable-table trigger (ADR-045 slice 3).
+    fn live_count(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|e| e.addr != REF_EMPTY && e.addr != REF_TOMBSTONE)
+            .count()
+    }
+
     fn acquire(&mut self, addr: PhysAddr) {
         let a = addr.as_u64();
         match self.probe_insert_slot(a) {
@@ -842,6 +851,15 @@ impl FrameRefs {
 }
 
 static FRAME_REFS: Mutex<FrameRefs> = Mutex::new(FrameRefs::new());
+
+/// FrameRefs occupancy (live slots / capacity) — logged at thread exit
+/// next to the kstack depth report, so the growable-table trigger
+/// (consistently > ~70%) is DATA-DRIVEN, not guessed.
+pub fn frame_refs_occupancy() -> (usize, usize, u64) {
+    let guard = FRAME_REFS.lock();
+    let live = guard.live_count();
+    (live, REFS_CAPACITY, guard.untrackable)
+}
 
 /// AS object: VMM state + its own paging backend (ADR-022 §1).
 pub struct AsObject {

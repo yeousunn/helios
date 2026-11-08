@@ -1022,6 +1022,15 @@ pub fn bury_thread_kstack_for_exit(id: ThreadId) {
                 base,
                 t.kstack_top
             );
+            // ADR-045 slice 3: the growable-FrameRefs trigger is data-driven
+            // — occupancy logged at every thread exit next to the depth.
+            let (live, cap, untrackable) = crate::aspace::frame_refs_occupancy();
+            crate::kinfo!(
+                "FRAMEREFS occupancy {}/{} (untrackable {})",
+                live,
+                cap,
+                untrackable
+            );
             bury_kstack(base, KSTACK_FRAMES as u32);
         }
     }

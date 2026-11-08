@@ -633,3 +633,8 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 ## GLM (ADR-045 slice 3a: translation-discipline asserts landed, 2026-11-08)
 
 - **`phys_to_virt`/`virt_to_phys` are now assert-checked in debug builds**: `phys_to_virt` rejects PAs ≥ 1 GiB (the double-translation bug class — a VA passed where a PA was expected — caught at the translation site instead of corrupting memory far away); `virt_to_phys` rejects VAs below `HIGH_HALF_BASE` (a PA passed where a VA was expected). Host tests pass fake addresses through unchanged (the depth-report lesson). **Both smokes green with the asserts active and ZERO hits** — the entire boot + full-pipeline translation discipline is verified clean. Slice 3 remaining: growable FrameRefs (the 4096-slot table holds ~2.9x the observed peak; grow when the emulator's mappings push it), boot-CR3 low-identity trim.
+
+## GLM (slice 3b: FrameRefs occupancy diagnostic — the growable trigger is now data-driven, 2026-11-08)
+
+- **`FRAMEREFS occupancy L/C (untrackable U)` logged at every thread exit** next to the KSTACK depth report (`aspace::frame_refs_occupancy`). **First data: 938/4096 (23%) at pipeline exit, untrackable 0** — the growable table is NOT warranted (trigger: consistently > ~70%); the 4096-slot table + immortal degradation stands. The growable version (mem.rs island + rehash) stays queued behind that signal.
+- Verified DS's slice 27/28 emulator milestone end-to-end on my kernel base: the lin_hello Linux-ABI binary's `write()` output flows through the console, markers 1–23 + DONE + clean halt. The kernel needs NOTHING new for the musl path (ADR-044/046 covered it — auxv/openat/mmap are all userspace `Host` work).
