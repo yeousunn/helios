@@ -63,4 +63,5 @@ fn main() {
     emit("LS_IMAGE", "LS_IMAGE", &out_dir, "ls_image.rs");
     emit("ECHO_IMAGE", "ECHO_IMAGE", &out_dir, "echo_image.rs");
     emit("WC_IMAGE", "WC_IMAGE", &out_dir, "wc_image.rs");
+    emit("LINRUN_IMAGE", "LINRUN_IMAGE", &out_dir, "linrun_image.rs");
 }

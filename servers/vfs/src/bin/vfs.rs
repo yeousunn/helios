@@ -57,6 +57,7 @@ include!(concat!(env!("OUT_DIR"), "/cat_image.rs"));
 include!(concat!(env!("OUT_DIR"), "/ls_image.rs"));
 include!(concat!(env!("OUT_DIR"), "/echo_image.rs"));
 include!(concat!(env!("OUT_DIR"), "/wc_image.rs"));
+include!(concat!(env!("OUT_DIR"), "/linrun_image.rs"));
 
 /// Stateless transport: one transient `Syscalls` per call.
 struct BinTransport;
@@ -246,6 +247,11 @@ pub extern "C" fn _start() -> ! {
         if HAS_WC_IMAGE {
             if let Ok(file) = server.fs().create_file(root, "wc", 0o755, 0) {
                 let _ = server.fs().write(file, 0, WC_IMAGE, 0);
+            }
+        }
+        if HAS_LINRUN_IMAGE {
+            if let Ok(file) = server.fs().create_file(root, "linrun", 0o755, 0) {
+                let _ = server.fs().write(file, 0, LINRUN_IMAGE, 0);
             }
         }
     }

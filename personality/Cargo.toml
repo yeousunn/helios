@@ -38,6 +38,11 @@ name = "wc"
 path = "src/bin/wc.rs"
 required-features = ["user"]
 
+[[bin]]
+name = "linrun"
+path = "src/bin/linrun.rs"
+required-features = ["user"]
+
 [dependencies]
 ipc = { path = "../ipc" }
 sdk = { path = "../sdk" }

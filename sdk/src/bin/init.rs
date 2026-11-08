@@ -62,6 +62,8 @@ const STEP_CONSOLE_SPAWN: u64 = 18;
 const STEP_CONSOLE_READY: u64 = 19;
 const STEP_SH_SPAWN: u64 = 20;
 const STEP_SH_WAIT: u64 = 21;
+const STEP_LINRUN: u64 = 22;
+const STEP_LINRUN_WAIT: u64 = 23;
 const STEP_DONE: u64 = 0x0F;
 /// Failure marker family for exits: `0xDEAD_0000_00SS_EEEE` (step, errno).
 const FAIL: u64 = 0xDEAD_0000_0000_0000;
@@ -625,6 +627,78 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
             return Err(fail_code(STEP_SH_WAIT, 0xE2 | (waited.words[1] << 8)));
         }
         mark(raw, info.debug_ep, STEP_SH_WAIT, waited.words[1]);
+    }
+
+    // Steps 22-23: the POSIX/Linux emulation demo (ADR-044/046) — a foreign
+    // (Linux-ABI) thread's raw syscalls are routed by the kernel to an
+    // in-process emulator (linrun). The launcher mints the route endpoint and
+    // hands it to the emulator; the emulator prints `helios-linux-abi`.
+    {
+        let route = mint(
+            raw,
+            info.factory,
+            methods::factory::NEW_ENDPOINT,
+            STEP_LINRUN,
+            0xE0,
+        )?;
+        write_spawn_blob(b"linrun", &[]);
+        let spawned = {
+            let mut sys = Syscalls::new(raw);
+            let mut m = Message::new(methods::process::SPAWN);
+            m.tag = m.tag.with_caps(4);
+            let _ = m.set_descriptor(
+                0,
+                ipc::CapSlot::pack(vfs_svc, ipc::Rights::SEND.union(ipc::Rights::GRANT)),
+            );
+            let _ = m.set_descriptor(1, ipc::CapSlot::NULL);
+            let _ = m.set_descriptor(
+                2,
+                ipc::CapSlot::pack(console_svc, ipc::Rights::SEND.union(ipc::Rights::GRANT)),
+            );
+            let _ = m.set_descriptor(
+                3,
+                ipc::CapSlot::pack(
+                    route,
+                    ipc::Rights::RECV
+                        .union(ipc::Rights::SEND)
+                        .union(ipc::Rights::GRANT),
+                ),
+            );
+            sys.call(session_ep, &m)
+                .map_err(|e| fail_code(STEP_LINRUN, e as u64))?
+        };
+        if spawned.words[0] != 0 || spawned.words[1] == 0 {
+            return Err(fail_code(
+                STEP_LINRUN,
+                0xE1 | ((spawned.words[0] as u64 & 0xFFFF) << 8),
+            ));
+        }
+        let pid = spawned.words[1];
+        mark(raw, info.debug_ep, STEP_LINRUN, pid);
+        let waited = loop {
+            let reply = {
+                let mut sys = Syscalls::new(raw);
+                let mut m = Message::new(methods::process::WAIT);
+                m.words[0] = pid;
+                sys.call(session_ep, &m)
+                    .map_err(|e| fail_code(STEP_LINRUN, e as u64))?
+            };
+            if reply.words[0] == 0 {
+                break reply;
+            }
+            if reply.words[0] == ipc::status::EWOULDBLOCK as i64 as u64 {
+                let _ = Syscalls::new(raw).yield_now();
+                continue;
+            }
+            return Err(fail_code(
+                STEP_LINRUN_WAIT,
+                0xE1 | ((reply.words[0] as u64 & 0xFF) << 8),
+            ));
+        };
+        if waited.words[1] != 0 {
+            return Err(fail_code(STEP_LINRUN_WAIT, 0xE2 | (waited.words[1] << 8)));
+        }
+        mark(raw, info.debug_ep, STEP_LINRUN_WAIT, waited.words[1]);
     }
 
     // Shutdown: console down (KILL acks, then it exits) and reap.
