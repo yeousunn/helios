@@ -211,6 +211,10 @@ pub extern "C" fn kernel_main() -> ! {
         // SAFETY: the high alias is mapped in every address space (shared
         // window); the helper abandons the low boot stack before returning.
         unsafe { enter_on_high_stack(kernel::mem::phys_to_virt(boot_stack_top_pa)) };
+        #[cfg(not(any()))]
+        {
+            let _ = (entry, bootinfo_va);
+        }
     }
 
     // M1 terminus (no init image embedded): halt cleanly (ADR-028 → ADR-013).
@@ -254,23 +258,28 @@ static ENTER_THREAD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 static ENTER_ENTRY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static ENTER_BI: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Switch to the boot stack's high-half alias, activate AS 1 (the CR3
-/// switch lands on a mapped stack), and start the first user thread. Never
-/// returns; the low boot stack is abandoned.
-unsafe extern "C" fn enter_on_high_stack(high_top: u64) -> ! {
+/// ADR-045 slice 2b: switch to the boot stack's high-half alias, activate
+/// AS 1 (the CR3 switch lands on a mapped stack), and start the first user
+/// thread. Never returns; the low boot stack is abandoned.
+///
+/// The stack switch MUST be naked asm: a Rust body that touches RSP/RBP
+/// inline then continues runs its own RSP/RBP-relative spill slots against
+/// the NEW stack (and with a zeroed RBP, near-NULL) — the corrupted-text /
+/// cr2=0x1 fault class. The trampoline only switches and jumps; the
+/// continuation is a normal Rust frame on the NEW stack.
+#[unsafe(naked)]
+unsafe extern "C" fn enter_on_high_stack(top: u64) -> ! {
+    core::arch::naked_asm!(
+        "mov rsp, rdi",
+        "xor ebp, ebp",
+        "call {continuation}",
+        continuation = sym enter_on_high_stack_continuation,
+    );
+}
+
+/// Continuation: runs on the high-half alias of the boot stack.
+unsafe extern "C" fn enter_on_high_stack_continuation() -> ! {
     use core::sync::atomic::Ordering;
-    // SAFETY: `high_top` is the top of the boot stack through the shared
-    // higher-half window (mapped in every address space); the switch happens
-    // before any stack access in this frame, and the continuation state is
-    // read from statics (never the abandoned stack).
-    unsafe {
-        core::arch::asm!(
-            "mov rsp, {top}",
-            "xor ebp, ebp",
-            top = in(reg) high_top,
-            options(nostack)
-        );
-    }
     let thread = kernel::sched::ThreadId(ENTER_THREAD.load(Ordering::Acquire));
     let entry = ENTER_ENTRY.load(Ordering::Acquire);
     let bootinfo_va = ENTER_BI.load(Ordering::Acquire);
