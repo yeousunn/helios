@@ -87,10 +87,35 @@ pub const HIGH_HALF_BASE: u64 = 0xFFFF_FFFF_8000_0000;
 #[cfg(test)]
 pub const HIGH_HALF_BASE: u64 = 0;
 
+/// ADR-045 slice 3 hardening: the translation discipline is assert-checked
+/// in debug builds. `phys_to_virt` of an ALREADY-high VA (the
+/// double-translation bug class — a VA passed where a PA was expected)
+/// overflows the 1 GiB window and is caught here instead of corrupting
+/// memory far away. Host tests pass fake addresses through unchanged.
+#[cfg(not(test))]
 pub fn phys_to_virt(pa: u64) -> u64 {
+    debug_assert!(
+        pa < 0x4000_0000,
+        "phys_to_virt: {pa:#x} is not a physical address below 1 GiB (already a high VA?)"
+    );
     HIGH_HALF_BASE + pa
 }
 
+#[cfg(test)]
+pub fn phys_to_virt(pa: u64) -> u64 {
+    pa
+}
+
+#[cfg(not(test))]
 pub fn virt_to_phys(va: u64) -> u64 {
+    debug_assert!(
+        va >= HIGH_HALF_BASE,
+        "virt_to_phys: {va:#x} is not a higher-half VA (a PA passed where a VA was expected?)"
+    );
     va - HIGH_HALF_BASE
+}
+
+#[cfg(test)]
+pub fn virt_to_phys(va: u64) -> u64 {
+    va
 }
