@@ -33,6 +33,12 @@ pub mod thread {
     pub const THREAD_CREATE: u16 = 13;
     /// ADR-039: rewrite a quiescent thread's entry PC + rebuild its context.
     pub const SET_ENTRY: u16 = 14;
+    /// ADR-044: route this thread's raw syscalls to a foreign endpoint
+    /// (`w0` = endpoint ObjId, 0 = clear).
+    pub const SET_FOREIGN: u16 = 15;
+    /// ADR-044: fetch a parked foreign thread's trap-frame tail
+    /// (`[tag.0, w0, w1, w2]`).
+    pub const TRAP_READ: u16 = 16;
 }
 
 pub mod aspace {
