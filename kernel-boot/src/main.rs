@@ -188,15 +188,31 @@ pub extern "C" fn kernel_main() -> ! {
         }
         // SAFETY: the linker symbol is the boot stack top defined in boot.S.
         let boot_stack_top = core::ptr::addr_of!(stack_top) as u64;
-        hal_x86_64::set_kstack(boot_stack_top);
+        // ADR-045 slice 2b: the per-AS PML4[0] window is gone — the boot
+        // stack is reachable only through its shared-window high alias, so
+        // the syscall entry's initial CURRENT_KSTACK must be the high VA.
+        hal_x86_64::set_kstack(kernel::mem::phys_to_virt(boot_stack_top));
         hal_x86_64::BOOTINFO_VA.store(bootinfo_va, Ordering::Relaxed);
         kernel::kinfo!(
             "M2: entering userspace: entry={:#x} bootinfo={:#x}",
             entry,
             bootinfo_va
         );
-        kernel::sched::start_first(launch.thread);
-        unreachable!("start_first returned");
+        // ADR-045 slice 2b: the per-AS PML4[0] window is retired — the boot
+        // stack (LOW VA) is unreachable under AS 1's CR3. Abandon it here:
+        // switch RSP to the boot stack's shared-window high alias in a
+        // never-returning helper (the switch is the helper's FIRST
+        // instruction, so no frame on the old stack is touched again), then
+        // activate AS 1 and start the first user thread — all on the high
+        // stack.
+        let boot_stack_top_pa = core::ptr::addr_of!(stack_top) as u64;
+        use core::sync::atomic::Ordering;
+        ENTER_THREAD.store(launch.thread.0, Ordering::Release);
+        ENTER_ENTRY.store(entry, Ordering::Release);
+        ENTER_BI.store(bootinfo_va, Ordering::Release);
+        // SAFETY: the high alias is mapped in every address space (shared
+        // window); the helper abandons the low boot stack before returning.
+        unsafe { enter_on_high_stack(kernel::mem::phys_to_virt(boot_stack_top_pa)) };
     }
 
     // M1 terminus (no init image embedded): halt cleanly (ADR-028 → ADR-013).
@@ -227,6 +243,49 @@ unsafe fn zero_phys(phys: u64, len: u64) {
     // SAFETY: caller contract above; phys_to_virt reaches the frame through
     // the shared higher-half window (ADR-045 slice 2).
     unsafe { core::ptr::write_bytes(phys_to_virt(phys) as *mut u8, 0, len as usize) };
+}
+
+/// ADR-045 slice 2b: switch to the boot stack's high-half alias, activate
+/// AS 1 (the CR3 switch lands on a mapped stack), and start the first user
+/// thread. Never returns; the low boot stack is abandoned.
+/// ADR-045 slice 2b: the pre-switch handoff. The RSP switch abandons the
+/// low boot stack — arguments passed through it (registers spilled to
+/// stack slots) read as garbage afterwards (found in the dev profile), so
+/// the continuation state travels through these statics instead.
+static ENTER_THREAD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static ENTER_ENTRY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static ENTER_BI: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Switch to the boot stack's high-half alias, activate AS 1 (the CR3
+/// switch lands on a mapped stack), and start the first user thread. Never
+/// returns; the low boot stack is abandoned.
+unsafe extern "C" fn enter_on_high_stack(high_top: u64) -> ! {
+    use core::sync::atomic::Ordering;
+    // SAFETY: `high_top` is the top of the boot stack through the shared
+    // higher-half window (mapped in every address space); the switch happens
+    // before any stack access in this frame, and the continuation state is
+    // read from statics (never the abandoned stack).
+    unsafe {
+        core::arch::asm!(
+            "mov rsp, {top}",
+            "xor ebp, ebp",
+            top = in(reg) high_top,
+            options(nostack)
+        );
+    }
+    let thread = kernel::sched::ThreadId(ENTER_THREAD.load(Ordering::Acquire));
+    let entry = ENTER_ENTRY.load(Ordering::Acquire);
+    let bootinfo_va = ENTER_BI.load(Ordering::Acquire);
+    assert!(hal_x86_64::activate_as(1), "DEFAULT_AS has no paging root");
+    // Post-staging TLB invalidate (covers huge-page splits done by the maps).
+    hal_x86_64::flush_tlb_all();
+    // Bring-up aid: the permission chain for the entry page (bit 2 = USER
+    // must be set at EVERY level for ring 3 to fetch the entry).
+    dump_pte_chain(entry);
+    dump_boot_state();
+    let _ = bootinfo_va;
+    kernel::sched::start_first(thread);
+    unreachable!("start_first returned");
 }
 
 /// Map the embedded init ELF into the default AS, map its stack, and write
@@ -299,19 +358,11 @@ fn stage_init(launch: &kernel::init::InitLaunch, image: &[u8]) -> (u64, u64) {
     assert!(n > 0, "bootinfo write failed");
     kernel::kinfo!("stage: bootinfo written");
 
-    // Switch the CPU to the staged address space (DEFAULT_AS = id 1) — the
-    // mappings above went into its tables; running on the boot root would
-    // leave top-level branches (e.g. the stack's PML4 entry) invisible.
-    kernel::kinfo!("stage: before activate_as");
-    assert!(hal_x86_64::activate_as(1), "DEFAULT_AS has no paging root");
-    kernel::kinfo!("stage: after activate_as");
-    // Post-staging TLB invalidate (covers huge-page splits done by the maps).
-    hal_x86_64::flush_tlb_all();
-
-    // Bring-up aid: show the permission chain for the entry page (bit 2 =
-    // USER must be set at EVERY level for ring 3 to fetch the entry).
-    dump_pte_chain(entry);
-    dump_boot_state();
+    // NOTE (ADR-045 slice 2b): the CR3 switch to AS 1 does NOT happen here —
+    // this function still runs on the low boot stack, which is unreachable
+    // under AS 1's CR3 once the per-AS PML4[0] window is retired. The caller
+    // switches stacks (high-half alias) BEFORE calling activate_as. See
+    // `enter_on_high_stack`.
 
     (entry, stack_bottom)
 }

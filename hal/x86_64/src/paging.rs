@@ -508,9 +508,8 @@ impl Default for BackendFactoryX86_64 {
 /// (frame allocator region). Supervisor 2 MiB pages, PRIVATE to this AS —
 /// sharing the boot chain leaked mappings across address spaces (found when
 /// a child's segment mappings overwrote the parent's live code).
-const KERNEL_LOW_MIB: usize = 16;
-const FRAME_REGION_START_MIB: usize = 16;
-const FRAME_REGION_END_MIB: usize = 256;
+// (The per-AS PML4[0] window constants — KERNEL_LOW_MIB, FRAME_REGION_* —
+// retired with the ADR-045 slice 2b window removal.)
 
 /// ADR-045: the shared higher-half kernel window (PDPT phys, PD phys).
 /// Built once from the frame allocator; every AS's PML4[511] points here.
@@ -550,49 +549,24 @@ impl BackendFactory for BackendFactoryX86_64 {
         // Allocate a PML4 page from the kernel frame allocator.
         let paddr = frame::alloc()?;
         let pml4 = paddr.as_u64() as usize;
-        // Private kernel window: PML4[0] -> fresh PDPT -> fresh PD with
-        // supervisor 2 MiB identity entries (U=1 on the pointing entries so
-        // user mappings under PML4[0] remain reachable; the huge leaves keep
-        // U=0, blocking user access to kernel memory).
+        // ADR-045 slice 2b: the per-AS PML4[0] private kernel window is
+        // RETIRED. User space owns PML4[0..511] exclusively; kernel memory is
+        // reachable ONLY through the shared PML4[511] higher-half window. A
+        // kernel bug dereferencing a user integer now faults at a small VA
+        // instead of silently corrupting identity-mapped RAM.
         //
-        // SAFETY: freshly allocated frames; identity direct map covers them.
+        // SAFETY: freshly allocated frame; the shared high window covers it.
         unsafe {
             core::ptr::write_bytes(
                 kernel::mem::phys_to_virt(pml4 as u64) as *mut u8,
                 0,
                 PAGE_SIZE,
             );
-            let pdpt = frame::alloc()?;
-            let pd = frame::alloc()?;
-            core::ptr::write_bytes(
-                kernel::mem::phys_to_virt(pdpt.as_u64()) as *mut u8,
-                0,
-                PAGE_SIZE,
-            );
-            core::ptr::write_bytes(
-                kernel::mem::phys_to_virt(pd.as_u64()) as *mut u8,
-                0,
-                PAGE_SIZE,
-            );
-
-            let pml4e = (kernel::mem::phys_to_virt(pml4 as u64) as *mut u64).add(0);
-            *pml4e = (pdpt.as_u64() & PTE_ADDR_MASK) | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
-            let pdpte = (kernel::mem::phys_to_virt(pdpt.as_u64()) as *mut u64).add(0);
-            *pdpte = (pd.as_u64() & PTE_ADDR_MASK) | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
             // Higher-half kernel window (shared; see above).
             let pml4e511 = (kernel::mem::phys_to_virt(pml4 as u64) as *mut u64).add(511);
             *pml4e511 = (shared.0.as_u64() & PTE_ADDR_MASK) | PTE_PRESENT | PTE_WRITABLE;
             let pdpte510 = (kernel::mem::phys_to_virt(shared.0.as_u64()) as *mut u64).add(510);
             *pdpte510 = (shared.1.as_u64() & PTE_ADDR_MASK) | PTE_PRESENT | PTE_WRITABLE;
-
-            let pd_entries = kernel::mem::phys_to_virt(pd.as_u64()) as *mut u64;
-            let huge = PTE_PRESENT | PTE_WRITABLE | PTE_PAGE_SIZE;
-            for i in 0..(KERNEL_LOW_MIB / 2) {
-                *pd_entries.add(i) = ((i as u64) * 0x20_0000) | huge;
-            }
-            for i in (FRAME_REGION_START_MIB / 2)..(FRAME_REGION_END_MIB / 2) {
-                *pd_entries.add(i) = ((i as u64) * 0x20_0000) | huge;
-            }
         }
 
         // Slot in the static pool, keyed by AS id. AS ids are recycled

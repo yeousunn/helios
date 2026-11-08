@@ -235,9 +235,13 @@ pub fn alloc_contiguous(n: usize) -> Option<PhysAddr> {
                         slot.set(j, true);
                     }
                     slot.used += n;
-                    return Some(PhysAddr::new(
-                        slot.region.base.as_u64() + start as u64 * FRAME_SIZE as u64,
-                    ));
+                    let pa =
+                        PhysAddr::new(slot.region.base.as_u64() + start as u64 * FRAME_SIZE as u64);
+                    // ADR-045 slice-2 bring-up: same diagnostic as alloc().
+                    if pa.as_u64() < 0x110_0000 {
+                        crate::kinfo!("frame::alloc_contiguous {:#x} x{}", pa.as_u64(), n);
+                    }
+                    return Some(pa);
                 }
             } else {
                 run = 0;

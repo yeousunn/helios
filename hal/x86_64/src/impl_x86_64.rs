@@ -917,7 +917,9 @@ impl sched::ContextBackend for ContextBackendX86_64 {
         if to_ksp == 0 || to_top == 0 {
             switch_fatal("\n[kernel] switch: target thread has no kernel context\n");
         }
-        set_kstack(to_top);
+        // ADR-045 slice 2b: kstack_top/ksp are PHYSICAL; the syscall entry
+        // stacks through the shared higher-half window.
+        set_kstack(kernel::mem::phys_to_virt(to_top));
         // SAFETY: pure-asm cooperative switch (syscall_entry.S). `from_slot`
         // belongs to the running thread (only writer); `to_ksp` is either a
         // context saved by a previous switch (resuming mid-dispatch) or a
@@ -953,7 +955,9 @@ impl sched::ContextBackend for ContextBackendX86_64 {
                 *top.sub(i) = 0;
             }
         }
-        kstack_top - 10 * 8
+        // ADR-045 slice 2b: the saved ksp must be the HIGH alias — `switch`
+        // loads it into RSP, and the low identity window is retired.
+        kernel::mem::phys_to_virt(kstack_top) - 10 * 8
     }
 
     fn start_first(&self, to: sched::ThreadId) {
@@ -974,7 +978,10 @@ impl sched::ContextBackend for ContextBackendX86_64 {
         // clobbering" family).
         let top = kernel::sched::kstack_top_of(to);
         if top != 0 {
-            set_kstack(top);
+            // ADR-045 slice 2b: `kstack_top` is stored as a PHYSICAL address;
+            // the syscall entry stacks through the shared higher-half window
+            // (the per-AS PML4[0] identity window is retired).
+            set_kstack(kernel::mem::phys_to_virt(top));
         }
         let bootinfo = BOOTINFO_VA.load(core::sync::atomic::Ordering::Relaxed);
         // SAFETY: ring-3 segments exist in the installed GDT (`Gdt::install`)

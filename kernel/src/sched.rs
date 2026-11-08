@@ -260,8 +260,14 @@ pub fn set_initial_pc(id: ThreadId, pc: u64) -> SchedResult<()> {
         // ADR-037 depth accounting: paint the unused tail below the built
         // context (debug builds only; the context occupies the top).
         #[cfg(debug_assertions)]
-        if ksp != 0 && top > ksp {
-            paint_kstack(top - crate::sched::KSTACK_FRAMES as u64 * 4096, ksp);
+        if ksp != 0 {
+            // ADR-045 slice 2b: `ksp` is the HIGH alias (init_context's
+            // return); the paint helpers take PHYSICAL bases. The depth
+            // report then measures the high-alias image identically.
+            let ksp_pa = crate::mem::virt_to_phys(ksp);
+            if ksp_pa > top - crate::sched::KSTACK_FRAMES as u64 * 4096 {
+                paint_kstack(top - crate::sched::KSTACK_FRAMES as u64 * 4096, ksp_pa);
+            }
         }
         ksp
     } else {

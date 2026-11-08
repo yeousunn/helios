@@ -135,6 +135,9 @@ fn kstack_guard() {
     if top == 0 {
         return; // boot thread before registration
     }
+    // ADR-045 slice 2b: kstack_top is physical; the guard compares against
+    // the shared-window high alias (the dispatch RSP lives there).
+    let top = kernel::mem::phys_to_virt(top);
     let rsp: u64;
     // SAFETY: reads the current stack pointer; no memory access.
     unsafe { core::arch::asm!("mov {0}, rsp", out(reg) rsp, options(nostack)) };
