@@ -65,8 +65,10 @@ fn load_elf<R: sdk::syscall::RawSyscalls>(
             );
             sys.invoke(as_cap, &map)?;
         }
-        // SAFETY: the segment VA is now mapped in this AS; copy its contents.
+        // SAFETY: the segment VAs are mapped in this AS. Zero the whole
+        // region (BSS = memsz - filesz), then copy the file contents.
         unsafe {
+            core::ptr::write_bytes(first as *mut u8, 0, pages as usize * 4096);
             core::ptr::copy_nonoverlapping(
                 bytes.as_ptr().add(seg.offset as usize),
                 seg.vaddr as *mut u8,
@@ -225,12 +227,27 @@ extern "C" fn linrun_main() -> ! {
             *base.add(1) = s as u64; // argv[0]
             *base.add(2) = 0; // argv terminator
             *base.add(3) = 0; // envp terminator
-            *base.add(4) = 6; // AT_PAGESZ
-            *base.add(5) = 4096;
-            *base.add(6) = 9; // AT_ENTRY
-            *base.add(7) = entry;
-            *base.add(8) = 0; // AT_NULL
-            *base.add(9) = 0;
+            let rnd = (USER_STACK_TOP + 0x200) as *mut u8;
+            for i in 0..16 {
+                *rnd.add(i) = (0xA5 ^ i) as u8;
+            }
+            let auxv = [
+                (3u64, 0x1000040u64), // AT_PHDR (ELF headers in the first LOAD)
+                (4, 56),              // AT_PHENT
+                (5, 3),               // AT_PHNUM
+                (6, 4096),            // AT_PAGESZ
+                (7, 0),               // AT_BASE (static)
+                (9, entry),           // AT_ENTRY
+                (16, 0),              // AT_HWCAP
+                (25, rnd as u64),     // AT_RANDOM
+                (0, 0),               // AT_NULL
+            ];
+            let mut k = 4;
+            for (a, v) in auxv {
+                *base.add(k) = a;
+                *base.add(k + 1) = v;
+                k += 2;
+            }
         }
     }
     let child = {

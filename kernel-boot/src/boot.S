@@ -121,7 +121,11 @@ _fill_pd:
     or eax, (1 << 9)             /* CR4.OSFXSR: enable SSE — userspace
                                     (compiler-emitted xorps/movaps) #UDs
                                     without it (found: DS's slice-24+ init) */
-    or eax, (1 << 18)            /* CR4.OSXSAVE: xgetbv/xsetbv valid */
+    /* NOTE: CR4.OSXSAVE is deliberately NOT set. Setting it while XCR0 is 0
+       (the reset value) makes SSE/x87 instructions #UD, and QEMU's default
+       CPU faults on `xsetbv` — so legacy SSE (OSFXSR alone, below) is what we
+       want: it lets userspace compiler-emitted xorps/movaps run. Found
+       bringing up a static musl binary (xorps -> #UD). */
     mov cr4, eax
 
     mov ecx, 0xC0000080          /* IA32_EFER */
