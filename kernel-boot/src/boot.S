@@ -118,6 +118,10 @@ _fill_pd:
 
     mov eax, cr4
     or eax, (1 << 5)             /* CR4.PAE */
+    or eax, (1 << 9)             /* CR4.OSFXSR: enable SSE — userspace
+                                    (compiler-emitted xorps/movaps) #UDs
+                                    without it (found: DS's slice-24+ init) */
+    or eax, (1 << 18)            /* CR4.OSXSAVE: xgetbv/xsetbv valid */
     mov cr4, eax
 
     mov ecx, 0xC0000080          /* IA32_EFER */
