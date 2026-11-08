@@ -210,7 +210,10 @@ pub extern "C" fn kernel_main() -> ! {
         ENTER_BI.store(bootinfo_va, Ordering::Release);
         // SAFETY: the high alias is mapped in every address space (shared
         // window); the helper abandons the low boot stack before returning.
-        unsafe { enter_on_high_stack(kernel::mem::phys_to_virt(boot_stack_top_pa)) };
+        // SAFETY: the high alias is mapped in every address space (shared
+        // window); the asm trampoline abandons the low boot stack before
+        // any compiler frame exists on it.
+        unsafe { enter_on_high_stack_trampoline(kernel::mem::phys_to_virt(boot_stack_top_pa)) };
         #[cfg(not(any()))]
         {
             let _ = (entry, bootinfo_va);
@@ -258,23 +261,24 @@ static ENTER_THREAD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 static ENTER_ENTRY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static ENTER_BI: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// ADR-045 slice 2b: switch to the boot stack's high-half alias, activate
-/// AS 1 (the CR3 switch lands on a mapped stack), and start the first user
-/// thread. Never returns; the low boot stack is abandoned.
-///
-/// The stack switch MUST be naked asm: a Rust body that touches RSP/RBP
-/// inline then continues runs its own RSP/RBP-relative spill slots against
-/// the NEW stack (and with a zeroed RBP, near-NULL) — the corrupted-text /
-/// cr2=0x1 fault class. The trampoline only switches and jumps; the
-/// continuation is a normal Rust frame on the NEW stack.
-#[unsafe(naked)]
-unsafe extern "C" fn enter_on_high_stack(top: u64) -> ! {
-    core::arch::naked_asm!(
-        "mov rsp, rdi",
-        "xor ebp, ebp",
-        "call {continuation}",
-        continuation = sym enter_on_high_stack_continuation,
-    );
+core::arch::global_asm!(
+    ".section .text",
+    ".global enter_on_high_stack_trampoline",
+    "enter_on_high_stack_trampoline:",
+    // ADR-045 slice 2b: the stack switch MUST be real asm with no compiler
+    // frame — a Rust/naked-fn body still gets a prologue and RSP-relative
+    // spill writes, which land ABOVE the switched stack (into the kernel
+    // text: the qword-at-.text+0 corruption class). This trampoline only
+    // switches RSP and calls the Rust continuation (whose frame then lives
+    // on the NEW stack).
+    "    mov rsp, rdi",
+    "    xor ebp, ebp",
+    "    call {continuation}",
+    continuation = sym enter_on_high_stack_continuation,
+);
+
+extern "C" {
+    fn enter_on_high_stack_trampoline(top: u64) -> !;
 }
 
 /// Continuation: runs on the high-half alias of the boot stack.
