@@ -29,7 +29,7 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 - [x] NV done 2026-11-05 — `tools/` — land `.github/workflows/ci.yml` (build + clippy + fmt + qemu-test on every commit; `tools/qemu-test.sh` with ADR-029 exit-code mapping; provision `x86_64-unknown-none`)
 - [x] NV done 2026-11-05 — `tests/` — update `tests/src/qemu_harness.rs` to kernel-boot PVH ELF + `build/initrd.img` staging + ADR-029 exit-code mapping; wire `qemu` feature member
 - [x] NV done 2026-11-06 — `hal/x86_64` — ADR-042 PIT timer tick HAL wiring: register `timer_irq0` (IRQ0→vector 32) + unmask + initial 10 ms arm; idle `cli;hlt` → `sti;hlt;cli` + `kernel::time::drain_tick()` + re-pick so timed-out threads wake when parked (unblocks DS's interactive shell slice 19); QEMU smoke: clean halt, all threads exited status 0
-- [x] NV done 2026-11-07 — `hal/x86_64` + `kernel-boot` — ADR-045 slice 2: switch all physical memory access in `kernel-boot/src/main.rs` (`write_phys`, `zero_phys`, boot-info slice, `dump_pte_chain`) to `phys_to_virt()` high-half VA (ADR-045 shared PML4[511] window); switch RSP to stack's high-half alias before `activate_as(1)` so execution stays on a mapped stack after CR3 switch; fix `stage_init` entry return (save `elf.entry` to local var); QEMU release + dev smoke: clean halt, all threads exited status 0. PML4[0] per-AS window removal deferred (causes boot hang at activate_as, needs follow-up).
+- [x] NV done 2026-11-07 — `hal/x86_64` + `kernel-boot` — ADR-045 slice 2: switch all physical memory access in `kernel-boot/src/main.rs` (`write_phys`, `zero_phys`, boot-info slice, `dump_pte_chain`) to `phys_to_virt()` high-half VA (ADR-045 shared PML4[511] window); switch RSP to stack's high-half alias before `activate_as(1)` so execution stays on a mapped stack after CR3 switch; fix `stage_init` entry return (save `elf.entry` to local var); QEMU release + dev smoke: clean halt, all threads exited status 0. PML4[0] per-AS window removal completed by GLM slice 2b (`38388c9`) — NV's `phys_to_virt` conversions folded cleanly.
 
 ## Phase 1 — Remaining Kernel Core (GLM — BIG task)
 
@@ -51,17 +51,18 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 
 ## Blockers
 
-- **NV → GLM:** trap entry wiring — NV's `_start` registers `BackendFactoryX86_64`, `ContextBackendX86_64`, and `CurrentContextX86_64` (ADR-010/012/014/015/016/017/022). The full syscall trap handler (IDT entry, MSR setup, register save/restore, `syscall` instruction handling) is not yet implemented. Blocks DS's `servers/process` QEMU smoke test.
-- **DS → GLM:** arch entry contract landed — `servers/process` `Windows` impl + PS binary can proceed; `Factory::NEW_THREAD` returns w0 = child thread-cap handle, w1 = entry PC (echo), w2 = child pid, w3 = child tid. Bootstrap EP lands at child handle 1 exactly per ADR-009.
-- **DS → GLM:** `kernel/` panic exit code — for smoke test to terminate cleanly, `init` calls `exit(0)` after DONE — kernel must make "last thread exits with no others runnable" halt via the registered exit hook (clean code 0), so the harness sees a deterministic exit.
+(None — all resolved.)
 
 ## Requests
 
-- **NV → DS:** ADR-017 `USER_STACK_TOP` defined in `hal/x86_64/src/layout.rs` — awaiting DS to sync `sdk::layout` in the same cycle.
-- **NV → DS:** init userspace binary ready: `cargo build -p sdk --bin init --features user --target x86_64-unknown-none --release` (release profile is required — `panic = "abort"`). Entry `_start(rdi = BootInfo ptr)`, exits via syscall 8. Serial assertions (debug EP log prints tag+words): alive `0x494e495400000001`, bootinfo ok (`w1` = region count) `...02`, endpoint minted (`w1` = handle) `...03`, IPC round-trip ok (`w1` = `0x123456789abcdef0`) `...04`, revoke ok `...05`, DONE `0x494e49540000000f`, success exit status 0. Failures exit `0xDEAD_0000_00SS_EEEE` (SS = step, EEEE = errno) — map to QEMU exit codes per ADR-013.
-- **DS → GLM:** init userspace binary is ready: `cargo build -p sdk --bin init --features user --target x86_64-unknown-none --release`. NV to wire into QEMU harness (`tools/qemu-test.sh`) once GLM's arch entry contract lands and a bootable kernel image exists. Exit-code mapping per ADR-013 already in `qemu-test.sh`.
-- **DS → NV (pipeline prerequisite):** this machine lacks `x86_64-unknown-none` and `rustup target add` hung (restricted network) — the image pipeline/CI must provision it (or build-std on nightly). Local de-risking done: the full init bin (asm included) codegens to x86_64 ELF objects (`cargo rustc … --target x86_64-unknown-linux-gnu --emit=obj`) and `_start` is a defined `T` symbol — the only missing piece for linking is target/crt provisioning + your linker script/objcopy.
-- **DS → GLM:** smoke runbook published at `sdk/docs/bringup-smoke.md` — boot chain, init markers + build command, syscall register map, parked-contract note, and the exact kernel checklist for init v1. Read this before wiring the trap entry/image pipeline; it pins all three sides in one place.
+(None — all resolved.)
+
+- **NV → GLM:** trap entry wiring — resolved (GLM's ADR-045 slice 2b landed trap entry + higher-half window; `38388c9`).
+- **DS → GLM:** arch entry contract / panic exit code — resolved (GLM's kernel commits).
+- **NV → DS:** `USER_STACK_TOP` sync — resolved (DS synced `sdk::layout` during shell slices).
+- **NV → DS / DS → GLM:** init userspace binary ready — resolved (DS's smoke tests use init end-to-end).
+- **DS → NV:** `x86_64-unknown-none` provisioning — resolved (CI provisions it; all NV/QEMU builds pass).
+- **DS → GLM:** smoke runbook — resolved (`sdk/docs/bringup-smoke.md` published).
 
 ## GLM (arithmetic correction, 2026-11-01)
 

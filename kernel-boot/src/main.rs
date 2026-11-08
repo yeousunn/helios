@@ -17,8 +17,6 @@
 
 use core::arch::global_asm;
 
-use core::sync::atomic::Ordering;
-
 use hal::EarlyBoot;
 use kernel::console::Level;
 use kernel::mem::phys_to_virt;
@@ -192,7 +190,7 @@ pub extern "C" fn kernel_main() -> ! {
         // stack is reachable only through its shared-window high alias, so
         // the syscall entry's initial CURRENT_KSTACK must be the high VA.
         hal_x86_64::set_kstack(kernel::mem::phys_to_virt(boot_stack_top));
-        hal_x86_64::BOOTINFO_VA.store(bootinfo_va, Ordering::Relaxed);
+        hal_x86_64::BOOTINFO_VA.store(bootinfo_va, core::sync::atomic::Ordering::Relaxed);
         kernel::kinfo!(
             "M2: entering userspace: entry={:#x} bootinfo={:#x}",
             entry,

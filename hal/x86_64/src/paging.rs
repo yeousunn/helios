@@ -503,14 +503,6 @@ impl Default for BackendFactoryX86_64 {
     }
 }
 
-/// Kernel identity window per AS: first 16 MiB (kernel image + boot stack +
-/// statics + the 8..16 MiB gap, closed per GLM's walk audit) and 16..256 MiB
-/// (frame allocator region). Supervisor 2 MiB pages, PRIVATE to this AS —
-/// sharing the boot chain leaked mappings across address spaces (found when
-/// a child's segment mappings overwrote the parent's live code).
-// (The per-AS PML4[0] window constants — KERNEL_LOW_MIB, FRAME_REGION_* —
-// retired with the ADR-045 slice 2b window removal.)
-
 /// ADR-045: the shared higher-half kernel window (PDPT phys, PD phys).
 /// Built once from the frame allocator; every AS's PML4[511] points here.
 static SHARED_HIGH: Mutex<Option<(kernel::frame::PhysAddr, kernel::frame::PhysAddr)>> =
