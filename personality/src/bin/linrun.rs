@@ -28,42 +28,53 @@ use sdk::syscall::{Syscalls, X86_64Syscalls};
 #[global_allocator]
 static HEAP: GlobalHeap = GlobalHeap::new();
 
-/// The message the emulated Linux program prints (raw syscall, no libc).
-static LIN_MSG: [u8; 17] = *b"helios-linux-abi\n";
+/// The foreign program to run: a freestanding static x86_64-linux ELF (no
+/// libc; raw `write`+`exit`). Loaded and executed like any Linux binary.
+static LIN_ELF: &[u8] = include_bytes!("../../assets/lin_hello");
 
-/// The foreign (Linux-ABI) thread entry: two raw `syscall`s, no libc. The
-/// kernel routes them to the emulator (the thread is foreign-flagged).
-extern "C" fn foreign_entry() -> ! {
-    // SAFETY: raw Linux ABI (rax=1 write, rax=60 exit); the kernel intercepts
-    // these because this thread is foreign-flagged. The message lives in this
-    // process's static memory (shared AS).
-    unsafe {
-        core::arch::asm!(
-            "mov rax, 1",
-            "mov rdi, 1",
-            "lea rsi, [rip + {msg}]",
-            "mov rdx, {len}",
-            "syscall",
-            msg = sym LIN_MSG,
-            len = const LIN_MSG.len(),
-            out("rax") _,
-            out("rcx") _,
-            out("r11") _,
-            options(nostack),
-        );
-        core::arch::asm!(
-            "mov rax, 60",
-            "xor rdi, rdi",
-            "syscall",
-            out("rax") _,
-            out("rcx") _,
-            out("r11") _,
-            options(nostack),
-        );
+/// Load an ET_EXEC ELF into this process's own AS (shared with the emulated
+/// thread): carve + map a frame per page of every PT_LOAD, then copy the file
+/// bytes straight to the segment VA. Returns the entry PC.
+fn load_elf<R: sdk::syscall::RawSyscalls>(
+    sys: &mut Syscalls<R>,
+    as_cap: u32,
+    region: u32,
+    bytes: &[u8],
+) -> Result<u64, i32> {
+    let elf = sdk::elf::ElfImage::parse(bytes)?;
+    for i in 0..elf.segment_count {
+        let seg = elf.segment(i).ok_or(-1)?;
+        let first = seg.vaddr & !0xFFF;
+        let pages = (seg.vaddr + seg.memsz - first).div_ceil(4096);
+        for p in 0..pages {
+            let va = first + p * 4096;
+            let mut carve = Message::new(sdk::methods::region::CARVE);
+            carve.words[0] = 4096;
+            carve.words[1] = 4096;
+            let frame = sys.invoke(region, &carve)?.words[0] as u32;
+            if frame == 0 {
+                return Err(-12); // ENOMEM
+            }
+            let mut map = Message::new(sdk::methods::aspace::MAP);
+            map.tag = map.tag.with_caps(1);
+            map.words[0] = va;
+            map.words[1] = 0b111; // R | W | X (v0: no W^X yet)
+            let _ = map.set_descriptor(
+                0,
+                ipc::CapSlot::pack(frame, ipc::Rights::READ.union(ipc::Rights::WRITE)),
+            );
+            sys.invoke(as_cap, &map)?;
+        }
+        // SAFETY: the segment VA is now mapped in this AS; copy its contents.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr().add(seg.offset as usize),
+                seg.vaddr as *mut u8,
+                seg.filesz as usize,
+            );
+        }
     }
-    loop {
-        core::hint::spin_loop();
-    }
+    Ok(elf.entry)
 }
 
 /// `foreign::Host` over direct memory (shared AS) + the console endpoint.
@@ -171,10 +182,17 @@ extern "C" fn linrun_main() -> ! {
     let notif = package.session_notifications[3];
 
     // Create the emulated thread, quiesce it, flag it foreign, bind its death.
+    let entry = {
+        let mut sys = Syscalls::new(&mut raw);
+        match load_elf(&mut sys, package.aspace, package.region, LIN_ELF) {
+            Ok(e) => e,
+            Err(e) => exit(&mut raw, 0x40 | (e & 0xF)),
+        }
+    };
     let child = {
         let mut sys = Syscalls::new(&mut raw);
         let mut m = Message::new(sdk::methods::thread::THREAD_CREATE);
-        m.words[0] = foreign_entry as *const () as u64;
+        m.words[0] = entry;
         match sys.invoke(package.thread, &m) {
             Ok(r) => r.words[0] as u32,
             Err(e) => exit(&mut raw, 0x51 | (e & 0xF)),
