@@ -481,12 +481,28 @@ fn thread_invoke(
             }
         }
         SET_FOREIGN => {
-            // ADR-044: flag the thread so its syscall traps route raw to the
-            // emulator's endpoint. w0 = endpoint ObjId (0 = clear).
-            let ep = msg.words[0];
-            match sched::set_foreign(target, (ep != 0).then_some(crate::sched::ObjRef(ep))) {
-                Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
-                Err(_) => SyscallReturn::err(ipc::status::EBADSTATE),
+            // ADR-044 (amended): flag the thread so its syscall traps route
+            // raw to the emulator's endpoint. w0 = the CALLER's cap HANDLE
+            // on the route endpoint (userspace cannot learn ObjIds; the
+            // kernel resolves it), 0 = clear.
+            let handle = msg.words[0] as u32;
+            let route = if handle == 0 {
+                Ok(None)
+            } else {
+                proc::get_cap(pid, handle).map(|c| {
+                    if c.typ == ObjType::Endpoint {
+                        Some(crate::sched::ObjRef(c.obj.0))
+                    } else {
+                        None
+                    }
+                })
+            };
+            match route {
+                Ok(ep) => match sched::set_foreign(target, ep) {
+                    Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
+                    Err(_) => SyscallReturn::err(ipc::status::EBADSTATE),
+                },
+                Err(_) => SyscallReturn::err(ipc::status::EBADCAP),
             }
         }
         TRAP_READ => {
@@ -1294,8 +1310,8 @@ mod tests {
                 SyscallArgs {
                     num: num::INVOKE,
                     cap: ctl,
-                    tag: Tag::new(15), // SET_FOREIGN
-                    w: [ep.0, 0, 0, 0],
+                    tag: Tag::new(15), // SET_FOREIGN (ADR-044 amended: cap HANDLE)
+                    w: [h as u64, 0, 0, 0],
                     nonblock: false,
                 },
             );

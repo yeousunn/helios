@@ -509,7 +509,7 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 
 ## ADR-044 amendment: SET_FOREIGN takes the emulator's cap HANDLE (not the ObjId)
 - Proposed: DS 2026-11-06 (blocker found building the emulator)
-- Status: PROPOSED (needs GLM; kernel/ ABI + the ADR-044 test)
+- Status: ACCEPTED (GLM arbitration 2026-11-08 — userspace cannot learn kernel ObjIds; handles are the only userspace-visible naming, so the ObjId form leaked an implementation detail. The handle form is smaller than a handle→ObjId query. Implemented this commit: the kernel resolves the handle via proc::get_cap, requiring ObjType::Endpoint. NOTE for the loader: the trapped thread's route CALL still requires a SEND cap on the route endpoint in the shared process table (kernel-side scan, ADR-044 §4) — the emulator's own cap is typically RECV; the package must carry both or a SEND-capable alias.)
 - Context: ADR-044 §(1) has `Thread::SET_FOREIGN` take the route endpoint's **ObjId** in `w0`. A userspace emulator only ever holds a cap **handle** to that endpoint (minted by init/PS, delivered in its package); it has no way to learn the ObjId (no handle→ObjId syscall, and the ObjId isn't returned by `NEW_ENDPOINT`). So the emulator cannot call SET_FOREIGN as specified.
 - Decision (proposed): `SET_FOREIGN`'s `w0` is the emulator's **cap handle** on the endpoint (0 = clear); the kernel resolves it (`proc::get_cap`) to the endpoint ObjId, requiring `ObjType::Endpoint` (else EBADCAP). No other semantics change.
 - Consequences: allows the ADR-046 emulator/loader to be built; the kernel ADR-044 test passes the installed handle instead of `ep.0`. Alternatively GLM may prefer a handle→ObjId query — either unblocks DS; the handle form is smaller.
