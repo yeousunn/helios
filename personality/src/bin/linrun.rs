@@ -22,7 +22,7 @@ use core::panic::PanicInfo;
 use ipc::Message;
 use personality::layout::HEAP_VA_BASE;
 use sdk::heap::{GlobalHeap, RegionSource};
-use sdk::layout::{HEAP_CHUNK, HEAP_CHUNKS};
+use sdk::layout::{HEAP_CHUNK, HEAP_CHUNKS, USER_STACK_TOP};
 use sdk::syscall::{Syscalls, X86_64Syscalls};
 
 #[global_allocator]
@@ -30,7 +30,7 @@ static HEAP: GlobalHeap = GlobalHeap::new();
 
 /// The foreign program to run: a freestanding static x86_64-linux ELF (no
 /// libc; raw `write`+`exit`). Loaded and executed like any Linux binary.
-static LIN_ELF: &[u8] = include_bytes!("../../assets/lin_hello");
+static LIN_ELF: &[u8] = include_bytes!("../../assets/lin_args");
 
 /// Load an ET_EXEC ELF into this process's own AS (shared with the emulated
 /// thread): carve + map a frame per page of every PT_LOAD, then copy the file
@@ -189,6 +189,50 @@ extern "C" fn linrun_main() -> ! {
             Err(e) => exit(&mut raw, 0x40 | (e & 0xF)),
         }
     };
+
+    // Craft the Linux initial stack at USER_STACK_TOP (where the kernel's
+    // fresh-thread context puts RSP): [argc][argv...][NULL][envp...][NULL]
+    // [auxv pairs][AT_NULL], with the argv string above it. A real libc
+    // `_start` reads this; our freestanding test binary reads argv[0].
+    {
+        let mut sys = Syscalls::new(&mut raw);
+        // Map one page at USER_STACK_TOP (above the process's own stack).
+        let mut carve = Message::new(sdk::methods::region::CARVE);
+        carve.words[0] = 4096;
+        carve.words[1] = 4096;
+        let frame = match sys.invoke(package.region, &carve) {
+            Ok(r) => r.words[0] as u32,
+            Err(e) => exit(&mut raw, 0x60 | (e & 0xF)),
+        };
+        let mut map = Message::new(sdk::methods::aspace::MAP);
+        map.tag = map.tag.with_caps(1);
+        map.words[0] = USER_STACK_TOP;
+        map.words[1] = 0b011; // R | W
+        let _ = map.set_descriptor(
+            0,
+            ipc::CapSlot::pack(frame, ipc::Rights::READ.union(ipc::Rights::WRITE)),
+        );
+        if let Err(e) = sys.invoke(package.aspace, &map) {
+            exit(&mut raw, 0x61 | (e & 0xF));
+        }
+        // SAFETY: the page is mapped; write the standard Linux startup layout.
+        unsafe {
+            let base = USER_STACK_TOP as *mut u64;
+            let arg = b"helios-linux-abi\n\0";
+            let s = (USER_STACK_TOP + 0x100) as *mut u8;
+            core::ptr::copy_nonoverlapping(arg.as_ptr(), s, arg.len());
+            *base.add(0) = 1; // argc
+            *base.add(1) = s as u64; // argv[0]
+            *base.add(2) = 0; // argv terminator
+            *base.add(3) = 0; // envp terminator
+            *base.add(4) = 6; // AT_PAGESZ
+            *base.add(5) = 4096;
+            *base.add(6) = 9; // AT_ENTRY
+            *base.add(7) = entry;
+            *base.add(8) = 0; // AT_NULL
+            *base.add(9) = 0;
+        }
+    }
     let child = {
         let mut sys = Syscalls::new(&mut raw);
         let mut m = Message::new(sdk::methods::thread::THREAD_CREATE);
