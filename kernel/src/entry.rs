@@ -42,8 +42,11 @@ impl SyscallArgs {
 /// What the kernel hands back to the arch entry: registers to restore.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SyscallReturn {
-    /// rax / x0 / a0: status (0 or negative errno).
-    pub status: i32,
+    /// rax / x0 / a0: 0 or negative errno for native syscalls; for
+    /// foreign-routed threads (ADR-044) the emulator's reply word[0] is the
+    /// FULL 64-bit Linux result (the widened field carries it verbatim —
+    /// native i32 errno values sign-extend identically).
+    pub status: i64,
     /// rdx / x1 / a1: returned tag.
     pub tag: Tag,
     /// returned w0..w3.
@@ -53,7 +56,7 @@ pub struct SyscallReturn {
 /// Reserved sentinel: the thread parked inside the syscall (ADR-019 §1).
 /// The arch entry must NOT return to userspace; it schedules another thread
 /// and later consults [`park_result`] when the thread is scheduled again.
-pub const PARKED_STATUS: i32 = i32::MIN;
+pub const PARKED_STATUS: i64 = i64::MIN;
 
 impl SyscallReturn {
     pub const fn parked() -> Self {
@@ -66,7 +69,7 @@ impl SyscallReturn {
 
     pub const fn err(status: i32) -> Self {
         SyscallReturn {
-            status,
+            status: status as i64,
             tag: Tag(0),
             w: [0; 4],
         }
@@ -74,7 +77,7 @@ impl SyscallReturn {
 
     pub const fn ok(tag: Tag, w: [u64; 4]) -> Self {
         SyscallReturn {
-            status: ipc::status::OK,
+            status: ipc::status::OK as i64,
             tag,
             w,
         }
@@ -165,7 +168,7 @@ pub fn park_result(tid: ThreadId) -> Option<SyscallReturn> {
         sched::clear_timed_out(tid);
         syscall::clear_park_entry(tid);
         return Some(SyscallReturn {
-            status: status::ETIMEDOUT,
+            status: status::ETIMEDOUT as i64,
             tag: Tag(0),
             w: [0; 4],
         });
@@ -206,7 +209,7 @@ pub fn dispatch(args: SyscallArgs) -> SyscallReturn {
             .unwrap_or_else(SyscallReturn::err),
         num::SEND => match syscall::sys_send(pid, tid, args.cap, args.message(), args.nonblock) {
             Ok(status) => SyscallReturn {
-                status,
+                status: status as i64,
                 tag: Tag(0),
                 w: [0; 4],
             },
@@ -214,7 +217,7 @@ pub fn dispatch(args: SyscallArgs) -> SyscallReturn {
         },
         num::CALL => match syscall::sys_call(pid, tid, args.cap, args.message()) {
             Ok(status) => SyscallReturn {
-                status,
+                status: status as i64,
                 tag: Tag(0),
                 w: [0; 4],
             },
@@ -270,9 +273,27 @@ fn invoke(pid: ProcessId, tid: ThreadId, args: SyscallArgs) -> SyscallReturn {
         ObjType::Factory => factory_invoke(pid, tid, &cap, &args),
         ObjType::Thread => thread_invoke(pid, tid, &cap, &args),
         ObjType::AddressSpace => as_invoke(pid, &cap, &args),
+        ObjType::Reply => {
+            // ADR-047: Reply::SEND (label 1) — deliver the deferred reply to
+            // the parked caller (the cap's ObjId = caller tid) and retire
+            // the cap (one-shot). The parked `call` completes via the park
+            // contract with this message.
+            if args.tag.label() != 1 {
+                return SyscallReturn::err(ipc::status::ENOSYS);
+            }
+            let caller = ThreadId(cap.obj.0);
+            let reply = args.message();
+            match syscall::deferred_reply_send(pid, caller, reply) {
+                Ok(()) => {
+                    let _ = proc::remove_cap(pid, args.cap);
+                    SyscallReturn::ok(args.tag, [0; 4])
+                }
+                Err(e) => SyscallReturn::err(e),
+            }
+        }
         _ => match syscall::sys_invoke(pid, tid, args.cap, args.message()) {
             Ok((status, w)) => SyscallReturn {
-                status,
+                status: status as i64,
                 tag: Tag(0),
                 w,
             },
@@ -408,7 +429,7 @@ fn as_invoke(pid: ProcessId, cap: &Capability, args: &SyscallArgs) -> SyscallRet
 /// control the target).
 fn thread_invoke(
     pid: ProcessId,
-    _tid: ThreadId,
+    tid: ThreadId,
     cap: &Capability,
     args: &SyscallArgs,
 ) -> SyscallReturn {
@@ -427,6 +448,7 @@ fn thread_invoke(
     const SET_ENTRY: u16 = 14;
     const SET_FOREIGN: u16 = 15;
     const TRAP_READ: u16 = 16;
+    const DEFER: u16 = 17;
     const REGS_READ: u16 = 9;
     const REGS_WRITE: u16 = 10;
 
@@ -478,6 +500,18 @@ fn thread_invoke(
             match sched::set_entry(target, pc) {
                 Ok(()) => SyscallReturn::ok(msg.tag, [0, pc, 0, 0]),
                 Err(_) => SyscallReturn::err(ipc::status::EBADSTATE),
+            }
+        }
+        DEFER => {
+            // ADR-047: mint a one-shot Reply cap from the TARGET thread's
+            // implicit reply slot (self only — the slot is per-thread) and
+            // clear the slot: the server will reply later via Reply::SEND.
+            if target != tid {
+                return SyscallReturn::err(ipc::status::EBADARG);
+            }
+            match syscall::defer_reply(pid, tid) {
+                Ok(handle) => SyscallReturn::ok(msg.tag, [handle as u64, 0, 0, 0]),
+                Err(e) => SyscallReturn::err(e),
             }
         }
         SET_FOREIGN => {
@@ -894,7 +928,7 @@ mod tests {
             (3, ObjType::AddressSpace),
         ] {
             let r = dispatch(args(num::INVOKE, factory, Tag::new(label), [0; 4]));
-            assert_eq!(r.status, ipc::status::OK, "label {label}");
+            assert_eq!(r.status, ipc::status::OK as i64, "label {label}");
             assert_eq!(proc::get_cap(pid, r.w[0] as u32).unwrap().typ, typ);
         }
         // ADR-023 §5b: notifications transferable.
@@ -920,7 +954,7 @@ mod tests {
             .unwrap();
 
         let r = dispatch(args(num::INVOKE, factory, m.tag, m.words));
-        assert_eq!(r.status, ipc::status::OK, "NEW_THREAD must succeed");
+        assert_eq!(r.status, ipc::status::OK as i64, "NEW_THREAD must succeed");
         let thread_h = r.w[0] as u32;
         let child_pid = ObjId(r.w[2]);
 
@@ -945,7 +979,7 @@ mod tests {
     fn unknown_syscall_is_enosys() {
         let (_pid, _tid, factory) = setup();
         let r = dispatch(args(99, factory, Tag(0), [0; 4]));
-        assert_eq!(r.status, ipc::status::ENOSYS);
+        assert_eq!(r.status, ipc::status::ENOSYS as i64);
     }
     #[test]
     fn as_invoke_map_protect_unmap_and_fault_pool() {
@@ -976,7 +1010,7 @@ mod tests {
         m.set_descriptor(0, ipc::CapSlot::pack(frame_h, ipc::Rights::READ))
             .unwrap();
         let r = dispatch(args(num::INVOKE, as_h, m.tag, m.words));
-        assert_eq!(r.status, ipc::status::OK, "AS::MAP");
+        assert_eq!(r.status, ipc::status::OK as i64, "AS::MAP");
         assert_eq!(
             crate::aspace::translate(as_id, Vaddr(0xA0_0000)),
             Ok((
@@ -990,7 +1024,7 @@ mod tests {
         m2.words[0] = 0xA1_0000;
         m2.words[1] = 0b001;
         let r = dispatch(args(num::INVOKE, as_h, m2.tag, m2.words));
-        assert_eq!(r.status, ipc::status::EBADARG);
+        assert_eq!(r.status, ipc::status::EBADARG as i64);
 
         // PROTECT → R only.
         let mut m3 = Message::new(3);
@@ -998,7 +1032,7 @@ mod tests {
         m3.words[2] = 0b001;
         assert_eq!(
             dispatch(args(num::INVOKE, as_h, m3.tag, m3.words)).status,
-            ipc::status::OK
+            ipc::status::OK as i64
         );
         assert_eq!(
             crate::aspace::translate(as_id, Vaddr(0xA0_0000)).unwrap().1,
@@ -1010,7 +1044,7 @@ mod tests {
         m4.words[0] = 0xA0_0000;
         assert_eq!(
             dispatch(args(num::INVOKE, as_h, m4.tag, m4.words)).status,
-            ipc::status::OK
+            ipc::status::OK as i64
         );
         assert!(crate::aspace::translate(as_id, Vaddr(0xA0_0000)).is_err());
 
@@ -1037,14 +1071,14 @@ mod tests {
         m5.set_descriptor(0, ipc::CapSlot::pack(region_h, ipc::Rights::default()))
             .unwrap();
         let r = dispatch(args(num::INVOKE, as_h, m5.tag, m5.words));
-        assert_eq!(r.status, ipc::status::OK, "SET_FAULT_POOL");
+        assert_eq!(r.status, ipc::status::OK as i64, "SET_FAULT_POOL");
 
         // ANON map + fault resolves from the attached pool (lazy path).
         let mut m6 = Message::new(1);
         m6.words[0] = 0xB0_0000;
         m6.words[1] = 0b1_1000; // ANON|R  (bit4 ANON, bit0 R)
         let r = dispatch(args(num::INVOKE, as_h, m6.tag, m6.words));
-        assert_eq!(r.status, ipc::status::OK, "ANON MAP");
+        assert_eq!(r.status, ipc::status::OK as i64, "ANON MAP");
         assert_eq!(
             crate::aspace::resolve_fault(as_id, Vaddr(0xB0_0000), false),
             Ok(crate::frame::PhysAddr::new(region_addr))
@@ -1053,12 +1087,12 @@ mod tests {
         // FORK clones this AS (ADR-024); DESTROY then cleans up the fork.
         let m7 = Message::new(5);
         let r = dispatch(args(num::INVOKE, as_h, m7.tag, m7.words));
-        assert_eq!(r.status, ipc::status::OK, "FORK (ADR-024)");
+        assert_eq!(r.status, ipc::status::OK as i64, "FORK (ADR-024)");
         let forked = proc::get_cap(pid, r.w[0] as u32).unwrap().obj;
         let m8 = Message::new(6);
         assert_eq!(
             dispatch(args(num::INVOKE, r.w[0] as u32, m8.tag, m8.words)).status,
-            ipc::status::OK,
+            ipc::status::OK as i64,
             "AS::DESTROY of the fork"
         );
         assert!(crate::aspace::translate(forked, Vaddr(0xB0_0000)).is_err());
@@ -1102,7 +1136,7 @@ mod tests {
         // FORK via invoke.
         let m = Message::new(5);
         let r = dispatch(args(num::INVOKE, as_h, m.tag, m.words));
-        assert_eq!(r.status, ipc::status::OK, "FORK must succeed");
+        assert_eq!(r.status, ipc::status::OK as i64, "FORK must succeed");
         let child_as = proc::get_cap(pid, r.w[0] as u32).unwrap();
         assert_eq!(child_as.typ, ObjType::AddressSpace);
         assert!(child_as.rights.contains(Rights::MAP));
@@ -1164,7 +1198,11 @@ mod tests {
         let mut m = m;
         m.words[0] = 0x402000; // entry PC
         let r = thread_invoke_for_test(pid, tc, m);
-        assert_eq!(r.status, ipc::status::OK, "THREAD_CREATE must succeed");
+        assert_eq!(
+            r.status,
+            ipc::status::OK as i64,
+            "THREAD_CREATE must succeed"
+        );
         let new_h = r.w[0] as u32;
         let new_tid = ThreadId(r.w[1]);
 
@@ -1194,7 +1232,7 @@ mod tests {
         )
         .unwrap();
         let r = thread_invoke_for_test(pid, weak, m);
-        assert_eq!(r.status, ipc::status::ERIGHTS);
+        assert_eq!(r.status, ipc::status::ERIGHTS as i64);
     }
     #[test]
     fn set_entry_exec_semantics() {
@@ -1211,7 +1249,7 @@ mod tests {
         m.set_descriptor(0, CapSlot::pack(as_h, Rights::MAP))
             .unwrap();
         let r = dispatch(args(num::INVOKE, factory, m.tag, m.words));
-        assert_eq!(r.status, ipc::status::OK);
+        assert_eq!(r.status, ipc::status::OK as i64);
         let thread_h = r.w[0] as u32;
         let child_tid = ThreadId(r.w[3]);
 
@@ -1224,12 +1262,12 @@ mod tests {
             Tag::new(14),
             [0x500000, 0, 0, 0],
         ));
-        assert_eq!(r2.status, ipc::status::EBADSTATE);
+        assert_eq!(r2.status, ipc::status::EBADSTATE as i64);
 
         // SUSPEND then SET_ENTRY succeeds and updates initial_pc.
         assert_eq!(
             dispatch(args(num::INVOKE, thread_h, Tag::new(3), [0; 4])).status,
-            ipc::status::OK
+            ipc::status::OK as i64
         );
         let r3 = dispatch(args(
             num::INVOKE,
@@ -1237,7 +1275,7 @@ mod tests {
             Tag::new(14),
             [0x500000, 0, 0, 0],
         ));
-        assert_eq!(r3.status, ipc::status::OK);
+        assert_eq!(r3.status, ipc::status::OK as i64);
         assert_eq!(proc::get_cap(pid, thread_h).unwrap().typ, ObjType::Thread);
         // initial_pc is visible via sched::get.
         let t = crate::sched::get(child_tid).unwrap();
@@ -1247,7 +1285,7 @@ mod tests {
         // RESUME makes it Ready again (the rebuilt context enters 0x500000).
         assert_eq!(
             dispatch(args(num::INVOKE, thread_h, Tag::new(4), [0; 4])).status,
-            ipc::status::OK
+            ipc::status::OK as i64
         );
         assert_eq!(
             crate::sched::get(child_tid).unwrap().state,
@@ -1389,8 +1427,9 @@ mod tests {
         })
         .unwrap();
         let r = syscall::park_result(fgn).expect("reply completes the foreign syscall");
-        assert_eq!(r.status, 0);
-        assert_eq!(r.w[0], 0x4242, "the emulator's reply words are the result");
+        // ADR-044 (amended): the foreign reply's word[0] IS the rax result.
+        assert_eq!(r.status, 0x4242, "the emulator's value lands in rax");
+        assert_eq!(r.w[0], 0x4242, "the reply words ride too");
         // TRAP_READ after completion → EBADSTATE (frame no longer exposed).
         let ret = invoke(
             pid,
@@ -1403,6 +1442,129 @@ mod tests {
                 nonblock: false,
             },
         );
-        assert_eq!(ret.status, ipc::status::EBADSTATE);
+        assert_eq!(ret.status, ipc::status::EBADSTATE as i64);
+    }
+
+    /// ADR-047: DEFER mints a Reply cap and clears the implicit slot;
+    /// Reply::SEND completes the parked `call` and retires the cap.
+    #[test]
+    fn defer_and_deferred_reply_complete_the_call() {
+        let (pid, server, client, ep_h) = {
+            crate::aspace::set_backend_factory(&MockFactory);
+            let _ = crate::aspace::init_default();
+            let _ = crate::frame::init(&[crate::frame::Region::new(
+                crate::frame::PhysAddr::new(0x1000),
+                64 * crate::frame::FRAME_SIZE as u64,
+            )
+            .unwrap()]);
+            crate::init::reset_regions_for_test();
+            crate::proc::reset_for_test();
+            crate::endpoint::reset_engine_for_test();
+            crate::notification::reset_for_test();
+            syscall::reset_reply_for_test();
+            *sched::SCHED.lock() = None;
+            set_context_backend(&MockCtx);
+            let _ = sched::init();
+            let pid = proc::create().unwrap();
+            let server = sched::spawn(ObjRef(1), 100).unwrap();
+            let client = sched::spawn(ObjRef(1), 100).unwrap();
+            let ctx: &'static FixedCtx = Box::leak(Box::new(FixedCtx(pid, client)));
+            set_current_context(ctx);
+            let ep = crate::endpoint::create_endpoint().unwrap();
+            let h = proc::install_cap(
+                pid,
+                caps::Capability {
+                    obj: caps::ObjId(ep.0),
+                    typ: caps::ObjType::Endpoint,
+                    rights: caps::Rights::SEND.union(caps::Rights::RECV),
+                },
+            )
+            .unwrap();
+            (pid, server, client, h)
+        };
+
+        // Client calls; server receives the request (implicit reply slot
+        // binds to the client).
+        let mut m = ipc::Message::new(0x0110);
+        m.words[0] = 42;
+        assert_eq!(syscall::sys_call(pid, client, ep_h, m), Ok(0));
+        let _req = syscall::sys_recv(pid, server, ep_h, false, 0)
+            .unwrap()
+            .unwrap();
+
+        // Server defers: DEFER (CONTROL, self) mints the Reply cap and
+        // clears the implicit slot.
+        let ctl = proc::install_cap(
+            pid,
+            caps::Capability {
+                obj: caps::ObjId(server.0),
+                typ: caps::ObjType::Thread,
+                rights: caps::Rights::CONTROL,
+            },
+        )
+        .unwrap();
+        let ret = invoke(
+            pid,
+            server,
+            SyscallArgs {
+                num: num::INVOKE,
+                cap: ctl,
+                tag: Tag::new(17), // DEFER
+                w: [0, 0, 0, 0],
+                nonblock: false,
+            },
+        );
+        assert_eq!(ret.status, 0, "DEFER ok");
+        let reply_cap = ret.w[0] as u32;
+        assert_ne!(reply_cap, 0, "Reply cap minted");
+        // The implicit slot is cleared: a second DEFER fails (EBADSTATE).
+        let ret = invoke(
+            pid,
+            server,
+            SyscallArgs {
+                num: num::INVOKE,
+                cap: ctl,
+                tag: Tag::new(17),
+                w: [0, 0, 0, 0],
+                nonblock: false,
+            },
+        );
+        assert_eq!(ret.status, status::EBADSTATE as i64, "slot cleared");
+
+        // The server answers LATER via Reply::SEND (label 1): the parked
+        // client completes and the cap retires (one-shot).
+        let ret = invoke(
+            pid,
+            server,
+            SyscallArgs {
+                num: num::INVOKE,
+                cap: reply_cap,
+                tag: Tag::new(1), // Reply::SEND
+                w: [0x4242, 0, 0, 0],
+                nonblock: false,
+            },
+        );
+        assert_eq!(ret.status, 0, "deferred reply delivered");
+        assert_eq!(
+            sched::get(client).unwrap().state,
+            sched::State::Ready,
+            "client woke"
+        );
+        let r = syscall::park_result(client).expect("the parked call completes");
+        assert_eq!(r.status, 0);
+        assert_eq!(r.w[0], 0x4242, "the deferred reply's words ride");
+        // One-shot: the cap is retired — a second SEND fails (EBADCAP).
+        let ret = invoke(
+            pid,
+            server,
+            SyscallArgs {
+                num: num::INVOKE,
+                cap: reply_cap,
+                tag: Tag::new(1),
+                w: [1, 0, 0, 0],
+                nonblock: false,
+            },
+        );
+        assert_eq!(ret.status, status::EBADCAP as i64, "cap retired");
     }
 }

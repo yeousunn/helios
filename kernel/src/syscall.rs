@@ -320,6 +320,21 @@ pub fn park_result(tid: ThreadId) -> Option<crate::entry::SyscallReturn> {
         let mut d = crate::endpoint::DELIVERED_FOR_REPLY.lock();
         if let Some(env) = d.take(tid) {
             clear_park(tid);
+            // ADR-044 (DS's musl blocker): a FOREIGN-parked thread's reply
+            // carries the full 64-bit Linux result in word[0] — the widened
+            // SyscallReturn.status lands it in rax on the sysret (native
+            // i32 errno values sign-extend identically). Non-foreign
+            // completions keep status = 0 with the words as data.
+            let foreign = sched::get(tid)
+                .map(|t| t.foreign_ep.is_some())
+                .unwrap_or(false);
+            if foreign {
+                return Some(crate::entry::SyscallReturn {
+                    status: env.msg.words[0] as i64,
+                    tag: env.msg.tag,
+                    w: env.msg.words,
+                });
+            }
             return Some(crate::entry::SyscallReturn::ok(env.msg.tag, env.msg.words));
         }
     }
@@ -364,7 +379,7 @@ pub fn park_result(tid: ThreadId) -> Option<crate::entry::SyscallReturn> {
             sched::clear_timed_out(tid);
             clear_park(tid);
             return Some(crate::entry::SyscallReturn {
-                status: ipc::status::ETIMEDOUT,
+                status: ipc::status::ETIMEDOUT as i64,
                 tag: Tag(0),
                 w: [0; 4],
             });
@@ -373,7 +388,45 @@ pub fn park_result(tid: ThreadId) -> Option<crate::entry::SyscallReturn> {
     None
 }
 
-/// ADR-044: is this thread's syscall a foreign trap? If so, save the raw
+/// ADR-047: mint a one-shot Reply cap from the caller's implicit reply slot
+/// (Thread::DEFER) and clear the slot. The cap's ObjId = the caller tid
+/// (the deferred reply completes the parked `call` via the park contract —
+/// no endpoint involved); Reply::SEND retires the cap.
+pub fn defer_reply(pid: ProcessId, tid: ThreadId) -> SysResult<u32> {
+    let caller = take_reply(tid).ok_or(err(ipc::status::EBADSTATE))?;
+    let handle = proc::install_cap(
+        pid,
+        caps::Capability {
+            obj: caps::ObjId(caller.0),
+            typ: caps::ObjType::Reply,
+            rights: caps::Rights::SEND,
+        },
+    )
+    .map_err(|e| err(map_proc(e)))?;
+    Ok(handle)
+}
+
+/// ADR-047: deliver a deferred reply to the parked caller (Reply::SEND).
+/// The envelope lands in the caller's DELIVERED_FOR_REPLY slot (the park
+/// contract completes the parked `call` on resume) and the caller wakes.
+pub fn deferred_reply_send(_pid: ProcessId, caller: ThreadId, reply: Message) -> SysResult<()> {
+    // The caller must still be parked on its deferred `call`.
+    let parked = matches!(
+        sched::get(caller).map(|t| t.state),
+        Ok(sched::State::Blocked(sched::BlockReason::Reply))
+    );
+    if !parked {
+        return Err(err(ipc::status::EBADSTATE));
+    }
+    let (env, _) = resolve_transfers(_pid, &reply, sched::current());
+    crate::endpoint::DELIVERED_FOR_REPLY
+        .lock()
+        .insert(caller, env);
+    sched::make_ready(caller).map_err(|_| err(ipc::status::EDEAD))?;
+    Ok(())
+}
+
+/// ADR-047: is this thread's syscall a foreign trap? If so, save the raw
 /// frame, deliver it to the emulator endpoint as a CALL (FAULT_PAGE-as-call
 /// pattern), and return the parked return for the dispatcher. The num is
 /// opaque (a foreign ABI number) — the emulator translates everything.
@@ -403,7 +456,7 @@ pub(crate) fn foreign_route(
         // No route cap: kill like an unroutable fault (ADR-007 §1).
         let _ = sys_exit(tid, -1);
         return Some(crate::entry::SyscallReturn {
-            status: ipc::status::EDEAD,
+            status: ipc::status::EDEAD as i64,
             tag: Tag(0),
             w: [0; 4],
         });
@@ -419,7 +472,7 @@ pub(crate) fn foreign_route(
         Err(_) => {
             let _ = sys_exit(tid, -1);
             Some(crate::entry::SyscallReturn {
-                status: ipc::status::EDEAD,
+                status: ipc::status::EDEAD as i64,
                 tag: Tag(0),
                 w: [0; 4],
             })
@@ -1058,7 +1111,7 @@ mod tests {
 
         // On resume, park_result completes the recv (message + caps).
         let r = park_result(server).expect("completed recv on resume");
-        assert_eq!(r.status, ipc::status::OK);
+        assert_eq!(r.status, ipc::status::OK as i64);
         assert_eq!(r.w[0], 5);
 
         // NOTIFIED wake: bind a notification, park in recv again.
@@ -1077,7 +1130,7 @@ mod tests {
             crate::sched::State::Ready
         );
         let r = park_result(server).expect("notified resume");
-        assert_eq!(r.status, ipc::status::OK);
+        assert_eq!(r.status, ipc::status::OK as i64);
         assert_eq!(r.tag.label(), ipc::labels::kernel::NOTIFY);
         assert!(r.tag.flags() & ipc::flags::NOTIFIED != 0);
         assert_eq!(r.w[0], 0b110, "mask consumed");
@@ -1251,7 +1304,7 @@ mod tests {
         // park_result (on resume) reports ETIMEDOUT and clears the flag.
         let r = park_result(server);
         assert!(
-            matches!(r, Some(crate::entry::SyscallReturn { status, .. }) if status == ipc::status::ETIMEDOUT)
+            matches!(r, Some(crate::entry::SyscallReturn { status, .. }) if status == ipc::status::ETIMEDOUT as i64)
         );
         // Flag consumed: no spurious second ETIMEDOUT.
         assert!(
