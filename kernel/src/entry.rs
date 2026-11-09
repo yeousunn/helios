@@ -1621,4 +1621,146 @@ mod tests {
         assert_eq!(ret.status, 0);
         assert_eq!(sched::fs_base_of(target), 0);
     }
+
+    /// ADR-044 (DS's slice-33 corruption report): the EMULATOR does a
+    /// blocking send MID-SERVE (after recv, before reply) that PARKS it;
+    /// a third thread drains the target; the emulator then replies. The
+    /// served foreign thread must complete with the reply's value in rax —
+    /// the intra-serve park must not corrupt the parked foreign thread or
+    /// the resume path.
+    #[test]
+    fn emulator_intra_serve_park_does_not_corrupt_the_foreign_resume() {
+        let (pid, emu, fgn, drain, route_h, sink_h) = {
+            crate::aspace::set_backend_factory(&MockFactory);
+            let _ = crate::aspace::init_default();
+            let _ = crate::frame::init(&[crate::frame::Region::new(
+                crate::frame::PhysAddr::new(0x1000),
+                64 * crate::frame::FRAME_SIZE as u64,
+            )
+            .unwrap()]);
+            crate::init::reset_regions_for_test();
+            crate::proc::reset_for_test();
+            crate::endpoint::reset_engine_for_test();
+            crate::notification::reset_for_test();
+            syscall::reset_reply_for_test();
+            *sched::SCHED.lock() = None;
+            set_context_backend(&MockCtx);
+            let _ = sched::init();
+            let pid = proc::create().unwrap();
+            let emu = sched::spawn(ObjRef(1), 100).unwrap();
+            let fgn = sched::spawn(ObjRef(1), 100).unwrap();
+            let drain = sched::spawn(ObjRef(1), 100).unwrap();
+            let ctx: &'static FixedCtx = Box::leak(Box::new(FixedCtx(pid, fgn)));
+            set_current_context(ctx);
+            // The route endpoint (emu recv's; fgn's traps route there).
+            let route = crate::endpoint::create_endpoint().unwrap();
+            let route_h = proc::install_cap(
+                pid,
+                caps::Capability {
+                    obj: caps::ObjId(route.0),
+                    typ: caps::ObjType::Endpoint,
+                    rights: caps::Rights::SEND.union(caps::Rights::RECV),
+                },
+            )
+            .unwrap();
+            // The "console" sink endpoint: emu sends into it; the DRAIN
+            // thread recv's — its mailbox stays FULL so emu's send parks.
+            let sink = crate::endpoint::create_endpoint().unwrap();
+            let sink_h = proc::install_cap(
+                pid,
+                caps::Capability {
+                    obj: caps::ObjId(sink.0),
+                    typ: caps::ObjType::Endpoint,
+                    rights: caps::Rights::SEND.union(caps::Rights::RECV),
+                },
+            )
+            .unwrap();
+            (pid, emu, fgn, drain, route_h, sink_h)
+        };
+
+        // Flag fgn (SET_FOREIGN with the route handle — ADR-044 amended).
+        let ctl = proc::install_cap(
+            pid,
+            caps::Capability {
+                obj: caps::ObjId(fgn.0),
+                typ: caps::ObjType::Thread,
+                rights: caps::Rights::CONTROL,
+            },
+        )
+        .unwrap();
+        let ret = invoke(
+            pid,
+            emu,
+            SyscallArgs {
+                num: num::INVOKE,
+                cap: ctl,
+                tag: Tag::new(15),
+                w: [route_h as u64, 0, 0, 0],
+                nonblock: false,
+            },
+        );
+        assert_eq!(ret.status, 0, "SET_FOREIGN ok");
+
+        // fgn traps a foreign syscall → routes → parked Blocked(Reply).
+        let ret = dispatch(SyscallArgs {
+            num: 999,
+            cap: 0,
+            tag: Tag::new(0x1234),
+            w: [0xAAAA, 0, 0, 0],
+            nonblock: false,
+        });
+        assert_eq!(ret.status, crate::entry::PARKED_STATUS);
+        // emu recv's the route.
+        let env = syscall::sys_recv(pid, emu, route_h, false, 0)
+            .unwrap()
+            .expect("route delivered");
+
+        // emu's INTRA-SERVE blocking send: fill the sink mailbox first
+        // (a filler send from emu), then the flush send PARKS emu.
+        let mut m = ipc::Message::new(0x77);
+        m.words[0] = 1;
+        assert_eq!(syscall::sys_send(pid, emu, sink_h, m, false), Ok(0));
+        m.words[0] = 2;
+        // Nonblocking first to confirm the mailbox is full...
+        assert_eq!(
+            syscall::sys_send(pid, emu, sink_h, m, true),
+            Err(status::EWOULDBLOCK)
+        );
+        // ...then the blocking flush send: emu parks Blocked(Send).
+        syscall::sys_send(pid, emu, sink_h, m, false).unwrap();
+        assert!(matches!(
+            sched::get(emu).unwrap().state,
+            sched::State::Blocked(sched::BlockReason::Send(_))
+        ));
+        assert!(matches!(
+            sched::get(fgn).unwrap().state,
+            sched::State::Blocked(sched::BlockReason::Reply)
+        ));
+
+        // The drain thread recv's the sink → emu unqueues and resumes.
+        let _drained = syscall::sys_recv(pid, drain, sink_h, false, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            sched::get(emu).unwrap().state,
+            sched::State::Ready,
+            "emu resumed after the drain"
+        );
+
+        // emu replies (word[0] = the rax value).
+        let mut rep = ipc::Message::new(0x99);
+        rep.words[0] = 0x1234_5678;
+        {
+            let (env, _) = syscall::resolve_transfers_for_test(pid, &rep, emu);
+            crate::endpoint::DELIVERED_FOR_REPLY.lock().insert(fgn, env);
+            sched::make_ready(fgn).unwrap();
+        }
+        let r = syscall::park_result(fgn).expect("fgn completes");
+        assert_eq!(r.status, 0x1234_5678, "rax = the reply value");
+        // The emu thread's own state is sane after the intra-serve park.
+        assert!(matches!(
+            sched::get(emu).unwrap().state,
+            sched::State::Ready | sched::State::Blocked(_)
+        ));
+    }
 }

@@ -84,6 +84,16 @@ pub(crate) fn reset_reply_for_test() {
 /// Resolve outgoing descriptors against the sender's table (ADR-011 §1).
 /// Returns the envelope with pending installs, or the count of failed
 /// descriptors (those become FLAG_CAP_PARTIAL and null words on delivery).
+/// Test hook for ADR-044 emulator tests: resolve a reply's transfers.
+#[cfg(test)]
+pub(crate) fn resolve_transfers_for_test(
+    pid: ProcessId,
+    msg: &Message,
+    sender: ThreadId,
+) -> (Envelope, usize) {
+    resolve_transfers(pid, msg, sender)
+}
+
 fn resolve_transfers(pid: ProcessId, msg: &Message, sender: ThreadId) -> (Envelope, usize) {
     let mut env = Envelope::new(*msg, sender);
     let mut failed = 0usize;
