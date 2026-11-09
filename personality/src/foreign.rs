@@ -32,7 +32,25 @@ pub mod linux {
     pub const EXIT_GROUP: u64 = 231;
     pub const SET_ROBUST_LIST: u64 = 273;
     pub const RSEQ: u64 = 334;
+    pub const OPENAT: u64 = 257;
+    pub const READLINKAT: u64 = 267;
+    pub const GETRANDOM: u64 = 318;
+    pub const FUTEX: u64 = 202;
+    pub const LSEEK: u64 = 8;
+    pub const GETUID: u64 = 102;
+    pub const GETGID: u64 = 104;
+    pub const GETEUID: u64 = 107;
+    pub const GETEGID: u64 = 108;
+    pub const NANOSLEEP: u64 = 35;
+    pub const RT_SIGRETURN: u64 = 15;
+    pub const CLOCK_GETTIME: u64 = 228;
 }
+
+/// `arch_prctl` sub-codes.
+pub const ARCH_SET_GS: u64 = 0x1001;
+pub const ARCH_SET_FS: u64 = 0x1002;
+pub const ARCH_GET_FS: u64 = 0x1003;
+pub const ARCH_GET_GS: u64 = 0x1004;
 
 /// Linux errno values (returned negated, as Linux does).
 pub const EFAULT: i64 = -14;
@@ -76,10 +94,31 @@ pub trait Host {
     /// Map `len` anonymous zeroed bytes; returns the base address or a
     /// negative errno (libc uses this for the heap/TLS/thread stacks).
     fn mmap_anon(&mut self, len: usize) -> i64;
+    /// Set this thread's `IA32_FS_BASE` (TLS); `arch_prctl(ARCH_SET_FS)`.
+    fn set_tls(&mut self, base: u64) -> i64;
+    /// `openat(dirfd, path, flags, mode)` -> fd or negative errno. `path` is
+    /// the NUL-trimmed guest string.
+    fn openat(&mut self, dirfd: i32, path: &[u8], flags: u32) -> i64;
+    /// `readlinkat(dirfd, path, buf)` -> the link target into `out`, or a
+    /// negative errno.
+    fn readlink(&mut self, path: &[u8], out: &mut [u8]) -> i64;
+    /// Fill `out` with entropy (`getrandom`).
+    fn getrandom(&mut self, out: &mut [u8]) -> i64;
 }
 
 /// `mmap` `flags` bit: anonymous (not file-backed).
 pub const MAP_ANONYMOUS: u64 = 0x20;
+
+/// Read a NUL-terminated guest string at `addr` into `out` (bounded); returns
+/// the length (without the NUL).
+fn read_cstr<H: Host>(host: &mut H, addr: u64, out: &mut [u8]) -> usize {
+    let n = host.mem_read(addr, out);
+    if n < 0 {
+        return 0;
+    }
+    let n = n as usize;
+    out[..n].iter().position(|&b| b == 0).unwrap_or(n)
+}
 
 /// Decode one foreign syscall and act via `host`. `args` are the six integer
 /// arguments in Linux order (rdi, rsi, rdx, r10, r8, r9).
@@ -122,11 +161,59 @@ pub fn dispatch<H: Host>(num: u64, args: [u64; 6], host: &mut H) -> Action {
         }
         linux::BRK => Action::Return(host.brk(args[0])),
         linux::EXIT | linux::EXIT_GROUP => Action::Exit(args[0] as i32),
-        linux::ARCH_PRCTL => {
-            // ARCH_SET_FS(0x1002)/ARCH_SET_GS(0x1001)/GET_FS/GET_GS: v0 has no
-            // segment-base support for the emulated image — accept as a no-op.
-            Action::Return(0)
+        linux::ARCH_PRCTL => match args[0] {
+            // Set the thread's TLS base (musl/libc startup does this before
+            // any %fs access). The kernel applies it via Thread::SET_TLS.
+            ARCH_SET_FS => Action::Return(host.set_tls(args[1])),
+            ARCH_SET_GS => Action::Return(0), // no %gs use in v0 userspace
+            ARCH_GET_FS | ARCH_GET_GS => Action::Return(0),
+            _ => Action::Return(EINVAL),
+        },
+        linux::OPENAT => {
+            let mut p = [0u8; 256];
+            let n = read_cstr(host, args[1], &mut p);
+            Action::Return(host.openat(args[0] as i32, &p[..n], args[2] as u32))
         }
+        linux::READLINKAT => {
+            let mut p = [0u8; 256];
+            let n = read_cstr(host, args[1], &mut p);
+            let mut out = [0u8; 256];
+            let want = (args[3] as usize).min(out.len());
+            let r = host.readlink(&p[..n], &mut out[..want]);
+            if r < 0 {
+                return Action::Return(r);
+            }
+            let w = host.mem_write(args[2], &out[..r as usize]);
+            Action::Return(if w < 0 { EFAULT } else { r })
+        }
+        linux::GETRANDOM => {
+            let mut b = [0u8; 256];
+            let want = (args[1] as usize).min(b.len());
+            let r = host.getrandom(&mut b[..want]);
+            if r < 0 {
+                return Action::Return(r);
+            }
+            let w = host.mem_write(args[0], &b[..r as usize]);
+            Action::Return(if w < 0 { EFAULT } else { r })
+        }
+        // Single-threaded v0: futexes/sleeps are no-ops (no contention).
+        linux::FUTEX => Action::Return(0),
+        linux::NANOSLEEP => Action::Return(0),
+        linux::RT_SIGRETURN => Action::Return(0),
+        linux::GETUID | linux::GETGID | linux::GETEUID | linux::GETEGID => Action::Return(0),
+        linux::CLOCK_GETTIME => {
+            let ts = [0u64; 2];
+            let mut bytes = [0u8; 16];
+            for (i, v) in ts.iter().enumerate() {
+                bytes[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+            }
+            if host.mem_write(args[1], &bytes) < 0 {
+                Action::Return(EFAULT)
+            } else {
+                Action::Return(0)
+            }
+        }
+        linux::LSEEK => Action::Return(0), // offset 0 (v0 fds are stream-like)
         linux::UNAME => {
             // struct utsname: six 65-byte NUL-terminated fields.
             let mut u = [0u8; 65 * 6];
@@ -174,6 +261,7 @@ mod tests {
         closed: i32,
         break_: u64,
         mmap_bump: u64,
+        tls: u64,
     }
     impl Mock {
         fn new() -> Self {
@@ -184,6 +272,7 @@ mod tests {
                 closed: -1,
                 break_: 0x1000,
                 mmap_bump: 0x1000_0000,
+                tls: 0,
             }
         }
     }
@@ -236,6 +325,25 @@ mod tests {
             let base = self.mmap_bump;
             self.mmap_bump += (len as u64).max(4096);
             base as i64
+        }
+        fn set_tls(&mut self, base: u64) -> i64 {
+            self.tls = base;
+            0
+        }
+        fn openat(&mut self, _dirfd: i32, _path: &[u8], _flags: u32) -> i64 {
+            3
+        }
+        fn readlink(&mut self, _path: &[u8], out: &mut [u8]) -> i64 {
+            let s = b"/proc/self/exe";
+            let n = s.len().min(out.len());
+            out[..n].copy_from_slice(&s[..n]);
+            n as i64
+        }
+        fn getrandom(&mut self, out: &mut [u8]) -> i64 {
+            for (i, b) in out.iter_mut().enumerate() {
+                *b = 0x30 + i as u8;
+            }
+            out.len() as i64
         }
     }
 
@@ -321,6 +429,45 @@ mod tests {
         // Non-anonymous (file) mappings are not supported yet.
         let f = dispatch(linux::MMAP, [0, 4096, 3, 0x02, 3, 0], &mut m);
         assert_eq!(f, Action::Return(ENOSYS));
+    }
+
+    #[test]
+    fn tls_openat_getrandom() {
+        let mut m = Mock::new();
+        // arch_prctl(ARCH_SET_FS, base) sets the thread TLS base.
+        assert_eq!(
+            dispatch(
+                linux::ARCH_PRCTL,
+                [ARCH_SET_FS, 0x7f00_1000, 0, 0, 0, 0],
+                &mut m
+            ),
+            Action::Return(0)
+        );
+        assert_eq!(m.tls, 0x7f00_1000);
+        // openat(AT_FDCWD, "/x", 0) -> fd 3 (mock).
+        m.mem[200] = b'/';
+        m.mem[201] = b'x';
+        m.mem[202] = 0;
+        assert_eq!(
+            dispatch(linux::OPENAT, [(-100i64) as u64, 200, 0, 0, 0, 0], &mut m),
+            Action::Return(3)
+        );
+        // getrandom(buf, 4) fills 4 bytes.
+        assert_eq!(
+            dispatch(linux::GETRANDOM, [300, 4, 0, 0, 0, 0], &mut m),
+            Action::Return(4)
+        );
+        assert_eq!(&m.mem[300..304], &[0x30, 0x31, 0x32, 0x33]);
+        // readlinkat writes the target.
+        assert_eq!(
+            dispatch(
+                linux::READLINKAT,
+                [(-100i64) as u64, 200, 400, 32, 0, 0],
+                &mut m
+            ),
+            Action::Return(14)
+        );
+        assert_eq!(&m.mem[400..414], b"/proc/self/exe");
     }
 
     #[test]

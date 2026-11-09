@@ -83,6 +83,7 @@ fn load_elf<R: sdk::syscall::RawSyscalls>(
 struct Emu<'a> {
     raw: &'a mut X86_64Syscalls,
     out: Option<u32>,
+    child: u32,
 }
 
 impl personality::foreign::Host for Emu<'_> {
@@ -131,6 +132,28 @@ impl personality::foreign::Host for Emu<'_> {
     }
     fn mmap_anon(&mut self, _len: usize) -> i64 {
         -12 // ENOMEM: no heap in this demo
+    }
+    fn set_tls(&mut self, base: u64) -> i64 {
+        // Thread::SET_TLS (kernel id 11) — the emulated thread's FS base.
+        let mut sys = Syscalls::new(self.raw);
+        let mut m = Message::new(sdk::methods::thread::SET_TLS);
+        m.words[0] = base;
+        match sys.invoke(self.child, &m) {
+            Ok(_) => 0,
+            Err(e) => e as i64,
+        }
+    }
+    fn openat(&mut self, _dirfd: i32, _path: &[u8], _flags: u32) -> i64 {
+        -2 // ENOENT (no VFS client wired in this demo yet)
+    }
+    fn readlink(&mut self, _path: &[u8], _out: &mut [u8]) -> i64 {
+        -2
+    }
+    fn getrandom(&mut self, out: &mut [u8]) -> i64 {
+        for (i, b) in out.iter_mut().enumerate() {
+            *b = (0x5a ^ i) as u8;
+        }
+        out.len() as i64
     }
 }
 
@@ -332,7 +355,11 @@ extern "C" fn linrun_main() -> ! {
                     msg.words[2],   // r9  = linux arg5
                 ];
                 let action = {
-                    let mut host = Emu { raw: &mut raw, out };
+                    let mut host = Emu {
+                        raw: &mut raw,
+                        out,
+                        child,
+                    };
                     personality::foreign::dispatch(num, args, &mut host)
                 };
                 match action {
