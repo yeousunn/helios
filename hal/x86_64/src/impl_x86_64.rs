@@ -893,6 +893,23 @@ pub unsafe fn install_tss() {
 /// at boot). The syscall entry stacks onto this address.
 #[no_mangle]
 pub static CURRENT_KSTACK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// ADR-044/046: the CPU's currently-loaded FS base (a mirror; the MSR is
+/// written only on change). IA32_FS_BASE = 0xC0000100.
+pub static CURRENT_FS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Write IA32_FS_BASE (musl TLS via Thread::SET_TLS).
+pub fn write_fs_base(va: u64) {
+    // SAFETY: `wrmsr` writes the FS-base MSR; single-CPU v0, kernel context.
+    unsafe {
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") 0xC000_0100u32,
+            in("eax") va as u32,
+            in("edx") (va >> 32) as u32,
+            options(nostack)
+        );
+    }
+}
 
 /// Set the running thread's kernel stack top (boot: the initial boot stack).
 pub fn set_kstack(top: u64) {
@@ -920,6 +937,14 @@ impl sched::ContextBackend for ContextBackendX86_64 {
         // ADR-045 slice 2b: kstack_top/ksp are PHYSICAL; the syscall entry
         // stacks through the shared higher-half window.
         set_kstack(kernel::mem::phys_to_virt(to_top));
+        // ADR-044/046 (Thread::SET_TLS): load the target's FS base when it
+        // differs from the CPU's current value (single-CPU v0: the mirror is
+        // authoritative; the MSR write takes effect for the resumed thread).
+        let to_fs = kernel::sched::fs_base_of(to);
+        if to_fs != CURRENT_FS.load(core::sync::atomic::Ordering::Relaxed) {
+            write_fs_base(to_fs);
+            CURRENT_FS.store(to_fs, core::sync::atomic::Ordering::Relaxed);
+        }
         // SAFETY: pure-asm cooperative switch (syscall_entry.S). `from_slot`
         // belongs to the running thread (only writer); `to_ksp` is either a
         // context saved by a previous switch (resuming mid-dispatch) or a

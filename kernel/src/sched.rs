@@ -69,6 +69,10 @@ pub struct Thread {
     /// ADR-044: foreign-syscall endpoint — when set, every syscall trap from
     /// this thread (except exit) routes there as a FOREIGN_SYSCALL call.
     pub(crate) foreign_ep: Option<ObjRef>,
+    /// ADR-044/046 (Thread::SET_TLS, id 11): the thread's FS base (musl TLS
+    /// via arch_prctl(ARCH_SET_FS)). 0 = default. Loaded by the arch switch
+    /// when it differs from the CPU's current value.
+    pub(crate) fs_base: u64,
     /// ADR-044: the trapped syscall's raw frame at route time
     /// [num, cap, tag, w0, w1, w2, w3]; read by the emulator via
     /// Thread::TRAP_READ while the thread is parked on the route call.
@@ -90,6 +94,7 @@ impl Thread {
             deadline_ns: 0,
             timed_out: false,
             foreign_ep: None,
+            fs_base: 0,
             trap_frame: [0; 7],
         }
     }
@@ -1074,6 +1079,27 @@ pub fn trap_read(id: ThreadId) -> Option<[u64; 4]> {
         t.trap_frame[4],
         t.trap_frame[5],
     ])
+}
+
+/// ADR-044/046 (Thread::SET_TLS, id 11): set the thread's FS base (musl
+/// TLS via arch_prctl(ARCH_SET_FS); the arch switch loads it when it
+/// differs from the CPU's current value).
+pub fn set_tls(id: ThreadId, fs_base: u64) -> SchedResult<()> {
+    let mut guard = SCHED.lock();
+    let s = guard.as_mut().ok_or(SchedError::NoSuchThread)?;
+    let slot = find_slot(s, id)?;
+    s.slots.threads[slot].as_mut().unwrap().fs_base = fs_base;
+    Ok(())
+}
+
+/// The thread's FS base (0 = default).
+pub fn fs_base_of(id: ThreadId) -> u64 {
+    let guard = SCHED.lock();
+    let Some(s) = guard.as_ref() else { return 0 };
+    match find_slot(s, id) {
+        Ok(slot) => s.slots.threads[slot].as_ref().unwrap().fs_base,
+        Err(_) => 0,
+    }
 }
 
 /// Timer-tick preemption hook (ADR-033 §2): yields the current thread to/// its run queue and switches to the best next thread. Callable from a

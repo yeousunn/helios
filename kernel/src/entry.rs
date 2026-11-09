@@ -446,6 +446,7 @@ fn thread_invoke(
     const BIND_DEATH_NOTIFICATION: u16 = 12;
     const THREAD_CREATE: u16 = 13;
     const SET_ENTRY: u16 = 14;
+    const SET_TLS: u16 = 11;
     const SET_FOREIGN: u16 = 15;
     const TRAP_READ: u16 = 16;
     const DEFER: u16 = 17;
@@ -499,6 +500,15 @@ fn thread_invoke(
             let pc = msg.words[0];
             match sched::set_entry(target, pc) {
                 Ok(()) => SyscallReturn::ok(msg.tag, [0, pc, 0, 0]),
+                Err(_) => SyscallReturn::err(ipc::status::EBADSTATE),
+            }
+        }
+        SET_TLS => {
+            // ADR-044/046 (musl TLS): w0 = the thread's FS base — musl's
+            // arch_prctl(ARCH_SET_FS) lands here via the emulator. The arch
+            // switch loads it when the target is scheduled.
+            match sched::set_tls(target, msg.words[0]) {
+                Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
                 Err(_) => SyscallReturn::err(ipc::status::EBADSTATE),
             }
         }
@@ -1566,5 +1576,49 @@ mod tests {
             },
         );
         assert_eq!(ret.status, status::EBADCAP as i64, "cap retired");
+    }
+
+    /// ADR-044/046: SET_TLS (id 11) stores the FS base; the sched accessor
+    /// roundtrips it (the arch switch loads it on schedule).
+    #[test]
+    fn set_tls_stores_fs_base() {
+        let (pid, target, _ep_h) = setup();
+        let ctl = proc::install_cap(
+            pid,
+            caps::Capability {
+                obj: caps::ObjId(target.0),
+                typ: caps::ObjType::Thread,
+                rights: caps::Rights::CONTROL,
+            },
+        )
+        .unwrap();
+        assert_eq!(sched::fs_base_of(target), 0, "default FS base");
+        let ret = invoke(
+            pid,
+            target,
+            SyscallArgs {
+                num: num::INVOKE,
+                cap: ctl,
+                tag: Tag::new(11), // SET_TLS
+                w: [0x7E00_1234_5678, 0, 0, 0],
+                nonblock: false,
+            },
+        );
+        assert_eq!(ret.status, 0, "SET_TLS ok");
+        assert_eq!(sched::fs_base_of(target), 0x7E00_1234_5678);
+        // Clear: w0 = 0.
+        let ret = invoke(
+            pid,
+            target,
+            SyscallArgs {
+                num: num::INVOKE,
+                cap: ctl,
+                tag: Tag::new(11),
+                w: [0, 0, 0, 0],
+                nonblock: false,
+            },
+        );
+        assert_eq!(ret.status, 0);
+        assert_eq!(sched::fs_base_of(target), 0);
     }
 }
