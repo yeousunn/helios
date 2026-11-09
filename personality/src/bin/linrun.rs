@@ -16,6 +16,8 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+extern crate alloc;
+
 use core::arch::global_asm;
 use core::panic::PanicInfo;
 
@@ -30,7 +32,7 @@ static HEAP: GlobalHeap = GlobalHeap::new();
 
 /// The foreign program to run: a freestanding static x86_64-linux ELF (no
 /// libc; raw `write`+`exit`). Loaded and executed like any Linux binary.
-static LIN_ELF: &[u8] = include_bytes!("../../assets/lin_args");
+static LIN_ELF: &[u8] = include_bytes!("../../assets/musl_noop");
 
 /// Load an ET_EXEC ELF into this process's own AS (shared with the emulated
 /// thread): carve + map a frame per page of every PT_LOAD, then copy the file
@@ -82,8 +84,8 @@ fn load_elf<R: sdk::syscall::RawSyscalls>(
 /// `foreign::Host` over direct memory (shared AS) + the console endpoint.
 struct Emu<'a> {
     raw: &'a mut X86_64Syscalls,
-    out: Option<u32>,
     child: u32,
+    buf: &'a mut alloc::vec::Vec<u8>,
 }
 
 impl personality::foreign::Host for Emu<'_> {
@@ -105,14 +107,10 @@ impl personality::foreign::Host for Emu<'_> {
         if fd != 1 && fd != 2 {
             return -9; // EBADF
         }
-        if let Some(h) = self.out {
-            let mut sys = Syscalls::new(self.raw);
-            for chunk in data.chunks(sdk::methods::console::TEXT_BYTES) {
-                let mut m = Message::new(sdk::methods::console::WRITE);
-                m.words = sdk::methods::pack_console_text(chunk);
-                let _ = sys.send(h, &m);
-            }
-        }
+        // Buffer: the console send must happen AFTER this syscall's reply —
+        // a nested blocking send while the foreign reply is pending corrupted
+        // the resume (found: musl `write` then crashed at rip=0).
+        self.buf.extend_from_slice(data);
         data.len() as i64
     }
     fn read_fd(&mut self, _fd: i32, _out: &mut [u8]) -> i64 {
@@ -326,6 +324,9 @@ extern "C" fn linrun_main() -> ! {
     }
 
     // Emulate: serve routed syscalls until the emulated thread dies.
+    // Emulated stdout is buffered and flushed after each reply (never a
+    // nested send while a foreign reply is pending).
+    let mut outbuf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     loop {
         let routed = {
             let mut sys = Syscalls::new(&mut raw);
@@ -339,6 +340,17 @@ extern "C" fn linrun_main() -> ! {
                 // (rdi,rsi,rdx,r10,r8,r9), so the Linux args are
                 // [cap, tag.0, w0, w1, w2, w3].
                 let num = msg.words[0];
+                if let Some(h) = out {
+                    let mut b = [b'#'; 17];
+                    for i in 0..16 {
+                        let nib = ((num >> ((15 - i) * 4)) & 0xF) as u8;
+                        b[1 + i] = b"0123456789abcdef"[nib as usize];
+                    }
+                    let mut sys = Syscalls::new(&mut raw);
+                    let mut m = Message::new(sdk::methods::console::WRITE);
+                    m.words = sdk::methods::pack_console_text(&b);
+                    let _ = sys.send(h, &m);
+                }
                 let frame = {
                     let mut sys = Syscalls::new(&mut raw);
                     match sys.invoke(child, &Message::new(sdk::methods::thread::TRAP_READ)) {
@@ -357,8 +369,8 @@ extern "C" fn linrun_main() -> ! {
                 let action = {
                     let mut host = Emu {
                         raw: &mut raw,
-                        out,
                         child,
+                        buf: &mut outbuf,
                     };
                     personality::foreign::dispatch(num, args, &mut host)
                 };
@@ -368,6 +380,15 @@ extern "C" fn linrun_main() -> ! {
                         rep.words[0] = v as u64;
                         let mut sys = Syscalls::new(&mut raw);
                         let _ = sys.reply(&rep);
+                        // Now (no pending reply) flush buffered stdout.
+                        if let Some(h) = out {
+                            for chunk in outbuf.chunks(sdk::methods::console::TEXT_BYTES) {
+                                let mut m = Message::new(sdk::methods::console::WRITE);
+                                m.words = sdk::methods::pack_console_text(chunk);
+                                let _ = sys.send(h, &m);
+                            }
+                        }
+                        outbuf.clear();
                     }
                     personality::foreign::Action::Exit(code) => {
                         // Linux `exit`: terminate the emulated thread (the
