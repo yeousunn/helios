@@ -18,6 +18,7 @@ pub mod linux {
     pub const WRITE: u64 = 1;
     pub const OPEN: u64 = 2;
     pub const CLOSE: u64 = 3;
+    pub const WRITEV: u64 = 20;
     pub const MMAP: u64 = 9;
     pub const MPROTECT: u64 = 10;
     pub const BRK: u64 = 12;
@@ -170,6 +171,39 @@ pub fn dispatch<H: Host>(num: u64, args: [u64; 6], host: &mut H) -> Action {
             ARCH_GET_FS | ARCH_GET_GS => Action::Return(0),
             _ => Action::Return(EINVAL),
         },
+        // musl's stdio `__stdio_write` emits `writev` (gather of up to three
+        // iovecs: the FILE's pending buffer + the new data). iov is an array
+        // of { u64 base, u64 len }.
+        linux::WRITEV => {
+            let fd = args[0] as i32;
+            let iov = args[1];
+            let cnt = (args[2] as usize).min(64);
+            let mut total = 0i64;
+            for i in 0..cnt {
+                let mut e = [0u8; 16];
+                if host.mem_read(iov + (i as u64) * 16, &mut e) < 0 {
+                    return Action::Return(EFAULT);
+                }
+                let base = u64::from_le_bytes([e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7]]);
+                let len = u64::from_le_bytes([e[8], e[9], e[10], e[11], e[12], e[13], e[14], e[15]])
+                    as usize;
+                if len == 0 {
+                    continue;
+                }
+                let mut buf = [0u8; 4096];
+                let want = len.min(buf.len());
+                let r = host.mem_read(base, &mut buf[..want]);
+                if r < 0 {
+                    return Action::Return(EFAULT);
+                }
+                let w = host.write_fd(fd, &buf[..r as usize]);
+                if w < 0 {
+                    return Action::Return(if total > 0 { total } else { w });
+                }
+                total += w;
+            }
+            Action::Return(total)
+        }
         // Legacy `open(2)` (musl's `open` uses this on x86_64): path is arg0
         // (no dirfd), flags arg1, mode arg2 — dirfd is implicitly AT_FDCWD.
         linux::OPEN => {
@@ -362,6 +396,21 @@ mod tests {
         let a = dispatch(linux::WRITE, [1, 16, 5, 0, 0, 0], &mut m);
         assert_eq!(a, Action::Return(5));
         assert_eq!(&m.out[..5], b"hello");
+    }
+
+    #[test]
+    fn writev_writes_all_iovecs() {
+        let mut m = Mock::new();
+        m.mem[16..19].copy_from_slice(b"abc");
+        m.mem[32..34].copy_from_slice(b"de");
+        // iovec[0] = {base 16, len 3}; iovec[1] = {base 32, len 2} at 64.
+        m.mem[64..72].copy_from_slice(&16u64.to_le_bytes());
+        m.mem[72..80].copy_from_slice(&3u64.to_le_bytes());
+        m.mem[80..88].copy_from_slice(&32u64.to_le_bytes());
+        m.mem[88..96].copy_from_slice(&2u64.to_le_bytes());
+        let a = dispatch(linux::WRITEV, [1, 64, 2, 0, 0, 0], &mut m);
+        assert_eq!(a, Action::Return(5));
+        assert_eq!(&m.out[..5], b"abcde");
     }
 
     #[test]
