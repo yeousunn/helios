@@ -26,6 +26,9 @@ pub enum ObjType {
     Frame,
     Irq,
     Region,
+    /// ADR-047: one-shot deferred-reply token (kernel-minted via
+    /// Thread::DEFER; retired on use). ObjId = (endpoint << 32) | caller_tid.
+    Reply,
 }
 
 /// An unforgeable token granting `rights` over the object `obj`.
