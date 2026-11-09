@@ -81,11 +81,13 @@ fn load_elf<R: sdk::syscall::RawSyscalls>(
     Ok(elf.entry)
 }
 
-/// `foreign::Host` over direct memory (shared AS) + the console endpoint.
+/// `foreign::Host` over direct memory (shared AS) + the console endpoint +
+/// an optional VFS client (emulated `open`/`read`/`close` of real files).
 struct Emu<'a> {
     raw: &'a mut X86_64Syscalls,
     child: u32,
     buf: &'a mut alloc::vec::Vec<u8>,
+    vfs: Option<&'a mut personality::vfs::VfsClient>,
 }
 
 impl personality::foreign::Host for Emu<'_> {
@@ -113,11 +115,33 @@ impl personality::foreign::Host for Emu<'_> {
         self.buf.extend_from_slice(data);
         data.len() as i64
     }
-    fn read_fd(&mut self, _fd: i32, _out: &mut [u8]) -> i64 {
-        -9 // EBADF (no stdin in this demo)
+    fn read_fd(&mut self, fd: i32, out: &mut [u8]) -> i64 {
+        // stdio (0/1/2) has no VFS backing here; VFS slot fds are remapped to
+        // Linux fd = slot + 3 (see `openat`).
+        if fd < 3 {
+            return -9; // EBADF
+        }
+        let Some(vfs) = self.vfs.as_deref_mut() else {
+            return -9;
+        };
+        let mut sys = Syscalls::new(self.raw);
+        match vfs.read(&mut sys, (fd as u32) - 3, out) {
+            Ok(n) => n as i64,
+            Err(e) => -(e as i64),
+        }
     }
-    fn close_fd(&mut self, _fd: i32) -> i64 {
-        -9
+    fn close_fd(&mut self, fd: i32) -> i64 {
+        if fd < 3 {
+            return 0; // closing stdio is a no-op here
+        }
+        let Some(vfs) = self.vfs.as_deref_mut() else {
+            return 0;
+        };
+        let mut sys = Syscalls::new(self.raw);
+        match vfs.close(&mut sys, (fd as u32) - 3) {
+            Ok(()) => 0,
+            Err(e) => -(e as i64),
+        }
     }
     fn getpid(&mut self) -> i64 {
         1
@@ -141,8 +165,31 @@ impl personality::foreign::Host for Emu<'_> {
             Err(e) => e as i64,
         }
     }
-    fn openat(&mut self, _dirfd: i32, _path: &[u8], _flags: u32) -> i64 {
-        -2 // ENOENT (no VFS client wired in this demo yet)
+    fn openat(&mut self, _dirfd: i32, path: &[u8], flags: u32) -> i64 {
+        let Some(vfs) = self.vfs.as_deref_mut() else {
+            return -2; // ENOENT (no VFS client wired)
+        };
+        let name = match path.iter().position(|&b| b == 0) {
+            Some(n) => &path[..n],
+            None => path,
+        };
+        // Translate Linux open(2) flags to the personality VFS's own O_* bits
+        // (they differ: Linux O_CREAT=0x40/O_TRUNC=0x200 vs VFS 1/2).
+        let mut pflags = 0u32;
+        if flags & 0o3 != 0 {
+            pflags |= personality::posix::O_WRONLY; // O_WRONLY | O_RDWR
+        }
+        if flags & 0x40 != 0 {
+            pflags |= personality::posix::O_CREAT;
+        }
+        if flags & 0x200 != 0 {
+            pflags |= personality::posix::O_TRUNC;
+        }
+        let mut sys = Syscalls::new(self.raw);
+        match vfs.open(&mut sys, name, pflags) {
+            Ok(slot) => slot as i64 + 3,
+            Err(e) => -(e as i64),
+        }
     }
     fn readlink(&mut self, _path: &[u8], _out: &mut [u8]) -> i64 {
         -2
@@ -183,6 +230,33 @@ extern "C" fn linrun_main() -> ! {
     if HEAP.init(start, len).is_err() {
         exit(&mut raw, 0xE2);
     }
+
+    // Connect to the VFS (package `optional[0]`, the caller-supplied service
+    // endpoint) so emulated `open`/`read`/`close` reach real files. Optional:
+    // a demo run without a VFS cap still works (openat → ENOENT).
+    let mut vfs = {
+        let ep = package
+            .optional
+            .first()
+            .copied()
+            .flatten()
+            .map(|cs| cs.handle())
+            .filter(|h| *h != 0);
+        match ep {
+            Some(ep) => {
+                let mut sys = Syscalls::new(&mut raw);
+                personality::vfs::VfsClient::connect(
+                    &mut sys,
+                    package.aspace,
+                    package.region,
+                    ep,
+                    package.session_notifications[0],
+                )
+                .ok()
+            }
+            None => None,
+        }
+    };
 
     let out = package
         .optional
@@ -412,11 +486,13 @@ extern "C" fn linrun_main() -> ! {
                         raw: &mut raw,
                         child,
                         buf: &mut outbuf,
+                        vfs: vfs.as_mut(),
                     };
                     personality::foreign::dispatch(num, args, &mut host)
                 };
                 match action {
                     personality::foreign::Action::Return(v) => {
+                        let _ = v;
                         let mut rep = Message::new(ipc::labels::kernel::FOREIGN_SYSCALL);
                         rep.words[0] = v as u64;
                         let mut sys = Syscalls::new(&mut raw);

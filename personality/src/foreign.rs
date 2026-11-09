@@ -16,6 +16,7 @@
 pub mod linux {
     pub const READ: u64 = 0;
     pub const WRITE: u64 = 1;
+    pub const OPEN: u64 = 2;
     pub const CLOSE: u64 = 3;
     pub const MMAP: u64 = 9;
     pub const MPROTECT: u64 = 10;
@@ -169,6 +170,13 @@ pub fn dispatch<H: Host>(num: u64, args: [u64; 6], host: &mut H) -> Action {
             ARCH_GET_FS | ARCH_GET_GS => Action::Return(0),
             _ => Action::Return(EINVAL),
         },
+        // Legacy `open(2)` (musl's `open` uses this on x86_64): path is arg0
+        // (no dirfd), flags arg1, mode arg2 — dirfd is implicitly AT_FDCWD.
+        linux::OPEN => {
+            let mut p = [0u8; 256];
+            let n = read_cstr(host, args[0], &mut p);
+            Action::Return(host.openat(-100, &p[..n], args[1] as u32))
+        }
         linux::OPENAT => {
             let mut p = [0u8; 256];
             let n = read_cstr(host, args[1], &mut p);
