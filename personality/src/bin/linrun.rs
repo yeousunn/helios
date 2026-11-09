@@ -231,16 +231,40 @@ extern "C" fn linrun_main() -> ! {
             for i in 0..16 {
                 *rnd.add(i) = (0xA5 ^ i) as u8;
             }
+            // AT_PHDR/PHNUM/PHENT must describe ALL program headers (musl
+            // walks them to find PT_TLS/PT_PHDR), not just the LOAD count.
+            let rd16 = |o: usize| u16::from_le_bytes([LIN_ELF[o], LIN_ELF[o + 1]]) as u64;
+            let rd64 = |o: usize| {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&LIN_ELF[o..o + 8]);
+                u64::from_le_bytes(b)
+            };
+            let e_phoff = rd64(32);
+            let e_phentsize = rd16(54);
+            let e_phnum = rd16(56);
+            // Virtual address of the phdrs: the LOAD segment covering e_phoff.
+            let mut phdr_va = 0u64;
+            for i in 0..6 {
+                if let Some(s) = sdk::elf::ElfImage::parse(LIN_ELF)
+                    .ok()
+                    .and_then(|e| e.segment(i))
+                {
+                    if e_phoff >= s.offset && e_phoff < s.offset + s.filesz {
+                        phdr_va = s.vaddr + (e_phoff - s.offset);
+                        break;
+                    }
+                }
+            }
             let auxv = [
-                (3u64, 0x1000040u64), // AT_PHDR (ELF headers in the first LOAD)
-                (4, 56),              // AT_PHENT
-                (5, 3),               // AT_PHNUM
-                (6, 4096),            // AT_PAGESZ
-                (7, 0),               // AT_BASE (static)
-                (9, entry),           // AT_ENTRY
-                (16, 0),              // AT_HWCAP
-                (25, rnd as u64),     // AT_RANDOM
-                (0, 0),               // AT_NULL
+                (3u64, phdr_va),  // AT_PHDR
+                (4, e_phentsize), // AT_PHENT
+                (5, e_phnum),     // AT_PHNUM
+                (6, 4096),        // AT_PAGESZ
+                (7, 0),           // AT_BASE (static)
+                (9, entry),       // AT_ENTRY
+                (16, 0),          // AT_HWCAP
+                (25, rnd as u64), // AT_RANDOM
+                (0, 0),           // AT_NULL
             ];
             let mut k = 4;
             for (a, v) in auxv {
