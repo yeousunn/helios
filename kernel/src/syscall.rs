@@ -339,10 +339,17 @@ pub fn park_result(tid: ThreadId) -> Option<crate::entry::SyscallReturn> {
                 .map(|t| t.foreign_ep.is_some())
                 .unwrap_or(false);
             if foreign {
+                // ADR-044 (foreign restore): the trap frame holds the
+                // trap-time user GPRs — [num, cap(=rdi), tag(=rsi), w0(=rdx),
+                // w1(=r10), w2(=r8), w3(=r9)]. Restore the FULL set, changing
+                // only rax = the reply's word[0] (the Linux result). rcx/r11
+                // are clobbered by `syscall` per the Linux ABI.
+                let f = sched::get(tid).map(|t| t.trap_frame).unwrap_or([0; 7]);
                 return Some(crate::entry::SyscallReturn {
                     status: env.msg.words[0] as i64,
-                    tag: env.msg.tag,
-                    w: env.msg.words,
+                    tag: Tag(f[3]),              // user rdx
+                    w: [f[2], f[1], f[5], f[6]], // rsi, rdi, r8, r9
+                    r10: f[4],                   // user r10
                 });
             }
             return Some(crate::entry::SyscallReturn::ok(env.msg.tag, env.msg.words));
@@ -392,6 +399,7 @@ pub fn park_result(tid: ThreadId) -> Option<crate::entry::SyscallReturn> {
                 status: ipc::status::ETIMEDOUT as i64,
                 tag: Tag(0),
                 w: [0; 4],
+                r10: 0,
             });
         }
     }
@@ -469,6 +477,7 @@ pub(crate) fn foreign_route(
             status: ipc::status::EDEAD as i64,
             tag: Tag(0),
             w: [0; 4],
+            r10: 0,
         });
     };
     let mut m = Message::new(ipc::labels::kernel::FOREIGN_SYSCALL);
@@ -485,6 +494,7 @@ pub(crate) fn foreign_route(
                 status: ipc::status::EDEAD as i64,
                 tag: Tag(0),
                 w: [0; 4],
+                r10: 0,
             })
         }
     }

@@ -41,6 +41,10 @@ helios_syscall_entry:
     mov rdi, [rip + SYS_RET + 24]
     mov r8,  [rip + SYS_RET + 32]
     mov r9,  [rip + SYS_RET + 40]
+    /* ADR-044 (foreign restore): r10 is clobbered by the entry shuffle;
+     * SYS_RET[6] carries the trap-time user r10 for foreign resumes (any
+     * value is fine for native — r10 is caller-saved there). */
+    mov r10, [rip + SYS_RET + 48]
     sysretq
 
 /* Cooperative kernel context switch (M3). C ABI: rdi = &from_thread.ksp,

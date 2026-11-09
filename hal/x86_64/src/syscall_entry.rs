@@ -265,5 +265,6 @@ fn store_ret(ret: SyscallReturn) {
         p.add(3).write_volatile(ret.w[1]);
         p.add(4).write_volatile(ret.w[2]);
         p.add(5).write_volatile(ret.w[3]);
+        p.add(6).write_volatile(ret.r10);
     }
 }

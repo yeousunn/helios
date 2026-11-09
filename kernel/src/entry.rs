@@ -51,6 +51,10 @@ pub struct SyscallReturn {
     pub tag: Tag,
     /// returned w0..w3.
     pub w: [u64; 4],
+    /// ADR-044 (foreign restore): the trap-time user r10 (the entry shuffle
+    /// clobbers it; SYS_RET[6] carries it back). Any value for native — r10
+    /// is caller-saved there.
+    pub r10: u64,
 }
 
 /// Reserved sentinel: the thread parked inside the syscall (ADR-019 §1).
@@ -64,6 +68,7 @@ impl SyscallReturn {
             status: PARKED_STATUS,
             tag: Tag(0),
             w: [0; 4],
+            r10: 0,
         }
     }
 
@@ -72,6 +77,7 @@ impl SyscallReturn {
             status: status as i64,
             tag: Tag(0),
             w: [0; 4],
+            r10: 0,
         }
     }
 
@@ -80,6 +86,7 @@ impl SyscallReturn {
             status: ipc::status::OK as i64,
             tag,
             w,
+            r10: 0,
         }
     }
 }
@@ -171,6 +178,7 @@ pub fn park_result(tid: ThreadId) -> Option<SyscallReturn> {
             status: status::ETIMEDOUT as i64,
             tag: Tag(0),
             w: [0; 4],
+            r10: 0,
         });
     }
 
@@ -212,6 +220,7 @@ pub fn dispatch(args: SyscallArgs) -> SyscallReturn {
                 status: status as i64,
                 tag: Tag(0),
                 w: [0; 4],
+                r10: 0,
             },
             Err(e) => SyscallReturn::err(e),
         },
@@ -220,6 +229,7 @@ pub fn dispatch(args: SyscallArgs) -> SyscallReturn {
                 status: status as i64,
                 tag: Tag(0),
                 w: [0; 4],
+                r10: 0,
             },
             Err(e) => SyscallReturn::err(e),
         },
@@ -296,6 +306,7 @@ fn invoke(pid: ProcessId, tid: ThreadId, args: SyscallArgs) -> SyscallReturn {
                 status: status as i64,
                 tag: Tag(0),
                 w,
+                r10: 0,
             },
             Err(e) => SyscallReturn::err(e),
         },
@@ -1437,9 +1448,18 @@ mod tests {
         })
         .unwrap();
         let r = syscall::park_result(fgn).expect("reply completes the foreign syscall");
-        // ADR-044 (amended): the foreign reply's word[0] IS the rax result.
+        // ADR-044 (amended): the foreign reply's word[0] IS the rax result;
+        // the REST of the trap-time user GPRs are restored (Linux ABI: only
+        // rax/rcx/r11 are clobbered by a syscall).
         assert_eq!(r.status, 0x4242, "the emulator's value lands in rax");
-        assert_eq!(r.w[0], 0x4242, "the reply words ride too");
+        // The trap-time user GPRs: rdx=w0, rsi=tag, rdi=cap, r10=w1,
+        // r8=w2, r9=w3 (the native arg shuffle's register mapping).
+        assert_eq!(r.tag.0, 0xAAAA, "user rdx restored (w0)");
+        assert_eq!(r.w[0], Tag::new(0x1234).0, "user rsi restored (tag)");
+        assert_eq!(r.w[1], 0, "user rdi restored (cap arg was 0)");
+        assert_eq!(r.w[2], 0xCCCC, "user r8 restored (w2→arg4)");
+        assert_eq!(r.w[3], 0xDDDD, "user r9 restored (w3→arg5)");
+        assert_eq!(r.r10, 0xBBBB, "user r10 restored (w1→arg3)");
         // TRAP_READ after completion → EBADSTATE (frame no longer exposed).
         let ret = invoke(
             pid,
