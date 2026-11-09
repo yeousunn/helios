@@ -88,6 +88,46 @@ struct Emu<'a> {
     child: u32,
     buf: &'a mut alloc::vec::Vec<u8>,
     vfs: Option<&'a mut personality::vfs::VfsClient>,
+    region: u32,
+    aspace: u32,
+    /// Bump pointer for emulated anonymous `mmap`.
+    mmap_bump: &'a mut u64,
+    /// Current emulated program break.
+    brk_cur: &'a mut u64,
+}
+
+/// Base VAs for emulated anonymous memory (distinct from the image, the Linux
+/// stack, the stub and the personality heap/windows).
+const MMAP_VA_BASE: u64 = 0x0000_6000_0000_0000;
+const BRK_VA_BASE: u64 = 0x0000_6100_0000_0000;
+
+impl Emu<'_> {
+    /// Carve + map `len` bytes of zero-filled anonymous RW memory at `va`.
+    fn map_pages(&mut self, va: u64, len: usize) -> bool {
+        let pages = len.div_ceil(4096);
+        for i in 0..pages {
+            let mut sys = Syscalls::new(self.raw);
+            let mut carve = Message::new(sdk::methods::region::CARVE);
+            carve.words[0] = 4096;
+            carve.words[1] = 4096;
+            let frame = match sys.invoke(self.region, &carve) {
+                Ok(r) => r.words[0] as u32,
+                Err(_) => return false,
+            };
+            let mut map = Message::new(sdk::methods::aspace::MAP);
+            map.tag = map.tag.with_caps(1);
+            map.words[0] = va + i as u64 * 4096;
+            map.words[1] = 0b011; // R | W
+            let _ = map.set_descriptor(
+                0,
+                ipc::CapSlot::pack(frame, ipc::Rights::READ.union(ipc::Rights::WRITE)),
+            );
+            if sys.invoke(self.aspace, &map).is_err() {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 impl personality::foreign::Host for Emu<'_> {
@@ -150,10 +190,31 @@ impl personality::foreign::Host for Emu<'_> {
         1
     }
     fn brk(&mut self, requested: u64) -> i64 {
-        requested as i64 // accept and report unchanged
+        if requested == 0 {
+            return *self.brk_cur as i64; // query the current break
+        }
+        if requested <= *self.brk_cur {
+            *self.brk_cur = requested;
+            return requested as i64;
+        }
+        let cur = *self.brk_cur;
+        if !self.map_pages(cur, (requested - cur) as usize) {
+            return cur as i64; // grow failed: report the old break
+        }
+        *self.brk_cur = requested;
+        requested as i64
     }
-    fn mmap_anon(&mut self, _len: usize) -> i64 {
-        -12 // ENOMEM: no heap in this demo
+    fn mmap_anon(&mut self, len: usize) -> i64 {
+        if len == 0 {
+            return -22; // EINVAL
+        }
+        let pages = (len as u64).div_ceil(4096);
+        let base = *self.mmap_bump;
+        if !self.map_pages(base, len) {
+            return -12; // ENOMEM
+        }
+        *self.mmap_bump += pages * 4096;
+        base as i64
     }
     fn set_tls(&mut self, base: u64) -> i64 {
         // Thread::SET_TLS (kernel id 11) — the emulated thread's FS base.
@@ -441,6 +502,9 @@ extern "C" fn linrun_main() -> ! {
     // Emulate: serve routed syscalls until the emulated thread dies.
     // Emulated stdout is buffered and flushed after each reply (never a
     // nested send while a foreign reply is pending).
+    let (region_h, aspace_h) = (package.region, package.aspace);
+    let mut mmap_bump = MMAP_VA_BASE;
+    let mut brk_cur = BRK_VA_BASE;
     let mut outbuf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     loop {
         let routed = {
@@ -487,6 +551,10 @@ extern "C" fn linrun_main() -> ! {
                         child,
                         buf: &mut outbuf,
                         vfs: vfs.as_mut(),
+                        region: region_h,
+                        aspace: aspace_h,
+                        mmap_bump: &mut mmap_bump,
+                        brk_cur: &mut brk_cur,
                     };
                     personality::foreign::dispatch(num, args, &mut host)
                 };
