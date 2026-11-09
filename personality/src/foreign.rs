@@ -316,7 +316,7 @@ mod tests {
             7
         }
         fn brk(&mut self, requested: u64) -> i64 {
-            if requested >= 0x1000 && requested < 0x2000 {
+            if (0x1000..0x2000).contains(&requested) {
                 self.break_ = requested;
             }
             self.break_ as i64

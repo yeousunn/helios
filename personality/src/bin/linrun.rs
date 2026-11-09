@@ -24,7 +24,7 @@ use core::panic::PanicInfo;
 use ipc::Message;
 use personality::layout::HEAP_VA_BASE;
 use sdk::heap::{GlobalHeap, RegionSource};
-use sdk::layout::{HEAP_CHUNK, HEAP_CHUNKS, USER_STACK_TOP};
+use sdk::layout::{HEAP_CHUNK, HEAP_CHUNKS};
 use sdk::syscall::{Syscalls, X86_64Syscalls};
 
 #[global_allocator]
@@ -32,7 +32,7 @@ static HEAP: GlobalHeap = GlobalHeap::new();
 
 /// The foreign program to run: a freestanding static x86_64-linux ELF (no
 /// libc; raw `write`+`exit`). Loaded and executed like any Linux binary.
-static LIN_ELF: &[u8] = include_bytes!("../../assets/musl_noop");
+static LIN_ELF: &[u8] = include_bytes!("../../assets/musl_write");
 
 /// Load an ET_EXEC ELF into this process's own AS (shared with the emulated
 /// thread): carve + map a frame per page of every PT_LOAD, then copy the file
@@ -213,42 +213,63 @@ extern "C" fn linrun_main() -> ! {
         }
     };
 
-    // Craft the Linux initial stack at USER_STACK_TOP (where the kernel's
-    // fresh-thread context puts RSP): [argc][argv...][NULL][envp...][NULL]
-    // [auxv pairs][AT_NULL], with the argv string above it. A real libc
-    // `_start` reads this; our freestanding test binary reads argv[0].
+    // Craft the Linux initial stack at a DEDICATED VA — NOT USER_STACK_TOP,
+    // which is where the emulator's OWN main-thread Rust stack lives (sharing
+    // it corrupts the emulated thread as soon as the emulator nests deeper
+    // into the serve loop). A stackless stub, set as the child's entry, moves
+    // RSP to here then jumps to the ELF entry.
+    const STACK_BASE: u64 = 0x0000_7F00_0000_0000;
+    const STACK_PAGES: u64 = 8; // 32 KiB
+    const STUB_PAGE: u64 = 0x0000_0000_4000_0000;
     {
         let mut sys = Syscalls::new(&mut raw);
-        // Map one page at USER_STACK_TOP (above the process's own stack).
-        let mut carve = Message::new(sdk::methods::region::CARVE);
-        carve.words[0] = 4096;
-        carve.words[1] = 4096;
-        let frame = match sys.invoke(package.region, &carve) {
-            Ok(r) => r.words[0] as u32,
-            Err(e) => exit(&mut raw, 0x60 | (e & 0xF)),
-        };
-        let mut map = Message::new(sdk::methods::aspace::MAP);
-        map.tag = map.tag.with_caps(1);
-        map.words[0] = USER_STACK_TOP;
-        map.words[1] = 0b011; // R | W
-        let _ = map.set_descriptor(
-            0,
-            ipc::CapSlot::pack(frame, ipc::Rights::READ.union(ipc::Rights::WRITE)),
-        );
-        if let Err(e) = sys.invoke(package.aspace, &map) {
-            exit(&mut raw, 0x61 | (e & 0xF));
+        // Map STACK_PAGES for the Linux stack.
+        for i in 0..STACK_PAGES {
+            let mut carve = Message::new(sdk::methods::region::CARVE);
+            carve.words[0] = 4096;
+            carve.words[1] = 4096;
+            let frame = match sys.invoke(package.region, &carve) {
+                Ok(r) => r.words[0] as u32,
+                Err(e) => exit(&mut raw, 0x60 | (e & 0xF)),
+            };
+            let mut map = Message::new(sdk::methods::aspace::MAP);
+            map.tag = map.tag.with_caps(1);
+            map.words[0] = STACK_BASE + i * 4096;
+            map.words[1] = 0b011; // R | W
+            let _ = map.set_descriptor(
+                0,
+                ipc::CapSlot::pack(frame, ipc::Rights::READ.union(ipc::Rights::WRITE)),
+            );
+            if let Err(e) = sys.invoke(package.aspace, &map) {
+                exit(&mut raw, 0x61 | (e & 0xF));
+            }
         }
-        // SAFETY: the page is mapped; write the standard Linux startup layout.
+        // Map one page for the RSP-switch stub.
+        let mut carve2 = Message::new(sdk::methods::region::CARVE);
+        carve2.words[0] = 4096;
+        carve2.words[1] = 4096;
+        let sframe = match sys.invoke(package.region, &carve2) {
+            Ok(r) => r.words[0] as u32,
+            Err(e) => exit(&mut raw, 0x62 | (e & 0xF)),
+        };
+        let mut smap = Message::new(sdk::methods::aspace::MAP);
+        smap.tag = smap.tag.with_caps(1);
+        smap.words[0] = STUB_PAGE;
+        smap.words[1] = 0b111; // R | W | X (no W^X yet; we write the stub)
+        let _ = smap.set_descriptor(
+            0,
+            ipc::CapSlot::pack(sframe, ipc::Rights::READ.union(ipc::Rights::WRITE)),
+        );
+        if let Err(e) = sys.invoke(package.aspace, &smap) {
+            exit(&mut raw, 0x63 | (e & 0xF));
+        }
+        // SAFETY: the pages are mapped; write the Linux startup layout and the
+        // stub (mov rsp, STACK_PAGE; mov rax, entry; jmp rax).
         unsafe {
-            let base = USER_STACK_TOP as *mut u64;
             let arg = b"helios-linux-abi\n\0";
-            let s = (USER_STACK_TOP + 0x100) as *mut u8;
+            let s = (STACK_BASE + 0x100) as *mut u8;
             core::ptr::copy_nonoverlapping(arg.as_ptr(), s, arg.len());
-            *base.add(0) = 1; // argc
-            *base.add(1) = s as u64; // argv[0]
-            *base.add(2) = 0; // argv terminator
-            *base.add(3) = 0; // envp terminator
-            let rnd = (USER_STACK_TOP + 0x200) as *mut u8;
+            let rnd = (STACK_BASE + 0x200) as *mut u8;
             for i in 0..16 {
                 *rnd.add(i) = (0xA5 ^ i) as u8;
             }
@@ -287,18 +308,38 @@ extern "C" fn linrun_main() -> ! {
                 (25, rnd as u64), // AT_RANDOM
                 (0, 0),           // AT_NULL
             ];
+            // The initial block sits at the TOP of the stack with rsp pointing
+            // at argc; the block runs upward, calls grow down into the pages.
+            let n_qwords = 4 + auxv.len() * 2;
+            let rsp = STACK_BASE + STACK_PAGES * 4096 - (n_qwords as u64) * 8;
+            let base = rsp as *mut u64;
+            *base.add(0) = 1; // argc
+            *base.add(1) = s as u64; // argv[0]
+            *base.add(2) = 0; // argv terminator
+            *base.add(3) = 0; // envp terminator
             let mut k = 4;
             for (a, v) in auxv {
                 *base.add(k) = a;
                 *base.add(k + 1) = v;
                 k += 2;
             }
+            // The stub: mov rsp, <rsp> (48 BC imm64); mov rax, entry
+            // (48 B8 imm64); jmp rax (FF E0).
+            let stub = STUB_PAGE as *mut u8;
+            *stub.add(0) = 0x48;
+            *stub.add(1) = 0xBC;
+            core::ptr::copy_nonoverlapping(rsp.to_le_bytes().as_ptr(), stub.add(2), 8);
+            *stub.add(10) = 0x48;
+            *stub.add(11) = 0xB8;
+            core::ptr::copy_nonoverlapping(entry.to_le_bytes().as_ptr(), stub.add(12), 8);
+            *stub.add(20) = 0xFF;
+            *stub.add(21) = 0xE0;
         }
     }
     let child = {
         let mut sys = Syscalls::new(&mut raw);
         let mut m = Message::new(sdk::methods::thread::THREAD_CREATE);
-        m.words[0] = entry;
+        m.words[0] = STUB_PAGE; // run the RSP-switch stub first, not entry
         match sys.invoke(package.thread, &m) {
             Ok(r) => r.words[0] as u32,
             Err(e) => exit(&mut raw, 0x51 | (e & 0xF)),
@@ -380,11 +421,13 @@ extern "C" fn linrun_main() -> ! {
                         rep.words[0] = v as u64;
                         let mut sys = Syscalls::new(&mut raw);
                         let _ = sys.reply(&rep);
-                        // Now (no pending reply) flush buffered stdout.
+                        // No foreign reply is pending now, so flush the emulated
+                        // stdout to the console.
                         if let Some(h) = out {
                             for chunk in outbuf.chunks(sdk::methods::console::TEXT_BYTES) {
                                 let mut m = Message::new(sdk::methods::console::WRITE);
                                 m.words = sdk::methods::pack_console_text(chunk);
+                                let mut sys = Syscalls::new(&mut raw);
                                 let _ = sys.send(h, &m);
                             }
                         }
