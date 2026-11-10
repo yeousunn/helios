@@ -637,4 +637,32 @@ impl VfsClient {
         }
         Ok(Some((next, reply.words[3] as u8, len)))
     }
+    /// Open a **directory** by path into an fd slot (the emulator's
+    /// `open(O_DIRECTORY)`): uses `walk_path`, which resolves `"/"` to the
+    /// root (`resolve` rejects a bare `/` — it wants a final component).
+    pub fn open_dir<R: RawSyscalls>(
+        &mut self,
+        sys: &mut Syscalls<R>,
+        path: &[u8],
+    ) -> Result<u32, Status> {
+        let handle = self.walk_path(sys, path)?;
+        let slot = self.fds.iter().position(|f| f.is_none()).ok_or(EMFILE)?;
+        self.fds[slot] = Some(Fd { handle, offset: 0 });
+        Ok(slot as u32)
+    }
+
+    /// One `READDIR` step addressed by VFS **fd slot** (the emulator's
+    /// `getdents`): uses the slot's handle with an explicit `cookie` (the
+    /// caller keeps the cursor, since a caller that cannot fit an entry into
+    /// its output buffer must be able to re-read it).
+    pub fn readdir_fd<R: RawSyscalls>(
+        &mut self,
+        sys: &mut Syscalls<R>,
+        fd: u32,
+        cookie: u64,
+        name_out: &mut [u8],
+    ) -> Result<Option<(u64, u8, usize)>, Status> {
+        let entry = self.fds.get(fd as usize).copied().flatten().ok_or(EBADF)?;
+        self.readdir(sys, entry.handle, cookie, name_out)
+    }
 }

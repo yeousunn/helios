@@ -37,6 +37,7 @@ pub mod linux {
     pub const OPENAT: u64 = 257;
     pub const READLINKAT: u64 = 267;
     pub const GETRANDOM: u64 = 318;
+    pub const GETDENTS64: u64 = 217;
     pub const FUTEX: u64 = 202;
     pub const LSEEK: u64 = 8;
     pub const GETUID: u64 = 102;
@@ -83,6 +84,9 @@ pub trait Host {
     fn mem_write(&mut self, addr: u64, data: &[u8]) -> i64;
     /// Write to file descriptor `fd`.
     fn write_fd(&mut self, fd: i32, data: &[u8]) -> i64;
+    /// Linux `getdents64`: fill `out` with linux_dirent64 records (the host
+    /// formats them from its directory source). Returns bytes written.
+    fn getdents(&mut self, fd: i32, out: &mut [u8]) -> i64;
     /// Read from file descriptor `fd` into `out`.
     fn read_fd(&mut self, fd: i32, out: &mut [u8]) -> i64;
     /// Close a file descriptor.
@@ -152,6 +156,16 @@ pub fn dispatch<H: Host>(num: u64, args: [u64; 6], host: &mut H) -> Action {
             Action::Return(r)
         }
         linux::CLOSE => Action::Return(host.close_fd(args[0] as i32)),
+        linux::GETDENTS64 => {
+            let want = (args[2] as usize).min(4096);
+            let mut buf = [0u8; 4096];
+            let r = host.getdents(args[0] as i32, &mut buf[..want]);
+            if r < 0 {
+                return Action::Return(r);
+            }
+            let w = host.mem_write(args[1], &buf[..r as usize]);
+            Action::Return(if w < 0 { EFAULT } else { r })
+        }
         linux::GETPID => Action::Return(host.getpid()),
         linux::GETTID => Action::Return(host.gettid()),
         linux::SET_TID_ADDRESS => {
@@ -351,6 +365,19 @@ mod tests {
             self.closed = fd;
             0
         }
+        fn getdents(&mut self, _fd: i32, out: &mut [u8]) -> i64 {
+            // One fake entry: ino=7, off=1, reclen=24, type=8(DT_REG), "a\0".
+            if out.len() < 24 {
+                return 0;
+            }
+            out[..24].fill(0);
+            out[0..8].copy_from_slice(&7u64.to_le_bytes());
+            out[8..16].copy_from_slice(&1u64.to_le_bytes());
+            out[16..18].copy_from_slice(&24u16.to_le_bytes());
+            out[18] = 8;
+            out[19] = b'a';
+            24
+        }
         fn getpid(&mut self) -> i64 {
             42
         }
@@ -411,6 +438,18 @@ mod tests {
         let a = dispatch(linux::WRITEV, [1, 64, 2, 0, 0, 0], &mut m);
         assert_eq!(a, Action::Return(5));
         assert_eq!(&m.out[..5], b"abcde");
+    }
+
+    #[test]
+    fn getdents_writes_dirent64() {
+        let mut m = Mock::new();
+        let a = dispatch(linux::GETDENTS64, [3, 64, 128, 0, 0, 0], &mut m);
+        assert_eq!(a, Action::Return(24));
+        assert_eq!(m.mem[64], 7); // d_ino
+        assert_eq!(m.mem[72], 1); // d_off
+        assert_eq!(u16::from_le_bytes([m.mem[80], m.mem[81]]), 24); // d_reclen
+        assert_eq!(m.mem[82], 8); // d_type = DT_REG
+        assert_eq!(m.mem[83], b'a'); // d_name
     }
 
     #[test]

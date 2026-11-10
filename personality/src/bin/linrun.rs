@@ -94,6 +94,9 @@ struct Emu<'a> {
     mmap_bump: &'a mut u64,
     /// Current emulated program break.
     brk_cur: &'a mut u64,
+    /// Per-VFS-fd directory cursor for emulated `getdents64`
+    /// (`u64::MAX` = end-of-directory reached).
+    dents_cookie: &'a mut [u64; 16],
 }
 
 /// Base VAs for emulated anonymous memory (distinct from the image, the Linux
@@ -247,10 +250,72 @@ impl personality::foreign::Host for Emu<'_> {
             pflags |= personality::posix::O_TRUNC;
         }
         let mut sys = Syscalls::new(self.raw);
-        match vfs.open(&mut sys, name, pflags) {
+        // O_DIRECTORY (0x10000): a directory fd — `open_dir` resolves "/" to
+        // the root (a plain `open` rejects a bare "/"; musl's opendir uses it).
+        let r = if flags & 0x10000 != 0 {
+            vfs.open_dir(&mut sys, name)
+        } else {
+            vfs.open(&mut sys, name, pflags)
+        };
+        match r {
             Ok(slot) => slot as i64 + 3,
             Err(e) => -(e as i64),
         }
+    }
+    fn getdents(&mut self, fd: i32, out: &mut [u8]) -> i64 {
+        if fd < 3 {
+            return -9; // EBADF
+        }
+        let slot = (fd as u32) - 3;
+        if slot as usize >= self.dents_cookie.len() {
+            return -9;
+        }
+        let slot = slot as usize;
+        if self.dents_cookie[slot] == u64::MAX {
+            return 0; // end-of-directory already reached
+        }
+        let Some(vfs) = self.vfs.as_deref_mut() else {
+            return -9;
+        };
+        let mut off = 0usize;
+        while out.len() - off >= 24 {
+            let mut name = [0u8; 256];
+            let cookie = self.dents_cookie[slot];
+            let res = {
+                let mut sys = Syscalls::new(self.raw);
+                vfs.readdir_fd(&mut sys, slot as u32, cookie, &mut name)
+            };
+            match res {
+                Ok(Some((next, kind, nlen))) => {
+                    // struct linux_dirent64 { u64 ino; u64 off; u16 reclen;
+                    // u8 type; char name[]; } padded to 8.
+                    let reclen = (19 + nlen + 1 + 7) & !7;
+                    if off + reclen > out.len() {
+                        break; // does not fit: leave the cookie for the next call
+                    }
+                    let e = &mut out[off..off + reclen];
+                    e.fill(0);
+                    e[0..8].copy_from_slice(&(cookie.wrapping_add(1)).to_le_bytes()); // d_ino
+                    e[8..16].copy_from_slice(&next.to_le_bytes()); // d_off
+                    e[16..18].copy_from_slice(&(reclen as u16).to_le_bytes());
+                    e[18] = if kind == personality::vfs::KIND_DIR {
+                        4 // DT_DIR
+                    } else {
+                        8 // DT_REG
+                    };
+                    e[19..19 + nlen].copy_from_slice(&name[..nlen]);
+                    off += reclen;
+                    if next == 0 {
+                        self.dents_cookie[slot] = u64::MAX; // last entry
+                        break;
+                    }
+                    self.dents_cookie[slot] = next;
+                }
+                Ok(None) => break,
+                Err(e) => return if off > 0 { off as i64 } else { -(e as i64) },
+            }
+        }
+        off as i64
     }
     fn readlink(&mut self, _path: &[u8], _out: &mut [u8]) -> i64 {
         -2
@@ -505,6 +570,7 @@ extern "C" fn linrun_main() -> ! {
     let (region_h, aspace_h) = (package.region, package.aspace);
     let mut mmap_bump = MMAP_VA_BASE;
     let mut brk_cur = BRK_VA_BASE;
+    let mut dents_cookie = [0u64; 16];
     let mut outbuf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     loop {
         let routed = {
@@ -555,6 +621,7 @@ extern "C" fn linrun_main() -> ! {
                         aspace: aspace_h,
                         mmap_bump: &mut mmap_bump,
                         brk_cur: &mut brk_cur,
+                        dents_cookie: &mut dents_cookie,
                     };
                     personality::foreign::dispatch(num, args, &mut host)
                 };

@@ -777,3 +777,10 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 - **`syscall::park_result` is now a thin delegate to `entry::park_result`** (the real arch-resume implementation). The dedup surfaced and fixed a **semantic drift**: entry's notification-completion returns used `Tag(0)|NOTIFIED` while the schema §4 contract (pinned by the syscall tests) is **label NOTIFY + NOTIFIED + mask** — entry's steps 2/3 now match. Also ported the park-record hygiene (clear_park) into entry's delivered branch.
 - **Verified**: the arch resume path calls entry::park_result ✓ (hal syscall_entry.rs:228); all 66 kernel tests green (including the notification, foreign-restore, timeout, and ADR-047 tests that previously exercised both copies); release smoke E2E=0.
 - **Thanks to DS for catching the two-park_result trap** — my ADR-044 foreign restore landed only in the test-visible copy; the production resume path silently lacked it until DS's real-musl testing exposed it. The SYS_RET out-of-bounds fix (48→56 bytes) also came from DS's review. Cross-area review works.
+
+## DS (Phase 3 slice 33g — musl getdents/readdir, 2026-11-10) — COMPLETE
+
+- [x] DS done 2026-11-10 — **A static musl `opendir("/")`/`readdir` program lists real directory entries** (`cat child echo hello linrun ls posix posix-log sh wc work`). GLM's checklist item 2.
+- `foreign`: `linux::GETDENTS64` (217) + `Host::getdents` (Linux-dir→host formats `linux_dirent64`; Mock + test). `linrun`'s `Host::getdents` formats the host's directory source into `linux_dirent64` records with a per-fd cursor (sentinel at end-of-directory). `VfsClient`: `readdir_fd` (by fd slot, explicit cookie) + `open_dir`.
+- **Bug found + fixed:** `VfsClient::resolve("/")` returns `EINVAL` (it wants a final component), so `open("/")` — musl's `opendir` — failed. `openat(O_DIRECTORY)` now uses `open_dir` → `walk_path`, which resolves `"/"` to the root. Asset: `personality/assets/musl_ls`. Gates green, 200 tests.
+- **Next DS (GLM checklist):** signals v0 (`Host::kill` → `Thread::KILL`+death notif), then login/auth (`servers/auth`).
