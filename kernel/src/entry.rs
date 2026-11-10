@@ -135,6 +135,23 @@ pub fn park_result(tid: ThreadId) -> Option<SyscallReturn> {
         let (pid, _) = current();
         syscall::install_transfers(pid, &mut env);
         syscall::set_reply_if_call(&env, tid);
+        // ADR-044 (foreign restore): the arch resume path calls THIS function
+        // (not `syscall::park_result`), so the foreign completion must be
+        // handled here: restore the trap-time user GPRs and land the Linux
+        // result (reply word[0]) in rax. Without this a foreign thread's
+        // syscall return value is lost (rax = 0) — the musl fd/getpid bug.
+        if sched::get(tid)
+            .map(|t| t.foreign_ep.is_some())
+            .unwrap_or(false)
+        {
+            let f = sched::get(tid).map(|t| t.trap_frame).unwrap_or([0; 7]);
+            return Some(SyscallReturn {
+                status: env.msg.words[0] as i64,
+                tag: Tag(f[3]),              // user rdx
+                w: [f[2], f[1], f[5], f[6]], // rsi, rdi, r8, r9
+                r10: f[4],                   // user r10
+            });
+        }
         return Some(SyscallReturn::ok(env.msg.tag, env.msg.words));
     }
 

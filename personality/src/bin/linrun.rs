@@ -32,7 +32,7 @@ static HEAP: GlobalHeap = GlobalHeap::new();
 
 /// The foreign program to run: a freestanding static x86_64-linux ELF (no
 /// libc; raw `write`+`exit`). Loaded and executed like any Linux binary.
-static LIN_ELF: &[u8] = include_bytes!("../../assets/musl_write");
+static LIN_ELF: &[u8] = include_bytes!("../../assets/musl_hello");
 
 /// Load an ET_EXEC ELF into this process's own AS (shared with the emulated
 /// thread): carve + map a frame per page of every PT_LOAD, then copy the file
@@ -560,7 +560,6 @@ extern "C" fn linrun_main() -> ! {
                 };
                 match action {
                     personality::foreign::Action::Return(v) => {
-                        let _ = v;
                         let mut rep = Message::new(ipc::labels::kernel::FOREIGN_SYSCALL);
                         rep.words[0] = v as u64;
                         let mut sys = Syscalls::new(&mut raw);

@@ -89,7 +89,7 @@ thread_trampoline:
 .global SYS_RET
 .align 8
 SYS_RET:
-    .skip 48
+    .skip 56
 .global SYS_USER_RSP_TMP
 SYS_USER_RSP_TMP:
     .skip 8

@@ -17,7 +17,7 @@ extern "C" {
     fn helios_syscall_entry();
     fn thread_trampoline();
     fn helios_switch(from_slot: *mut u64, to_ksp: u64);
-    static mut SYS_RET: [u64; 6];
+    static mut SYS_RET: [u64; 7];
 }
 
 /// Address of the fresh-thread ring-3 entry trampoline (used by
