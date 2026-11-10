@@ -62,7 +62,29 @@ cargo build -p sdk --bin init --features user --target x86_64-unknown-none --rel
 | — | `tag=0x301` | text words | any `console::WRITE` line on the serial (e.g. the demo's `helios-posix-ok\n` at `w=[0x702d736f696c6568 0x0a6b6f2d7869736f ...]`) |
 | 20 | `...0014` | sh pid | init spawns `/sh` (the scripted shell; vfs + stdout caps) |
 | 21 | `...0015` | 0 | `WAIT` for the shell: full script — builtins, `/ls`, `/cat`, `/echo`, the pipeline `cat hello posix-log | wc` (token `bytes=28 lines=0`), then `exec child 9` (the shell process becomes the child; WAIT observes its real status 9) — printed `sh ok` |
+| 22 | `...0016` | linrun pid | init spawns `/linrun` (caps: vfs, NULL, console, route-endpoint). `linrun` is a userspace **Linux-ABI emulator**: it loads an embedded static ELF, creates a THREAD_CREATE'd thread, `SET_FOREIGN`s it (its traps route raw to the emulator), and serves `open`/`read`/`write`/`mmap`/… back through the VFS/console |
+| 23 | `...0017` | 0 | `WAIT` for `linrun`: the emulated thread ran the embedded binary to completion and exited |
 | DONE | `0x494e49540000000f` | 0 | all passed (all servers reaped; clean halt) |
+
+### musl (Linux-ABI) milestone
+
+`linrun` runs a real static `zig cc -target x86_64-linux-musl -static` binary
+end-to-end: musl startup (`arch_prctl(ARCH_SET_FS)` → `Thread::SET_TLS`;
+`set_tid_address`), then `printf` (ioctl + `writev`), file I/O
+(`open`/`openat`/`read`/`close` → the VFS client), `mmap`/`brk` (region
+carve+map), and `exit_group`. Swap the embedded asset by editing `LIN_ELF` in
+`personality/src/bin/linrun.rs` (`assets/{musl_hello,musl_open,musl_mmap,musl_write,musl_noop}`):
+
+```text
+helios-musl-hello      # musl_hello — printf via musl stdio
+helios-open-ok:helios-vfs-ok   # musl_open  — open("hello") + read + write
+helios-mmap:ok         # musl_mmap  — mmap(MAP_ANONYMOUS) write/read
+```
+
+The emulator's stdout is buffered and flushed after each foreign syscall reply;
+foreign replies restore the full trap-time user GPR set (only `rax` = the Linux
+result), and the emulated thread runs on a dedicated stack VA (the emulator's
+own stack lives at `USER_STACK_TOP`).
 
 ### Pipeline console sequence (slice 14)
 
