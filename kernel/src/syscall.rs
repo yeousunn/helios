@@ -320,90 +320,12 @@ fn clear_park(tid: ThreadId) {
 /// Priority: `call` reply → bound notification (NOTIFIED + mask) → endpoint
 /// delivery (completed recv).
 pub fn park_result(tid: ThreadId) -> Option<crate::entry::SyscallReturn> {
-    // 0. A `call` reply delivered while parked → complete the call. The
-    // thread's implicit *request* reply slot (who to answer when serving)
-    // must survive nested calls: a server that calls out mid-request
-    // (e.g. PS loading a program through the VFS) still owes its answer to
-    // the original requester. Only consuming a *request* (endpoint delivery
-    // below) rebinds the slot; consuming a reply must not clear it.
-    {
-        let mut d = crate::endpoint::DELIVERED_FOR_REPLY.lock();
-        if let Some(env) = d.take(tid) {
-            clear_park(tid);
-            // ADR-044 (DS's musl blocker): a FOREIGN-parked thread's reply
-            // carries the full 64-bit Linux result in word[0] — the widened
-            // SyscallReturn.status lands it in rax on the sysret (native
-            // i32 errno values sign-extend identically). Non-foreign
-            // completions keep status = 0 with the words as data.
-            let foreign = sched::get(tid)
-                .map(|t| t.foreign_ep.is_some())
-                .unwrap_or(false);
-            if foreign {
-                // ADR-044 (foreign restore): the trap frame holds the
-                // trap-time user GPRs — [num, cap(=rdi), tag(=rsi), w0(=rdx),
-                // w1(=r10), w2(=r8), w3(=r9)]. Restore the FULL set, changing
-                // only rax = the reply's word[0] (the Linux result). rcx/r11
-                // are clobbered by `syscall` per the Linux ABI.
-                let f = sched::get(tid).map(|t| t.trap_frame).unwrap_or([0; 7]);
-                return Some(crate::entry::SyscallReturn {
-                    status: env.msg.words[0] as i64,
-                    tag: Tag(f[3]),              // user rdx
-                    w: [f[2], f[1], f[5], f[6]], // rsi, rdi, r8, r9
-                    r10: f[4],                   // user r10
-                });
-            }
-            return Some(crate::entry::SyscallReturn::ok(env.msg.tag, env.msg.words));
-        }
-    }
-    // 1. Bound notification pending → NOTIFIED + mask (schema §4).
-    if let Ok(t) = sched::get(tid) {
-        if let Some(n) = t.bound_notification {
-            if let Ok(mask) = crate::notification::pending(n) {
-                if mask != 0 {
-                    let _ = crate::notification::take(n);
-                    clear_park(tid);
-                    return Some(crate::entry::SyscallReturn::ok(
-                        Tag::new(ipc::labels::kernel::NOTIFY).with_flags(ipc::flags::NOTIFIED),
-                        [mask, 0, 0, 0],
-                    ));
-                }
-            }
-        }
-    }
-    // 2. Endpoint delivery → complete the recv into the parking process's
-    //    table (cap install + implicit reply, then the message).
-    if let Some(env) = endpoint::take_delivered(tid) {
-        let park_pid = {
-            let p = PARKS.lock();
-            p.who
-                .iter()
-                .find_map(|s| s.as_ref().filter(|(t, _, _)| *t == tid))
-                .map(|(_, _, pid)| *pid)
-        };
-        clear_park(tid);
-        let mut env = env;
-        if let Some(ppid) = park_pid {
-            set_reply_if_call(&env, tid);
-            install_transfers(ppid, &mut env);
-        }
-        return Some(crate::entry::SyscallReturn::ok(env.msg.tag, env.msg.words));
-    }
-    // 3. Deadline expiry (ADR-041): nothing was delivered and the timeout
-    //    fired — report ETIMEDOUT. Delivery checks above win on a race
-    //    (clear_park then clears the stale flag).
-    if let Ok(t) = sched::get(tid) {
-        if t.timed_out {
-            sched::clear_timed_out(tid);
-            clear_park(tid);
-            return Some(crate::entry::SyscallReturn {
-                status: ipc::status::ETIMEDOUT as i64,
-                tag: Tag(0),
-                w: [0; 4],
-                r10: 0,
-            });
-        }
-    }
-    None
+    // ADR-044 dedup: the REAL resume-path implementation lives in
+    // `entry::park_result` (the arch resume calls it — including the ADR-044
+    // foreign restore, the ADR-038 blocked-notification check, and the
+    // ADR-041 deadline step). This delegate exists for host tests that
+    // exercise the resume contract without the arch entry.
+    crate::entry::park_result(tid)
 }
 
 /// ADR-047: mint a one-shot Reply cap from the caller's implicit reply slot

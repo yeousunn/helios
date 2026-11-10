@@ -133,6 +133,7 @@ pub fn park_result(tid: ThreadId) -> Option<SyscallReturn> {
     // (see `set_reply_if_call`), whichever completion path delivered them.
     if let Some(mut env) = crate::endpoint::take_delivered(tid) {
         let (pid, _) = current();
+        syscall::clear_park_entry(tid);
         syscall::install_transfers(pid, &mut env);
         syscall::set_reply_if_call(&env, tid);
         // ADR-044 (foreign restore): the arch resume path calls THIS function
@@ -164,7 +165,7 @@ pub fn park_result(tid: ThreadId) -> Option<SyscallReturn> {
             if mask != 0 {
                 let _ = crate::notification::clear(obj, mask);
                 return Some(SyscallReturn::ok(
-                    Tag::new(0).with_flags(flags::NOTIFIED),
+                    Tag::new(ipc::labels::kernel::NOTIFY).with_flags(flags::NOTIFIED),
                     [mask, 0, 0, 0],
                 ));
             }
@@ -180,7 +181,7 @@ pub fn park_result(tid: ThreadId) -> Option<SyscallReturn> {
         if mask > 0 {
             let _ = crate::notification::clear(n, mask);
             return Some(SyscallReturn::ok(
-                Tag::new(0).with_flags(flags::NOTIFIED),
+                Tag::new(ipc::labels::kernel::NOTIFY).with_flags(flags::NOTIFIED),
                 [mask, 0, 0, 0],
             ));
         }
