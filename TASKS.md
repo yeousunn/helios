@@ -789,3 +789,10 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 
 - **DS's slice 33g (getdents/readdir) verified green**: the musl `opendir("/")`/`readdir` program lists real VFS entries, the run completes with DONE + clean halt. Checklist item 2 closed.
 - **Kernel: idle-by-design.** The Phase-3 kernel surface is complete (foreign emulation + TLS + deferred replies + register restore + higher-half + timers); every DS blocker has been resolved within a session; the growable FrameRefs is signal-gated (23%); no consumer exists for the handler-delivery signals design yet (v0 kill+notify suffices until a ported applet breaks on it). The kernel takes no further slices until a userspace need surfaces — virtio-blk (NV) remains the critical path for busybox.
+
+## DS (Phase 3 slice 33h — signals v0, 2026-11-10) — COMPLETE
+
+- [x] DS done 2026-11-10 — **A static musl `raise(SIGTERM)` program prints its pre-raise line then dies with status 143 (128+SIGTERM); `helios-after-raise` never prints.** GLM's checklist item 3.
+- `foreign`: `linux::KILL`(62)/`TKILL`(200)/`TGKILL`(234); a self-directed signal whose default action terminates (`default_terminates`, excluding CHLD/CONT/STOP/TSTP/TTIN/TTOU/URG/WINCH) ends the process with `128+sig` (the shell convention); ignore/stop/continue signals are no-ops. Unit-tested (sigterm_kills_self, sigchld_is_ignored). Asset `personality/assets/musl_sig`.
+- **Deferred (ADR when a ported applet needs it):** real POSIX signal *handler* delivery (handlers/EINTR/sigreturn) — v0 synthesizes death only, per GLM's checklist.
+- **Remaining DS (GLM checklist item 4):** login/auth (`servers/auth` stub → user DB + login flow + per-user shell session).

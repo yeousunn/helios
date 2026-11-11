@@ -47,6 +47,9 @@ pub mod linux {
     pub const NANOSLEEP: u64 = 35;
     pub const RT_SIGRETURN: u64 = 15;
     pub const CLOCK_GETTIME: u64 = 228;
+    pub const KILL: u64 = 62;
+    pub const TKILL: u64 = 200;
+    pub const TGKILL: u64 = 234;
 }
 
 /// `arch_prctl` sub-codes.
@@ -126,6 +129,13 @@ fn read_cstr<H: Host>(host: &mut H, addr: u64, out: &mut [u8]) -> usize {
     out[..n].iter().position(|&b| b == 0).unwrap_or(n)
 }
 
+/// Signals v0: does this signal number's default action terminate the process?
+/// (Excludes the ignore/stop/continue defaults: CHLD, CONT, STOP, TSTP, TTIN,
+/// TTOU, URG, WINCH.)
+pub fn default_terminates(sig: u32) -> bool {
+    !matches!(sig, 17 | 18 | 19 | 20 | 21 | 22 | 23 | 28)
+}
+
 /// Decode one foreign syscall and act via `host`. `args` are the six integer
 /// arguments in Linux order (rdi, rsi, rdx, r10, r8, r9).
 pub fn dispatch<H: Host>(num: u64, args: [u64; 6], host: &mut H) -> Action {
@@ -177,6 +187,23 @@ pub fn dispatch<H: Host>(num: u64, args: [u64; 6], host: &mut H) -> Action {
         }
         linux::BRK => Action::Return(host.brk(args[0])),
         linux::EXIT | linux::EXIT_GROUP => Action::Exit(args[0] as i32),
+        // Signals v0 (single process): a self-directed *terminating* signal
+        // ends the process (128+sig, the shell convention); signals whose
+        // default action is ignore/stop/continue are no-ops. Real POSIX
+        // handler delivery is the deferred ADR (GLM's checklist).
+        linux::KILL | linux::TKILL | linux::TGKILL => {
+            // kill(pid,sig) / tkill(tid,sig): sig is arg1; tgkill(g,t,sig): arg2.
+            let sig = if num == linux::TGKILL {
+                args[2]
+            } else {
+                args[1]
+            };
+            if default_terminates(sig as u32) {
+                Action::Exit(0x80 | (sig as i32 & 0x7f))
+            } else {
+                Action::Return(0)
+            }
+        }
         linux::ARCH_PRCTL => match args[0] {
             // Set the thread's TLS base (musl/libc startup does this before
             // any %fs access). The kernel applies it via Thread::SET_TLS.
@@ -450,6 +477,20 @@ mod tests {
         assert_eq!(u16::from_le_bytes([m.mem[80], m.mem[81]]), 24); // d_reclen
         assert_eq!(m.mem[82], 8); // d_type = DT_REG
         assert_eq!(m.mem[83], b'a'); // d_name
+    }
+
+    #[test]
+    fn sigterm_kills_self() {
+        let mut m = Mock::new();
+        let a = dispatch(linux::KILL, [1, 15, 0, 0, 0, 0], &mut m);
+        assert_eq!(a, Action::Exit(0x8f));
+    }
+
+    #[test]
+    fn sigchld_is_ignored() {
+        let mut m = Mock::new();
+        let a = dispatch(linux::TGKILL, [1, 1, 17, 0, 0, 0], &mut m);
+        assert_eq!(a, Action::Return(0));
     }
 
     #[test]
