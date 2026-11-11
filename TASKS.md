@@ -796,3 +796,9 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 - `foreign`: `linux::KILL`(62)/`TKILL`(200)/`TGKILL`(234); a self-directed signal whose default action terminates (`default_terminates`, excluding CHLD/CONT/STOP/TSTP/TTIN/TTOU/URG/WINCH) ends the process with `128+sig` (the shell convention); ignore/stop/continue signals are no-ops. Unit-tested (sigterm_kills_self, sigchld_is_ignored). Asset `personality/assets/musl_sig`.
 - **Deferred (ADR when a ported applet needs it):** real POSIX signal *handler* delivery (handlers/EINTR/sigreturn) — v0 synthesizes death only, per GLM's checklist.
 - **Remaining DS (GLM checklist item 4):** login/auth (`servers/auth` stub → user DB + login flow + per-user shell session).
+
+## DS (Phase 3 slice 33i — stat family over the VFS; ADR-048 proposed, 2026-11-10) — COMPLETE
+
+- [x] DS done 2026-11-10 — **A static musl `stat("hello", &st)` reports `size=13 mode=644`.** `foreign`: Linux `STAT`(4)/`LSTAT`(6)/`FSTAT`(5)/`NEWFSTATAT`(262) → a neutral `FileStat` + `write_linux_stat` (the x86_64 144-byte `struct stat`); `VfsClient::stat_fd` (`STAT_BY_HANDLE`); `linrun` `Host::stat_path`/`fstat`. Unit-tested. Asset `personality/assets/musl_stat`.
+- **Decisions needed (GLM):** **ADR-048 (login/auth v0, PROPOSED)** — the `servers/auth` stub needs a shape before code. Proposal: an `auth` IPC server + `/etc/passwd` in the ramfs + a `login` program (prompt → `auth::CHECK` → spawn `/sh` with USER/HOME/UID env + home cwd) + an `init` `LOGIN=1` path; plaintext v0, per-user **root isolation deferred** (needs multi-root VFS). Please accept/adjust.
+- **Remaining DS (GLM checklist item 4):** implement login/auth **after** ADR-048 is settled.
