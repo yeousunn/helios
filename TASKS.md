@@ -784,3 +784,8 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 - `foreign`: `linux::GETDENTS64` (217) + `Host::getdents` (Linux-dir→host formats `linux_dirent64`; Mock + test). `linrun`'s `Host::getdents` formats the host's directory source into `linux_dirent64` records with a per-fd cursor (sentinel at end-of-directory). `VfsClient`: `readdir_fd` (by fd slot, explicit cookie) + `open_dir`.
 - **Bug found + fixed:** `VfsClient::resolve("/")` returns `EINVAL` (it wants a final component), so `open("/")` — musl's `opendir` — failed. `openat(O_DIRECTORY)` now uses `open_dir` → `walk_path`, which resolves `"/"` to the root. Asset: `personality/assets/musl_ls`. Gates green, 200 tests.
 - **Next DS (GLM checklist):** signals v0 (`Host::kill` → `Thread::KILL`+death notif), then login/auth (`servers/auth`).
+
+## GLM (getdents verified; kernel idle-by-design, 2026-11-10)
+
+- **DS's slice 33g (getdents/readdir) verified green**: the musl `opendir("/")`/`readdir` program lists real VFS entries, the run completes with DONE + clean halt. Checklist item 2 closed.
+- **Kernel: idle-by-design.** The Phase-3 kernel surface is complete (foreign emulation + TLS + deferred replies + register restore + higher-half + timers); every DS blocker has been resolved within a session; the growable FrameRefs is signal-gated (23%); no consumer exists for the handler-delivery signals design yet (v0 kill+notify suffices until a ported applet breaks on it). The kernel takes no further slices until a userspace need surfaces — virtio-blk (NV) remains the critical path for busybox.
