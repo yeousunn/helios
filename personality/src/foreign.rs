@@ -50,6 +50,10 @@ pub mod linux {
     pub const KILL: u64 = 62;
     pub const TKILL: u64 = 200;
     pub const TGKILL: u64 = 234;
+    pub const FSTAT: u64 = 5;
+    pub const STAT: u64 = 4;
+    pub const LSTAT: u64 = 6;
+    pub const NEWFSTATAT: u64 = 262;
 }
 
 /// `arch_prctl` sub-codes.
@@ -64,6 +68,29 @@ pub const EINVAL: i64 = -22;
 pub const EBADF: i64 = -9;
 pub const ENOSYS: i64 = -38;
 pub const EPERM: i64 = -1;
+
+/// A host file's metadata (neutral; hosts map their own stat-bearing types).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FileStat {
+    pub kind: u8,
+    pub mode: u32,
+    pub size: u64,
+}
+
+/// Format a Linux x86_64 `struct stat` (144 bytes) into `out`.
+pub fn write_linux_stat(out: &mut [u8], s: FileStat) {
+    if out.len() < 144 {
+        return;
+    }
+    out[..144].fill(0);
+    let ifmt: u32 = if s.kind == 2 { 0o040000 } else { 0o100000 };
+    out[8..16].copy_from_slice(&1u64.to_le_bytes()); // st_ino
+    out[16..24].copy_from_slice(&(if s.kind == 2 { 2u64 } else { 1u64 }).to_le_bytes()); // nlink
+    out[24..28].copy_from_slice(&(ifmt | (s.mode & 0o7777)).to_le_bytes()); // st_mode
+    out[48..56].copy_from_slice(&(s.size as i64).to_le_bytes()); // st_size
+    out[56..64].copy_from_slice(&4096i64.to_le_bytes()); // st_blksize
+    out[64..72].copy_from_slice(&(s.size.div_ceil(512) as i64).to_le_bytes()); // st_blocks
+}
 
 /// The emulator's decision for one foreign syscall.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -90,6 +117,10 @@ pub trait Host {
     /// Linux `getdents64`: fill `out` with linux_dirent64 records (the host
     /// formats them from its directory source). Returns bytes written.
     fn getdents(&mut self, fd: i32, out: &mut [u8]) -> i64;
+    /// `fstat` — stat an open fd (host maps its stat-bearing type).
+    fn fstat(&mut self, fd: i32) -> Result<FileStat, i64>;
+    /// `stat`/`lstat`/`newfstatat` — stat by path.
+    fn stat_path(&mut self, path: &[u8]) -> Result<FileStat, i64>;
     /// Read from file descriptor `fd` into `out`.
     fn read_fd(&mut self, fd: i32, out: &mut [u8]) -> i64;
     /// Close a file descriptor.
@@ -245,6 +276,33 @@ pub fn dispatch<H: Host>(num: u64, args: [u64; 6], host: &mut H) -> Action {
             }
             Action::Return(total)
         }
+        linux::FSTAT => match host.fstat(args[0] as i32) {
+            Ok(st) => {
+                let mut b = [0u8; 144];
+                write_linux_stat(&mut b, st);
+                let w = host.mem_write(args[1], &b);
+                Action::Return(if w < 0 { EFAULT } else { 0 })
+            }
+            Err(e) => Action::Return(e),
+        },
+        linux::STAT | linux::LSTAT | linux::NEWFSTATAT => {
+            let (parg, barg) = if num == linux::NEWFSTATAT {
+                (args[1], args[2])
+            } else {
+                (args[0], args[1])
+            };
+            let mut p = [0u8; 256];
+            let n = read_cstr(host, parg, &mut p);
+            match host.stat_path(&p[..n]) {
+                Ok(st) => {
+                    let mut b = [0u8; 144];
+                    write_linux_stat(&mut b, st);
+                    let w = host.mem_write(barg, &b);
+                    Action::Return(if w < 0 { EFAULT } else { 0 })
+                }
+                Err(e) => Action::Return(e),
+            }
+        }
         // Legacy `open(2)` (musl's `open` uses this on x86_64): path is arg0
         // (no dirfd), flags arg1, mode arg2 — dirfd is implicitly AT_FDCWD.
         linux::OPEN => {
@@ -392,6 +450,20 @@ mod tests {
             self.closed = fd;
             0
         }
+        fn fstat(&mut self, _fd: i32) -> Result<FileStat, i64> {
+            Ok(FileStat {
+                kind: 1,
+                mode: 0o644,
+                size: 3,
+            })
+        }
+        fn stat_path(&mut self, _path: &[u8]) -> Result<FileStat, i64> {
+            Ok(FileStat {
+                kind: 1,
+                mode: 0o644,
+                size: 3,
+            })
+        }
         fn getdents(&mut self, _fd: i32, out: &mut [u8]) -> i64 {
             // One fake entry: ino=7, off=1, reclen=24, type=8(DT_REG), "a\0".
             if out.len() < 24 {
@@ -477,6 +549,32 @@ mod tests {
         assert_eq!(u16::from_le_bytes([m.mem[80], m.mem[81]]), 24); // d_reclen
         assert_eq!(m.mem[82], 8); // d_type = DT_REG
         assert_eq!(m.mem[83], b'a'); // d_name
+    }
+
+    #[test]
+    fn fstat_writes_linux_stat() {
+        let mut m = Mock::new();
+        let a = dispatch(linux::FSTAT, [3, 64, 0, 0, 0, 0], &mut m);
+        assert_eq!(a, Action::Return(0));
+        // The struct is at the statbuf arg (64): st_mode at +24, st_size at +48.
+        let mode = u32::from_le_bytes([m.mem[88], m.mem[89], m.mem[90], m.mem[91]]);
+        assert_eq!(mode, 0o100000 | 0o644);
+        let size = u64::from_le_bytes(m.mem[112..120].try_into().unwrap());
+        assert_eq!(size, 3);
+    }
+
+    #[test]
+    fn newfstatat_writes_linux_stat() {
+        let mut m = Mock::new();
+        m.mem[200..206].copy_from_slice(b"hello\0");
+        let a = dispatch(
+            linux::NEWFSTATAT,
+            [(-100i64) as u64, 200, 64, 0, 0, 0],
+            &mut m,
+        );
+        assert_eq!(a, Action::Return(0));
+        let size = u64::from_le_bytes(m.mem[112..120].try_into().unwrap());
+        assert_eq!(size, 3);
     }
 
     #[test]

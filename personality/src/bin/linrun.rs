@@ -317,6 +317,40 @@ impl personality::foreign::Host for Emu<'_> {
         }
         off as i64
     }
+    fn fstat(&mut self, fd: i32) -> Result<personality::foreign::FileStat, i64> {
+        if fd < 3 {
+            return Err(-9); // EBADF
+        }
+        let Some(vfs) = self.vfs.as_deref_mut() else {
+            return Err(-9);
+        };
+        let mut sys = Syscalls::new(self.raw);
+        vfs.stat_fd(&mut sys, (fd as u32) - 3)
+            .map(|s| personality::foreign::FileStat {
+                kind: s.kind,
+                mode: s.mode,
+                size: s.size,
+            })
+            .map_err(|e| -(e as i64))
+    }
+    fn stat_path(&mut self, path: &[u8]) -> Result<personality::foreign::FileStat, i64> {
+        let Some(vfs) = self.vfs.as_deref_mut() else {
+            return Err(-2); // ENOENT
+        };
+        let name = match path.iter().position(|&b| b == 0) {
+            Some(n) => &path[..n],
+            None => path,
+        };
+        let mut sys = Syscalls::new(self.raw);
+        match vfs.stat(&mut sys, name) {
+            Ok(s) => Ok(personality::foreign::FileStat {
+                kind: s.kind,
+                mode: s.mode,
+                size: s.size,
+            }),
+            Err(e) => Err(-(e as i64)),
+        }
+    }
     fn readlink(&mut self, _path: &[u8], _out: &mut [u8]) -> i64 {
         -2
     }

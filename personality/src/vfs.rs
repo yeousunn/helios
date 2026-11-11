@@ -447,6 +447,7 @@ pub const KIND_FILE: u8 = 1;
 pub const KIND_DIR: u8 = 2;
 
 const STAT_BY_NAME: u32 = 1;
+const STAT_BY_HANDLE: u32 = 0;
 
 const EMFILE: Status = status::EMFILE;
 
@@ -457,6 +458,29 @@ impl VfsClient {
     }
 
     /// `STAT` by name under the root.
+    /// `fstat` by VFS **fd slot** (Linux `fstat`): stats the slot's handle.
+    pub fn stat_fd<R: RawSyscalls>(
+        &mut self,
+        sys: &mut Syscalls<R>,
+        fd: u32,
+    ) -> Result<Stat, Status> {
+        let entry = self.fds.get(fd as usize).copied().flatten().ok_or(EBADF)?;
+        let mut req = Message::new(methods::vfs::STAT);
+        req.words[0] = entry.handle;
+        req.words[1] = 0;
+        req.words[2] = STAT_BY_HANDLE as u64;
+        let reply = sys.call(self.conn, &req)?;
+        if reply.words[0] != 0 {
+            return Err(reply.words[0] as i64 as i32);
+        }
+        let packed = reply.words[1];
+        Ok(Stat {
+            kind: packed as u8,
+            mode: ((packed >> 8) & 0xFF_FFFF) as u32,
+            size: reply.words[2],
+        })
+    }
+
     pub fn stat<R: RawSyscalls>(
         &mut self,
         sys: &mut Syscalls<R>,
