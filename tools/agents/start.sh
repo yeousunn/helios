@@ -46,10 +46,16 @@ mkdir -p "$CTRL/logs" "$REPO/.agents"
 rm -f "$CTRL/STOP"
 for a in "${AGENTS[@]}"; do rm -f "$CTRL/STOP-$a"; done
 
-# Fresh control copies (read-only to the agents through the sandbox).
-chmod -R u+w "$CTRL" 2>/dev/null || true
-cp "$SRC/sandbox.sb" "$SRC/opencode.json" "$SRC/prompt.md" "$SRC/run-agent.sh" "$SRC/hooks/commit-msg" "$CTRL/"
+# Fresh control copies (read-only to the agents through the sandbox), taken
+# from the committed version, not the working tree.
+for f in sandbox.sb opencode.json prompt.md run-agent.sh hooks/commit-msg; do
+    git -C "$REPO" show "HEAD:tools/agents/$f" >"$CTRL/$(basename "$f")"
+done
 echo "$REPO" >"$CTRL/repo-path"
+# The agents run with this PATH, inside the sandbox only. The supervisor itself
+# uses a fixed system PATH and calls opencode by absolute path.
+echo "$PATH" >"$CTRL/agent-path"
+command -v opencode >"$CTRL/opencode-bin"
 shasum -a 256 "$REPO/AGENTS.md" | cut -d' ' -f1 >"$CTRL/AGENTS.md.sha256"
 chmod 0755 "$CTRL/run-agent.sh" "$CTRL/commit-msg"
 install -m 0755 "$CTRL/commit-msg" "$REPO/.git/hooks/commit-msg"

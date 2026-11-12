@@ -40,10 +40,10 @@ tag_of() {
 if [ "${1:-}" = "--audit" ]; then
     commit="$2"
     subject="$(git log -1 --format=%s "$commit")"
-    files="$(git diff-tree --no-commit-id --name-only --no-renames -r --root "$commit")"
+    list_files() { git -c core.quotePath=false diff-tree -z --no-commit-id --name-only --no-renames -r --root "$commit"; }
 else
     subject="$(head -n 1 "$1")"
-    files="$(git diff --cached --name-only --no-renames)"
+    list_files() { git -c core.quotePath=false diff --cached -z --name-only --no-renames; }
 fi
 
 tag="$(tag_of "$subject")"
@@ -62,10 +62,9 @@ if [ -n "$expected" ] && [ "$tag" != "$expected" ]; then
 fi
 
 bad=()
-while IFS= read -r f; do
-    [ -z "$f" ] && continue
+while IFS= read -r -d '' f; do
     owner_ok "$tag" "$f" || bad+=("$f")
-done <<<"$files"
+done < <(list_files)
 
 if [ "${#bad[@]}" -gt 0 ]; then
     echo "commit-msg: [$tag] does not own these files (AGENTS.md section 1):" >&2

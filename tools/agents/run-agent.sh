@@ -8,9 +8,18 @@
 # Usage: run-agent.sh nv|glm|ds
 set -uo pipefail
 
+# The supervisor never runs programs from PATH entries an agent could reach.
+# The agent gets the owner's PATH (recorded by start.sh) only inside the
+# sandbox, where every directory on it is read-only.
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
+
 NAME="${1:?usage: run-agent.sh nv|glm|ds}"
 CTRL="${HELIOS_CTRL:-$HOME/.local/state/helios-agents}"
 REPO="$(cat "$CTRL/repo-path")"
+AGENT_PATH="$(cat "$CTRL/agent-path")"
+OPENCODE_BIN="$(cat "$CTRL/opencode-bin")"
+GTIMEOUT_BIN="$(command -v gtimeout)"
+TMP_REAL="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
 WORK="$REPO/.agents" # agent-writable: build dirs and serial logs only
 CYCLE_TIMEOUT="${CYCLE_TIMEOUT:-10800}" # 3 hours per cycle
 
@@ -35,7 +44,6 @@ case "$NAME" in
         ;;
     *) echo "unknown agent: $NAME" >&2; exit 2 ;;
 esac
-TAGWORD="$(echo "$NAME" | tr '[:lower:]' '[:upper:]')"
 
 mkdir -p "$CTRL/logs" "$WORK"
 export HELIOS_AGENT="$NAME"
@@ -62,9 +70,9 @@ case "$NAME" in
     glm) OWN_DIRS="kernel kernel-boot caps ipc"; OWN_ROOT="kernel.ld" ;;
     ds) OWN_DIRS="servers personality sdk"; OWN_ROOT="" ;;
     nv) OWN_DIRS="hal drivers graphics tools tests .github docs .cargo"
-        OWN_ROOT="PLAN.md Cargo.toml .gitignore README.md LICENSE LICENSE-MIT LICENSE-APACHE" ;;
+        OWN_ROOT="PLAN.md Cargo.toml .gitignore .gitattributes README.md LICENSE LICENSE-MIT LICENSE-APACHE" ;;
 esac
-ALL_ROOT="kernel.ld PLAN.md Cargo.toml .gitignore README.md LICENSE LICENSE-MIT LICENSE-APACHE"
+ALL_ROOT="kernel.ld PLAN.md Cargo.toml .gitignore .gitattributes README.md LICENSE LICENSE-MIT LICENSE-APACHE"
 re_escape() { printf '%s' "$1" | sed 's/[][\.*^$()+?{}|]/\\&/g'; }
 
 make_profile() {
@@ -81,6 +89,14 @@ make_profile() {
         for d in $OWN_DIRS; do echo "(allow file-write* (subpath \"$REPO/$d\"))"; done
         for f in $ALL_ROOT; do
             case " $OWN_ROOT " in *" $f "*) ;; *) echo "(deny file-write* (literal \"$REPO/$f\"))" ;; esac
+        done
+        # No agent may rename, replace or delete an existing top-level entry
+        # (a directory node or a root file) except the shared files and its
+        # own root files. Writes inside owned directories stay allowed.
+        local e
+        for e in $(ls -A "$REPO"); do
+            case " TASKS.md Cargo.lock $OWN_ROOT " in *" $e "*) continue ;; esac
+            echo "(deny file-write* (literal \"$REPO/$e\"))"
         done
         echo "(deny file-write* (literal \"$REPO/AGENTS.md\") (subpath \"$REPO/tools/agents\"))"
         echo "(deny file-write* (literal \"$REPO/.git\") (subpath \"$REPO/.git/hooks\") (subpath \"$REPO/.git/info\")"
@@ -129,29 +145,35 @@ audit() { # start-commit refs-before
         esac
         (cd "$REPO" && env -u HELIOS_AGENT "$CTRL/commit-msg" --audit "$c" 2>>"$CTRL/violations.log") ||
             halt_all "commit $c breaks directory ownership"
-        worktree_check "$c"
     done
+    worktree_check "$1"
 }
 
 blob_or_none() { g rev-parse -q --verify "$1" 2>/dev/null || echo none; }
 
-# A commit built with git plumbing can carry another agent's tag and touch only
+# Commits built with git plumbing can carry another agent's tag and touch only
 # that agent's files, without the sandbox ever letting the forger write those
-# files on disk. Such a commit leaves the working tree holding the version from
-# before the commit. An honest commit never does: its author edited the file on
-# disk first. Only paths that no later commit changed again are checked.
-worktree_check() { # commit
-    local c="$1" p in_commit before on_disk
-    while IFS= read -r p; do
-        case "$p" in TASKS.md | docs/DECISIONS.md | Cargo.lock | "") continue ;; esac
-        in_commit="$(blob_or_none "$c:$p")"
-        [ "$(blob_or_none "HEAD:$p")" = "$in_commit" ] || continue
-        before="$(blob_or_none "$c^:$p")"
-        if [ -f "$REPO/$p" ]; then on_disk="$(g hash-object -- "$REPO/$p")"; else on_disk=none; fi
-        if [ "$on_disk" = "$before" ] && [ "$on_disk" != "$in_commit" ]; then
-            halt_all "commit $c changed $p only inside .git (the file on disk still has the old version)"
+# files on disk. Whatever chain of commits it uses, the file on disk is left at
+# its version from before the cycle while history moved on. An honest change
+# never looks like that: its author edited the file on disk first.
+worktree_check() { # start-commit
+    local p at_start at_head on_disk
+    while IFS= read -r -d '' p; do
+        case "$p" in TASKS.md | docs/DECISIONS.md | Cargo.lock) continue ;; esac
+        at_start="$(blob_or_none "$1:$p")"
+        at_head="$(blob_or_none "HEAD:$p")"
+        [ "$at_start" != "$at_head" ] || continue
+        if [ -f "$REPO/$p" ] && [ ! -L "$REPO/$p" ]; then
+            on_disk="$(g hash-object --no-filters -- "$REPO/$p")"
+        elif [ -e "$REPO/$p" ] || [ -L "$REPO/$p" ]; then
+            halt_all "$p changed during the cycle and is not a regular file on disk"
+        else
+            on_disk=none
         fi
-    done < <(g diff-tree --no-commit-id --name-only --no-renames -r "$c")
+        if [ "$on_disk" = "$at_start" ]; then
+            halt_all "$p changed in history during the cycle, but the file on disk still has its version from before (changed only inside .git)"
+        fi
+    done < <(g -c core.quotePath=false diff -z --name-only --no-renames "$1" HEAD)
 }
 
 if [ "${2:-}" = "--print-profile" ]; then # for testing: write and print the profile, then exit
@@ -181,9 +203,10 @@ while true; do
         -e "s|{{SERIAL}}|$SERIAL_LOG|g" "$CTRL/prompt.md")"
 
     log "cycle $cycle start -> $(basename "$out")"
-    sandbox-exec -f "$profile" -D HOME="$HOME" -D CTRL="$CTRL" \
-        gtimeout --kill-after=60 "$CYCLE_TIMEOUT" \
-        opencode run -m "$MODEL" --auto --title "$TAG cycle $cycle $(date '+%F %H:%M')" \
+    sandbox-exec -f "$profile" -D HOME="$HOME" -D CTRL="$CTRL" -D TMP="$TMP_REAL" \
+        "$GTIMEOUT_BIN" --kill-after=60 "$CYCLE_TIMEOUT" \
+        /usr/bin/env PATH="$AGENT_PATH" \
+        "$OPENCODE_BIN" run -m "$MODEL" --auto --title "$TAG cycle $cycle $(date '+%F %H:%M')" \
         "$prompt" </dev/null >"$out" 2>&1
     rc=$?
     result="$(grep -aoE 'CYCLE-RESULT: [A-Z]+' "$out" | tail -n 1)"

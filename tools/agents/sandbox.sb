@@ -1,22 +1,30 @@
 ;; macOS sandbox base for one unattended agent cycle.
 ;; run-agent.sh appends the per-agent repository rules (which directories this
 ;; agent owns) and runs: sandbox-exec -f <control>/sandbox-<agent>.sb
-;; Parameters: HOME, CTRL (the supervisor's control directory).
+;; Parameters: HOME, CTRL (the supervisor's control directory), TMP (the real
+;; path of the user's TMPDIR).
 ;;
-;; Everything under HOME is read-only except the toolchain and opencode
-;; caches, the control directory is read-only, and ~/.ssh is unreadable.
-;; Later rules win.
+;; Writes are denied everywhere except the places the work needs: temp dirs,
+;; cargo's download caches and opencode's own data. Toolchains, Homebrew,
+;; ~/.cargo/bin and every other binary stay read-only, so an agent cannot plant
+;; a program that the supervisor or the owner would later run. The control
+;; directory is read-only and ~/.ssh is unreadable. Later rules win.
 (version 1)
 (allow default)
 
-(deny file-write* (subpath (param "HOME")))
+(deny file-write* (subpath "/"))
 (allow file-write*
-    (subpath (string-append (param "HOME") "/.cargo"))
-    (subpath (string-append (param "HOME") "/.rustup"))
+    (subpath "/private/tmp")
+    (subpath (param "TMP"))
+    (subpath "/dev")
+    (subpath (string-append (param "HOME") "/.cargo/registry"))
+    (subpath (string-append (param "HOME") "/.cargo/git"))
+    (literal (string-append (param "HOME") "/.cargo/.package-cache"))
+    (literal (string-append (param "HOME") "/.cargo/.package-cache-mutate"))
+    (literal (string-append (param "HOME") "/.cargo/.global-cache"))
     (subpath (string-append (param "HOME") "/.local/share/opencode"))
     (subpath (string-append (param "HOME") "/.local/state/opencode"))
-    (subpath (string-append (param "HOME") "/.cache"))
-    (subpath (string-append (param "HOME") "/Library/Caches")))
+    (subpath (string-append (param "HOME") "/.cache/opencode")))
 
 (deny file-write* (subpath (param "CTRL")))
 (deny file-read* file-write* (subpath (string-append (param "HOME") "/.ssh")))
