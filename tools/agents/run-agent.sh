@@ -51,6 +51,44 @@ export SERIAL_LOG="$WORK/serial-$NAME.log"
 
 log() { echo "$(date '+%F %T') $*" | tee -a "$CTRL/$NAME.history"; }
 
+# The supervisor's own git calls ignore hooks, fsmonitor and system config,
+# so nothing the agent planted in the repo runs with supervisor rights.
+export GIT_CONFIG_NOSYSTEM=1
+g() { git -C "$REPO" -c core.hooksPath=/dev/null -c core.fsmonitor= "$@"; }
+
+# Per-agent sandbox profile: the base rules plus write access to the agent's
+# own directories only. Ownership is enforced by the file system, not by tags.
+case "$NAME" in
+    glm) OWN_DIRS="kernel kernel-boot caps ipc"; OWN_ROOT="kernel.ld" ;;
+    ds) OWN_DIRS="servers personality sdk"; OWN_ROOT="" ;;
+    nv) OWN_DIRS="hal drivers graphics tools tests .github docs .cargo"
+        OWN_ROOT="PLAN.md Cargo.toml .gitignore README.md LICENSE LICENSE-MIT LICENSE-APACHE" ;;
+esac
+ALL_ROOT="kernel.ld PLAN.md Cargo.toml .gitignore README.md LICENSE LICENSE-MIT LICENSE-APACHE"
+re_escape() { printf '%s' "$1" | sed 's/[][\.*^$()+?{}|]/\\&/g'; }
+
+make_profile() {
+    local p="$CTRL/sandbox-$NAME.sb" re d f
+    re="$(re_escape "$REPO")"
+    {
+        cat "$CTRL/sandbox.sb"
+        # Root-level files (shared TASKS.md and Cargo.lock, and the temp files
+        # that in-place editors create next to them). Owned root files are
+        # carved out again below.
+        echo "(allow file-write* (regex #\"^$re/[^/]+\$\"))"
+        echo "(allow file-write* (regex #\"^$re/docs/DECISIONS\\.md[^/]*\$\"))"
+        echo "(allow file-write* (subpath \"$REPO/.git\") (subpath \"$WORK/target-$NAME\") (literal \"$WORK/serial-$NAME.log\"))"
+        for d in $OWN_DIRS; do echo "(allow file-write* (subpath \"$REPO/$d\"))"; done
+        for f in $ALL_ROOT; do
+            case " $OWN_ROOT " in *" $f "*) ;; *) echo "(deny file-write* (literal \"$REPO/$f\"))" ;; esac
+        done
+        echo "(deny file-write* (literal \"$REPO/AGENTS.md\") (subpath \"$REPO/tools/agents\"))"
+        echo "(deny file-write* (literal \"$REPO/.git\") (subpath \"$REPO/.git/hooks\") (subpath \"$REPO/.git/info\")"
+        echo "    (literal \"$REPO/.git/config\") (literal \"$REPO/.git/config.worktree\") (literal \"$REPO/.git/commondir\"))"
+    } >"$p"
+    echo "$p"
+}
+
 halt_all() { # reason
     echo "$(date '+%F %T') [$NAME] $1" >>"$CTRL/violations.log"
     log "VIOLATION: $1. Stopping all agents."
@@ -59,29 +97,45 @@ halt_all() { # reason
 }
 
 preflight() {
+    [ -d "$REPO/.git" ] && [ ! -L "$REPO/.git" ] || halt_all ".git is not a plain directory"
     [ "$(shasum -a 256 "$REPO/AGENTS.md" | cut -d' ' -f1)" = "$(cat "$CTRL/AGENTS.md.sha256")" ] ||
         halt_all "AGENTS.md differs from the copy recorded by start.sh (re-run start.sh after a human edit)"
     if ! cmp -s "$CTRL/commit-msg" "$REPO/.git/hooks/commit-msg"; then
         log "commit-msg hook missing or changed, reinstalling"
         install -m 0755 "$CTRL/commit-msg" "$REPO/.git/hooks/commit-msg"
     fi
-    [ -z "$(git -C "$REPO" config --get core.hooksPath)" ] || halt_all "core.hooksPath is set"
+    local extra
+    extra="$(ls -A "$REPO/.git/hooks" | grep -v -e '\.sample$' -e '^commit-msg$')"
+    [ -z "$extra" ] || halt_all "unexpected git hooks: $extra"
+    # Plain git here, not g(): g() itself overrides hooksPath.
+    [ -z "$(git -C "$REPO" config --get core.hooksPath)" ] || halt_all "core.hooksPath is set, the ownership hook would not run"
+    [ "$(g symbolic-ref -q HEAD)" = "refs/heads/main" ] || halt_all "HEAD is not on main"
 }
 
-audit() { # start-commit
-    git -C "$REPO" merge-base --is-ancestor "$1" HEAD || halt_all "history before $1 was rewritten"
+refs_except_main() { g for-each-ref --format='%(refname) %(objectname)' | grep -v '^refs/heads/main '; }
+
+audit() { # start-commit refs-before
+    [ "$(g symbolic-ref -q HEAD)" = "refs/heads/main" ] || halt_all "HEAD left main during the cycle"
+    [ "$(refs_except_main)" = "$2" ] || halt_all "branches, tags or other refs changed during the cycle"
+    g merge-base --is-ancestor "$1" HEAD || halt_all "history before $1 was rewritten"
+    [ -z "$(g rev-list --min-parents=2 "$1"..HEAD)" ] || halt_all "merge commit during the cycle"
     local c subject
-    for c in $(git -C "$REPO" rev-list --reverse "$1"..HEAD); do
-        subject="$(git -C "$REPO" log -1 --format=%s "$c")"
+    # Every new commit, whoever made it: tagged, and touching only files its tag owns.
+    for c in $(g rev-list --reverse "$1"..HEAD); do
+        subject="$(g log -1 --format=%s "$c")"
         case "$subject" in
             "[NV]"* | "[GLM]"* | "[DS]"*) ;;
             *) halt_all "untagged commit $c during a $TAG cycle: $subject" ;;
         esac
-        case "$subject" in "$TAG"*) ;; *) continue ;; esac # other agents audit their own
         (cd "$REPO" && env -u HELIOS_AGENT "$CTRL/commit-msg" --audit "$c" 2>>"$CTRL/violations.log") ||
             halt_all "commit $c breaks directory ownership"
     done
 }
+
+if [ "${2:-}" = "--print-profile" ]; then # for testing: write and print the profile, then exit
+    cat "$(make_profile)"
+    exit 0
+fi
 
 fails=0
 cycle=0
@@ -94,7 +148,9 @@ while true; do
         exit 0
     fi
     preflight
-    start="$(git rev-parse HEAD)"
+    start="$(g rev-parse HEAD)"
+    refs_before="$(refs_except_main)"
+    profile="$(make_profile)"
 
     cycle=$((cycle + 1))
     out="$CTRL/logs/$NAME-$(date +%Y%m%d-%H%M%S).log"
@@ -103,14 +159,14 @@ while true; do
         -e "s|{{SERIAL}}|$SERIAL_LOG|g" "$CTRL/prompt.md")"
 
     log "cycle $cycle start -> $(basename "$out")"
-    sandbox-exec -f "$CTRL/sandbox.sb" -D HOME="$HOME" -D REPO="$REPO" -D CTRL="$CTRL" \
+    sandbox-exec -f "$profile" -D HOME="$HOME" -D CTRL="$CTRL" \
         gtimeout --kill-after=60 "$CYCLE_TIMEOUT" \
         opencode run -m "$MODEL" --auto --title "$TAG cycle $cycle $(date '+%F %H:%M')" \
         "$prompt" </dev/null >"$out" 2>&1
     rc=$?
     result="$(grep -aoE 'CYCLE-RESULT: [A-Z]+' "$out" | tail -n 1)"
-    log "cycle $cycle end rc=$rc ${result:-no-result} commits=$(git rev-list --count "$start"..HEAD 2>/dev/null)"
-    audit "$start"
+    log "cycle $cycle end rc=$rc ${result:-no-result} commits=$(g rev-list --count "$start"..HEAD 2>/dev/null)"
+    audit "$start" "$refs_before"
 
     case "$result" in
         "CYCLE-RESULT: DONE" | "CYCLE-RESULT: PROGRESS")

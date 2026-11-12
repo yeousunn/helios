@@ -1,17 +1,16 @@
-;; macOS sandbox for one unattended agent cycle (sandbox-exec -f this-file).
-;; Parameters: HOME, REPO, CTRL (the supervisor's control directory).
+;; macOS sandbox base for one unattended agent cycle.
+;; run-agent.sh appends the per-agent repository rules (which directories this
+;; agent owns) and runs: sandbox-exec -f <control>/sandbox-<agent>.sb
+;; Parameters: HOME, CTRL (the supervisor's control directory).
 ;;
-;; The agent may write the repository (except the human-owned files and git
-;; hooks/config), temp directories, the Rust toolchain caches and opencode's
-;; own data. Everything else under HOME is read-only, the control directory is
-;; read-only, and ~/.ssh is unreadable.
+;; Everything under HOME is read-only except the toolchain and opencode
+;; caches, the control directory is read-only, and ~/.ssh is unreadable.
+;; Later rules win.
 (version 1)
 (allow default)
 
-;; Read-only home, then the holes the work needs. Later rules win.
 (deny file-write* (subpath (param "HOME")))
 (allow file-write*
-    (subpath (param "REPO"))
     (subpath (string-append (param "HOME") "/.cargo"))
     (subpath (string-append (param "HOME") "/.rustup"))
     (subpath (string-append (param "HOME") "/.local/share/opencode"))
@@ -19,13 +18,7 @@
     (subpath (string-append (param "HOME") "/.cache"))
     (subpath (string-append (param "HOME") "/Library/Caches")))
 
-;; Human-owned files and git plumbing inside the repo stay read-only.
-(deny file-write*
-    (literal (string-append (param "REPO") "/AGENTS.md"))
-    (subpath (string-append (param "REPO") "/tools/agents"))
-    (subpath (string-append (param "REPO") "/.git/hooks"))
-    (literal (string-append (param "REPO") "/.git/config"))
-    (subpath (param "CTRL")))
-
-;; Never readable.
+(deny file-write* (subpath (param "CTRL")))
 (deny file-read* file-write* (subpath (string-append (param "HOME") "/.ssh")))
+
+;; ---- per-agent repository rules follow (generated) ----
