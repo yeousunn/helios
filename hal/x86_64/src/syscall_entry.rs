@@ -259,7 +259,7 @@ fn store_ret(ret: SyscallReturn) {
     // SAFETY: single-CPU v0; `SYS_RET` is only touched on the syscall path.
     unsafe {
         let p = core::ptr::addr_of_mut!(SYS_RET) as *mut u64;
-        p.write_volatile(ret.status as i64 as u64);
+        p.write_volatile(ret.status as u64);
         p.add(1).write_volatile(ret.tag.0);
         p.add(2).write_volatile(ret.w[0]);
         p.add(3).write_volatile(ret.w[1]);

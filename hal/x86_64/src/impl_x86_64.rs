@@ -13,6 +13,7 @@ use hal::{EarlyBoot, Framebuffer, Gdt as HalGdt, Idt as HalIdt, Irq, Timer, Uart
 use kernel::aspace;
 use kernel::console::Level;
 use kernel::entry;
+use kernel::frame;
 use kernel::sched;
 
 /// COM1 I/O base address.
@@ -125,6 +126,55 @@ unsafe fn port_inb(port: u16) -> u8 {
         core::arch::asm!("in al, dx", in("dx") port, lateout("al") value, options(nostack));
     }
     value
+}
+
+#[inline(always)]
+unsafe fn port_outl(port: u16, value: u32) {
+    // SAFETY: Raw 32-bit I/O port write; PCI config address/data ports are safe.
+    unsafe {
+        core::arch::asm!("out dx, eax", in("dx") port, in("eax") value, options(nostack));
+    }
+}
+
+#[inline(always)]
+unsafe fn port_inl(port: u16) -> u32 {
+    let value: u32;
+    // SAFETY: Raw 32-bit I/O port read; PCI config address/data ports are safe.
+    unsafe {
+        core::arch::asm!("in eax, dx", in("dx") port, lateout("eax") value, options(nostack));
+    }
+    value
+}
+
+// ---------------------------------------------------------------------------
+// PCI config space (IO-port mechanism, ADR-016 PciBus)
+// ---------------------------------------------------------------------------
+
+/// PCI configuration address register (IO port).
+const PCI_CONFIG_ADDR: u16 = 0xCF8;
+/// PCI configuration data register (IO port).
+const PCI_CONFIG_DATA: u16 = 0xCFC;
+
+/// Build the PCI config-space address for `bus`/`device`/`function`/`offset`.
+///
+/// `offset` must be 4-byte aligned; the low 2 bits are masked out.
+#[inline(always)]
+fn pci_config_addr(bus: u8, dev: u8, fn_: u8, offset: u8) -> u32 {
+    // SAFETY: Pure bit construction; no port access.
+    (1u32 << 31) // enable bit
+        | ((bus as u32) << 16)
+        | ((dev as u32) << 11)
+        | ((fn_ as u32) << 8)
+        | ((offset as u32) & 0xFC)
+}
+
+/// Read a vendor ID to test whether a PCI function exists.
+fn pci_function_present(bus: u8, dev: u8, fn_: u8) -> bool {
+    // SAFETY: PCI config address/data ports are safe to program.
+    unsafe {
+        port_outl(PCI_CONFIG_ADDR, pci_config_addr(bus, dev, fn_, 0));
+        port_inl(PCI_CONFIG_DATA) != 0xFFFF_FFFF
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -480,47 +530,150 @@ impl Default for PciBusX86_64 {
 }
 
 impl PciBus for PciBusX86_64 {
-    fn enumerate(&mut self, _out: &mut [(u8, u8, u8)]) -> usize {
-        // SAFETY: No-op stub; PCI enumeration lands with virtio-blk/net drivers.
-        0
+    fn enumerate(&mut self, out: &mut [(u8, u8, u8)]) -> usize {
+        // x86_64 bring-up targets a single PCI bus (bus 0). Scan every device
+        // / function and record the ones that respond with a valid vendor ID.
+        let mut count = 0;
+        for dev in 0..32u8 {
+            if !pci_function_present(0, dev, 0) {
+                continue;
+            }
+            if count < out.len() {
+                out[count] = (0, dev, 0);
+                count += 1;
+            }
+            // Multi-function device? Bit 7 of the header-type byte (config reg
+            // 0x0C, byte 3) indicates additional functions on this device.
+            // SAFETY: PCI config space reads are safe.
+            let header = unsafe { self.config_read32(0, dev, 0, 0x0C) };
+            let multi_fn = (header >> 16) & 0x80 != 0;
+            if multi_fn {
+                for fn_ in 1..8u8 {
+                    if pci_function_present(0, dev, fn_) && count < out.len() {
+                        out[count] = (0, dev, fn_);
+                        count += 1;
+                    }
+                }
+            }
+        }
+        count
     }
-    unsafe fn config_read32(&mut self, _bus: u8, _dev: u8, _fn: u8, _offset: u8) -> u32 {
-        // SAFETY: No-op stub.
-        0
+
+    unsafe fn config_read32(&mut self, bus: u8, dev: u8, fn_: u8, offset: u8) -> u32 {
+        // SAFETY: PCI config address/data ports are safe to program.
+        unsafe {
+            port_outl(PCI_CONFIG_ADDR, pci_config_addr(bus, dev, fn_, offset));
+            port_inl(PCI_CONFIG_DATA)
+        }
     }
-    unsafe fn config_write32(&mut self, _bus: u8, _dev: u8, _fn: u8, _offset: u8, _value: u32) {
-        // SAFETY: No-op stub.
+
+    unsafe fn config_write32(&mut self, bus: u8, dev: u8, fn_: u8, offset: u8, value: u32) {
+        // SAFETY: PCI config address/data ports are safe to program.
+        unsafe {
+            port_outl(PCI_CONFIG_ADDR, pci_config_addr(bus, dev, fn_, offset));
+            port_outl(PCI_CONFIG_DATA, value);
+        }
     }
-    unsafe fn set_bus_master(&mut self, _bus: u8, _dev: u8, _fn: u8, _enable: bool) {
-        // SAFETY: No-op stub.
+
+    unsafe fn set_bus_master(&mut self, bus: u8, dev: u8, fn_: u8, enable: bool) {
+        // Command register is at offset 0x04; bus-master enable is bit 2.
+        // SAFETY: PCI config space reads/writes are safe.
+        let cmd = unsafe { self.config_read32(bus, dev, fn_, 0x04) };
+        let mask: u32 = 1 << 2;
+        let cmd = if enable { cmd | mask } else { cmd & !mask };
+        unsafe { self.config_write32(bus, dev, fn_, 0x04, cmd) };
     }
-    unsafe fn bar_info(&mut self, _bus: u8, _dev: u8, _fn: u8, _bar: u8) -> Option<(u64, u64)> {
-        // SAFETY: No-op stub.
-        None
+
+    unsafe fn bar_info(&mut self, bus: u8, dev: u8, fn_: u8, bar: u8) -> Option<(u64, u64)> {
+        if bar >= 6 {
+            return None;
+        }
+        let offset = 0x10 + bar * 4;
+        // SAFETY: PCI config space reads/writes are safe.
+        let base = unsafe { self.config_read32(bus, dev, fn_, offset) };
+        if base == 0 || base == 0xFFFF_FFFF {
+            return None;
+        }
+        let is_mmio = (base & 1) == 0;
+        let addr_mask = if is_mmio { 0xFFFFFFF0 } else { 0xFFFFFFFC };
+        let addr = base & addr_mask;
+        // Probe the BAR size: write all 1s, read back the writable mask.
+        let orig = base;
+        // SAFETY: PCI config space write is safe.
+        unsafe { self.config_write32(bus, dev, fn_, offset, 0xFFFF_FFFF) };
+        let size_raw = unsafe { self.config_read32(bus, dev, fn_, offset) };
+        // Restore the original BAR value.
+        // SAFETY: PCI config space write is safe.
+        unsafe { self.config_write32(bus, dev, fn_, offset, orig) };
+        let size_mask = if is_mmio { 0xFFFFFFF0 } else { 0xFFFFFFFC };
+        let size = ((!size_raw) & size_mask).wrapping_add(1);
+        if size == 0 {
+            return None;
+        }
+        if is_mmio {
+            // 64-bit BAR: the next register holds the high 32 bits of the address.
+            // SAFETY: PCI config space read is safe.
+            let base_hi = unsafe { self.config_read32(bus, dev, fn_, offset + 4) };
+            let pa = (addr as u64) | ((base_hi as u64) << 32);
+            Some((pa, size as u64))
+        } else {
+            Some((addr as u64, size as u64))
+        }
     }
 }
 
-pub struct VirtioX86_64;
+/// Virtio device over MMIO. Holds the device's mapped MMIO base address so
+/// the trait methods (which take no device argument) can address it.
+#[derive(Default)]
+pub struct VirtioX86_64 {
+    mmio_base: usize,
+}
 
-impl Default for VirtioX86_64 {
-    fn default() -> Self {
-        Self
+impl VirtioX86_64 {
+    /// Configure the device's MMIO base address (from a PCI BAR via
+    /// `PciBus::bar_info` + `MmioRegion::map_mmio`). Call before any virtio
+    /// operation.
+    pub fn set_mmio_base(&mut self, base: usize) {
+        self.mmio_base = base;
+    }
+
+    /// Read a u32 from a virtio MMIO register offset.
+    fn mmio_read32(&self, offset: usize) -> u32 {
+        // SAFETY: `mmio_base` points at a mapped virtio device MMIO region.
+        unsafe { core::ptr::read_volatile((self.mmio_base + offset) as *const u32) }
+    }
+
+    /// Write a u32 to a virtio MMIO register offset.
+    fn mmio_write32(&self, offset: usize, value: u32) {
+        // SAFETY: `mmio_base` points at a mapped writable virtio MMIO region.
+        unsafe {
+            core::ptr::write_volatile((self.mmio_base + offset) as *mut u32, value);
+        }
     }
 }
+
+/// Virtio MMIO register offsets (legacy 0x10000-byte device layout).
+const VIRTIO_MMIO_QUEUE_NOTIFY: usize = 0x4C;
+const VIRTIO_MMIO_INTERRUPT_STATUS: usize = 0x50;
+const VIRTIO_MMIO_INTERRUPT_ACK: usize = 0x54;
 
 impl Virtio for VirtioX86_64 {
-    unsafe fn notify(&mut self, _queue_sel: u16) {
-        // SAFETY: No-op stub.
+    unsafe fn notify(&mut self, queue_sel: u16) {
+        // SAFETY: writing the QueueNotify register kicks the virtio device.
+        self.mmio_write32(VIRTIO_MMIO_QUEUE_NOTIFY, queue_sel as u32);
     }
     unsafe fn read_isr(&mut self) -> u8 {
-        // SAFETY: No-op stub.
-        0
+        // SAFETY: reading the InterruptStatus register.
+        (self.mmio_read32(VIRTIO_MMIO_INTERRUPT_STATUS) & 0xFF) as u8
     }
     unsafe fn ack_used(&mut self) {
-        // SAFETY: No-op stub.
+        // SAFETY: writing the InterruptACK register acknowledges used-buffer
+        // interrupts.
+        self.mmio_write32(VIRTIO_MMIO_INTERRUPT_ACK, 0xFFFF_FFFF);
     }
 }
 
+/// DMA-safe, physically contiguous memory allocator.
 pub struct DmaX86_64;
 
 impl Default for DmaX86_64 {
@@ -530,21 +683,32 @@ impl Default for DmaX86_64 {
 }
 
 impl Dma for DmaX86_64 {
-    unsafe fn alloc_dma(&mut self, _bytes: u64, _align: u64) -> Option<(usize, usize)> {
-        // SAFETY: No-op stub; DMA allocator lands with block/net drivers.
-        None
+    unsafe fn alloc_dma(&mut self, bytes: u64, _align: u64) -> Option<(usize, usize)> {
+        // Allocate contiguous frames. Alignment is honored by rounding the
+        // byte count up; the frame allocator hands out page-aligned frames.
+        let pages = bytes.div_ceil(frame::FRAME_SIZE as u64) as usize;
+        let paddr = frame::alloc_contiguous(pages)?;
+        // SAFETY: freshly allocated frames, identity-mapped through the
+        // shared higher-half window via phys_to_virt.
+        let va = kernel::mem::phys_to_virt(paddr.as_u64()) as usize;
+        Some((va, paddr.as_u64() as usize))
     }
     unsafe fn free_dma(&mut self, _virt: usize, _phys: usize) {
-        // SAFETY: No-op stub.
+        // v0: DMA frames are intentionally leaked (no size tracked by the
+        // trait). Reclaim lands with a proper DMA pool in Phase 4.
     }
     unsafe fn sync_for_device(&mut self, _virt: usize, _bytes: u64) {
-        // SAFETY: No-op stub.
+        // x86_64 is cache-coherent; no explicit sync needed.
     }
     unsafe fn sync_for_cpu(&mut self, _virt: usize, _bytes: u64) {
-        // SAFETY: No-op stub.
+        // x86_64 is cache-coherent; no explicit sync needed.
     }
 }
 
+/// Memory-mapped I/O region access. On x86_64 the shared higher-half
+/// identity window (ADR-045 slice 2) already maps every physical page below
+/// 1 GiB at `0xFFFFFFFF80000000 + PA`, so mapping an MMIO region is just an
+/// address translation.
 pub struct MmioRegionX86_64;
 
 impl Default for MmioRegionX86_64 {
@@ -554,12 +718,13 @@ impl Default for MmioRegionX86_64 {
 }
 
 impl MmioRegion for MmioRegionX86_64 {
-    unsafe fn map_mmio(&mut self, _paddr: u64, _len: u64) -> Option<usize> {
-        // SAFETY: No-op stub; MMIO mapping lands with framebuffer/GPU drivers.
-        None
+    unsafe fn map_mmio(&mut self, paddr: u64, _len: u64) -> Option<usize> {
+        // SAFETY: `paddr` must describe a valid device MMIO region below
+        // 1 GiB (covered by the higher-half identity window).
+        Some(kernel::mem::phys_to_virt(paddr) as usize)
     }
     unsafe fn unmap_mmio(&mut self, _virt: usize, _len: u64) {
-        // SAFETY: No-op stub.
+        // The higher-half identity map is permanent; nothing to unmap.
     }
 }
 
