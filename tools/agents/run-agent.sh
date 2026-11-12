@@ -111,10 +111,14 @@ make_profile() {
 }
 
 halt_all() { # reason
-    echo "$(date '+%F %T') [$NAME] $1" >>"$CTRL/violations.log"
-    log "VIOLATION: $1. Stopping all agents."
+    # Reasons can quote commit subjects and file names, which agents control.
+    # Strip control characters so nothing can rewrite the owner's terminal.
+    local reason
+    reason="$(printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177' | cut -c1-300)"
+    echo "$(date '+%F %T') [$NAME] $reason" >>"$CTRL/violations.log"
+    log "VIOLATION: $reason. Stopping all agents."
     # start.sh refuses to run while HALTED exists, until the owner has looked.
-    echo "$(date '+%F %T') [$NAME] $1 (HEAD $(g rev-parse --short HEAD 2>/dev/null))" >>"$CTRL/HALTED"
+    echo "$(date '+%F %T') [$NAME] $reason (HEAD $(g rev-parse --short HEAD 2>/dev/null))" >>"$CTRL/HALTED"
     touch "$CTRL/STOP"
     exit 1
 }

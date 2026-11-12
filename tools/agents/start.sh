@@ -30,7 +30,7 @@ done
 # After a violation, the supervisors leave HALTED behind. Look at it first.
 if [ -f "$CTRL/HALTED" ]; then
     echo "The agents were stopped by a violation:" >&2
-    sed 's/^/  /' "$CTRL/HALTED" >&2
+    LC_ALL=C tr -cd '[:print:]\n' <"$CTRL/HALTED" | sed 's/^/  /' >&2
     echo "Details: $CTRL/violations.log" >&2
     if [ "$ACK" != 1 ]; then
         echo "Check the commits named above (git log, git show). When you are satisfied," >&2
@@ -71,11 +71,18 @@ for a in "${AGENTS[@]}"; do rm -f "$CTRL/STOP-$a"; done
 # agent write, and only when it matches HEAD. Agents can write git objects, so
 # a forged commit touching tools/agents makes the working tree differ from HEAD
 # and stops the start here.
-if ! git -C "$REPO" diff --quiet HEAD -- tools/agents; then
-    echo "tools/agents/ differs from HEAD. A commit changed the supervisor files without" >&2
-    echo "the working tree following. Inspect: git log -p -- tools/agents" >&2
-    exit 1
-fi
+# Compare bytes on disk with the HEAD blobs directly. Agents can write the git
+# index (for example an assume-unchanged flag), so git diff is not trusted here.
+for f in sandbox.sb opencode.json prompt.md run-agent.sh start.sh stop.sh status.sh hooks/commit-msg; do
+    on_disk="$(git -C "$REPO" hash-object --no-filters -- "$SRC/$f")"
+    in_head="$(git -C "$REPO" rev-parse -q --verify "HEAD:tools/agents/$f" || echo none)"
+    if [ "$on_disk" != "$in_head" ]; then
+        echo "tools/agents/$f differs from HEAD. A commit changed the supervisor files" >&2
+        echo "without the working tree following, or the file has uncommitted edits." >&2
+        echo "Inspect: git log -p -- tools/agents" >&2
+        exit 1
+    fi
+done
 
 # The supervisor runs outside the sandbox, so any change to it since the last
 # start must be approved by the owner.
