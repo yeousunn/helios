@@ -24,6 +24,11 @@ path = "src/bin/cat.rs"
 required-features = ["user"]
 
 [[bin]]
+name = "login"
+path = "src/bin/login.rs"
+required-features = ["user"]
+
+[[bin]]
 name = "ls"
 path = "src/bin/ls.rs"
 required-features = ["user"]

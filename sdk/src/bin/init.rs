@@ -67,6 +67,8 @@ const STEP_LINRUN_WAIT: u64 = 23;
 const STEP_AUTH_SPAWN: u64 = 24;
 const STEP_AUTH_READY: u64 = 25;
 const STEP_AUTH_CHECK: u64 = 26;
+const STEP_LOGIN_SPAWN: u64 = 27;
+const STEP_LOGIN_WAIT: u64 = 28;
 const STEP_DONE: u64 = 0x0F;
 /// Failure marker family for exits: `0xDEAD_0000_00SS_EEEE` (step, errno).
 const FAIL: u64 = 0xDEAD_0000_0000_0000;
@@ -609,6 +611,59 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
             return Err(fail_code(STEP_POSIX_WAIT, 0xE2 | (waited.words[1] << 8)));
         }
         mark(raw, info.debug_ep, STEP_POSIX_WAIT, waited.words[1]);
+    }
+
+    // Steps 27–28 (ADR-048 slice 2): the /login client. Spawned through PS
+    // (loaded over the VFS) with the auth service cap in optional[3]; it
+    // authenticates `user` and reports the session (exit 0 on success).
+    {
+        write_spawn_blob(b"login", &[b"login", b"user", b"user"]);
+        let spawned = {
+            let mut sys = Syscalls::new(raw);
+            let mut m = Message::new(methods::process::SPAWN);
+            m.tag = m.tag.with_caps(4);
+            let _ = m.set_descriptor(
+                0,
+                ipc::CapSlot::pack(vfs_svc, ipc::Rights::SEND.union(ipc::Rights::GRANT)),
+            );
+            let _ = m.set_descriptor(1, ipc::CapSlot::NULL);
+            let _ = m.set_descriptor(
+                2,
+                ipc::CapSlot::pack(console_svc, ipc::Rights::SEND.union(ipc::Rights::GRANT)),
+            );
+            let _ = m.set_descriptor(
+                3,
+                ipc::CapSlot::pack(auth_svc, ipc::Rights::SEND.union(ipc::Rights::GRANT)),
+            );
+            sys.call(session_ep, &m)
+                .map_err(|e| fail_code(STEP_LOGIN_SPAWN, e as u64))?
+        };
+        if spawned.words[0] != 0 || spawned.words[1] == 0 {
+            return Err(fail_code(STEP_LOGIN_SPAWN, 0xE1));
+        }
+        let login_pid = spawned.words[1];
+        mark(raw, info.debug_ep, STEP_LOGIN_SPAWN, login_pid);
+        let waited = loop {
+            let reply = {
+                let mut sys = Syscalls::new(raw);
+                let mut m = Message::new(methods::process::WAIT);
+                m.words[0] = login_pid;
+                sys.call(session_ep, &m)
+                    .map_err(|e| fail_code(STEP_LOGIN_WAIT, e as u64))?
+            };
+            if reply.words[0] == 0 {
+                break reply;
+            }
+            if reply.words[0] == ipc::status::EWOULDBLOCK as i64 as u64 {
+                let _ = Syscalls::new(raw).yield_now();
+                continue;
+            }
+            return Err(fail_code(STEP_LOGIN_WAIT, 0xE1));
+        };
+        if waited.words[1] != 0 {
+            return Err(fail_code(STEP_LOGIN_WAIT, 0xE2 | (waited.words[1] << 8)));
+        }
+        mark(raw, info.debug_ep, STEP_LOGIN_WAIT, waited.words[1]);
     }
 
     // Steps 20–21: the shell — the userland driver (scripted in v0; input

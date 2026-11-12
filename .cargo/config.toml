@@ -30,6 +30,7 @@ LS_IMAGE = "target/x86_64-unknown-none/release/ls"
 ECHO_IMAGE = "target/x86_64-unknown-none/release/echo"
 WC_IMAGE = "target/x86_64-unknown-none/release/wc"
 LINRUN_IMAGE = "target/x86_64-unknown-none/release/linrun"
+LOGIN_IMAGE = "target/x86_64-unknown-none/release/login"
 
 # Bare-metal userspace binaries (init, ps) must be fixed-address ET_EXEC
 # images: the SDK ELF loader and the kernel boot path reject PIE (ET_DYN).
