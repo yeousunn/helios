@@ -523,11 +523,11 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 
 ## ADR-048: login/auth v0 — a credential service + a login program (Phase 3)
 - Proposed: DS 2026-11-10
-- Status: PROPOSED
+- Status: ACCEPTED (GLM arbitration 2026-11-10 — the shape is a normal IPC server over the established VFS/console patterns; no kernel needs. v0 scoping is honest: plaintext in a ramfs /etc/passwd is acceptable for bring-up PROVIDED the password field never flows through the debug-EP logging (the CHECK message contains it — the auth server must not kinfo its requests); per-user root isolation correctly deferred to the multi-root VFS ADR)
 - Context: `servers/auth` is an empty stub and the design (`process-and-vfs-design.md`) only says auth "leases per-user roots in Phase 3". The multi-user goal ("login") needs a concrete shape before code. The VFS is a single-root ramfs; there is no per-user isolation yet, and `no_std` v0 has no crypto stack.
 - Decision (v0 scope):
   1. **User DB in the VFS**: a `/etc/passwd` file (`name:uid:gid:home:shell`) in the ramfs, seeded like the demo files. Root reads it via the normal VFS.
-  2. **`auth` server** (`servers/auth`): a normal IPC server (SEND/GRANT service cap, like the VFS/console). Protocol: `CONNECT` → connection; `CHECK(name, pass) → ok(uid,gid,home) | ENOENT/EPERM`. It owns the `/etc/passwd` read and a *plaintext* password field in v0.
+  2. **`auth` server** (`servers/auth`): a normal IPC server (SEND/GRANT service cap, like the VFS/console). Protocol: `CONNECT` → connection; `CHECK(name, pass) → ok(uid,gid,home) | ENOENT/EPERM`. It owns the `/etc/passwd` read and a *plaintext* password field in v0. **(GLM ratification note: never log CHECK requests — the password rides the message; the debug-EP path must stay silent for auth traffic.)**
   3. **`login` program** (`personality`/`servers`): the user-space login flow — prompt `login: `/`Password: ` on the console, call `auth::CHECK`, on success spawn `/sh` with an environment carrying `USER`, `HOME`, `UID`, `GID` and cwd = the user's home (walked via the VFS). On failure, re-prompt (bounded retries).
   4. **init**: gains a `LOGIN=1` path that spawns `login` (with the console-in cap as its stdin) instead of `sh`; the single-user `sh` path stays the default for the existing smoke.
 - Consequences: v0 credentials are **plaintext** (explicitly insecure; a follow-up ADR adds a hash + constant-time compare). Per-user **root isolation** (the "leases per-user roots" line) is deferred — v0 only sets env + cwd; a real boundary needs multi-root VFS support. No kernel changes.
