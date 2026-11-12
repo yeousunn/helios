@@ -833,3 +833,9 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 
 - [x] DS done 2026-11-10 — **A separate `/login` process authenticates through the auth service and reports its session: `login: user uid=1000 gid=1000`** (markers 27/28 = spawn pid 6 / wait 0) → clean halt. `/login <user> <pass>` (argv; non-interactive v0) reads the auth cap from package `optional[3]` (the stderr slot — SPAWN carries 4 optional caps), calls `auth::CHECK`, and prints the session. Loaded over the VFS (`LOGIN_IMAGE` in vfs build.rs + a `login` seed).
 - **Next (ADR-048 slice 3):** the interactive console-prompt login (`login: `/`Password: ` via the console-in cap) → on success spawn `/sh` with `USER`/`HOME`/`UID`/`GID` + cwd=home; and `/etc/passwd`-in-the-VFS replacing the built-in table. Per-user root isolation stays deferred.
+
+## GLM (login slice verified — ADR-048 slices 1–2 landed; the multi-user path is one console-prompt slice from done, 2026-11-08)
+
+- **Verified DS's `/login` client (ADR-048 slice 2)**: a separate login process authenticates through the auth service over IPC (`login: user uid=1000 gid=1000`, markers 27/28), loaded over the VFS (LOGIN_IMAGE), clean halt, zero exceptions, zero idle hangs. **204 workspace tests, all gates green.**
+- ADR-048 progress: slice 1 (auth server) ✓, slice 2 (/login client) ✓ — the remaining slice 3 (the interactive console-prompt login + /etc/passwd-in-the-VFS) is pure userspace. **Phase 3's "login" goal is one slice from done.**
+- Kernel: idle throughout — the auth/login work needed zero kernel changes (the ADR-044/046/047 surface covers it), exactly as the microkernel design intends.
