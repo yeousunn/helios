@@ -1062,9 +1062,30 @@ pub static CURRENT_KSTACK: core::sync::atomic::AtomicU64 = core::sync::atomic::A
 /// written only on change). IA32_FS_BASE = 0xC0000100.
 pub static CURRENT_FS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Ceiling for a canonical x86_64 user address: bits 63..47 must all be
+/// zero (the lower half). A kernel-range or non-canonical FS base faults in
+/// ring 0 at the next context switch, so reject it here as defense in depth
+/// for `Thread::SET_TLS` (S3). `write_fs_base` asserts this before `wrmsr`.
+const FS_BASE_USER_CEIL: u64 = 0x0000_8000_0000_0000;
+
+/// True iff `va` is a canonical x86_64 user address (lower half, sign bit
+/// clear): `va < 0x0000_8000_0000_0000`.
+fn fs_base_is_canonical_user(va: u64) -> bool {
+    va < FS_BASE_USER_CEIL
+}
+
 /// Write IA32_FS_BASE (musl TLS via Thread::SET_TLS).
 pub fn write_fs_base(va: u64) {
-    // SAFETY: `wrmsr` writes the FS-base MSR; single-CPU v0, kernel context.
+    // S3b: reject a non-canonical or kernel-range FS base before touching the
+    // MSR — a bad base faults in ring 0 at the next switch.
+    if !fs_base_is_canonical_user(va) {
+        panic!(
+            "write_fs_base: non-canonical/user FS base {:#x} (must be < {:#x})",
+            va, FS_BASE_USER_CEIL
+        );
+    }
+    // SAFETY: `wrmsr` writes the FS-base MSR; single-CPU v0, kernel context;
+    // `va` is a canonical user base (checked above).
     unsafe {
         core::arch::asm!(
             "wrmsr",
@@ -1393,5 +1414,46 @@ pub unsafe fn arch_boot() -> ! {
     // Should never reach here: start_first switches to init and never comes back.
     loop {
         core::hint::spin_loop();
+    }
+}
+
+// S3b host unit tests: the canonical-user FS-base check. `write_fs_base`
+// panics on a bad base before reaching `wrmsr`, so `catch_unwind` runs it
+// safely on the host (dev profile unwinds; the privileged instruction is
+// never executed for a rejected base).
+#[cfg(test)]
+extern crate std;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fs_base_is_canonical_user_bounds() {
+        // Canonical user addresses (lower half) are accepted.
+        assert!(fs_base_is_canonical_user(0));
+        assert!(fs_base_is_canonical_user(0x7FFF_FFFF_FFFF));
+        assert!(fs_base_is_canonical_user(0x0000_7FFF_FFFF_FFFF));
+        // Just above the ceiling is not a canonical user address.
+        assert!(!fs_base_is_canonical_user(FS_BASE_USER_CEIL));
+        assert!(!fs_base_is_canonical_user(FS_BASE_USER_CEIL + 1));
+        // Kernel range is not a valid user FS base.
+        assert!(!fs_base_is_canonical_user(0xFFFF_8000_0000_0000));
+        // Non-canonical high half is rejected.
+        assert!(!fs_base_is_canonical_user(0xFFFF_7FFF_FFFF_FFFF));
+    }
+
+    #[test]
+    fn write_fs_base_rejects_non_canonical_base() {
+        // A kernel-range base must panic before `wrmsr` (which would fault in
+        // ring 0). On host this unwinds cleanly instead of executing the
+        // privileged instruction.
+        let result = std::panic::catch_unwind(|| {
+            write_fs_base(0xFFFF_8000_0000_0000);
+        });
+        assert!(
+            result.is_err(),
+            "expected write_fs_base to panic on a kernel-range FS base"
+        );
     }
 }
