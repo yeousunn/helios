@@ -64,6 +64,9 @@ const STEP_SH_SPAWN: u64 = 20;
 const STEP_SH_WAIT: u64 = 21;
 const STEP_LINRUN: u64 = 22;
 const STEP_LINRUN_WAIT: u64 = 23;
+const STEP_AUTH_SPAWN: u64 = 24;
+const STEP_AUTH_READY: u64 = 25;
+const STEP_AUTH_CHECK: u64 = 26;
 const STEP_DONE: u64 = 0x0F;
 /// Failure marker family for exits: `0xDEAD_0000_00SS_EEEE` (step, errno).
 const FAIL: u64 = 0xDEAD_0000_0000_0000;
@@ -212,6 +215,60 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
             .filter(|h| *h != 0)
             .ok_or(fail_code(STEP_CONSOLE_READY, 0xE2))?;
         mark(raw, info.debug_ep, STEP_CONSOLE_READY, svc as u64);
+        (svc, death)
+    };
+
+    // Steps 24–26 (ADR-048 v0): the auth server. Spawned with the Factory cap
+    // (the default package tail); it publishes its service endpoint. init then
+    // acts as the first client — a `CHECK(user,user)` self-test must return
+    // uid 1000 — so the credential service is exercised end-to-end.
+    let (auth_svc, auth_death) = {
+        if !HAS_AUTH_IMAGE {
+            return Err(fail_code(STEP_AUTH_SPAWN, 0xE1));
+        }
+        let pid = spawn_server(
+            raw,
+            info,
+            self_as,
+            region,
+            AUTH_IMAGE,
+            STEP_AUTH_SPAWN,
+            None,
+        )?;
+        let ready_ep = SP_INIT_EP.load(SpOrdering::Relaxed);
+        let death = SP_DEATH.load(SpOrdering::Relaxed);
+        mark(raw, info.debug_ep, STEP_AUTH_SPAWN, pid);
+        let ready = {
+            let mut sys = Syscalls::new(raw);
+            sys.recv(ready_ep)
+                .map_err(|e| fail_code(STEP_AUTH_READY, e as u64))?
+        };
+        if ready.tag.label() != bootstrap::READY_LABEL || ready.words[0] != bootstrap::READY_MAGIC {
+            return Err(fail_code(STEP_AUTH_READY, 0xE1));
+        }
+        let svc = ready
+            .descriptor(0)
+            .map(|cs| cs.handle())
+            .filter(|h| *h != 0)
+            .ok_or(fail_code(STEP_AUTH_READY, 0xE2))?;
+        mark(raw, info.debug_ep, STEP_AUTH_READY, svc as u64);
+        // Self-test: CHECK("user","user") -> ok, uid 1000.
+        let checked = {
+            let mut sys = Syscalls::new(raw);
+            let n = methods::auth::pack16(b"user");
+            let p = methods::auth::pack16(b"user");
+            let mut m = Message::new(methods::auth::CHECK);
+            m.words[0] = n[0];
+            m.words[1] = n[1];
+            m.words[2] = p[0];
+            m.words[3] = p[1];
+            sys.call(svc, &m)
+                .map_err(|e| fail_code(STEP_AUTH_CHECK, e as u64))?
+        };
+        if checked.words[0] != 0 || checked.words[1] != 1000 {
+            return Err(fail_code(STEP_AUTH_CHECK, 0xE1));
+        }
+        mark(raw, info.debug_ep, STEP_AUTH_CHECK, checked.words[1]);
         (svc, death)
     };
 
@@ -730,6 +787,22 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
     {
         let mut sys = Syscalls::new(raw);
         sys.recv(vfs_death)
+            .map_err(|e| fail_code(STEP_CHILD_EXIT, e as u64))?;
+    }
+    // Shutdown: auth down (KILL acks, then it exits) and reap.
+    {
+        let mut sys = Syscalls::new(raw);
+        let kill = Message::new(methods::process::KILL);
+        let ack = sys
+            .call(auth_svc, &kill)
+            .map_err(|e| fail_code(STEP_CHILD_EXIT, e as u64))?;
+        if ack.words[0] != 0 {
+            return Err(fail_code(STEP_CHILD_EXIT, 0xE2));
+        }
+    }
+    {
+        let mut sys = Syscalls::new(raw);
+        sys.recv(auth_death)
             .map_err(|e| fail_code(STEP_CHILD_EXIT, e as u64))?;
     }
 

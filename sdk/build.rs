@@ -55,6 +55,7 @@ fn main() {
     embed("PS_IMAGE", "PS", &mut code);
     embed("VFS_IMAGE", "VFS", &mut code);
     embed("CONSOLE_IMAGE", "CONSOLE", &mut code);
+    embed("AUTH_IMAGE", "AUTH", &mut code);
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     fs::write(out_dir.join("ps_image.rs"), code).expect("write ps_image.rs");
 }

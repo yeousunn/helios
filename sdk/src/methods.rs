@@ -138,3 +138,31 @@ pub mod map_flags {
     pub const COW: u32 = 1 << 3;
     pub const ANON: u32 = 1 << 4;
 }
+
+/// `servers/auth` protocol (ADR-048).
+pub mod auth {
+    /// `CHECK` (call): `w0..w1` = the user name (16 bytes LE, NUL-padded),
+    /// `w2..w3` = the password (16 bytes LE, NUL-padded). Reply: `w0` =
+    /// status (0 = ok, negative = errno), `w1` = uid, `w2` = gid.
+    pub const CHECK: u16 = 0x0302;
+
+    /// Pack a NUL-padded ≤16-byte credential string into two words.
+    pub fn pack16(s: &[u8]) -> [u64; 2] {
+        let mut b = [0u8; 16];
+        let n = s.len().min(16);
+        b[..n].copy_from_slice(&s[..n]);
+        [
+            u64::from_le_bytes(b[0..8].try_into().unwrap()),
+            u64::from_le_bytes(b[8..16].try_into().unwrap()),
+        ]
+    }
+
+    /// Unpack a two-word credential string (stop at the first NUL).
+    pub fn unpack16(w: [u64; 2]) -> ([u8; 16], usize) {
+        let mut b = [0u8; 16];
+        b[0..8].copy_from_slice(&w[0].to_le_bytes());
+        b[8..16].copy_from_slice(&w[1].to_le_bytes());
+        let n = b.iter().position(|&c| c == 0).unwrap_or(16);
+        (b, n)
+    }
+}

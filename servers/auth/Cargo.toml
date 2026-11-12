@@ -4,4 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+user = []
+
+[[bin]]
+name = "auth"
+path = "src/bin/auth.rs"
+required-features = ["user"]
+
 [dependencies]
+ipc = { path = "../../ipc" }
+sdk = { path = "../../sdk" }
