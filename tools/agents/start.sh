@@ -1,26 +1,31 @@
 #!/usr/bin/env bash
-# Start the three unattended agents in a tmux session named "helios-agents".
+# Start the unattended agents in a tmux session named "helios-agents".
 #
 #   tools/agents/start.sh            start all three (NV first, then GLM, then DS)
 #   tools/agents/start.sh glm        start one agent
 #
+# Control files (config, prompt, sandbox, supervisor, hook, logs) live in
+# ~/.local/state/helios-agents, which the sandboxed agents cannot write.
+# Build directories and serial logs live in <repo>/.agents.
+#
 # Stop with tools/agents/stop.sh. Watch with tools/agents/status.sh or
-# `tmux attach -t helios-agents`.
+# `tmux attach -t helios-agents`. Stop the agents before you commit yourself:
+# the audit treats an untagged commit during a cycle as a violation.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SRC="$REPO/tools/agents"
-STATE="$REPO/.agents"
+CTRL="${HELIOS_CTRL:-$HOME/.local/state/helios-agents}"
 SESSION="helios-agents"
 if [ $# -gt 0 ]; then AGENTS=("$@"); else AGENTS=(nv glm ds); fi
 
-for bin in opencode tmux gtimeout qemu-system-x86_64 cargo; do
+for bin in opencode tmux gtimeout sandbox-exec shasum qemu-system-x86_64 cargo; do
     command -v "$bin" >/dev/null || { echo "missing: $bin" >&2; exit 1; }
 done
 
 # Interactive opencode sessions in this repo would fight over the same files.
 busy=""
-for p in $(pgrep -x opencode || true) $(pgrep -f '^opencode' || true); do
+for p in $(pgrep -f '^opencode' || true); do
     cwd="$(lsof -a -p "$p" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')"
     [ "$cwd" = "$REPO" ] && busy="$busy $p"
 done
@@ -30,20 +35,24 @@ if [ -n "$busy" ] && [ "${FORCE:-0}" != 1 ]; then
     exit 1
 fi
 
-mkdir -p "$STATE/logs"
-rm -f "$STATE/STOP"
-for a in "${AGENTS[@]}"; do rm -f "$STATE/STOP-$a"; done
+if [ -n "$(git -C "$REPO" status --porcelain --untracked-files=no)" ]; then
+    echo "The repo has uncommitted changes. Commit or discard them first, so no agent" >&2
+    echo "commits them under its own tag." >&2
+    git -C "$REPO" status --short --untracked-files=no >&2
+    exit 1
+fi
 
-# Run from a copy, so a stray edit in the working tree cannot change a live supervisor.
-cp "$SRC/opencode.json" "$SRC/prompt.md" "$SRC/run-agent.sh" "$STATE/"
-# The supervisors restore AGENTS.md from this copy if an agent edits it.
-cp "$REPO/AGENTS.md" "$STATE/AGENTS.md.saved"
-chmod +x "$STATE/run-agent.sh"
-# run-agent.sh resolves REPO from its own location, so point the copy at the repo.
-sed -i '' "s|^REPO=.*|REPO=\"$REPO\"|" "$STATE/run-agent.sh"
+mkdir -p "$CTRL/logs" "$REPO/.agents"
+rm -f "$CTRL/STOP"
+for a in "${AGENTS[@]}"; do rm -f "$CTRL/STOP-$a"; done
 
-# Ownership hook (AGENTS.md section 1).
-install -m 0755 "$SRC/hooks/commit-msg" "$REPO/.git/hooks/commit-msg"
+# Fresh control copies (read-only to the agents through the sandbox).
+chmod -R u+w "$CTRL" 2>/dev/null || true
+cp "$SRC/sandbox.sb" "$SRC/opencode.json" "$SRC/prompt.md" "$SRC/run-agent.sh" "$SRC/hooks/commit-msg" "$CTRL/"
+echo "$REPO" >"$CTRL/repo-path"
+shasum -a 256 "$REPO/AGENTS.md" | cut -d' ' -f1 >"$CTRL/AGENTS.md.sha256"
+chmod 0755 "$CTRL/run-agent.sh" "$CTRL/commit-msg"
+install -m 0755 "$CTRL/commit-msg" "$REPO/.git/hooks/commit-msg"
 
 if ! tmux has-session -t "$SESSION" 2>/dev/null; then
     tmux new-session -d -s "$SESSION" -n keepawake -c "$REPO" "caffeinate -dims"
@@ -56,9 +65,9 @@ for a in "${AGENTS[@]}"; do
         continue
     fi
     tmux new-window -d -t "$SESSION" -n "$a" -c "$REPO" \
-        "sleep $delay; $STATE/run-agent.sh $a; echo '[supervisor exited]'; sleep 86400"
+        "sleep $delay; HELIOS_CTRL='$CTRL' '$CTRL/run-agent.sh' $a; echo '[supervisor exited]'; sleep 86400"
     echo "started $a (after ${delay}s)"
     delay=$((delay + 120))
 done
 
-echo "tmux session: $SESSION   logs: $STATE/logs   history: $STATE/<agent>.history"
+echo "tmux session: $SESSION   control and logs: $CTRL"

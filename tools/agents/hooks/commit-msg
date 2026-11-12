@@ -1,43 +1,71 @@
 #!/usr/bin/env bash
-# Enforces directory ownership from AGENTS.md section 1 on agent commits.
-# Commits without an agent tag ([NV], [GLM], [DS]) are human commits and pass.
+# Directory ownership from AGENTS.md section 1.
+#
+# As a git commit-msg hook:   commit-msg <message-file>
+#   Checks the staged files against the tag on the first line.
+#   When HELIOS_AGENT is set (the supervisor sets it), the commit must carry
+#   that agent's tag. Commits without a tag are human commits and pass only
+#   when HELIOS_AGENT is unset.
+#
+# As the supervisor's audit:  commit-msg --audit <commit>
+#   Checks one existing commit the same way. The supervisor runs this outside
+#   the sandbox after every cycle, so it holds even if the hook was skipped.
 
-first_line=$(head -n 1 "$1")
-case "$first_line" in
-    "[NV]"*) tag=NV ;;
-    "[GLM]"*) tag=GLM ;;
-    "[DS]"*) tag=DS ;;
-    *) exit 0 ;;
-esac
+owner_ok() { # tag path
+    case "$2" in
+        AGENTS.md | tools/agents/*) return 1 ;;
+        TASKS.md | docs/DECISIONS.md | Cargo.lock) return 0 ;;
+    esac
+    case "$1" in
+        GLM) case "$2" in kernel/* | kernel-boot/* | caps/* | ipc/* | kernel.ld) return 0 ;; esac ;;
+        DS) case "$2" in servers/* | personality/* | sdk/*) return 0 ;; esac ;;
+        NV)
+            case "$2" in
+                hal/* | drivers/* | graphics/* | tools/* | tests/* | .github/* | docs/* | PLAN.md | README* | LICENSE* | Cargo.toml | .gitignore | .cargo/*) return 0 ;;
+            esac
+            ;;
+    esac
+    return 1
+}
+
+tag_of() {
+    case "$1" in
+        "[NV]"*) echo NV ;;
+        "[GLM]"*) echo GLM ;;
+        "[DS]"*) echo DS ;;
+        *) echo "" ;;
+    esac
+}
+
+if [ "${1:-}" = "--audit" ]; then
+    commit="$2"
+    subject="$(git log -1 --format=%s "$commit")"
+    files="$(git diff-tree --no-commit-id --name-only --no-renames -r --root "$commit")"
+else
+    subject="$(head -n 1 "$1")"
+    files="$(git diff --cached --name-only --no-renames)"
+fi
+
+tag="$(tag_of "$subject")"
+expected="$(echo "${HELIOS_AGENT:-}" | tr '[:lower:]' '[:upper:]')"
+
+if [ -z "$tag" ]; then
+    if [ -n "$expected" ]; then
+        echo "commit-msg: agent $expected must start the message with [$expected]." >&2
+        exit 1
+    fi
+    exit 0 # human commit
+fi
+if [ -n "$expected" ] && [ "$tag" != "$expected" ]; then
+    echo "commit-msg: you are [$expected], not [$tag]." >&2
+    exit 1
+fi
 
 bad=()
 while IFS= read -r f; do
     [ -z "$f" ] && continue
-    case "$f" in
-        AGENTS.md | tools/agents/*)
-            bad+=("$f (human-owned)")
-            continue
-            ;;
-        TASKS.md | docs/DECISIONS.md | Cargo.lock)
-            continue
-            ;;
-    esac
-    ok=0
-    case "$tag" in
-        GLM)
-            case "$f" in kernel/* | kernel-boot/* | caps/* | ipc/* | kernel.ld) ok=1 ;; esac
-            ;;
-        DS)
-            case "$f" in servers/* | personality/* | sdk/*) ok=1 ;; esac
-            ;;
-        NV)
-            case "$f" in
-                hal/* | drivers/* | graphics/* | tools/* | tests/* | .github/* | docs/* | PLAN.md | README* | LICENSE* | Cargo.toml | .gitignore | .cargo/*) ok=1 ;;
-            esac
-            ;;
-    esac
-    [ "$ok" = 1 ] || bad+=("$f")
-done < <(git diff --cached --name-only)
+    owner_ok "$tag" "$f" || bad+=("$f")
+done <<<"$files"
 
 if [ "${#bad[@]}" -gt 0 ]; then
     echo "commit-msg: [$tag] does not own these files (AGENTS.md section 1):" >&2

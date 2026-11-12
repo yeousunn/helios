@@ -6,20 +6,19 @@
 #   tools/agents/stop.sh --now     kill everything immediately (may leave half-done work)
 set -euo pipefail
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-STATE="$REPO/.agents"
+CTRL="${HELIOS_CTRL:-$HOME/.local/state/helios-agents}"
 SESSION="helios-agents"
-mkdir -p "$STATE"
+mkdir -p "$CTRL"
 
 if [ "${1:-}" = "--now" ]; then
-    touch "$STATE/STOP"
+    touch "$CTRL/STOP"
     tmux kill-session -t "$SESSION" 2>/dev/null || true
     pkill -f "opencode run -m nvidia/" 2>/dev/null || true
     echo "killed. Check 'git status' for half-done work."
 elif [ -n "${1:-}" ]; then
-    touch "$STATE/STOP-$1"
+    touch "$CTRL/STOP-$1"
     echo "$1 will stop after its current cycle."
 else
-    touch "$STATE/STOP"
+    touch "$CTRL/STOP"
     echo "all agents will stop after their current cycle. Then: tmux kill-session -t $SESSION"
 fi
