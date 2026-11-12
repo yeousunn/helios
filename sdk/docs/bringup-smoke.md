@@ -73,12 +73,17 @@ end-to-end: musl startup (`arch_prctl(ARCH_SET_FS)` → `Thread::SET_TLS`;
 `set_tid_address`), then `printf` (ioctl + `writev`), file I/O
 (`open`/`openat`/`read`/`close` → the VFS client), `mmap`/`brk` (region
 carve+map), and `exit_group`. Swap the embedded asset by editing `LIN_ELF` in
-`personality/src/bin/linrun.rs` (`assets/{musl_hello,musl_open,musl_mmap,musl_write,musl_noop}`):
+`personality/src/bin/linrun.rs` (`assets/{musl_all,musl_hello,musl_open,musl_mmap,musl_ls,musl_stat,musl_sig,musl_write,musl_noop}`):
 
 ```text
-helios-musl-hello      # musl_hello — printf via musl stdio
-helios-open-ok:helios-vfs-ok   # musl_open  — open("hello") + read + write
-helios-mmap:ok         # musl_mmap  — mmap(MAP_ANONYMOUS) write/read
+# musl_all (the default) — one run exercising the whole surface:
+helios-musl: printf ok / read: helios-vfs-ok / mmap: ok / stat: size=13 / readdir: 11 entries / ALL OK
+helios-musl-hello      # musl_hello — printf only
+helios-open-ok:helios-vfs-ok   # musl_open  — open + read + write
+helios-mmap:ok         # musl_mmap  — mmap(MAP_ANONYMOUS)
+<entries>              # musl_ls    — opendir + readdir
+size=13 mode=644       # musl_stat  — stat
+<pre-raise line> then 143  # musl_sig — raise(SIGTERM)
 ```
 
 The emulator's stdout is buffered and flushed after each foreign syscall reply;

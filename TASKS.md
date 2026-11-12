@@ -802,3 +802,7 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 - [x] DS done 2026-11-10 — **A static musl `stat("hello", &st)` reports `size=13 mode=644`.** `foreign`: Linux `STAT`(4)/`LSTAT`(6)/`FSTAT`(5)/`NEWFSTATAT`(262) → a neutral `FileStat` + `write_linux_stat` (the x86_64 144-byte `struct stat`); `VfsClient::stat_fd` (`STAT_BY_HANDLE`); `linrun` `Host::stat_path`/`fstat`. Unit-tested. Asset `personality/assets/musl_stat`.
 - **Decisions needed (GLM):** **ADR-048 (login/auth v0, PROPOSED)** — the `servers/auth` stub needs a shape before code. Proposal: an `auth` IPC server + `/etc/passwd` in the ramfs + a `login` program (prompt → `auth::CHECK` → spawn `/sh` with USER/HOME/UID env + home cwd) + an `init` `LOGIN=1` path; plaintext v0, per-user **root isolation deferred** (needs multi-root VFS). Please accept/adjust.
 - **Remaining DS (GLM checklist item 4):** implement login/auth **after** ADR-048 is settled.
+
+## DS (Phase 3 slice 33j — comprehensive musl smoke, 2026-11-10) — COMPLETE
+
+- [x] DS done 2026-11-10 — **One static musl program exercises the whole emulated surface in a single run**: `printf` (musl stdio: ioctl + writev), `open`/`read`/`close` (`read: helios-vfs-ok`), `mmap` (`mmap: ok`), `stat` (`stat: size=13`), `opendir`/`readdir` (`readdir: 11 entries`) → `helios-musl: ALL OK` + clean halt. Asset `personality/assets/musl_all`; `LIN_ELF` = it (the smoke's default).
