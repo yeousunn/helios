@@ -532,3 +532,17 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
   4. **init**: gains a `LOGIN=1` path that spawns `login` (with the console-in cap as its stdin) instead of `sh`; the single-user `sh` path stays the default for the existing smoke.
 - Consequences: v0 credentials are **plaintext** (explicitly insecure; a follow-up ADR adds a hash + constant-time compare). Per-user **root isolation** (the "leases per-user roots" line) is deferred — v0 only sets env + cwd; a real boundary needs multi-root VFS support. No kernel changes.
 - Supersedes/relates: extends `process-and-vfs-design.md` §auth.
+
+## ADR-049: Coordinator change, Phase H feature freeze, enforced ownership, unattended cycles
+- Proposed: project owner 2026-11-12
+- Status: ACCEPTED (project owner)
+- Context: A review on 2026-11-12 found that a user process can take control of the kernel (REGS_WRITE writes the kernel stack, MAP reaches the shared kernel window, SMEP/SMAP off, FMASK leaves DF set, NEW_THREAD skips the GRANT check). CI has never run on a remote, the gates skip the userspace binaries, and the repo has no README or license files. The task board had grown to 172 KB of debugging narrative.
+- Decision:
+  1. Nemotron (NV) becomes coordinator and also owns the root files, `docs/` and `PLAN.md`. GLM and DeepSeek (DS) become workers. This supersedes AGENTS.md section 1 of 2026-10-30. The new ownership table is in AGENTS.md.
+  2. Phase H, a feature freeze: only tasks S1–S11 and E1–E10 on TASKS.md (and work they create) until the freeze lifts.
+  3. The freeze lifts when S1–S11 are done with host tests, the S11 attack test passes in QEMU, E1–E5 are done (E3 counts once CI runs locally, until the human adds a remote), and E9 is done. NV records that in an ADR.
+  4. Ownership is enforced by a git `commit-msg` hook installed from `tools/agents/hooks/`. `AGENTS.md` and `tools/agents/` belong to the human owner only.
+  5. Agents run unattended through `tools/agents/run-agent.sh`: one task per fresh session, with a per-agent build directory and serial log.
+  6. The old board is archived at `docs/history/TASKS-2026-10-30_to_2026-11-12.md`. The new board allows at most two lines per task.
+- Validation: every future ADR that adds or changes a syscall argument states its allowed range and the error returned otherwise.
+- Consequences: Feature work stops until the kernel is safe against its own userspace. The old hotfix rule ("fix the workspace regardless of ownership") is replaced: a broken build goes in Blockers, addressed to the owner, and the owner fixes it first.

@@ -1,0 +1,65 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permission": {
+    "edit": {
+      "*": "allow",
+      "*AGENTS.md": "deny",
+      "*tools/agents/*": "deny",
+      "*.git/*": "deny"
+    },
+    "read": {
+      "*": "allow",
+      "*/.ssh/*": "deny",
+      "*.env": "deny",
+      "*/.local/share/opencode/*": "deny",
+      "*/.config/opencode/opencode.json*": "deny"
+    },
+    "external_directory": {
+      "*": "deny",
+      "/tmp/*": "allow",
+      "/private/tmp/*": "allow",
+      "~/.cargo/*": "allow",
+      "~/.rustup/*": "allow",
+      "~/.local/share/opencode/tool-output/*": "allow"
+    },
+    "bash": {
+      "*": "allow",
+      "git push*": "deny",
+      "git remote*": "deny",
+      "git reset*": "deny",
+      "git rebase*": "deny",
+      "git clean*": "deny",
+      "git stash*": "deny",
+      "git checkout*": "deny",
+      "git restore*": "deny",
+      "git switch*": "deny",
+      "git config*": "deny",
+      "git filter-branch*": "deny",
+      "git update-ref*": "deny",
+      "*--amend*": "deny",
+      "*--no-verify*": "deny",
+      "*core.hooksPath*": "deny",
+      "git add -A*": "deny",
+      "git add .*": "deny",
+      "git commit -a*": "deny",
+      "gh *": "deny",
+      "sudo *": "deny",
+      "ssh *": "deny",
+      "scp *": "deny",
+      "*.ssh*": "deny",
+      "*auth.json*": "deny",
+      "opencode*": "deny",
+      "launchctl*": "deny",
+      "crontab*": "deny",
+      "killall*": "deny",
+      "pkill -f opencode*": "deny",
+      "tmux*": "deny",
+      "rm -rf /": "deny",
+      "rm -rf ~*": "deny",
+      "rm -rf $HOME*": "deny"
+    },
+    "question": "deny",
+    "doom_loop": "allow",
+    "webfetch": "allow"
+  }
+}

@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Enforces directory ownership from AGENTS.md section 1 on agent commits.
+# Commits without an agent tag ([NV], [GLM], [DS]) are human commits and pass.
+
+first_line=$(head -n 1 "$1")
+case "$first_line" in
+    "[NV]"*) tag=NV ;;
+    "[GLM]"*) tag=GLM ;;
+    "[DS]"*) tag=DS ;;
+    *) exit 0 ;;
+esac
+
+bad=()
+while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    case "$f" in
+        AGENTS.md | tools/agents/*)
+            bad+=("$f (human-owned)")
+            continue
+            ;;
+        TASKS.md | docs/DECISIONS.md | Cargo.lock)
+            continue
+            ;;
+    esac
+    ok=0
+    case "$tag" in
+        GLM)
+            case "$f" in kernel/* | kernel-boot/* | caps/* | ipc/* | kernel.ld) ok=1 ;; esac
+            ;;
+        DS)
+            case "$f" in servers/* | personality/* | sdk/*) ok=1 ;; esac
+            ;;
+        NV)
+            case "$f" in
+                hal/* | drivers/* | graphics/* | tools/* | tests/* | .github/* | docs/* | PLAN.md | README* | LICENSE* | Cargo.toml | .gitignore | .cargo/*) ok=1 ;;
+            esac
+            ;;
+    esac
+    [ "$ok" = 1 ] || bad+=("$f")
+done < <(git diff --cached --name-only)
+
+if [ "${#bad[@]}" -gt 0 ]; then
+    echo "commit-msg: [$tag] does not own these files (AGENTS.md section 1):" >&2
+    printf '  %s\n' "${bad[@]}" >&2
+    echo "Commit only your own paths: git commit -m \"[$tag] ...\" -- <your paths>" >&2
+    echo "For other areas, add a line under Requests in TASKS.md." >&2
+    exit 1
+fi
+exit 0

@@ -99,13 +99,24 @@ The kernel itself needs **zero** changes for each personality — this is the pa
 
 ## 4. Roadmap
 
-- **Phase 0 — Foundations (weeks 1–2):** workspace, CI, QEMU boot, serial logging, arch bring-up on x86_64.
-- **Phase 1 — Kernel core (weeks 3–8):** frame allocator, paging, threads + scheduler, IPC v1, capability table, IRQ delivery. Boot a userspace test process.
-- **Phase 2 — System servers (weeks 9–16):** process server (fork/exec semantics), VFS + ramfs + virtio-blk ext-ish fs, PCI + virtio drivers, user/auth server, netstack (smoltcp in userspace).
-- **Phase 3 — POSIX personality + shell (weeks 17–24):** run busybox; port musl; interactive multi-user shell; login.
-- **Phase 4 — Graphics & desktop (weeks 25–36):** virtio-gpu → real drivers, compositor, toolkit, mobile bring-up (aarch64 phone/tablet SBCs: Pi, Pixel 3a postmarketOS-class).
-- **Phase 5 — Portability & polish:** riscv64 port, SMP hardening, power management, verified core.
-- **Phase 6 — Compatibility long-tail:** Win32, macOS personalities.
+Milestones, in order. No dates: a phase is done when its exit check passes, not when a week ends.
+
+- **Phase H — Hardening (active, feature freeze, ADR-049):** close the security holes S1–S11 and the engineering gaps E1–E10 on `TASKS.md`. Exit: the freeze-lift conditions in ADR-049.
+- **Phase 0 — Foundations:** workspace, CI, QEMU boot, serial logging, arch bring-up on x86_64. *Mostly done. CI has never run on a remote (E3).*
+- **Phase 1 — Kernel core:** frame allocator, paging, threads + scheduler, IPC v1, capability table, IRQ delivery. Boot a userspace test process. *Done for one CPU without preemption.*
+- **Phase 2 — System servers:** process server (fork/exec semantics), VFS + ramfs + virtio-blk ext-ish fs, PCI + virtio drivers, user/auth server, netstack (smoltcp in userspace). *Process server, ramfs VFS, console and auth done. virtio-blk, disk filesystem and netstack open.*
+- **Phase 3 — POSIX personality + shell:** run busybox; port musl; interactive multi-user shell; login. *Static musl binaries run. Busybox and interactive login open.*
+- **Phase 4 — Graphics & desktop:** virtio-gpu → real drivers, compositor, toolkit, mobile bring-up (aarch64 phone/tablet SBCs: Pi, Pixel 3a postmarketOS-class). *Not started.*
+- **Phase 5 — Portability & polish:** aarch64 and riscv64 ports, SMP, preemption, power management, verified core. *Not started. The aarch64 and riscv64 HAL crates are empty stubs.*
+- **Phase 6 — Compatibility long-tail:** Win32, macOS personalities. *Not started.*
+
+## 4a. Current status (2026-11-12)
+
+- x86_64 only, single CPU, cooperative scheduling with a PIT tick and no preemption.
+- A clean release build boots in QEMU through init, VFS, process server, console, a scripted shell with a pipeline, a static musl program (printf, file I/O, mmap, stat, readdir), the auth server and `/login`, then halts cleanly.
+- 207 host unit tests pass. Host clippy and fmt are clean. Userspace binaries do not pass clippy yet (E4).
+- **Not secure.** A user process can take control of the kernel (REGS_WRITE, MAP into the kernel window, no SMEP/SMAP). See S1–S10. Do not run untrusted code on it.
+- Fixed limits: 16 processes, 16 address spaces, 64 threads, 64 kernel objects.
 
 ## 5. Repository Layout (Cargo workspace)
 
@@ -129,9 +140,9 @@ micro-kernel-rs/
 
 ## 6. Engineering Rules
 
-1. Every crate: `cargo clippy -- -D warnings` clean; `cargo fmt` enforced in CI.
-2. Kernel-entry fuzzing: any byte arriving over IPC must never panic the kernel (harness in `tests/`).
-3. No `unsafe` without a `// SAFETY:` comment + entry in `docs/DECISIONS.md`.
-4. Every PR boots in QEMU before merge (`tools/qemu-test.sh`).
-5. Benchmarks for IPC fast path and context switch tracked per commit (criterion).
-6. All design changes go through `docs/DECISIONS.md` (append-only ADRs).
+1. Every crate: `cargo clippy -- -D warnings` clean; `cargo fmt` enforced in CI. *Enforced for host crates. Userspace binaries: not yet enforced (E4, E5).*
+2. Kernel-entry fuzzing: any byte arriving over IPC must never panic the kernel (harness in `tests/`). *Not yet enforced. The S11 attack test is the first step.*
+3. No `unsafe` without a `// SAFETY:` comment + entry in `docs/DECISIONS.md`. *SAFETY comments enforced by clippy. DECISIONS entries: not yet enforced.*
+4. Every PR boots in QEMU before merge (`tools/qemu-test.sh`). *Not yet enforced: the script does not boot the full system (E1, E2).*
+5. Benchmarks for IPC fast path and context switch tracked per commit (criterion). *Not yet enforced.*
+6. All design changes go through `docs/DECISIONS.md` (append-only ADRs). *Enforced.*

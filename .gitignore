@@ -4,3 +4,6 @@ Cargo.lock.orig
 *.img
 *.iso
 *.elf
+
+# Unattended agent state (logs, per-agent build dirs, stop files)
+.agents/
