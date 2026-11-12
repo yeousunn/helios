@@ -54,6 +54,9 @@ pub mod linux {
     pub const STAT: u64 = 4;
     pub const LSTAT: u64 = 6;
     pub const NEWFSTATAT: u64 = 262;
+    pub const GETCWD: u64 = 79;
+    pub const CHDIR: u64 = 80;
+    pub const READLINK: u64 = 89;
 }
 
 /// `arch_prctl` sub-codes.
@@ -121,6 +124,11 @@ pub trait Host {
     fn fstat(&mut self, fd: i32) -> Result<FileStat, i64>;
     /// `stat`/`lstat`/`newfstatat` — stat by path.
     fn stat_path(&mut self, path: &[u8]) -> Result<FileStat, i64>;
+    /// `chdir` — change the working directory (0 or -errno).
+    fn chdir(&mut self, path: &[u8]) -> i64;
+    /// `getcwd` — write the working directory into `out` (no NUL); returns
+    /// its length, or -errno.
+    fn getcwd(&mut self, out: &mut [u8]) -> i64;
     /// Read from file descriptor `fd` into `out`.
     fn read_fd(&mut self, fd: i32, out: &mut [u8]) -> i64;
     /// Close a file descriptor.
@@ -275,6 +283,37 @@ pub fn dispatch<H: Host>(num: u64, args: [u64; 6], host: &mut H) -> Action {
                 total += w;
             }
             Action::Return(total)
+        }
+        linux::GETCWD => {
+            let mut b = [0u8; 4096];
+            let n = host.getcwd(&mut b);
+            if n < 0 || n as usize + 1 > b.len() {
+                return Action::Return(if n < 0 { n } else { EINVAL });
+            }
+            let n = n as usize;
+            b[n] = 0;
+            if host.mem_write(args[0], &b[..n + 1]) < 0 {
+                return Action::Return(EFAULT);
+            }
+            Action::Return(args[0] as i64) // getcwd returns the buffer pointer
+        }
+        linux::CHDIR => {
+            let mut p = [0u8; 256];
+            let n = read_cstr(host, args[0], &mut p);
+            Action::Return(host.chdir(&p[..n]))
+        }
+        // readlink(2): path in rdi, buf rsi, size rdx (no dirfd).
+        linux::READLINK => {
+            let mut p = [0u8; 256];
+            let n = read_cstr(host, args[0], &mut p);
+            let mut out = [0u8; 256];
+            let want = (args[2] as usize).min(out.len());
+            let r = host.readlink(&p[..n], &mut out[..want]);
+            if r < 0 {
+                return Action::Return(r);
+            }
+            let w = host.mem_write(args[1], &out[..r as usize]);
+            Action::Return(if w < 0 { EFAULT } else { r })
         }
         linux::FSTAT => match host.fstat(args[0] as i32) {
             Ok(st) => {
@@ -464,6 +503,15 @@ mod tests {
                 size: 3,
             })
         }
+        fn chdir(&mut self, _path: &[u8]) -> i64 {
+            0
+        }
+        fn getcwd(&mut self, out: &mut [u8]) -> i64 {
+            let s = b"/";
+            let n = s.len().min(out.len());
+            out[..n].copy_from_slice(&s[..n]);
+            n as i64
+        }
         fn getdents(&mut self, _fd: i32, out: &mut [u8]) -> i64 {
             // One fake entry: ino=7, off=1, reclen=24, type=8(DT_REG), "a\0".
             if out.len() < 24 {
@@ -549,6 +597,24 @@ mod tests {
         assert_eq!(u16::from_le_bytes([m.mem[80], m.mem[81]]), 24); // d_reclen
         assert_eq!(m.mem[82], 8); // d_type = DT_REG
         assert_eq!(m.mem[83], b'a'); // d_name
+    }
+
+    #[test]
+    fn getcwd_returns_buffer_ptr_and_writes_path() {
+        let mut m = Mock::new();
+        let a = dispatch(linux::GETCWD, [128, 64, 0, 0, 0, 0], &mut m);
+        assert_eq!(a, Action::Return(128));
+        assert_eq!(m.mem[128], b'/');
+        assert_eq!(m.mem[129], 0);
+    }
+
+    #[test]
+    fn readlink_89_writes_target() {
+        let mut m = Mock::new();
+        m.mem[200..208].copy_from_slice(b"/x/exe\0\0");
+        let a = dispatch(linux::READLINK, [200, 128, 64, 0, 0, 0], &mut m);
+        assert_eq!(a, Action::Return(14));
+        assert_eq!(&m.mem[128..142], b"/proc/self/exe");
     }
 
     #[test]

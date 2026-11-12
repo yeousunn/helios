@@ -32,7 +32,7 @@ static HEAP: GlobalHeap = GlobalHeap::new();
 
 /// The foreign program to run: a freestanding static x86_64-linux ELF (no
 /// libc; raw `write`+`exit`). Loaded and executed like any Linux binary.
-static LIN_ELF: &[u8] = include_bytes!("../../assets/musl_all");
+static LIN_ELF: &[u8] = include_bytes!("../../assets/musl_cwd");
 
 /// Load an ET_EXEC ELF into this process's own AS (shared with the emulated
 /// thread): carve + map a frame per page of every PT_LOAD, then copy the file
@@ -351,8 +351,38 @@ impl personality::foreign::Host for Emu<'_> {
             Err(e) => Err(-(e as i64)),
         }
     }
-    fn readlink(&mut self, _path: &[u8], _out: &mut [u8]) -> i64 {
-        -2
+    fn chdir(&mut self, path: &[u8]) -> i64 {
+        let Some(vfs) = self.vfs.as_deref_mut() else {
+            return -2;
+        };
+        let name = match path.iter().position(|&b| b == 0) {
+            Some(n) => &path[..n],
+            None => path,
+        };
+        let mut sys = Syscalls::new(self.raw);
+        vfs.chdir(&mut sys, name)
+            .map(|_| 0)
+            .unwrap_or_else(|e| -(e as i64))
+    }
+    fn getcwd(&mut self, out: &mut [u8]) -> i64 {
+        // v0: the emulated program's cwd is always the VFS root.
+        let p = b"/";
+        let n = p.len().min(out.len());
+        out[..n].copy_from_slice(&p[..n]);
+        n as i64
+    }
+    fn readlink(&mut self, path: &[u8], out: &mut [u8]) -> i64 {
+        let name = match path.iter().position(|&b| b == 0) {
+            Some(n) => &path[..n],
+            None => path,
+        };
+        if name == b"/proc/self/exe" {
+            let exe = b"/linrun";
+            let n = exe.len().min(out.len());
+            out[..n].copy_from_slice(&exe[..n]);
+            return n as i64;
+        }
+        -2 // ENOENT
     }
     fn getrandom(&mut self, out: &mut [u8]) -> i64 {
         for (i, b) in out.iter_mut().enumerate() {

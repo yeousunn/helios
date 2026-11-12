@@ -380,13 +380,7 @@ pub(crate) fn foreign_route(
     sched::set_trap_frame(
         tid,
         [
-            args.num,
-            args.cap as u64,
-            args.tag.0,
-            args.w[0],
-            args.w[1],
-            args.w[2],
-            args.w[3],
+            args.num, args.cap, args.tag.0, args.w[0], args.w[1], args.w[2], args.w[3],
         ],
     );
     // The emulator must hold a SEND cap on the route endpoint in the trapped
@@ -404,7 +398,7 @@ pub(crate) fn foreign_route(
     };
     let mut m = Message::new(ipc::labels::kernel::FOREIGN_SYSCALL);
     m.words[0] = args.num;
-    m.words[1] = args.cap as u64;
+    m.words[1] = args.cap;
     m.words[2] = args.w[3];
     // sys_call parks the thread Blocked(Reply); the emulator's reply becomes
     // the syscall's SyscallReturn via park_result (ADR-019 §1).

@@ -90,7 +90,7 @@ extern "sysv64" fn helios_syscall_dispatch(
     let t = Tag(tag);
     let args = SyscallArgs {
         num,
-        cap: cap as u32,
+        cap,
         tag: t,
         w: [w0, w1, w2, w3],
         nonblock: t.flags() & flags::NONBLOCK != 0,

@@ -21,7 +21,7 @@ pub struct SyscallArgs {
     /// rax / x8 / a7.
     pub num: u64,
     /// arg0: destination cap handle.
-    pub cap: u32,
+    pub cap: u64,
     /// arg1: message tag.
     pub tag: Tag,
     /// arg2..arg5.
@@ -233,7 +233,18 @@ pub fn dispatch(args: SyscallArgs) -> SyscallReturn {
         num::YIELD => syscall::sys_yield(tid)
             .map(|_| SyscallReturn::ok(Tag(0), [0; 4]))
             .unwrap_or_else(SyscallReturn::err),
-        num::SEND => match syscall::sys_send(pid, tid, args.cap, args.message(), args.nonblock) {
+        num::SEND => {
+            match syscall::sys_send(pid, tid, args.cap as u32, args.message(), args.nonblock) {
+                Ok(status) => SyscallReturn {
+                    status: status as i64,
+                    tag: Tag(0),
+                    w: [0; 4],
+                    r10: 0,
+                },
+                Err(e) => SyscallReturn::err(e),
+            }
+        }
+        num::CALL => match syscall::sys_call(pid, tid, args.cap as u32, args.message()) {
             Ok(status) => SyscallReturn {
                 status: status as i64,
                 tag: Tag(0),
@@ -242,22 +253,15 @@ pub fn dispatch(args: SyscallArgs) -> SyscallReturn {
             },
             Err(e) => SyscallReturn::err(e),
         },
-        num::CALL => match syscall::sys_call(pid, tid, args.cap, args.message()) {
-            Ok(status) => SyscallReturn {
-                status: status as i64,
-                tag: Tag(0),
-                w: [0; 4],
-                r10: 0,
-            },
-            Err(e) => SyscallReturn::err(e),
-        },
-        num::RECV => match syscall::sys_recv(pid, tid, args.cap, args.w[0] != 0, args.w[1]) {
-            Ok(Some(m)) => SyscallReturn::ok(m.tag, m.words),
-            Ok(None) => SyscallReturn::parked(), // ADR-019 §1
-            Err(e) => SyscallReturn::err(e),
-        },
+        num::RECV => {
+            match syscall::sys_recv(pid, tid, args.cap as u32, args.w[0] != 0, args.w[1]) {
+                Ok(Some(m)) => SyscallReturn::ok(m.tag, m.words),
+                Ok(None) => SyscallReturn::parked(), // ADR-019 §1
+                Err(e) => SyscallReturn::err(e),
+            }
+        }
         num::REPLY_RECV => {
-            match syscall::sys_reply_recv(pid, tid, args.cap, args.message(), args.w[1]) {
+            match syscall::sys_reply_recv(pid, tid, args.cap as u32, args.message(), args.w[1]) {
                 Ok(Some(m)) => SyscallReturn::ok(m.tag, m.words),
                 Ok(None) => SyscallReturn::parked(), // ADR-019 §1
                 Err(e) => SyscallReturn::err(e),
@@ -266,12 +270,17 @@ pub fn dispatch(args: SyscallArgs) -> SyscallReturn {
         num::INVOKE => invoke(pid, tid, args),
         num::CAP_MINT => {
             let rights = ipc::Rights(u32::try_from(args.w[1]).unwrap_or(0) & Rights::ALL.0);
-            match proc::mint(pid, args.cap, rights, u32::try_from(args.w[0]).unwrap_or(0)) {
+            match proc::mint(
+                pid,
+                args.cap as u32,
+                rights,
+                u32::try_from(args.w[0]).unwrap_or(0),
+            ) {
                 Ok(handle) => SyscallReturn::ok(Tag(0), [handle as u64, 0, 0, 0]),
                 Err(e) => SyscallReturn::err(map_proc(e)),
             }
         }
-        num::CAP_REVOKE => match proc::revoke(pid, args.cap, args.w[0]) {
+        num::CAP_REVOKE => match proc::revoke(pid, args.cap as u32, args.w[0]) {
             Ok(n) => SyscallReturn::ok(Tag(0), [n as u64, 0, 0, 0]),
             Err(e) => SyscallReturn::err(map_proc(e)),
         },
@@ -294,7 +303,7 @@ fn map_proc(e: ProcError) -> i32 {
 
 /// Invoke dispatch: Factory + object methods (syscall-abi §7).
 fn invoke(pid: ProcessId, tid: ThreadId, args: SyscallArgs) -> SyscallReturn {
-    let Ok(cap) = proc::get_cap(pid, args.cap) else {
+    let Ok(cap) = proc::get_cap(pid, args.cap as u32) else {
         return SyscallReturn::err(ipc::status::EBADCAP);
     };
     match cap.typ {
@@ -313,13 +322,13 @@ fn invoke(pid: ProcessId, tid: ThreadId, args: SyscallArgs) -> SyscallReturn {
             let reply = args.message();
             match syscall::deferred_reply_send(pid, caller, reply) {
                 Ok(()) => {
-                    let _ = proc::remove_cap(pid, args.cap);
+                    let _ = proc::remove_cap(pid, args.cap as u32);
                     SyscallReturn::ok(args.tag, [0; 4])
                 }
                 Err(e) => SyscallReturn::err(e),
             }
         }
-        _ => match syscall::sys_invoke(pid, tid, args.cap, args.message()) {
+        _ => match syscall::sys_invoke(pid, tid, args.cap as u32, args.message()) {
             Ok((status, w)) => SyscallReturn {
                 status: status as i64,
                 tag: Tag(0),
@@ -660,7 +669,7 @@ pub(crate) fn thread_invoke_for_test(
         &cap,
         &SyscallArgs {
             num: crate::entry::num::INVOKE,
-            cap: cap_handle,
+            cap: cap_handle as u64,
             tag: msg.tag,
             w: msg.words,
             nonblock: false,
@@ -949,7 +958,7 @@ mod tests {
     fn args(num: u64, cap: u32, tag: Tag, w: [u64; 4]) -> SyscallArgs {
         SyscallArgs {
             num,
-            cap,
+            cap: cap as u64,
             tag,
             w,
             nonblock: false,
@@ -1386,7 +1395,7 @@ mod tests {
                 emu,
                 SyscallArgs {
                     num: num::INVOKE,
-                    cap: ctl,
+                    cap: ctl as u64,
                     tag: Tag::new(15), // SET_FOREIGN (ADR-044 amended: cap HANDLE)
                     w: [h as u64, 0, 0, 0],
                     nonblock: false,
@@ -1441,7 +1450,7 @@ mod tests {
             emu,
             SyscallArgs {
                 num: num::INVOKE,
-                cap: ctl,
+                cap: ctl as u64,
                 tag: Tag::new(16), // TRAP_READ
                 w: [0, 0, 0, 0],
                 nonblock: false,
@@ -1484,7 +1493,7 @@ mod tests {
             emu,
             SyscallArgs {
                 num: num::INVOKE,
-                cap: ctl,
+                cap: ctl as u64,
                 tag: Tag::new(16),
                 w: [0, 0, 0, 0],
                 nonblock: false,
@@ -1556,7 +1565,7 @@ mod tests {
             server,
             SyscallArgs {
                 num: num::INVOKE,
-                cap: ctl,
+                cap: ctl as u64,
                 tag: Tag::new(17), // DEFER
                 w: [0, 0, 0, 0],
                 nonblock: false,
@@ -1571,7 +1580,7 @@ mod tests {
             server,
             SyscallArgs {
                 num: num::INVOKE,
-                cap: ctl,
+                cap: ctl as u64,
                 tag: Tag::new(17),
                 w: [0, 0, 0, 0],
                 nonblock: false,
@@ -1586,7 +1595,7 @@ mod tests {
             server,
             SyscallArgs {
                 num: num::INVOKE,
-                cap: reply_cap,
+                cap: reply_cap as u64,
                 tag: Tag::new(1), // Reply::SEND
                 w: [0x4242, 0, 0, 0],
                 nonblock: false,
@@ -1607,7 +1616,7 @@ mod tests {
             server,
             SyscallArgs {
                 num: num::INVOKE,
-                cap: reply_cap,
+                cap: reply_cap as u64,
                 tag: Tag::new(1),
                 w: [1, 0, 0, 0],
                 nonblock: false,
@@ -1636,7 +1645,7 @@ mod tests {
             target,
             SyscallArgs {
                 num: num::INVOKE,
-                cap: ctl,
+                cap: ctl as u64,
                 tag: Tag::new(11), // SET_TLS
                 w: [0x7E00_1234_5678, 0, 0, 0],
                 nonblock: false,
@@ -1650,7 +1659,7 @@ mod tests {
             target,
             SyscallArgs {
                 num: num::INVOKE,
-                cap: ctl,
+                cap: ctl as u64,
                 tag: Tag::new(11),
                 w: [0, 0, 0, 0],
                 nonblock: false,
@@ -1731,7 +1740,7 @@ mod tests {
             emu,
             SyscallArgs {
                 num: num::INVOKE,
-                cap: ctl,
+                cap: ctl as u64,
                 tag: Tag::new(15),
                 w: [route_h as u64, 0, 0, 0],
                 nonblock: false,
@@ -1749,7 +1758,7 @@ mod tests {
         });
         assert_eq!(ret.status, crate::entry::PARKED_STATUS);
         // emu recv's the route.
-        let env = syscall::sys_recv(pid, emu, route_h, false, 0)
+        let _env = syscall::sys_recv(pid, emu, route_h, false, 0)
             .unwrap()
             .expect("route delivered");
 
