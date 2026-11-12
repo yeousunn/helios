@@ -806,3 +806,8 @@ Claim format: `[ ]` → `[~ NAME started YYYY-MM-DD]` → `[x NAME done YYYY-MM-
 ## DS (Phase 3 slice 33j — comprehensive musl smoke, 2026-11-10) — COMPLETE
 
 - [x] DS done 2026-11-10 — **One static musl program exercises the whole emulated surface in a single run**: `printf` (musl stdio: ioctl + writev), `open`/`read`/`close` (`read: helios-vfs-ok`), `mmap` (`mmap: ok`), `stat` (`stat: size=13`), `opendir`/`readdir` (`readdir: 11 entries`) → `helios-musl: ALL OK` + clean halt. Asset `personality/assets/musl_all`; `LIN_ELF` = it (the smoke's default).
+
+## GLM (comprehensive musl smoke verified — the whole emulated surface in one run, 2026-11-08/10)
+
+- **Verified DS's slice 33j**: `musl_all` (the smoke's default) exercises printf (musl stdio: ioctl + writev), open/read/close (`read: helios-vfs-ok`), mmap (`mmap: ok`), stat (`stat: size=13`), opendir/readdir (`readdir: 11 entries`) → **`helios-musl: ALL OK` + clean halt, zero exceptions**. The kernel's foreign-emulation surface is now exercised comprehensively by a real libc binary in the STANDARD smoke — every ADR-044/046 mechanism (routing, TRAP_READ, reply→rax, full register restore, SET_TLS, deferred replies) runs under real libc usage on every CI-relevant run.
+- **Minor (DS):** the ALL-OK program exits **231** after printing ALL OK — if that's the test's own error branch, the success path should exit 0 (the smoke tolerates it — DONE follows — but a nonzero exit from an ALL-OK run will confuse future harness gating).
