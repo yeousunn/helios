@@ -93,11 +93,16 @@ make_profile() {
         # No agent may rename, replace or delete an existing top-level entry
         # (a directory node or a root file) except the shared files and its
         # own root files. Writes inside owned directories stay allowed.
-        local e
-        for e in $(ls -A "$REPO"); do
+        # Names go into the profile text, so only plain names are accepted;
+        # anything else (quotes, brackets, spaces, control characters) could
+        # inject sandbox rules, and stops everything instead.
+        local e path
+        while IFS= read -r -d '' path; do
+            e="${path##*/}"
+            [[ "$e" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "BADNAME"; break; }
             case " TASKS.md Cargo.lock $OWN_ROOT " in *" $e "*) continue ;; esac
             echo "(deny file-write* (literal \"$REPO/$e\"))"
-        done
+        done < <(find "$REPO" -mindepth 1 -maxdepth 1 -print0)
         echo "(deny file-write* (literal \"$REPO/AGENTS.md\") (subpath \"$REPO/tools/agents\"))"
         echo "(deny file-write* (literal \"$REPO/.git\") (subpath \"$REPO/.git/hooks\") (subpath \"$REPO/.git/info\")"
         echo "    (literal \"$REPO/.git/config\") (literal \"$REPO/.git/config.worktree\") (literal \"$REPO/.git/commondir\"))"
@@ -108,6 +113,8 @@ make_profile() {
 halt_all() { # reason
     echo "$(date '+%F %T') [$NAME] $1" >>"$CTRL/violations.log"
     log "VIOLATION: $1. Stopping all agents."
+    # start.sh refuses to run while HALTED exists, until the owner has looked.
+    echo "$(date '+%F %T') [$NAME] $1 (HEAD $(g rev-parse --short HEAD 2>/dev/null))" >>"$CTRL/HALTED"
     touch "$CTRL/STOP"
     exit 1
 }
@@ -195,6 +202,9 @@ while true; do
     start="$(g rev-parse HEAD)"
     refs_before="$(refs_except_main)"
     profile="$(make_profile)"
+    if [ ! -s "$profile" ] || grep -qx 'BADNAME' "$profile"; then
+        halt_all "a top-level entry in the repo has a name with characters other than letters, digits, '.', '_' or '-'"
+    fi
 
     cycle=$((cycle + 1))
     out="$CTRL/logs/$NAME-$(date +%Y%m%d-%H%M%S).log"

@@ -17,7 +17,28 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SRC="$REPO/tools/agents"
 CTRL="${HELIOS_CTRL:-$HOME/.local/state/helios-agents}"
 SESSION="helios-agents"
-if [ $# -gt 0 ]; then AGENTS=("$@"); else AGENTS=(nv glm ds); fi
+ACK=0
+AGENTS=()
+for arg in "$@"; do
+    case "$arg" in
+        --acknowledge) ACK=1 ;;
+        *) AGENTS+=("$arg") ;;
+    esac
+done
+[ "${#AGENTS[@]}" -gt 0 ] || AGENTS=(nv glm ds)
+
+# After a violation, the supervisors leave HALTED behind. Look at it first.
+if [ -f "$CTRL/HALTED" ]; then
+    echo "The agents were stopped by a violation:" >&2
+    sed 's/^/  /' "$CTRL/HALTED" >&2
+    echo "Details: $CTRL/violations.log" >&2
+    if [ "$ACK" != 1 ]; then
+        echo "Check the commits named above (git log, git show). When you are satisfied," >&2
+        echo "run: tools/agents/start.sh --acknowledge" >&2
+        exit 1
+    fi
+    mv "$CTRL/HALTED" "$CTRL/HALTED.acknowledged-$(date +%Y%m%d-%H%M%S)"
+fi
 
 for bin in opencode tmux gtimeout sandbox-exec shasum qemu-system-x86_64 cargo; do
     command -v "$bin" >/dev/null || { echo "missing: $bin" >&2; exit 1; }
@@ -46,11 +67,38 @@ mkdir -p "$CTRL/logs" "$REPO/.agents"
 rm -f "$CTRL/STOP"
 for a in "${AGENTS[@]}"; do rm -f "$CTRL/STOP-$a"; done
 
-# Fresh control copies (read-only to the agents through the sandbox), taken
-# from the committed version, not the working tree.
-for f in sandbox.sb opencode.json prompt.md run-agent.sh hooks/commit-msg; do
-    git -C "$REPO" show "HEAD:tools/agents/$f" >"$CTRL/$(basename "$f")"
+# Control copies come from the working tree, which the sandbox never lets an
+# agent write, and only when it matches HEAD. Agents can write git objects, so
+# a forged commit touching tools/agents makes the working tree differ from HEAD
+# and stops the start here.
+if ! git -C "$REPO" diff --quiet HEAD -- tools/agents; then
+    echo "tools/agents/ differs from HEAD. A commit changed the supervisor files without" >&2
+    echo "the working tree following. Inspect: git log -p -- tools/agents" >&2
+    exit 1
+fi
+
+# The supervisor runs outside the sandbox, so any change to it since the last
+# start must be approved by the owner.
+FILES=(sandbox.sb opencode.json prompt.md run-agent.sh hooks/commit-msg)
+changed=0
+for f in "${FILES[@]}" ; do
+    old="$CTRL/approved/$(basename "$f")"
+    if [ -f "$old" ] && ! cmp -s "$old" "$SRC/$f"; then changed=1; diff -u "$old" "$SRC/$f" || true; fi
 done
+if [ -f "$CTRL/approved/AGENTS.md" ] && ! cmp -s "$CTRL/approved/AGENTS.md" "$REPO/AGENTS.md"; then
+    changed=1; diff -u "$CTRL/approved/AGENTS.md" "$REPO/AGENTS.md" || true
+fi
+if [ "$changed" = 1 ] && [ "${ACCEPT_CONTROL_CHANGES:-0}" != 1 ]; then
+    printf '\nThe supervisor files or AGENTS.md changed since the last start (diff above).\nType yes to approve: '
+    read -r answer </dev/tty
+    [ "$answer" = "yes" ] || { echo "not approved, nothing started" >&2; exit 1; }
+fi
+mkdir -p "$CTRL/approved"
+for f in "${FILES[@]}"; do
+    cp "$SRC/$f" "$CTRL/$(basename "$f")"
+    cp "$SRC/$f" "$CTRL/approved/$(basename "$f")"
+done
+cp "$REPO/AGENTS.md" "$CTRL/approved/AGENTS.md"
 echo "$REPO" >"$CTRL/repo-path"
 # The agents run with this PATH, inside the sandbox only. The supervisor itself
 # uses a fixed system PATH and calls opencode by absolute path.
