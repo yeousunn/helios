@@ -129,7 +129,29 @@ audit() { # start-commit refs-before
         esac
         (cd "$REPO" && env -u HELIOS_AGENT "$CTRL/commit-msg" --audit "$c" 2>>"$CTRL/violations.log") ||
             halt_all "commit $c breaks directory ownership"
+        worktree_check "$c"
     done
+}
+
+blob_or_none() { g rev-parse -q --verify "$1" 2>/dev/null || echo none; }
+
+# A commit built with git plumbing can carry another agent's tag and touch only
+# that agent's files, without the sandbox ever letting the forger write those
+# files on disk. Such a commit leaves the working tree holding the version from
+# before the commit. An honest commit never does: its author edited the file on
+# disk first. Only paths that no later commit changed again are checked.
+worktree_check() { # commit
+    local c="$1" p in_commit before on_disk
+    while IFS= read -r p; do
+        case "$p" in TASKS.md | docs/DECISIONS.md | Cargo.lock | "") continue ;; esac
+        in_commit="$(blob_or_none "$c:$p")"
+        [ "$(blob_or_none "HEAD:$p")" = "$in_commit" ] || continue
+        before="$(blob_or_none "$c^:$p")"
+        if [ -f "$REPO/$p" ]; then on_disk="$(g hash-object -- "$REPO/$p")"; else on_disk=none; fi
+        if [ "$on_disk" = "$before" ] && [ "$on_disk" != "$in_commit" ]; then
+            halt_all "commit $c changed $p only inside .git (the file on disk still has the old version)"
+        fi
+    done < <(g diff-tree --no-commit-id --name-only --no-renames -r "$c")
 }
 
 if [ "${2:-}" = "--print-profile" ]; then # for testing: write and print the profile, then exit
