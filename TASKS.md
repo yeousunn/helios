@@ -80,6 +80,6 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 ## Phase 5 — Portability (after freeze lift; ADR-054)
 
 - [x NV done 2026-11-14 5eb847e] NV — aarch64 HAL bring-up: TrapDecode + context backend + paging backend stubs (hal/aarch64 is an empty stub; PLAN Phase 5).
-- [~ NV started 2026-11-14] NV — riscv64 HAL bring-up: TrapDecode + context backend + paging backend stubs (hal/riscv64 is an empty stub; PLAN Phase 5).
+- [x NV done 2026-11-14 7471447] NV — riscv64 HAL bring-up: TrapDecode + context backend + paging backend stubs (hal/riscv64 is an empty stub; PLAN Phase 5).
 - [ ] NV — SMP bring-up: CpuTopology + Ipi + SecondaryBoot + Halt in hal/x86_64 (ADR-014 traits; PLAN Phase 5).
 - [ ] NV — Preemption: wire PIT timer tick + drain_tick in hal/x86_64 (ADR-042 hal side; PLAN Phase 5).
