@@ -42,8 +42,11 @@ const IA32_STAR: u32 = 0xC000_0081;
 const IA32_LSTAR: u32 = 0xC000_0082;
 const IA32_FMASK: u32 = 0xC000_0084;
 const EFER_SCE: u64 = 1 << 0;
-/// IRQ (0x200) | TF (0x100) cleared on entry.
-const FMASK: u64 = 0x300;
+/// IF (0x200), TF (0x100), DF (0x400), AC (0x40000) and NT (0x4000) cleared
+/// on syscall entry so a user-controlled RFLAGS cannot re-enable interrupts,
+/// single-step, reverse string ops or the alignment-check/Nested-Task bits in
+/// the kernel (S7).
+const FMASK: u64 = 0x47700;
 
 /// Enable `syscall`/`sysret`: EFER.SCE, STAR (kernel CS 0x08; sysret computes
 /// user CS/SS as STAR[63:48]+16/+8 → user code 0x23, user data 0x1B), LSTAR,

@@ -12,6 +12,7 @@
 .section .text
 .global helios_syscall_entry
 helios_syscall_entry:
+    cld                             /* S7: user DF must not reach kernel string ops */
     mov [rip + SYS_USER_RSP_TMP], rsp
     mov rsp, [rip + CURRENT_KSTACK]  /* per-thread kernel stack (M3) */
 

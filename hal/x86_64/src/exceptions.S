@@ -84,6 +84,7 @@ EXC_NOERR 47
 .macro IRQ vec
 .global irq_stub_\vec
 irq_stub_\vec:
+    cld                             /* S7: user DF must not reach kernel string ops */
     push qword ptr \vec
     push rax
     push rcx
@@ -128,6 +129,7 @@ IRQ 47
 /* Vectors >= 48 do not occur in v0; no gates are installed past 47. */
 
 exc_common:
+    cld                             /* S7: user DF must not reach kernel string ops */
     cli
     mov rdi, [rsp]          /* vector */
     mov rsi, [rsp + 8]      /* error code */
