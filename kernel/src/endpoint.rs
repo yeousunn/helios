@@ -102,7 +102,7 @@ impl SenderQueue {
         self.len -= 1;
         self.ids[self.len] = sched::IDLE;
         self.msgs[self.len] = None;
-        Some(msg.unwrap())
+        msg
     }
 
     fn remove(&mut self, id: ThreadId) -> Option<Envelope> {

@@ -324,7 +324,7 @@ impl AddressSpace {
             base,
             flags,
         });
-        self.merge_neighbors(slot);
+        self.merge_neighbors(slot)?;
         Ok(base.unwrap_or(PhysAddr::new(0)))
     }
 
@@ -333,9 +333,9 @@ impl AddressSpace {
     /// the region table small under loader/heap map patterns). Per-page
     /// overrides (`page_frames`) key on global page index and survive
     /// merging untouched.
-    fn merge_neighbors(&mut self, slot: usize) {
+    fn merge_neighbors(&mut self, slot: usize) -> Result<(), VmmError> {
         let Some(new) = self.regions[slot] else {
-            return;
+            return Ok(());
         };
         // Left neighbor: ends exactly where `new` begins.
         let left = self.regions.iter().position(|r| {
@@ -351,12 +351,12 @@ impl AddressSpace {
                 })
         });
         if let Some(l) = left {
-            let mut m = self.regions[l].take().unwrap();
+            let mut m = self.regions[l].take().ok_or(VmmError::NotFound)?;
             m.pages += new.pages;
             self.regions[slot] = Some(m);
             // Re-merge rightward from the grown region.
-            self.merge_neighbors(slot);
-            return;
+            self.merge_neighbors(slot)?;
+            return Ok(());
         }
         // Right neighbor: begins exactly where `new` ends.
         let right = self.regions.iter().position(|r| {
@@ -372,11 +372,12 @@ impl AddressSpace {
                 })
         });
         if let Some(r) = right {
-            let m = self.regions[r].take().unwrap();
+            let m = self.regions[r].take().ok_or(VmmError::NotFound)?;
             if let Some(n) = self.regions[slot].as_mut() {
                 n.pages += m.pages;
             }
         }
+        Ok(())
     }
 
     /// Install backend entries page by page (called with the backend
@@ -562,7 +563,10 @@ impl AddressSpace {
                     }
                 }
                 if let Some(base) = m.base {
-                    return Ok((base.checked_add(m.offset(vaddr)).unwrap(), m.flags));
+                    let pa = base
+                        .checked_add(m.offset(vaddr))
+                        .ok_or(VmmError::BadVaddr)?;
+                    return Ok((pa, m.flags));
                 }
                 return vmm_err(VmmError::NotMapped);
             }
@@ -652,7 +656,7 @@ impl AddressSpace {
             }
         }
 
-        let m = self.regions[slot].as_mut().unwrap();
+        let m = self.regions[slot].as_mut().ok_or(VmmError::NotFound)?;
 
         // Anonymous zero-fill (idempotent: a refault returns the same frame).
         if m.flags.contains(MapFlags::ANON) {
@@ -681,7 +685,9 @@ impl AddressSpace {
         // COW copy-on-write.
         if write && m.flags.contains(MapFlags::COW) {
             let base = m.base.ok_or(VmmError::NotMapped)?;
-            let old = base.checked_add(m.offset(vaddr)).unwrap();
+            let old = base
+                .checked_add(m.offset(vaddr))
+                .ok_or(VmmError::BadVaddr)?;
             if FRAME_REFS.lock().count(old) <= 1 {
                 // Sole owner: promote in place (per-page override, COW cleared).
                 let va = Vaddr(m.vaddr.as_u64() + m.offset(vaddr));
