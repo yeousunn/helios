@@ -23,5 +23,19 @@ jobs:
       - name: Install QEMU (for boot smoke test)
         run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
 
-      - name: Run quality gates + QEMU bring-up test
+      - name: rustfmt check
+        run: cargo fmt --check
+
+      - name: Host clippy (all kernel/host crates)
+        run: cargo clippy --workspace --exclude kernel-boot -- -D warnings
+
+      - name: Host unit tests
+        run: cargo test --workspace --exclude kernel-boot
+
+      - name: Userspace clippy (best-effort until E4 lands)
+        run: |
+          cargo clippy -p sdk -p process -p vfs -p console -p auth -p personality \
+            --features user --target x86_64-unknown-none --release -- -D warnings || true
+
+      - name: Full-system QEMU bring-up test (E2)
         run: ./tools/qemu-test.sh
