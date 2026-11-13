@@ -8,6 +8,8 @@
 
 use core::arch::{asm, global_asm};
 
+use crate::SmpX86_64;
+use hal::Halt;
 use ipc::{flags, Tag};
 use kernel::entry::{self, SyscallArgs, SyscallReturn, PARKED_STATUS};
 
@@ -210,11 +212,16 @@ fn resume_loop(saved: Option<SyscallReturn>) {
             // lock-free before re-picking to expire parked recv/send
             // deadlines. Re-pick until a thread is runnable.
             loop {
-                // SAFETY: `sti; hlt; cli` briefly enables interrupts so a
-                // pending IRQ wakes `hlt`, then re-disables for dispatch.
+                // SAFETY: `sti; cli` briefly enables interrupts so a pending
+                // IRQ wakes the CPU, then re-disables for dispatch. The halt
+                // between them routes through the `Halt` trait (ADR-014 /
+                // power management) instead of raw inline asm; `SmpX86_64` is
+                // a zero-sized BSP instance, `halt()` executes `hlt`.
                 unsafe {
                     asm!("sti", options(nostack));
-                    asm!("hlt", options(nostack));
+                    // SAFETY: `hlt` halts the CPU until the next interrupt;
+                    // safe with interrupts enabled (sti just executed).
+                    SmpX86_64.halt();
                     asm!("cli", options(nostack));
                 }
                 kernel::time::drain_tick();
