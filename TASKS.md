@@ -37,7 +37,7 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 - [ ] E7 DS — Remove the `.data` atomics workaround in `sdk/src/bin/init.rs:902` and its copy in ps. The real causes (kstack overflow, asm clobber) are fixed. The boot must still reach DONE.
 - [ ] E8 NV — ADR: where drivers run. `drivers/src/virtio_blk.rs` reaches the kernel frame allocator and `phys_to_virt` through `hal/x86_64`, which breaks the userspace-driver rule in PLAN.md. Decide how a userspace driver gets MMIO and DMA through caps. The move itself waits for the freeze to lift.
 - [ ] E9 NV — README (honest status from PLAN.md 4a, build and boot steps), LICENSE-MIT, LICENSE-APACHE, `build/` and `graphify-out/` in `.gitignore`. Leave `repository` in Cargo.toml as is until the human names the URL.
-- [ ] E10 NV — PLAN.md section 5 says PLAN.md and TASKS.md live in `docs/`, but they are at the root. Fix the text in PLAN.md to match (do not move the files: the supervisor reads them at the root).
+- [~ NV started 2026-11-13] E10 NV — PLAN.md section 5 says PLAN.md and TASKS.md live in `docs/`, but they are at the root. Fix the text in PLAN.md to match (do not move the files: the supervisor reads them at the root).
 - [x NV done 2026-11-13 243bd24] E11 NV (do next) — The `hal/x86_64` tests never run: `impl_x86_64` is `#[cfg(target_arch = "x86_64")]` and the host is arm64, so `cargo test -p hal-x86-64` reports 0 tests (S3b's new tests included). Move pure, register-free logic (address checks, PTE math, PCI address building) into a module compiled on every host, and make the gate fail if the crate's test count is 0.
 
 ## Requests
