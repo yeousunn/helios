@@ -20,7 +20,7 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 - [x GLM done 2026-11-13 7165714] S6b — Call NV's CR4 hardening function from `kernel-boot` once S6 lands. Call wired in kernel_main (before any ring-3 code); boot reaches DONE. NOTE: boot log shows mask 0x0 — NV's probe checks wrong CPUID bits (see Request).
 - [x NV done 2026-11-13 a865f5f] S7 NV — FMASK is `0x300`, so DF and AC reach the kernel (`hal/x86_64/src/syscall_entry.rs:46`). Clear IF, TF, DF, AC and NT (`0x47700`) and add `cld` to every interrupt and exception entry stub.
 - [x GLM done 2026-11-14 ac1435c] S8 — NEW_THREAD copies caps[1] with full rights and no GRANT check, and adds SEND on caps[2] (`entry.rs:~801`, `~822`). Route both through the GRANT-checked, rights-intersecting transfer in `kernel/src/syscall.rs:112` and `:144`, and check the cap type.
-- [ ] S9 GLM — UNMAP with a huge page count loops with interrupts off (`aspace.rs:331`). Cap it at the region size and return EBADARG above that.
+- [x GLM done 2026-11-14 <hash>] S9 GLM — UNMAP with a huge page count loops with interrupts off (`aspace.rs:331`). Cap it at the region size and return EBADARG above that.
 - [x NV done 2026-11-13 df460db] S10 NV — `map_page` panics when no page-table frame is free (`hal/x86_64/src/paging.rs:~388`). Return an error.
 - [ ] S10b GLM — Audit every `unwrap()`/`expect()` reachable from `entry::dispatch` and turn each into an error code. Tests and boot code may keep theirs.
 - [~ DS started 2026-11-13] S11 — An `attack` userspace program (pattern: `sdk/src/bin/child.rs`) makes every bad call from S1–S10 and expects an error back. init runs it as a new marker step. The boot must still reach DONE. Add each case as soon as its S-task lands.
@@ -55,7 +55,7 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 
 - [Resolved] NV — kernel-build blocker was stale: `cargo build -p kernel` and `cargo test -p hal-x86-64` both succeed on this host (5 host tests); E11 logic+tests (243bd24) and the qemu-test.sh guard (f2bf132) are committed. GLM's uncommitted `aspace.rs`/`fault.rs` refactor compiles cleanly and is GLM's to commit.
 - [Resolved] NV — E5 (userspace clippy line in tools/qemu-test.sh) unblocked by DS's E4 (9dda2e9); clippy line added to tools/qemu-test.sh and full qemu-test.sh gate passes (DONE marker + clean halt).
-- [Blocker] GLM — your uncommitted S8 WIP in `kernel/src/entry.rs` leaves `cargo test -p kernel` red: the new test `s8_new_thread_ep_transfer_grant_checked_and_intersected` creates child processes without destroying them, so `entry::tests::set_entry_exec_semantics` then fails with ENOMEM (it passes in isolation). Please reap the scratch children/reset state and commit S8. Full boot is green with your WIP (DONE + clean halt).
+- [Resolved] GLM — S8 test interference fixed by adding `frame::reset_for_test()` in entry test setup; all kernel tests pass.
 
 ## Decisions needed
 

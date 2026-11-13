@@ -173,6 +173,24 @@ pub struct AddressSpace {
 
 const MAX_REGIONS: usize = 128;
 const MAX_PAGE_FRAMES: usize = 64;
+const MAX_UNMAP_PAGES: u64 = 1024;
+
+/// S9: validate a user range for UNMAP — same as `validate_user_range`
+/// but with an additional cap on the page count to prevent unbounded
+/// iteration with interrupts off.
+fn validate_unmap_range(vaddr: Vaddr, pages: u64) -> Result<(), VmmError> {
+    if pages == 0 || pages > MAX_UNMAP_PAGES || !vaddr.is_page_aligned() || vaddr.0 == 0 {
+        return vmm_err(VmmError::BadVaddr);
+    }
+    let end_page = vaddr
+        .page_index()
+        .checked_add(pages)
+        .ok_or(VmmError::BadVaddr)?;
+    if end_page > crate::sched::USER_ADDR_LIMIT / PAGE_SIZE as u64 {
+        return vmm_err(VmmError::BadVaddr);
+    }
+    Ok(())
+}
 
 /// Reserve of physical frames for in-kernel COW/anon resolution (ADR-007 §4).
 #[derive(Clone, Copy, Debug)]
@@ -399,7 +417,8 @@ impl AddressSpace {
     fn unmap(&mut self, be: &dyn PagingBackend, vaddr: Vaddr, pages: u64) -> Result<(), VmmError> {
         // S4: the whole range must be in user space, checked BEFORE the
         // hole-skipping walk (a kernel-window span must not be swept).
-        validate_user_range(vaddr, pages)?;
+        // S9: also cap the page count to prevent unbounded iteration.
+        validate_unmap_range(vaddr, pages)?;
         let mut cur = vaddr.page_index();
         let end_idx = cur.checked_add(pages).ok_or(VmmError::BadVaddr)?;
         while cur < end_idx {

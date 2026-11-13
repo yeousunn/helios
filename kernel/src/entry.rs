@@ -973,6 +973,7 @@ mod tests {
         let _ = crate::aspace::init_default();
         // Frame allocator: entry tests run before frame tests; seed the same
         // region frame::full_lifecycle expects so both suites coexist.
+        crate::frame::reset_for_test();
         let _ = crate::frame::init(&[crate::frame::Region::new(
             crate::frame::PhysAddr::new(0x1000),
             64 * crate::frame::FRAME_SIZE as u64,
@@ -1634,6 +1635,35 @@ mod tests {
             ipc::status::OK as i64,
             "UNMAP of the legal ANON map"
         );
+    }
+
+    /// S9: UNMAP with a huge page count must be rejected with EBADARG —
+    /// the kernel must not loop with interrupts off for an unbounded span.
+    #[test]
+    fn s9_unmap_huge_page_count_rejected() {
+        let (_pid, _tid, factory) = setup();
+        let r_as = dispatch(args(num::INVOKE, factory, Tag::new(3), [0; 4]));
+        let as_h = r_as.w[0] as u32;
+
+        // UNMAP with page count > MAX_UNMAP_PAGES (1024) → EBADARG.
+        for huge in [1025, 10_000, u64::MAX] {
+            let mut m = Message::new(2);
+            m.words[0] = 0x100_000; // valid user VA
+            m.words[1] = huge;
+            let r = dispatch(args(num::INVOKE, as_h, m.tag, m.words));
+            assert_eq!(
+                r.status,
+                ipc::status::EBADARG as i64,
+                "UNMAP pages={huge} must be rejected"
+            );
+        }
+
+        // A legal page count still works.
+        let mut m = Message::new(2);
+        m.words[0] = 0xA0_0000;
+        m.words[1] = 1;
+        let r = dispatch(args(num::INVOKE, as_h, m.tag, m.words));
+        assert_eq!(r.status, ipc::status::OK as i64, "valid UNMAP");
     }
 
     /// S1/ADR-050: the REGS_WRITE syscall masks RFLAGS (IOPL=0, IF=1) and
