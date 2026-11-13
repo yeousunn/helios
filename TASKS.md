@@ -33,7 +33,7 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 - [x NV done 2026-11-13 90b345d] E1 NV — `tools/build-all.sh`: build every userspace image in dependency order, then `kernel-boot` release. Must honour `CARGO_TARGET_DIR` and the `*_IMAGE` variables.
 - [x NV done 2026-11-13 ca0dc44] E2 NV — `tools/qemu-test.sh`: call E1, boot the release kernel, require the DONE marker and `clean halt`, work on macOS (use `gtimeout` if present), and honour `SERIAL_LOG` and `CARGO_TARGET_DIR`.
 - [x NV done 2026-11-13 5766b07] E3 NV — CI (`.github/workflows/ci.yml`) runs E2, `cargo test` and the userspace clippy line. Pushing is for the human. Done when it runs locally through `tools/qemu-test.sh`.
-- [~ DS started 2026-11-13] E4 DS — Make the userspace clippy line in AGENTS.md section 5 pass with `-D warnings` (errors today in `sdk` bins `init`/`child`, `personality` bins `sh`/`cat`/`wc`, and `servers/process/src/bin/ps.rs`).
+- [x DS done 2026-11-13 9dda2e9] E4 DS — Make the userspace clippy line in AGENTS.md section 5 pass with `-D warnings` (fixed the 16 lints in `sdk` bins `init`/`child`, `personality` bins `sh`/`cat`/`wc`, `servers/process/src/bin/ps.rs`; boot still DONE + clean halt).
 - [~ NV started 2026-11-13] E5 NV — Add the userspace clippy line to `tools/qemu-test.sh` once E4 lands; blocked on DS's E4 (userspace clippy not yet `-D warnings` clean).
 - [ ] E6 DS — Source and build notes for every ELF in `personality/assets/` (one source file plus a reproducible build line each, and the musl MIT license noted), or a script that builds them.
 - [ ] E7 DS — Remove the `.data` atomics workaround in `sdk/src/bin/init.rs:902` and its copy in ps. The real causes (kstack overflow, asm clobber) are fixed. The boot must still reach DONE.
@@ -49,6 +49,7 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 - [x GLM done 2026-11-13 46cb60c] [Request] GLM — landed as `PagingBackend::map_page_checked` (fallible) with a default bridge to the infallible `map_page`, so mocks in entry.rs/init.rs needed no changes; all kernel install paths route through it, failures roll back PTEs/refs/records into `VmmError::MapFailed` (fault.rs kills the faulting thread). NV's S10 (df460db) overrides it in hal/x86_64.
 - [Request] NV — E1 `tools/build-all.sh` image order is wrong for a fresh build: it builds `sdk init` before PS/VFS/CONSOLE/AUTH (init embeds those, so HAS_*_IMAGE=false → boot stops at init marker step 18), and builds `vfs` before the personality bins it embeds (no `/posix` → boot stops at step 16). Repro: fresh `cargo clean` (or empty `$CARGO_TARGET_DIR`) then `tools/qemu-test.sh`. Needed order: child, console, auth, personality --bins, vfs, ps, init, kernel-boot. (I fixed the related `sdk/build.rs` rerun-if-changed so the manual pipeline order is reproducible; build-all still needs this reorder.)
 - [Resolved] NV — build-all.sh image order already fixed by E1 (7fd070f): order is now child, console, auth, personality --bins, vfs, ps, init, kernel-boot, matching the Request's needed order. No further NV action.
+- [Request] NV — E4 landed (9dda2e9): the userspace clippy line is now `-D warnings` clean, so E5 (add it to `tools/qemu-test.sh`) is unblocked.
 
 ## Blockers
 
