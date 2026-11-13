@@ -1,105 +1,44 @@
 #!/usr/bin/env bash
 #
-# tools/qemu-test.sh — Phase 0 QEMU bring-up test.
+# tools/qemu-test.sh — Phase H full-system boot test.
 #
-# Runs the workspace quality gates and, when QEMU is available, boots an
-# x86_64 kernel image capturing the serial (UART) log.
+# Calls E1 (tools/build-all.sh) to build every userspace image and the
+# release kernel, then boots the kernel in QEMU and requires the DONE
+# marker plus a clean halt.
 #
 # Usage:
 #   tools/qemu-test.sh [qemu-extra-args...]
 #
-# Exit codes (ADR-013):
-#   0 — quality gates pass (and QEMU boot, if attempted, succeeded)
-#   1 — a quality gate failed
-#   2 — QEMU exit code 1 (kernel panic)
-#   3 — QEMU exit code 2 (unhandled fault / shutdown)
-#   4 — QEMU exit code 3 (boot timeout)
-#   5 — QEMU exit code 4 (userspace test process failure)
-#   255 — QEMU failed to launch / harness error
+# Environment:
+#   CARGO_TARGET_DIR  build dir passed through to E1/cargo (default: target)
+#   SERIAL_LOG        serial (UART) log path (default: <CARGO_TARGET_DIR>/serial.log)
+#   KERNEL_ELF        release kernel ELF (default: <CARGO_TARGET_DIR>/x86_64-unknown-none/release/kernel-boot)
+#   QEMU              qemu binary (default: qemu-system-x86_64)
+#   QEMU_TIMEOUT      seconds (default: 90)
+#
+# Exit codes (ADR-013/ADR-029):
+#   0 — clean boot (DONE marker + clean halt)
+#   1 — serial-log check failed / unexpected QEMU status
+#   2 — kernel panic (isa-debug-exit value 1)
+#   3 — unhandled fault / shutdown (value 2)
+#   4 — boot timeout (value 3 or harness kill)
+#   255 — QEMU failed to launch
 #
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-KERNEL_ELF="${KERNEL_ELF:-target/x86_64-unknown-none/debug/kernel-boot}"
-INITRD="${INITRD:-build/initrd.img}"
-QEMU_BIN="${QEMU:-qemu-system-x86_64}"
-SERIAL_LOG="${SERIAL_LOG:-/tmp/helios-serial.log}"
-QEMU_TIMEOUT="${QEMU_TIMEOUT:-30}"
+TD="${CARGO_TARGET_DIR:-target}"
+TARGET="${TARGET:-x86_64-unknown-none}"
+KERNEL_ELF="${KERNEL_ELF:-$TD/$TARGET/release/kernel-boot}"
+SERIAL_LOG="${SERIAL_LOG:-$TD/serial.log}"
+QEMU="${QEMU:-qemu-system-x86_64}"
+QEMU_TIMEOUT="${QEMU_TIMEOUT:-90}"
 
-fail() {
-    echo "[qemu-test] ERROR: $*" >&2
-    exit 1
-}
-
-# ADR-013 exit-code mapping (ADR-029 amended): qemu's isa-debug-exit reports
-# process status (value << 1) | 1, so kernel codes decode as:
-#   status 1 = value 0 = clean bring-up halt | status 3 = value 1 = panic
-#   status 5 = value 2 = unhandled fault     | status 7 = value 3 = boot timeout
-qemu_exit_to_ci() {
-    case "$1" in
-        0) echo 0 ;;     # (non-exit-device paths) clean
-        1) echo 0 ;;     # isa-debug-exit: value 0 = clean bring-up halt
-        3) echo 2 ;;     # isa-debug-exit: value 1 = kernel panic
-        5) echo 3 ;;     # isa-debug-exit: value 2 = unhandled fault / shutdown
-        7) echo 4 ;;     # isa-debug-exit: value 3 = boot timeout
-        124) echo 4 ;;   # harness timeout killed QEMU
-        4) echo 5 ;;     # userspace test process failure
-        255) echo 255 ;; # QEMU failed to launch / harness error
-        *) echo 1 ;;     # unexpected qemu exit code
-    esac
-}
-
-echo "[qemu-test] ===== Helios Phase 0 QEMU bring-up ====="
-echo "[qemu-test] workspace root: $ROOT"
-
-# ---------------------------------------------------------------------------
-# 1. Quality gates (always run)
-# ---------------------------------------------------------------------------
-
-echo "[qemu-test] --- cargo build ---"
-cargo build --workspace --exclude kernel-boot || fail "cargo build failed"
-
-echo "[qemu-test] --- cargo build -p kernel-boot --target x86_64-unknown-none ---"
-cargo build -p kernel-boot --target x86_64-unknown-none || fail "cargo build -p kernel-boot --target x86_64-unknown-none failed"
-
-echo "[qemu-test] --- cargo clippy -p kernel-boot --target x86_64-unknown-none -- -D warnings ---"
-cargo clippy -p kernel-boot --target x86_64-unknown-none -- -D warnings || fail "cargo clippy -p kernel-boot failed"
-
-echo "[qemu-test] --- cargo clippy --workspace --exclude kernel-boot -- -D warnings ---"
-cargo clippy --workspace --exclude kernel-boot -- -D warnings || fail "cargo clippy --workspace failed"
-
-echo "[qemu-test] --- cargo fmt --check ---"
-cargo fmt --check || fail "cargo fmt --check failed (run 'cargo fmt')"
-
-# ---------------------------------------------------------------------------
-# 2. QEMU boot (conditional on QEMU being installed)
-# ---------------------------------------------------------------------------
-
-if ! command -v "$QEMU_BIN" >/dev/null 2>&1; then
-    echo
-    echo "[qemu-test] WARN: '$QEMU_BIN' not found on PATH."
-    echo "[qemu-test]       Install it (e.g. 'brew install qemu' on macOS) to enable boot tests."
-    echo "[qemu-test]       Quality gates passed; QEMU boot skipped."
-    echo "[qemu-test] ===== done (boot skipped) ====="
-    exit 0
-fi
-
-if [[ ! -f "$KERNEL_ELF" ]]; then
-    echo
-    echo "[qemu-test] WARN: '$KERNEL_ELF' not found."
-    echo "[qemu-test]       Build it first: cargo build -p kernel-boot --target x86_64-unknown-none"
-    echo "[qemu-test]       Quality gates passed; QEMU boot skipped."
-    echo "[qemu-test] ===== done (boot skipped) ====="
-    exit 0
-fi
-
-echo "[qemu-test] --- QEMU boot: $QEMU_BIN ---"
+fail() { echo "[qemu-test] ERROR: $*" >&2; exit 1; }
 
 # Pick a host-accelerated machine type when available; fall back to TCG.
-# On Apple Silicon (arm64), hvf/kvm are unavailable for x86_64 emulation;
-# use TCG (slow but works everywhere).
 case "$(uname -m)-$(uname -s)" in
     arm64-Darwin)  QEMU_ACCEL="tcg" ;;
     x86_64-Darwin) QEMU_ACCEL="hvf" ;;
@@ -107,58 +46,54 @@ case "$(uname -m)-$(uname -s)" in
     *)             QEMU_ACCEL="tcg" ;;
 esac
 
-# Build initrd if it doesn't exist
-if [[ ! -f "$INITRD" ]]; then
-    echo "[qemu-test] Building initrd..."
-    mkdir -p build
-    # Find init and PS binaries
-    INIT_ELF="target/x86_64-unknown-none/release/init"
-    PS_ELF="target/x86_64-unknown-none/release/ps"
-    if [[ -f "$INIT_ELF" ]]; then
-        cp "$INIT_ELF" build/init
-    fi
-    if [[ -f "$PS_ELF" ]]; then
-        cp "$PS_ELF" build/ps
-    fi
-    if [[ -f build/init ]] || [[ -f build/ps ]]; then
-        cat build/init build/ps > "$INITRD" 2>/dev/null || true
-    fi
-fi
+# Resolve the timeout binary: gtimeout (GNU coreutils on macOS) preferred.
+if command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN=gtimeout;
+elif command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN=timeout;
+else fail "neither 'timeout' nor 'gtimeout' found on PATH"; fi
 
-# Run QEMU with the kernel image
+echo "[qemu-test] ===== Helios Phase H full-system boot ====="
+echo "[qemu-test] workspace root: $ROOT"
+echo "[qemu-test] kernel: $KERNEL_ELF"
+echo "[qemu-test] serial log: $SERIAL_LOG"
+echo "[qemu-test] target dir: $TD"
+
+# 1. Build every userspace image + kernel-boot release (E1).
+tools/build-all.sh || fail "E1 (tools/build-all.sh) failed"
+
+# 2. Sanity: kernel ELF must exist.
+[[ -f "$KERNEL_ELF" ]] || fail "kernel ELF not found: $KERNEL_ELF (build it first)"
+
+rm -f "$SERIAL_LOG"
+
+echo "[qemu-test] --- QEMU boot: $QEMU (accel=$QEMU_ACCEL) ---"
 set +e
-if [[ -f "$INITRD" ]]; then
-    timeout "${QEMU_TIMEOUT}" "$QEMU_BIN" \
-        -machine accel="$QEMU_ACCEL" \
-        -cpu max \
-        -m 256M \
-        -kernel "$KERNEL_ELF" \
-        -initrd "$INITRD" \
-        -serial file:"$SERIAL_LOG" \
-        -display none \
-        -no-reboot \
-        -device isa-debug-exit,iobase=0x501,iosize=0x02 \
-        -nographic \
-        ${1+"$@"} \
-        >/tmp/helios-qemu-stdout.log 2>/tmp/helios-qemu-stderr.log
-else
-    timeout "${QEMU_TIMEOUT}" "$QEMU_BIN" \
-        -machine accel="$QEMU_ACCEL" \
-        -cpu max \
-        -m 256M \
-        -kernel "$KERNEL_ELF" \
-        -serial file:"$SERIAL_LOG" \
-        -display none \
-        -no-reboot \
-        -device isa-debug-exit,iobase=0x501,iosize=0x02 \
-        -nographic \
-        ${1+"$@"} \
-        >/tmp/helios-qemu-stdout.log 2>/tmp/helios-qemu-stderr.log
-fi
+"$TIMEOUT_BIN" "${QEMU_TIMEOUT}" "$QEMU" \
+    -machine accel="$QEMU_ACCEL" \
+    -cpu max \
+    -m 256M \
+    -kernel "$KERNEL_ELF" \
+    -serial file:"$SERIAL_LOG" \
+    -display none \
+    -no-reboot \
+    -device isa-debug-exit,iobase=0x501,iosize=0x02 \
+    -nographic \
+    "$@" \
+    </dev/null >/tmp/helios-qemu-stdout.log 2>/tmp/helios-qemu-stderr.log
 qemu_status=$?
 set -e
 
-ci_code="$(qemu_exit_to_ci "$qemu_status")"
+# ADR-013 / ADR-029: isa-debug-exit reports (value << 1) | 1.
+#   status 1 = value 0 = clean bring-up halt (success)
+case "$qemu_status" in
+    1) ci_code=0 ;;   # clean halt
+    3) ci_code=2 ;;   # kernel panic
+    5) ci_code=3 ;;   # unhandled fault / shutdown
+    7) ci_code=4 ;;   # boot timeout
+    124) ci_code=4 ;; # harness timeout killed QEMU
+    255) ci_code=255 ;; # QEMU failed to launch
+    *) ci_code=1 ;;   # unexpected
+esac
+
 if [[ "$ci_code" != "0" ]]; then
     echo "[qemu-test] QEMU exited with status $qemu_status (CI code $ci_code)"
     cat /tmp/helios-qemu-stderr.log 2>/dev/null || true
@@ -167,11 +102,30 @@ if [[ "$ci_code" != "0" ]]; then
     exit "$ci_code"
 fi
 
-echo "[qemu-test] QEMU exited cleanly (status $qemu_status)"
+# 3. Require the DONE marker and a clean halt in the serial log.
+serial_ok=1
 if [[ -f "$SERIAL_LOG" ]]; then
-    echo "[qemu-test] Serial log captured at: $SERIAL_LOG"
-    echo "--- Serial log contents ---"
-    cat "$SERIAL_LOG" 2>/dev/null || true
+    if grep -aq '494e49540000000f' "$SERIAL_LOG"; then
+        echo "[qemu-test] DONE marker (0x494e49540000000f) found in serial log"
+    else
+        echo "[qemu-test] ERROR: DONE marker not found in serial log" >&2
+        serial_ok=0
+    fi
+    if grep -aq 'clean halt' "$SERIAL_LOG"; then
+        echo "[qemu-test] clean halt found in serial log"
+    else
+        echo "[qemu-test] ERROR: clean halt not found in serial log" >&2
+        serial_ok=0
+    fi
+    echo "--- Serial log (tail) ---"
+    tail -5 "$SERIAL_LOG" 2>/dev/null || true
+else
+    echo "[qemu-test] ERROR: serial log not written: $SERIAL_LOG" >&2
+    serial_ok=0
 fi
 
-echo "[qemu-test] ===== done (boot smoke-test complete) ====="
+[[ "$serial_ok" == "1" ]] || exit 1
+
+echo "[qemu-test] QEMU exited cleanly (status $qemu_status)"
+echo "[qemu-test] ===== done (full-system boot smoke-test complete) ====="
+exit 0

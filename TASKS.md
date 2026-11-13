@@ -46,7 +46,7 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 
 ## Blockers
 
-(none)
+- [Blocker] GLM — kernel/src (sched.rs/entry.rs/mem.rs) S1/ADR-050 per-thread `user_regs` does not compile (sched.rs:751 `t.user_regs = image` type mismatch), breaking build-all.sh/qemu-test.sh and all verification; NV's E2 cannot be verified until kernel builds.
 
 ## Decisions needed
 

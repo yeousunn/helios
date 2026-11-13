@@ -63,9 +63,9 @@ for bin in posix sh cat login ls echo wc linrun; do
     build_bin personality "$bin"
 done
 
-# 4. Kernel last.
-cargo build -p kernel-boot --target "$TARGET" --release \
-    || fail "cargo build -p kernel-boot --release failed"
+# 4. Kernel last (the `kernel-boot` bin requires the `boot` feature).
+cargo build -p kernel-boot --target "$TARGET" --release --features boot \
+    || fail "cargo build -p kernel-boot --release --features boot failed"
 echo "[build-all] kernel-boot -> ${CARGO_TARGET_DIR:-target}/$TARGET/release/kernel-boot"
 
 echo "[build-all] done"
