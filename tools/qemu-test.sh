@@ -70,6 +70,13 @@ if ! printf '%s\n' "$hal_test_out" | grep -Eq 'running [1-9][0-9]* tests'; then
 fi
 echo "[qemu-test] hal-x86-64 host tests present (E11)"
 
+# E5: userspace clippy must be -D warnings clean (unblocked by DS's E4).
+echo "[qemu-test] --- userspace clippy (E5: -D warnings) ---"
+cargo clippy -p sdk -p process -p vfs -p console -p auth -p personality \
+    --features user --target x86_64-unknown-none --release -- -D warnings \
+    || fail "userspace clippy is not -D warnings clean (E4/E5)"
+echo "[qemu-test] userspace clippy clean (E5)"
+
 rm -f "$SERIAL_LOG"
 
 echo "[qemu-test] --- QEMU boot: $QEMU (accel=$QEMU_ACCEL) ---"
