@@ -23,10 +23,11 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 - [x GLM done 2026-11-14 bb13bb8] S9 GLM — UNMAP with a huge page count loops with interrupts off (`aspace.rs:331`). Cap it at the region size and return EBADARG above that.
 - [x NV done 2026-11-13 df460db] S10 NV — `map_page` panics when no page-table frame is free (`hal/x86_64/src/paging.rs:~388`). Return an error.
 - [x GLM done 2026-11-14 ac5cf0e] S10b GLM — Audit every `unwrap()`/`expect()` reachable from `entry::dispatch` and turn each into an error code. Tests and boot code may keep theirs.
-- [~ DS started 2026-11-13] S11 — An `attack` userspace program (pattern: `sdk/src/bin/child.rs`) makes every bad call from S1–S10 and expects an error back. init runs it as a new marker step. The boot must still reach DONE. Add each case as soon as its S-task lands. (S8/S9 landed 2026-11-14; adding their cases now.)
+- [x DS done 2026-11-14 e8493b8] S11 — An `attack` userspace program (pattern: `sdk/src/bin/child.rs`) makes every bad call from S1–S10 and expects an error back. init runs it as a new marker step. The boot must still reach DONE. Add each case as soon as its S-task lands.
   - [x DS done 2026-11-13 803becd] S11.1 — harness: `sdk::attack` runner (generic, host-tested) + `child` argv "attack" mode + init markers 29/30 + 2 baseline cases; boot reaches DONE. Also fixed `sdk/build.rs` rerun-if-changed (fresh-build reproducibility).
   - [x DS done 2026-11-13 0bf07eb] S11.2 — cases for S2 (kernel-PC THREAD_CREATE, and SET_ENTRY via a suspended scratch thread that is killed after) and S3 (non-canonical SET_TLS); 5 cases total, boot reaches DONE + clean halt.
-  - [x DS done 2026-11-13 b4c9bfd] S11.3 — cases for S4/S5 (MAP kernel-window, UNMAP kernel-window, PROTECT kernel-window, MAP null); 9 cases total, boot reaches DONE + clean halt. Pending: S8 GRANT-check and S9 oversized UNMAP (not landed); S6/S7 not observable from ring 3.
+  - [x DS done 2026-11-13 b4c9bfd] S11.3 — cases for S4/S5 (MAP kernel-window, UNMAP kernel-window, PROTECT kernel-window, MAP null); 9 cases total, boot reaches DONE + clean halt.
+  - [x DS done 2026-11-14 e8493b8] S11.4 — case for S9 (oversized UNMAP count → EBADARG); S8's NEW_THREAD transfer documented as not observable from ring 3 (regular processes hold no Factory cap, ADR-023 §3; covered by the host test). 10 cases total; full boot reaches DONE + clean halt, attack child exits 0.
 
 ## Phase H — Engineering
 
