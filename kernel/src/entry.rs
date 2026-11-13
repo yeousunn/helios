@@ -364,6 +364,12 @@ fn as_invoke(pid: ProcessId, cap: &Capability, args: &SyscallArgs) -> SyscallRet
             if flags.0 == 0 {
                 return SyscallReturn::err(ipc::status::EBADARG);
             }
+            // S4: reject non-user ranges (kernel window PML4[511], the
+            // reserved slots, VA 0) BEFORE any frame allocation so a bad
+            // range costs no memory. aspace::map re-validates.
+            if aspace::validate_user_range(vaddr, 1).is_err() {
+                return SyscallReturn::err(ipc::status::EBADARG);
+            }
             // Frame cap check (ANON ignores caps[0]). ANON maps resolve from
             // the AS fault pool when one is attached (v1 lazy path); without a
             // pool they resolve EAGERLY with a zeroed frame — non-pager
@@ -406,7 +412,11 @@ fn as_invoke(pid: ProcessId, cap: &Capability, args: &SyscallArgs) -> SyscallRet
             );
             match aspace::map(as_id, vaddr, 1, frame_addr, flags) {
                 Ok(_) => SyscallReturn::ok(msg.tag, [0; 4]),
-                Err(aspace::VmmError::Overlap) => SyscallReturn::err(ipc::status::EBADARG),
+                // S4: a range outside user space (or VA 0 / unaligned) is a
+                // bad argument, not an allocation failure.
+                Err(aspace::VmmError::Overlap) | Err(aspace::VmmError::BadVaddr) => {
+                    SyscallReturn::err(ipc::status::EBADARG)
+                }
                 Err(_) => SyscallReturn::err(ipc::status::ENOMEM),
             }
         }
@@ -1446,6 +1456,75 @@ mod tests {
         ));
         assert_eq!(r.status, ipc::status::OK as i64, "valid SET_ENTRY pc");
         assert_eq!(sched::get(child_tid).unwrap().initial_pc, 0x500000);
+    }
+
+    /// S4: AS::MAP/UNMAP/PROTECT must reject kernel-window, split and null
+    /// ranges with EBADARG — a user PTE must never be installable over the
+    /// shared kernel window (PML4[511]), and a rejected call must allocate
+    /// nothing.
+    #[test]
+    fn s4_as_ranges_must_stay_in_user_space() {
+        let (pid, _tid, factory) = setup();
+        let r_as = dispatch(args(num::INVOKE, factory, Tag::new(3), [0; 4]));
+        let as_h = r_as.w[0] as u32;
+        let as_id = proc::get_cap(pid, as_h).unwrap().obj;
+
+        // MAP (ANON|R — no frame cap needed) at bad ranges: kernel window,
+        // the split itself, null. All EBADARG, and no ANON frame burned
+        // (the range check fires before allocation).
+        for bad in [0xFFFF_8000_0100_0000, 0x0000_8000_0000_0000, 0] {
+            let mut m = Message::new(1);
+            m.words[0] = bad;
+            m.words[1] = 0b1_1000; // ANON|R
+            let r = dispatch(args(num::INVOKE, as_h, m.tag, m.words));
+            assert_eq!(r.status, ipc::status::EBADARG as i64, "MAP va={bad:#x}");
+            assert!(
+                crate::aspace::translate(as_id, Vaddr(bad)).is_err(),
+                "nothing recorded for va={bad:#x}"
+            );
+        }
+
+        // UNMAP of the kernel window (munmap hole-skip semantics would
+        // otherwise "succeed") → EBADARG.
+        let mut m = Message::new(2);
+        m.words[0] = 0xFFFF_8000_0100_0000;
+        m.words[1] = 1;
+        assert_eq!(
+            dispatch(args(num::INVOKE, as_h, m.tag, m.words)).status,
+            ipc::status::EBADARG as i64,
+            "UNMAP kernel window"
+        );
+
+        // PROTECT of the kernel window → EBADARG.
+        let mut m = Message::new(3);
+        m.words[0] = 0xFFFF_8000_0100_0000;
+        m.words[2] = 0b001;
+        assert_eq!(
+            dispatch(args(num::INVOKE, as_h, m.tag, m.words)).status,
+            ipc::status::EBADARG as i64,
+            "PROTECT kernel window"
+        );
+
+        // A legal ANON map still works after the rejections.
+        let mut m = Message::new(1);
+        m.words[0] = 0xA0_0000;
+        m.words[1] = 0b1_1000; // ANON|R
+        let r = dispatch(args(num::INVOKE, as_h, m.tag, m.words));
+        assert_eq!(r.status, ipc::status::OK as i64, "valid ANON MAP");
+        assert!(crate::aspace::translate(as_id, Vaddr(0xA0_0000)).is_ok());
+
+        // Release the ANON frame: kernel tests share one frame::init region
+        // cumulatively (setup's re-init no-ops once initialized), so every
+        // entry test must end frame-neutral or later kstack allocations
+        // fail (spawn leaves kstack_top=0 → SET_ENTRY EBADSTATE).
+        let mut m = Message::new(2);
+        m.words[0] = 0xA0_0000;
+        m.words[1] = 1;
+        assert_eq!(
+            dispatch(args(num::INVOKE, as_h, m.tag, m.words)).status,
+            ipc::status::OK as i64,
+            "UNMAP of the legal ANON map"
+        );
     }
 
     /// S1/ADR-050: the REGS_WRITE syscall masks RFLAGS (IOPL=0, IF=1) and

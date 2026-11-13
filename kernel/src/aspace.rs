@@ -205,6 +205,39 @@ impl Pool {
     }
 }
 
+/// S4: the whole page range `[vaddr, vaddr + pages)` must lie entirely in
+/// user space (PML4[0..256), strictly below the canonical split
+/// `sched::USER_ADDR_LIMIT`), VA 0 is never mappable, and the end index is
+/// overflow-checked so a huge page count cannot wrap back into user space.
+/// Every user-reachable VMM entry point (MAP/UNMAP/PROTECT, and the pager
+/// resolve path) validates through this helper — a region may therefore
+/// never reach the shared kernel window (PML4[511]) or the reserved
+/// PML4[256..510] slots.
+pub fn validate_user_range(vaddr: Vaddr, pages: u64) -> Result<(), VmmError> {
+    if pages == 0 || !vaddr.is_page_aligned() || vaddr.0 == 0 {
+        return vmm_err(VmmError::BadVaddr);
+    }
+    // Exclusive end page index, overflow-checked (a wrapping end would let
+    // a range "start over" inside user space while covering the kernel).
+    let end_page = vaddr
+        .page_index()
+        .checked_add(pages)
+        .ok_or(VmmError::BadVaddr)?;
+    // The split itself (page index USER_ADDR_LIMIT / PAGE_SIZE) is the
+    // first kernel-owned page (PML4[256]); the range must end at or below
+    // it, i.e. the last mapped byte stays below USER_ADDR_LIMIT.
+    if end_page > crate::sched::USER_ADDR_LIMIT / PAGE_SIZE as u64 {
+        return vmm_err(VmmError::BadVaddr);
+    }
+    Ok(())
+}
+
+/// S4: single-address form of [`validate_user_range`] (PROTECT, pager
+/// resolve): the address must be a non-null, page-aligned user address.
+fn validate_user_addr(vaddr: Vaddr) -> Result<(), VmmError> {
+    validate_user_range(vaddr, 1)
+}
+
 impl AddressSpace {
     const fn new() -> Self {
         AddressSpace {
@@ -233,9 +266,9 @@ impl AddressSpace {
         base: Option<PhysAddr>,
         flags: MapFlags,
     ) -> Result<PhysAddr, VmmError> {
-        if !vaddr.is_page_aligned() || pages == 0 {
-            return vmm_err(VmmError::BadVaddr);
-        }
+        // S4: the whole range must be in user space (rejects VA 0, the
+        // kernel window and overflowed end addresses).
+        validate_user_range(vaddr, pages)?;
         if base.is_some() && flags.contains(MapFlags::ANON) {
             return vmm_err(VmmError::FrameNotOwned);
         }
@@ -364,9 +397,9 @@ impl AddressSpace {
     /// mappings (missing mid-stack PTEs, corrupted package data). Head/tail
     /// splits keep the survivors; refs drop only for the unmapped pages.
     fn unmap(&mut self, be: &dyn PagingBackend, vaddr: Vaddr, pages: u64) -> Result<(), VmmError> {
-        if !vaddr.is_page_aligned() || pages == 0 {
-            return vmm_err(VmmError::BadVaddr);
-        }
+        // S4: the whole range must be in user space, checked BEFORE the
+        // hole-skipping walk (a kernel-window span must not be swept).
+        validate_user_range(vaddr, pages)?;
         let mut cur = vaddr.page_index();
         let end_idx = cur.checked_add(pages).ok_or(VmmError::BadVaddr)?;
         while cur < end_idx {
@@ -482,6 +515,10 @@ impl AddressSpace {
         vaddr: Vaddr,
         flags: MapFlags,
     ) -> Result<(), VmmError> {
+        // S4: the target address must be a user page (the containing region
+        // was range-validated at map time, so the whole reflagged region
+        // stays in user space).
+        validate_user_addr(vaddr)?;
         for r in self.regions.iter_mut().flatten() {
             if r.contains(vaddr) {
                 r.flags = flags;
@@ -522,7 +559,7 @@ impl AddressSpace {
         frame_addr: PhysAddr,
         flags: MapFlags,
     ) -> Result<bool, VmmError> {
-        if !vaddr.is_page_aligned() || !frame_addr.is_frame_aligned() {
+        if !frame_addr.is_frame_aligned() || validate_user_addr(vaddr).is_err() {
             return vmm_err(VmmError::BadVaddr);
         }
         let idx = vaddr.page_index();
@@ -1635,5 +1672,184 @@ mod tests {
         let (pa, _) = translate(as_id, Vaddr(cr2)).unwrap();
         assert_eq!(pa, sp.checked_add(15 * PAGE_SIZE as u64).unwrap());
         assert_eq!(pa, PhysAddr::new(0x10_23000));
+    }
+
+    /// S4: the pure range validator. Kernel-window addresses (PML4[511]),
+    /// the reserved PML4[256..510] range, the split value itself, VA 0 and
+    /// unaligned addresses are all rejected; the last user page and a range
+    /// ending exactly at the split are accepted.
+    #[test]
+    fn s4_validate_user_range_bounds() {
+        let split = crate::sched::USER_ADDR_LIMIT;
+        let last_user = split - PAGE_SIZE as u64;
+
+        // Accepted: ordinary user pages, the final user page, a range that
+        // ends exactly at the split.
+        assert_eq!(validate_user_range(Vaddr(0x40_0000), 2), Ok(()));
+        assert_eq!(validate_user_range(Vaddr(last_user), 1), Ok(()));
+        assert_eq!(
+            validate_user_range(Vaddr(last_user - PAGE_SIZE as u64), 2),
+            Ok(())
+        );
+
+        // Rejected: null, unaligned, empty.
+        assert_eq!(validate_user_range(Vaddr(0), 1), Err(VmmError::BadVaddr));
+        assert_eq!(
+            validate_user_range(Vaddr(0x40_0001), 1),
+            Err(VmmError::BadVaddr)
+        );
+        assert_eq!(
+            validate_user_range(Vaddr(0x40_0000), 0),
+            Err(VmmError::BadVaddr)
+        );
+
+        // Rejected: the split itself, the reserved middle, the kernel window.
+        for bad in [
+            split,
+            0x0000_C000_0000_0000, // PML4[384] (reserved non-canonical middle)
+            0xFFFF_0000_0000_0000, // PML4[510]
+            0xFFFF_8000_0100_0000, // the shared kernel window (ADR-045)
+            0xFFFF_FFFF_FFFF_F000, // top of PML4[511]
+        ] {
+            assert_eq!(
+                validate_user_range(Vaddr(bad), 1),
+                Err(VmmError::BadVaddr),
+                "range start {bad:#x}"
+            );
+        }
+
+        // Overflow-checked: a page count that wraps u64 must not pass, and
+        // a range starting in user space but ending in the kernel half is
+        // rejected wholesale.
+        assert_eq!(
+            validate_user_range(Vaddr(0x40_0000), u64::MAX),
+            Err(VmmError::BadVaddr)
+        );
+        assert_eq!(
+            validate_user_range(Vaddr(last_user), 2),
+            Err(VmmError::BadVaddr),
+            "range crosses the split"
+        );
+    }
+
+    /// S4: MAP must not be able to install a mapping over the shared kernel
+    /// window (PML4[511]) or any non-user range — the exact takeover vector
+    /// (a user PTE on a kernel page). Nothing is recorded on rejection.
+    #[test]
+    fn s4_map_rejects_kernel_window_and_null_ranges() {
+        let as_id = setup();
+        let base = PhysAddr::new(0x21_0000);
+        track_frame(base);
+
+        for bad in [0u64, 0x0000_8000_0000_0000, 0xFFFF_8000_0100_0000] {
+            assert_eq!(
+                map(as_id, Vaddr(bad), 1, Some(base), MapFlags::READ),
+                Err(VmmError::BadVaddr),
+                "MAP frame-backed va={bad:#x}"
+            );
+            assert_eq!(
+                map(
+                    as_id,
+                    Vaddr(bad),
+                    1,
+                    None,
+                    MapFlags::ANON.union(MapFlags::READ)
+                ),
+                Err(VmmError::BadVaddr),
+                "MAP anon va={bad:#x}"
+            );
+        }
+        // Nothing recorded: no region, no phantom translation, no leaked ref.
+        assert!(translate(as_id, Vaddr(0xFFFF_8000_0100_0000)).is_err());
+        assert!(translate(as_id, Vaddr(0)).is_err());
+        assert_eq!(frame_refs(base), 1, "only the owner grant remains");
+
+        // A legal user map still works after the rejections.
+        assert!(map(as_id, Vaddr(0x60_0000), 1, Some(base), MapFlags::READ).is_ok());
+    }
+
+    /// S4: a range that starts in user space must not be allowed to run
+    /// into the kernel half, and a wrapping page count must not pass.
+    #[test]
+    fn s4_map_range_must_end_below_user_limit() {
+        let as_id = setup();
+        let base = PhysAddr::new(0x23_0000);
+        track_frame(base);
+        let last_user = crate::sched::USER_ADDR_LIMIT - PAGE_SIZE as u64;
+
+        assert_eq!(
+            map(as_id, Vaddr(last_user), 2, Some(base), MapFlags::READ),
+            Err(VmmError::BadVaddr),
+            "two pages at the last user page cross the split"
+        );
+        assert_eq!(
+            map(
+                as_id,
+                Vaddr(0x40_0000),
+                u64::MAX,
+                None,
+                MapFlags::ANON.union(MapFlags::READ)
+            ),
+            Err(VmmError::BadVaddr),
+            "wrapping page count"
+        );
+        assert!(
+            translate(as_id, Vaddr(last_user)).is_err(),
+            "nothing recorded"
+        );
+    }
+
+    /// S4: UNMAP and PROTECT validate their ranges before touching the
+    /// region table (UNMAP's hole-skip walk must never sweep the kernel
+    /// window; PROTECT must not reflag a kernel page).
+    #[test]
+    fn s4_unmap_protect_reject_non_user_ranges() {
+        let as_id = setup();
+        let base = PhysAddr::new(0x24_0000);
+        track_frame(base);
+        // A real user region to prove legitimate state survives.
+        map(as_id, Vaddr(0x40_0000), 1, Some(base), MapFlags::READ).unwrap();
+
+        // UNMAP: kernel window, null, crossing-the-split, wrapping count.
+        assert_eq!(
+            unmap(as_id, Vaddr(0xFFFF_8000_0100_0000), 1),
+            Err(VmmError::BadVaddr)
+        );
+        assert_eq!(unmap(as_id, Vaddr(0), 1), Err(VmmError::BadVaddr));
+        let last_user = crate::sched::USER_ADDR_LIMIT - PAGE_SIZE as u64;
+        assert_eq!(unmap(as_id, Vaddr(last_user), 2), Err(VmmError::BadVaddr));
+        assert_eq!(
+            unmap(as_id, Vaddr(0x40_0000), u64::MAX),
+            Err(VmmError::BadVaddr)
+        );
+
+        // PROTECT: null, unaligned, kernel window.
+        assert_eq!(
+            protect(as_id, Vaddr(0), MapFlags::READ),
+            Err(VmmError::BadVaddr)
+        );
+        assert_eq!(
+            protect(as_id, Vaddr(0x40_0001), MapFlags::READ),
+            Err(VmmError::BadVaddr)
+        );
+        assert_eq!(
+            protect(as_id, Vaddr(0xFFFF_8000_0100_0000), MapFlags::READ),
+            Err(VmmError::BadVaddr)
+        );
+
+        // The legitimate region is untouched by all the rejections above.
+        assert!(translate(as_id, Vaddr(0x40_0000)).is_ok());
+        assert_eq!(
+            protect(
+                as_id,
+                Vaddr(0x40_0000),
+                MapFlags::READ.union(MapFlags::WRITE)
+            ),
+            Ok(())
+        );
+        assert!(translate(as_id, Vaddr(0x40_0000))
+            .unwrap()
+            .1
+            .contains(MapFlags::WRITE));
     }
 }
