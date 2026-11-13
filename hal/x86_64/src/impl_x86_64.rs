@@ -3,6 +3,9 @@
 
 use core::fmt::{self, Write};
 
+use crate::host::{
+    fs_base_is_canonical_user, pci_config_addr, FS_BASE_USER_CEIL, PCI_CONFIG_ADDR, PCI_CONFIG_DATA,
+};
 use crate::paging::{enable_nx, BackendFactoryX86_64};
 use caps::ObjId;
 use hal::{
@@ -149,24 +152,6 @@ unsafe fn port_inl(port: u16) -> u32 {
 // ---------------------------------------------------------------------------
 // PCI config space (IO-port mechanism, ADR-016 PciBus)
 // ---------------------------------------------------------------------------
-
-/// PCI configuration address register (IO port).
-const PCI_CONFIG_ADDR: u16 = 0xCF8;
-/// PCI configuration data register (IO port).
-const PCI_CONFIG_DATA: u16 = 0xCFC;
-
-/// Build the PCI config-space address for `bus`/`device`/`function`/`offset`.
-///
-/// `offset` must be 4-byte aligned; the low 2 bits are masked out.
-#[inline(always)]
-fn pci_config_addr(bus: u8, dev: u8, fn_: u8, offset: u8) -> u32 {
-    // SAFETY: Pure bit construction; no port access.
-    (1u32 << 31) // enable bit
-        | ((bus as u32) << 16)
-        | ((dev as u32) << 11)
-        | ((fn_ as u32) << 8)
-        | ((offset as u32) & 0xFC)
-}
 
 /// Read a vendor ID to test whether a PCI function exists.
 fn pci_function_present(bus: u8, dev: u8, fn_: u8) -> bool {
@@ -1061,18 +1046,6 @@ pub static CURRENT_KSTACK: core::sync::atomic::AtomicU64 = core::sync::atomic::A
 /// ADR-044/046: the CPU's currently-loaded FS base (a mirror; the MSR is
 /// written only on change). IA32_FS_BASE = 0xC0000100.
 pub static CURRENT_FS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-/// Ceiling for a canonical x86_64 user address: bits 63..47 must all be
-/// zero (the lower half). A kernel-range or non-canonical FS base faults in
-/// ring 0 at the next context switch, so reject it here as defense in depth
-/// for `Thread::SET_TLS` (S3). `write_fs_base` asserts this before `wrmsr`.
-const FS_BASE_USER_CEIL: u64 = 0x0000_8000_0000_0000;
-
-/// True iff `va` is a canonical x86_64 user address (lower half, sign bit
-/// clear): `va < 0x0000_8000_0000_0000`.
-fn fs_base_is_canonical_user(va: u64) -> bool {
-    va < FS_BASE_USER_CEIL
-}
 
 /// Write IA32_FS_BASE (musl TLS via Thread::SET_TLS).
 pub fn write_fs_base(va: u64) {

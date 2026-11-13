@@ -11,6 +11,7 @@
 
 #![allow(dead_code)]
 
+use crate::host::{pt_index, PDPT_SHIFT, PD_SHIFT, PML4_SHIFT, PT_SHIFT};
 use kernel::aspace::{BackendFactory, MapFlags, PagingBackend, Vaddr};
 use kernel::frame::{self, PhysAddr};
 use spin::Mutex;
@@ -20,15 +21,6 @@ pub const PAGE_SIZE: usize = 4096;
 
 /// Page table entry count per level (512 entries, 9 bits each).
 pub const PT_ENTRIES: usize = 512;
-
-/// Page table index bit widths (x86_64 4-level paging, 9 bits per level).
-const PML4_SHIFT: usize = 39;
-const PDPT_SHIFT: usize = 30;
-const PD_SHIFT: usize = 21;
-const PT_SHIFT: usize = 12;
-
-/// Page table index masks.
-const PT_INDEX_MASK: usize = 0x1FF;
 
 /// Physical address mask for PTE page frame address (bits 12..51).
 const PTE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
@@ -133,12 +125,6 @@ impl PageTable {
     pub fn entry(&mut self, index: usize) -> &mut Pte {
         &mut self.entries[index]
     }
-}
-
-/// Extract the page table index at a given level from a virtual address.
-#[inline(always)]
-fn pt_index(vaddr: usize, shift: usize) -> usize {
-    (vaddr >> shift) & PT_INDEX_MASK
 }
 
 /// Read the current CR3 value (page table base).

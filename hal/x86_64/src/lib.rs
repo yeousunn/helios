@@ -5,6 +5,11 @@
 
 #![no_std]
 
+/// Pure, register-free logic compiled on every host (E11): address checks,
+/// page-table-index/PTE math, PCI config-address building. Host-testable on
+/// non-x86_64 hosts where the rest of this crate is cfg'd out.
+mod host;
+
 #[cfg(target_arch = "x86_64")]
 mod paging;
 
