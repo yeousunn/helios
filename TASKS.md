@@ -64,7 +64,7 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 
 ## Phase 2 — System servers (after freeze lift; ADR-054)
 
-- [~ NV started 2026-11-14] NV — virtio-blk as a userspace driver (after E8): drivers/ virtio_blk against MmioRegion + Frame caps per ADR-052; not wired into boot path yet; HAL traits stay kernel-internal.
+- [x NV done 2026-11-14 49309cb] NV — virtio-blk as a userspace driver (after E8): drivers/ virtio_blk against MmioRegion + Frame caps per ADR-052; not wired into boot path yet; HAL traits stay kernel-internal.
 
 ## Phase 3 — POSIX personality + shell (after freeze lift; ADR-054)
 
