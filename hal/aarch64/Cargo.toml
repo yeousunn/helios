@@ -6,3 +6,4 @@ license.workspace = true
 
 [dependencies]
 hal = { path = ".." }
+kernel = { path = "../../kernel" }
