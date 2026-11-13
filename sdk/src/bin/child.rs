@@ -52,6 +52,19 @@ global_asm!(
 extern "C" fn child_main(argc: u64, argv: *const *const u8, envp: *const *const u8) -> ! {
     let args = unsafe { sdk::args::Args::new(argc, argv, envp) };
     let mut raw = X86_64Syscalls;
+    // S11 attack mode: `argv[0] == "attack"` runs the kernel-hardening attack
+    // cases (sdk::attack) instead of the numeric-argv smoke. init spawns this
+    // as a new marker step; exit 0 = every bad call was rejected.
+    if matches!(args.arg(0), Some(b"attack")) {
+        let status = {
+            let mut sys = Syscalls::new(&mut raw);
+            match sdk::bootstrap::receive(&mut sys) {
+                Ok(package) => sdk::attack::run(&mut sys, &package),
+                Err(_) => sdk::attack::FAIL_NO_PACKAGE,
+            }
+        };
+        Syscalls::new(&mut raw).exit(status)
+    }
     // Consume the bootstrap package so the spawner's `deliver` completes.
     let package = {
         let mut sys = Syscalls::new(&mut raw);

@@ -9,6 +9,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod args;
+pub mod attack;
 pub mod bootinfo;
 pub mod bootstrap;
 pub mod elf;

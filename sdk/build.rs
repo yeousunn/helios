@@ -12,27 +12,36 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Resolve one image env var. Relative paths are tried against this crate's
-/// manifest dir and then the workspace root (manifest/..), matching how the
-/// pipeline is invoked from the workspace root.
-fn resolve_image(var: &str) -> Option<PathBuf> {
-    let raw = env::var(var).ok()?;
+/// Candidate paths for one image env var. Relative paths are tried against
+/// this crate's manifest dir and then the workspace root (manifest/..),
+/// matching how the pipeline is invoked from the workspace root.
+fn candidates(var: &str) -> Vec<PathBuf> {
+    let Ok(raw) = env::var(var) else {
+        return Vec::new();
+    };
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let given = Path::new(&raw);
-    let candidates = if given.is_absolute() {
+    if given.is_absolute() {
         vec![given.to_path_buf()]
     } else {
         vec![manifest.join(given), manifest.join("..").join(given)]
-    };
-    candidates.into_iter().find(|c| c.is_file())
+    }
 }
 
 fn embed(var: &str, const_name: &str, code: &mut String) {
     println!("cargo:rerun-if-env-changed={var}");
-    match resolve_image(var) {
+    let candidates = candidates(var);
+    // Register every candidate as a dependency even when it is absent: the
+    // sdk build script runs while building `child` (the first sdk bin), which
+    // is BEFORE the server images exist on a fresh build. Without this the
+    // cached "no image" output would be reused when `init` is built later and
+    // the boot would fail at init's first spawn (board E1).
+    for c in &candidates {
+        println!("cargo:rerun-if-changed={}", c.display());
+    }
+    match candidates.into_iter().find(|c| c.is_file()) {
         Some(path) => {
             let path = path.canonicalize().unwrap_or(path);
-            println!("cargo:rerun-if-changed={}", path.display());
             let escaped = path
                 .display()
                 .to_string()
