@@ -809,9 +809,44 @@ fn install_ret(pid: ProcessId, obj: u64, typ: ObjType, rights: Rights, tag: Tag)
     }
 }
 
+/// S8: resolve one NEW_THREAD endpoint descriptor (`idx` 1 = fault EP, 2 =
+/// bootstrap EP) under the transfer rules of the in-message cap path
+/// (`syscall::resolve_transfers`, ADR-026): the caller's cap must be a live
+/// `ObjType::Endpoint` carrying GRANT, and the child receives
+/// `rights ∩ requested` — never the caller's full rights, never an added
+/// right. `Ok(None)` = descriptor absent (NULL or no slot, ADR-017 §1).
+/// `Err(status)` = transfer refused; the caller must fail the syscall.
+fn resolve_thread_ep(pid: ProcessId, msg: &Message, idx: usize) -> Result<Option<Capability>, i32> {
+    let Some(cs) = msg.descriptor(idx) else {
+        return Ok(None);
+    };
+    if cs.handle() == 0 {
+        return Ok(None);
+    }
+    let cap = proc::get_cap(pid, cs.handle()).map_err(map_proc)?;
+    if cap.typ != ObjType::Endpoint {
+        return Err(ipc::status::EBADARG);
+    }
+    if !cap.rights.contains(Rights::GRANT) {
+        return Err(ipc::status::ERIGHTS);
+    }
+    if !crate::objreg::is_alive(cap.obj) {
+        return Err(ipc::status::EBADARG);
+    }
+    Ok(Some(Capability {
+        obj: cap.obj,
+        typ: cap.typ,
+        rights: cap.rights.intersect(cs.rights()),
+    }))
+}
+
 /// Factory::NEW_THREAD (ADR-017 packing): creates the child process + thread,
 /// applies caps[1] (fault EP) atomically, installs caps[2] (bootstrap EP) at
 /// child handle 1 (slot 0) per ADR-009, and returns the child's thread cap.
+/// S8: caps[1]/caps[2] transfer under the same rules as in-message caps
+/// (`syscall::resolve_transfers`, ADR-026): live Endpoint + GRANT on the
+/// caller's cap, child receives rights ∩ requested — no full-rights copy,
+/// no added SEND.
 fn new_thread(pid: ProcessId, cap: &Capability, msg: &Message) -> SyscallReturn {
     if !cap.rights.contains(Rights::GRANT) {
         return SyscallReturn::err(ipc::status::ERIGHTS);
@@ -822,6 +857,17 @@ fn new_thread(pid: ProcessId, cap: &Capability, msg: &Message) -> SyscallReturn 
     if !sched::is_user_addr(entry_pc) {
         return SyscallReturn::err(ipc::status::EBADARG);
     }
+
+    // S8: resolve both endpoint descriptors BEFORE the child exists, so a
+    // bad call costs no process slot.
+    let fault_ep = match resolve_thread_ep(pid, msg, 1) {
+        Ok(c) => c,
+        Err(status) => return SyscallReturn::err(status),
+    };
+    let boot_ep = match resolve_thread_ep(pid, msg, 2) {
+        Ok(c) => c,
+        Err(status) => return SyscallReturn::err(status),
+    };
 
     let child_pid = match proc::create() {
         Ok(p) => p,
@@ -840,51 +886,19 @@ fn new_thread(pid: ProcessId, cap: &Capability, msg: &Message) -> SyscallReturn 
         }
     }
 
-    // caps[1] = fault endpoint (optional).
-    if let Some(cs) = msg.descriptor(1) {
-        if cs.handle() != 0 {
-            match proc::get_cap(pid, cs.handle()) {
-                Ok(fep) => {
-                    if proc::install_cap(
-                        child_pid,
-                        Capability {
-                            obj: fep.obj,
-                            typ: fep.typ,
-                            rights: fep.rights,
-                        },
-                    )
-                    .is_err()
-                    {
-                        return SyscallReturn::err(ipc::status::ENOMEM);
-                    }
-                }
-                Err(e) => return SyscallReturn::err(map_proc(e)),
-            }
+    // caps[1] = fault endpoint (optional; S8-validated above).
+    if let Some(fep) = fault_ep {
+        if proc::install_cap(child_pid, fep).is_err() {
+            return SyscallReturn::err(ipc::status::ENOMEM);
         }
     }
 
-    // caps[2] = bootstrap endpoint → child handle 1 (slot 0), ADR-009.
-    if let Some(cs) = msg.descriptor(2) {
-        if cs.handle() != 0 {
-            match proc::get_cap(pid, cs.handle()) {
-                Ok(bep) => {
-                    let rights = bep.rights.intersect(cs.rights()).union(Rights::SEND);
-                    if proc::install_cap_at(
-                        child_pid,
-                        0,
-                        Capability {
-                            obj: bep.obj,
-                            typ: bep.typ,
-                            rights,
-                        },
-                    )
-                    .is_err()
-                    {
-                        return SyscallReturn::err(ipc::status::ENOMEM);
-                    }
-                }
-                Err(e) => return SyscallReturn::err(map_proc(e)),
-            }
+    // caps[2] = bootstrap endpoint → child handle 1 (slot 0), ADR-009
+    // (S8: rights ∩ requested only — the v0 forced SEND is gone; no current
+    // flow sends on the bootstrap EP, the child only receives + revokes it).
+    if let Some(bep) = boot_ep {
+        if proc::install_cap_at(child_pid, 0, bep).is_err() {
+            return SyscallReturn::err(ipc::status::ENOMEM);
         }
     }
 
@@ -966,6 +980,7 @@ mod tests {
         .unwrap()]);
         crate::init::reset_regions_for_test();
         crate::proc::reset_for_test();
+        crate::objreg::reset_for_test();
         crate::endpoint::reset_engine_for_test();
         crate::notification::reset_for_test();
         syscall::reset_reply_for_test();
@@ -1055,6 +1070,98 @@ mod tests {
         let boot = proc::get_cap(child_pid, 1).unwrap();
         assert_eq!(boot.typ, ObjType::Endpoint);
         assert_eq!(boot.obj, proc::get_cap(pid, boot_ep_h).unwrap().obj);
+    }
+
+    /// S8: NEW_THREAD's caps[1]/caps[2] endpoint transfer must follow the
+    /// in-message transfer rules (ADR-026): GRANT required on the caller's
+    /// cap, cap type must be Endpoint, and the child receives
+    /// rights ∩ requested — never the caller's full rights, never an added
+    /// SEND. Fails on the v0 code: it copied caps[1] with full rights, never
+    /// checked GRANT or type, and force-unioned SEND into caps[2].
+    #[test]
+    fn s8_new_thread_ep_transfer_grant_checked_and_intersected() {
+        let (pid, _tid, factory) = setup();
+
+        let r_as = dispatch(args(num::INVOKE, factory, Tag::new(3), [0; 4]));
+        let as_h = r_as.w[0] as u32;
+        // A live endpoint (created through the factory so objreg has it).
+        let r_ep = dispatch(args(num::INVOKE, factory, Tag::new(1), [0; 4]));
+        let live_ep = proc::get_cap(pid, r_ep.w[0] as u32).unwrap();
+        let r_notif = dispatch(args(num::INVOKE, factory, Tag::new(2), [0; 4]));
+
+        // A GRANT-less cap on the SAME live endpoint object: the v0 code
+        // transferred it with full rights; the transfer must refuse (ERIGHTS).
+        let ep_no_grant = proc::install_cap(
+            pid,
+            Capability {
+                obj: live_ep.obj,
+                typ: ObjType::Endpoint,
+                rights: Rights::SEND.union(Rights::RECV),
+            },
+        )
+        .unwrap();
+
+        let new_thread_msg = |c1: CapSlot, c2: CapSlot| {
+            let mut m = Message::new(4);
+            m.words[0] = 0x401000;
+            m.tag = m.tag.with_caps(3);
+            m.set_descriptor(0, CapSlot::pack(as_h, Rights::MAP))
+                .unwrap();
+            m.set_descriptor(1, c1).unwrap();
+            m.set_descriptor(2, c2).unwrap();
+            m
+        };
+
+        // (a) caps[2] without GRANT on the caller's cap → ERIGHTS.
+        let m = new_thread_msg(CapSlot::NULL, CapSlot::pack(ep_no_grant, Rights::SEND));
+        let r = dispatch(args(num::INVOKE, factory, m.tag, m.words));
+        assert_eq!(
+            r.status,
+            ipc::status::ERIGHTS as i64,
+            "caps[2] without GRANT must be refused (v0: full-rights copy)"
+        );
+
+        // (b) caps[1] with a non-Endpoint cap → EBADARG (type check).
+        let m = new_thread_msg(
+            CapSlot::pack(r_notif.w[0] as u32, Rights::RECV),
+            CapSlot::NULL,
+        );
+        let r = dispatch(args(num::INVOKE, factory, m.tag, m.words));
+        assert_eq!(
+            r.status,
+            ipc::status::EBADARG as i64,
+            "caps[1] must be an Endpoint (v0: any type accepted)"
+        );
+
+        // (c) caps[2] with GRANT, requesting only RECV → the child's
+        // bootstrap cap is exactly RECV: no forced SEND (v0 bug), no full
+        // copy of the caller's SEND|RECV|GRANT.
+        let m = new_thread_msg(CapSlot::NULL, CapSlot::pack(r_ep.w[0] as u32, Rights::RECV));
+        let r = dispatch(args(num::INVOKE, factory, m.tag, m.words));
+        assert_eq!(r.status, ipc::status::OK as i64);
+        let child_pid = ObjId(r.w[2]);
+        let boot = proc::get_cap(child_pid, 1).unwrap();
+        assert_eq!(
+            boot.rights,
+            Rights::RECV,
+            "bootstrap cap = rights ∩ requested"
+        );
+        assert_eq!(boot.obj, live_ep.obj);
+        proc::destroy(child_pid).unwrap();
+
+        // (d) caps[1] fault EP with full rights held, SEND requested → the
+        // child's fault-EP cap is exactly SEND (v0 copied full rights).
+        let m = new_thread_msg(CapSlot::pack(r_ep.w[0] as u32, Rights::SEND), CapSlot::NULL);
+        let r = dispatch(args(num::INVOKE, factory, m.tag, m.words));
+        assert_eq!(r.status, ipc::status::OK as i64);
+        let child_pid = ObjId(r.w[2]);
+        let fep = proc::get_cap(child_pid, 1).unwrap();
+        assert_eq!(fep.rights, Rights::SEND, "fault EP = rights ∩ requested");
+        assert_eq!(fep.obj, live_ep.obj);
+        assert_eq!(fep.typ, ObjType::Endpoint);
+        proc::destroy(child_pid).unwrap();
+        // Ensure clean registry for subsequent tests.
+        crate::proc::reset_for_test();
     }
 
     #[test]
@@ -1318,6 +1425,8 @@ mod tests {
     }
     #[test]
     fn set_entry_exec_semantics() {
+        // Ensure clean process registry (test interference from regs_write test).
+        crate::proc::reset_for_test();
         // ADR-039: SET_ENTRY rewrites a SUSPENDED thread's entry; running
         // threads are rejected; the rebuilt context enters the new PC.
         let (pid, _tid, factory) = setup();
@@ -1609,6 +1718,9 @@ mod tests {
         // REGS_WRITE without a Frame cap → EBADARG.
         let r = thread_invoke_for_test(pid, tc, Message::new(10));
         assert_eq!(r.status, ipc::status::EBADARG as i64);
+        // Clean up for subsequent tests.
+        crate::proc::reset_for_test();
+        *crate::sched::SCHED.lock() = None;
     }
 
     /// ADR-044: a foreign-flagged thread's syscall routes to the emulator
