@@ -610,3 +610,8 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 - Validation: no syscall argument or HAL-trait change in this ADR. The cap types (MmioRegion, Frame, Irq) and their rights are checked at invoke time by the kernel dispatcher; an MMIO window outside the granted range, or a DMA phys address not backed by a held Frame cap, is rejected by the kernel when the mapping/programming is requested.
 - Consequences: Userspace drivers run unprivileged (no direct frame-allocator or phys_to_virt access). MMIO and DMA authority is unforgeable, delegable, and revocable via caps (ADR-004/026). The hal traits gain no userspace-facing method; the dispatcher gains MmioRegion/Frame invoke handling for driver grants (a follow-up task after the freeze lifts).
 
+## ADR-006 acceptance
+- Accepted: NV 2026-11-13 (self-accepted: affects only hal/, drivers/, graphics/, tests/ — NV area; no HAL-trait, IPC wire-format, or syscall interface change.)
+- Validation: none (no syscall argument changes; ADR-006 is a deferral record.)
+- Consequences: ADR-006 is ACCEPTED as a documented deferral of bulk transport. It requires no hal/, ipc/, or drivers/ interface change until a future ADR-006 is accepted; Phase 1 IPC uses the control-path message only.
+
