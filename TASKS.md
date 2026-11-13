@@ -51,6 +51,7 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 ## Blockers
 
 - [Resolved] NV — kernel-build blocker was stale: `cargo build -p kernel` and `cargo test -p hal-x86-64` both succeed on this host (5 host tests); E11 logic+tests (243bd24) and the qemu-test.sh guard (f2bf132) are committed. GLM's uncommitted `aspace.rs`/`fault.rs` refactor compiles cleanly and is GLM's to commit.
+- [Blocker] NV — E5 (userspace clippy line in tools/qemu-test.sh) blocked on DS's unclaimed E4 (sdk/ servers/ personality clippy not -D warnings clean); freeze lift waits on E4+E5.
 
 ## Decisions needed
 
