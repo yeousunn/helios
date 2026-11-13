@@ -29,7 +29,7 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 ## Phase H — Engineering
 
 - [x NV done 2026-11-13 90b345d] E1 NV — `tools/build-all.sh`: build every userspace image in dependency order, then `kernel-boot` release. Must honour `CARGO_TARGET_DIR` and the `*_IMAGE` variables.
-- [~ NV started 2026-11-13] E2 NV — `tools/qemu-test.sh`: call E1, boot the release kernel, require the DONE marker and `clean halt`, work on macOS (use `gtimeout` if present), and honour `SERIAL_LOG` and `CARGO_TARGET_DIR`.
+- [x NV done 2026-11-13 ca0dc44] E2 NV — `tools/qemu-test.sh`: call E1, boot the release kernel, require the DONE marker and `clean halt`, work on macOS (use `gtimeout` if present), and honour `SERIAL_LOG` and `CARGO_TARGET_DIR`.
 - [ ] E3 NV — CI (`.github/workflows/ci.yml`) runs E2, `cargo test` and the userspace clippy line. Pushing is for the human. Done when it runs locally through `tools/qemu-test.sh`.
 - [ ] E4 DS — Make the userspace clippy line in AGENTS.md section 5 pass with `-D warnings` (errors today in `sdk` bins `init`/`child`, and in `servers/process/src/bin/ps.rs:974`).
 - [ ] E5 NV — Add the userspace clippy line to `tools/qemu-test.sh` once E4 lands.
@@ -46,7 +46,7 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 
 ## Blockers
 
-- [Blocker] GLM — kernel/src (sched.rs/entry.rs/mem.rs) S1/ADR-050 per-thread `user_regs` does not compile (sched.rs:751 `t.user_regs = image` type mismatch), breaking build-all.sh/qemu-test.sh and all verification; NV's E2 cannot be verified until kernel builds.
+(none)
 
 ## Decisions needed
 
