@@ -128,6 +128,22 @@ pub const fn cpuid_topology_level(eax: u32, ebx: u32, ecx: u32) -> CpuidTopology
     }
 }
 
+/// Compute the online logical-processor count from CPUID leaf 0xB topology
+/// entries: the largest `logical_processors` domain (the top level, e.g.
+/// package) is the total. Returns `1` (single-CPU fallback) when `entries` is
+/// empty or every domain reports zero.
+///
+/// Pure: no CPU instructions, host-testable on any target. Used by
+/// `CpuTopologyX86_64::probe()` on x86_64.
+pub fn cpuid_topology_ncpus(entries: &[CpuidTopologyEntry]) -> u32 {
+    entries
+        .iter()
+        .map(|e| e.logical_processors)
+        .max()
+        .unwrap_or(1)
+        .max(1)
+}
+
 /// True iff `vaddr` falls in a kernel-reserved PML4 slot (256..=511).
 pub const fn pml4_slot_is_kernel(vaddr: usize) -> bool {
     let idx = pt_index(vaddr, PML4_SHIFT);
@@ -250,5 +266,27 @@ mod tests {
         assert_eq!(CPUID_LEAF_TOPOLOGY, 0x0B);
         assert_eq!(CPUID_TOPOLOGY_LEVEL_THREAD, 0);
         assert_eq!(CPUID_TOPOLOGY_LEVEL_CORE, 1);
+    }
+
+    #[test]
+    fn cpuid_topology_ncpus_max_domain() {
+        // Empty input: single-CPU fallback.
+        assert_eq!(cpuid_topology_ncpus(&[]), 1);
+        // Single thread domain.
+        assert_eq!(
+            cpuid_topology_ncpus(&[cpuid_topology_level(1, 0, CPUID_TOPOLOGY_LEVEL_THREAD)]),
+            1
+        );
+        // Top (package) domain reports the total logical processors.
+        let entries = [
+            cpuid_topology_level(1, 0, CPUID_TOPOLOGY_LEVEL_THREAD), // 1 thread / core
+            cpuid_topology_level(2, 0, CPUID_TOPOLOGY_LEVEL_CORE),   // 2 threads / package
+        ];
+        assert_eq!(cpuid_topology_ncpus(&entries), 2);
+        // Zero-valued domains fall back to 1.
+        assert_eq!(
+            cpuid_topology_ncpus(&[cpuid_topology_level(0, 0, CPUID_TOPOLOGY_LEVEL_THREAD)]),
+            1
+        );
     }
 }

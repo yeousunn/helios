@@ -4,8 +4,10 @@
 use core::fmt::{self, Write};
 
 use crate::host::{
-    fs_base_is_canonical_user, pci_config_addr, FS_BASE_USER_CEIL, PCI_CONFIG_ADDR, PCI_CONFIG_DATA,
+    cpuid_leaf1_logical_processors, cpuid_topology_ncpus, fs_base_is_canonical_user,
+    pci_config_addr, FS_BASE_USER_CEIL, PCI_CONFIG_ADDR, PCI_CONFIG_DATA,
 };
+use crate::host::{CpuidTopologyEntry, CPUID_LEAF_1, CPUID_LEAF_TOPOLOGY};
 use crate::paging::{enable_nx, BackendFactoryX86_64};
 use caps::ObjId;
 use hal::{
@@ -362,30 +364,74 @@ impl Default for TimerSrc {
 // ADR-014: CPU topology + SMP — x86_64 stubs (LAPIC-based, wired when SMP lands)
 // ===========================================================================
 
-/// x86_64 CPU topology stub: single BSP, no secondary CPUs yet.
-pub struct CpuTopologyX86_64;
+/// x86_64 CPU topology: probes CPUID leaf 0x0B (falling back to leaf 1
+/// EBX[23:16]) to report the online logical-processor count. Single-CPU QEMU
+/// bring-up reports 1; the struct is `Default`-able (single-CPU fallback) so
+/// existing construction sites keep working.
+pub struct CpuTopologyX86_64 {
+    ncpus: u32,
+}
 
 impl Default for CpuTopologyX86_64 {
     fn default() -> Self {
-        Self
+        Self { ncpus: 1 }
+    }
+}
+
+impl CpuTopologyX86_64 {
+    /// Probe the boot CPU's topology via CPUID leaf 0x0B sub-leaves 0..=2
+    /// (bounded so an unsupported leaf can't loop), then fall back to leaf 1
+    /// EBX[23:16] ("logical processors per package"), then to 1.
+    pub fn probe() -> Self {
+        let mut entries: [CpuidTopologyEntry; 3] = [
+            CpuidTopologyEntry::default(),
+            CpuidTopologyEntry::default(),
+            CpuidTopologyEntry::default(),
+        ];
+        let mut count = 0;
+        for subleaf in 0..3u32 {
+            let (eax, ebx, ecx, _edx) = cpuid(CPUID_LEAF_TOPOLOGY, subleaf);
+            if eax == 0 {
+                break; // invalid sub-leaf: end of enumeration
+            }
+            entries[count] = CpuidTopologyEntry {
+                logical_processors: eax,
+                x2apic_id: ebx,
+                level_type: ecx,
+            };
+            count += 1;
+        }
+        let mut ncpus = if count > 0 {
+            cpuid_topology_ncpus(&entries[..count])
+        } else {
+            1
+        };
+        if ncpus == 1 {
+            // Leaf 0xB unavailable or reported a single domain: try leaf 1.
+            let (_eax, ebx, _ecx, _edx) = cpuid(CPUID_LEAF_1, 0);
+            let leaf1 = cpuid_leaf1_logical_processors(ebx);
+            if leaf1 != 0 {
+                ncpus = leaf1;
+            }
+        }
+        Self { ncpus }
     }
 }
 
 impl CpuTopology for CpuTopologyX86_64 {
     fn ncpus(&self) -> u32 {
-        1
+        self.ncpus
     }
     fn cpu_info(&self, id: u32) -> Option<hal::CpuInfo> {
-        if id == 0 {
-            Some(hal::CpuInfo {
-                id: 0,
-                r#type: hal::CpuType::Performance,
-                numa_node: 0,
-                cache_kib: 0,
-            })
-        } else {
-            None
+        if id >= self.ncpus {
+            return None;
         }
+        Some(hal::CpuInfo {
+            id,
+            r#type: hal::CpuType::Performance,
+            numa_node: 0,
+            cache_kib: 0,
+        })
     }
     fn bsp_id(&self) -> u32 {
         0
@@ -1127,6 +1173,34 @@ fn cpuid_leaf7() -> (u32, u32) {
         core::arch::asm!("mov rbx, {0}", in(reg) rbx_save, options(nostack));
     }
     (ebx as u32, subleaf)
+}
+
+/// Read CPUID `(leaf, subleaf)` into `(eax, ebx, ecx, edx)`. `cpuid` clobbers
+/// RBX (callee-saved in the SysV ABI), so RBX is saved/restored around it and
+/// the EBX output is read back into a general register.
+///
+/// # Safety
+///
+/// `cpuid` is architecturally safe on x86_64; no memory side effects.
+#[inline(never)]
+fn cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
+    let mut eax: u32 = leaf;
+    let mut ebx: u32 = 0;
+    let mut ecx: u32 = subleaf;
+    let mut edx: u32 = 0;
+    let rbx_save: u64;
+    // SAFETY: `cpuid` is always valid on x86_64; RBX is preserved for LLVM.
+    unsafe {
+        core::arch::asm!("mov {0}, rbx", out(reg) rbx_save, options(nostack));
+        core::arch::asm!("cpuid",
+            inout("eax") eax,
+            inout("ecx") ecx,
+            out("edx") edx,
+            options(nostack));
+        core::arch::asm!("mov {0:e}, rbx", out(reg) ebx, options(nostack));
+        core::arch::asm!("mov rbx, {0}", in(reg) rbx_save, options(nostack));
+    }
+    (eax, ebx, ecx, edx)
 }
 
 /// Enable supervisor-mode protections (SMEP + UMIP now; SMAP once a user-copy
