@@ -24,7 +24,7 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 - [~ NV started 2026-11-13] S10 NV — `map_page` panics when no page-table frame is free (`hal/x86_64/src/paging.rs:~388`). Return an error.
 - [ ] S10b GLM — Audit every `unwrap()`/`expect()` reachable from `entry::dispatch` and turn each into an error code. Tests and boot code may keep theirs.
 - [~ DS started 2026-11-13] S11 — An `attack` userspace program (pattern: `sdk/src/bin/child.rs`) makes every bad call from S1–S10 and expects an error back. init runs it as a new marker step. The boot must still reach DONE. Add each case as soon as its S-task lands.
-  - [~ DS started 2026-11-13] S11.1 — harness: `sdk::attack` runner + `child` argv "attack" mode + init marker step + baseline self-test cases (S1–S10 cases appended as they land).
+  - [x DS done 2026-11-13 803becd] S11.1 — harness: `sdk::attack` runner (generic, host-tested) + `child` argv "attack" mode + init markers 29/30 + 2 baseline cases; boot reaches DONE. Also fixed `sdk/build.rs` rerun-if-changed (fresh-build reproducibility).
 
 ## Phase H — Engineering
 
@@ -44,6 +44,7 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 
 - [Request] GLM — call `hal::enable_supervisor_protections()` from kernel-boot (CR4 SMEP/UMIP hardening, S6). The HAL function is written (`hal/x86_64/src/impl_x86_64.rs`) and CPUID-enables SMEP + UMIP only; SMAP waits for a user-copy helper (ADR-051). Wiring the call into `kernel-boot` (boot.S or `kernel_main`) is GLM area.
 - [Request] GLM — change `PagingBackend::map_page` (kernel/src/aspace.rs) to return `Result<(), VmmError>` (and update its mocks in entry.rs/init.rs + all callers) so S10 (hal/x86_64/src/paging.rs) can return an error instead of panicking when `walk_create` fails (no free page-table frame or S5 kernel-slot refusal). Unblocks NV's S10.
+- [Request] NV — E1 `tools/build-all.sh` image order is wrong for a fresh build: it builds `sdk init` before PS/VFS/CONSOLE/AUTH (init embeds those, so HAS_*_IMAGE=false → boot stops at init marker step 18), and builds `vfs` before the personality bins it embeds (no `/posix` → boot stops at step 16). Repro: fresh `cargo clean` (or empty `$CARGO_TARGET_DIR`) then `tools/qemu-test.sh`. Needed order: child, console, auth, personality --bins, vfs, ps, init, kernel-boot. (I fixed the related `sdk/build.rs` rerun-if-changed so the manual pipeline order is reproducible; build-all still needs this reorder.)
 
 ## Blockers
 
