@@ -34,7 +34,7 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 - [x NV done 2026-11-13 ca0dc44] E2 NV — `tools/qemu-test.sh`: call E1, boot the release kernel, require the DONE marker and `clean halt`, work on macOS (use `gtimeout` if present), and honour `SERIAL_LOG` and `CARGO_TARGET_DIR`.
 - [x NV done 2026-11-13 5766b07] E3 NV — CI (`.github/workflows/ci.yml`) runs E2, `cargo test` and the userspace clippy line. Pushing is for the human. Done when it runs locally through `tools/qemu-test.sh`.
 - [x DS done 2026-11-13 9dda2e9] E4 DS — Make the userspace clippy line in AGENTS.md section 5 pass with `-D warnings` (fixed the 16 lints in `sdk` bins `init`/`child`, `personality` bins `sh`/`cat`/`wc`, `servers/process/src/bin/ps.rs`; boot still DONE + clean halt).
-- [~ NV started 2026-11-13] E5 NV — Add the userspace clippy line to `tools/qemu-test.sh` once E4 lands; blocked on DS's E4 (userspace clippy not yet `-D warnings` clean).
+- [x NV done 2026-11-14 62e2826] E5 NV — Add the userspace clippy line to `tools/qemu-test.sh` once E4 lands; blocked on DS's E4 (userspace clippy not yet `-D warnings` clean).
 - [ ] E6 DS — Source and build notes for every ELF in `personality/assets/` (one source file plus a reproducible build line each, and the musl MIT license noted), or a script that builds them.
 - [ ] E7 DS — Remove the `.data` atomics workaround in `sdk/src/bin/init.rs:902` and its copy in ps. The real causes (kstack overflow, asm clobber) are fixed. The boot must still reach DONE.
 - [x NV done 2026-11-13 66c3dcd] E8 NV — ADR-052: userspace drivers get MMIO/DMA through capabilities (MmioRegion + Frame caps; HAL traits stay kernel-internal; driver move waits for freeze lift).
@@ -54,7 +54,7 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 ## Blockers
 
 - [Resolved] NV — kernel-build blocker was stale: `cargo build -p kernel` and `cargo test -p hal-x86-64` both succeed on this host (5 host tests); E11 logic+tests (243bd24) and the qemu-test.sh guard (f2bf132) are committed. GLM's uncommitted `aspace.rs`/`fault.rs` refactor compiles cleanly and is GLM's to commit.
-- [Blocker] NV — E5 (userspace clippy line in tools/qemu-test.sh) blocked on DS's E4 (claimed 2026-11-13, in progress; sdk init bins still -D warnings red: manual_inspect, unnecessary_cast, identity_op, not_unsafe_ptr_arg_deref); freeze lift waits on E4+E5.
+- [Resolved] NV — E5 (userspace clippy line in tools/qemu-test.sh) unblocked by DS's E4 (9dda2e9); clippy line added to tools/qemu-test.sh and full qemu-test.sh gate passes (DONE marker + clean halt).
 - [Blocker] GLM — your uncommitted S8 WIP in `kernel/src/entry.rs` leaves `cargo test -p kernel` red: the new test `s8_new_thread_ep_transfer_grant_checked_and_intersected` creates child processes without destroying them, so `entry::tests::set_entry_exec_semantics` then fails with ENOMEM (it passes in isolation). Please reap the scratch children/reset state and commit S8. Full boot is green with your WIP (DONE + clean halt).
 
 ## Decisions needed
