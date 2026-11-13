@@ -1105,14 +1105,16 @@ unsafe fn cr4_write(value: u64) {
     core::arch::asm!("mov cr4, {0}", in(reg) value, options(nostack));
 }
 
-/// CPUID leaf 7, sub-leaf 0: return ECX (SMEP/SMAP/UMIP feature bits).
+/// CPUID leaf 7, sub-leaf 0: return (EBX, ECX) feature bits.
 ///
-/// RBX is callee-saved and used internally by LLVM, but `cpuid` clobbers EBX;
-// since RBX cannot be listed as an asm operand, save/restore it around the
-/// instruction so LLVM's "RBX preserved across inline asm" assumption holds.
+/// EBX holds SMEP (bit 7) and SMAP (bit 20); ECX holds UMIP (bit 2).
+/// `cpuid` clobbers EBX, which LLVM treats as callee-saved and cannot name as
+/// an operand, so RBX is saved before the instruction and restored after;
+/// EBX's output is read back into a general register between the two.
 #[inline(never)]
-fn cpuid_leaf7_ecx() -> u32 {
+fn cpuid_leaf7() -> (u32, u32) {
     let mut subleaf: u32 = crate::host::CPUID_SUB_LEAF_0; // in: 0, out: ECX
+    let mut ebx: u64 = 0;
     let rbx_save: u64;
     // SAFETY: `cpuid` leaf 7 sub-leaf 0 is always valid on x86_64.
     unsafe {
@@ -1121,29 +1123,31 @@ fn cpuid_leaf7_ecx() -> u32 {
             in("eax") crate::host::CPUID_LEAF_FEATURES,
             inout("ecx") subleaf,
             options(nostack));
+        core::arch::asm!("mov {0}, rbx", out(reg) ebx, options(nostack));
         core::arch::asm!("mov rbx, {0}", in(reg) rbx_save, options(nostack));
     }
-    subleaf
+    (ebx as u32, subleaf)
 }
 
 /// Enable supervisor-mode protections (SMEP + UMIP now; SMAP once a user-copy
 /// helper exists — ADR-051). Each bit is set only if CPUID leaf 7 sub-leaf 0
-/// ECX advertises the feature, so the function is safe on CPUs that lack any
-/// of them. Returns the mask of features actually enabled.
+/// advertises the feature (SMEP/SMAP via EBX, UMIP via ECX), so the function
+/// is safe on CPUs that lack any of them. Returns the mask of features
+/// actually enabled.
 ///
 /// # Safety
 /// Writes CR4 (architectural state); call once at boot, after paging is on.
 pub unsafe fn enable_supervisor_protections() -> u64 {
-    let ecx = cpuid_leaf7_ecx();
+    let (ebx, ecx) = cpuid_leaf7();
     let mut mask: u64 = 0;
-    if crate::host::cpuid_ecx_has(ecx, crate::host::CPUID_ECX_SMEP) {
+    if crate::host::cpuid_ebx_has(ebx, crate::host::CPUID_EBX_SMEP) {
         mask |= CR4_SMEP;
     }
     if crate::host::cpuid_ecx_has(ecx, crate::host::CPUID_ECX_UMIP) {
         mask |= CR4_UMIP;
     }
-    // SMAP: CPUID-checked and ready, but not set until a user-copy helper
-    // (STAC/CLAC around user-memory access) exists — ADR-051.
+    // SMAP: CPUID-checked (EBX[20]) and ready, but not set until a user-copy
+    // helper (STAC/CLAC around user-memory access) exists — ADR-051.
     if mask == 0 {
         return 0;
     }
