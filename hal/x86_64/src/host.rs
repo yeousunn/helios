@@ -75,6 +75,59 @@ pub const fn cpuid_ebx_has(ebx: u32, bit: u32) -> bool {
     ebx & bit != 0
 }
 
+// ===========================================================================
+// CPUID topology leaf (leaf 0x0B): pure decoding used by `CpuTopology` for SMP
+// bring-up (ADR-014). The raw CPUID instruction itself is arch-specific; the
+// decoding below is pure and host-testable on any target.
+// ===========================================================================
+
+/// CPUID leaf 1: processor feature / brand information. EBX[23:16] holds the
+/// number of logical processors per physical package.
+pub const CPUID_LEAF_1: u32 = 0x0000_0001;
+/// CPUID extended topology leaf (leaf 0x0B): enumerate logical processors
+/// and cores via x2APIC ID across sub-leaves 0..N.
+pub const CPUID_LEAF_TOPOLOGY: u32 = 0x0000_000B;
+
+/// Level type reported by CPUID leaf 0xB, sub-leaf N, ECX: level 0 = logical
+/// processors (SMT thread), level 1 = core.
+pub const CPUID_TOPOLOGY_LEVEL_THREAD: u32 = 0;
+pub const CPUID_TOPOLOGY_LEVEL_CORE: u32 = 1;
+
+/// Decode CPUID leaf 1 EBX: bits 23..16 give the number of logical
+/// processors per physical package (Initial APIC ID max + 1). Returns 0 if the
+/// field is absent; callers fall back to 1 (single-CPU).
+///
+/// Pure: no CPU instructions, host-testable on any target.
+pub const fn cpuid_leaf1_logical_processors(ebx: u32) -> u32 {
+    (ebx >> 16) & 0xFF
+}
+
+/// One entry from CPUID leaf 0xB, sub-leaf `level`.
+///
+/// `logical_processors` (EAX) = number of logical processors in the domain
+/// identified by `x2apic_id` (EBX) at `level_type` (ECX).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CpuidTopologyEntry {
+    /// Logical processors in this domain (EAX).
+    pub logical_processors: u32,
+    /// x2APIC ID of the domain (EBX).
+    pub x2apic_id: u32,
+    /// Level type: 0 = thread/SMT, 1 = core (ECX).
+    pub level_type: u32,
+}
+
+/// Decode CPUID leaf 0xB sub-leaf output registers (EAX, EBX, ECX) into a
+/// [`CpuidTopologyEntry`].
+///
+/// Pure: no CPU instructions, host-testable on any target.
+pub const fn cpuid_topology_level(eax: u32, ebx: u32, ecx: u32) -> CpuidTopologyEntry {
+    CpuidTopologyEntry {
+        logical_processors: eax,
+        x2apic_id: ebx,
+        level_type: ecx,
+    }
+}
+
 /// True iff `vaddr` falls in a kernel-reserved PML4 slot (256..=511).
 pub const fn pml4_slot_is_kernel(vaddr: usize) -> bool {
     let idx = pt_index(vaddr, PML4_SHIFT);
@@ -168,5 +221,34 @@ mod tests {
         assert!(cpuid_ebx_has(ebx, CPUID_EBX_SMAP));
         assert!(!cpuid_ebx_has(ebx, CPUID_ECX_UMIP));
         assert!(!cpuid_ebx_has(0, CPUID_EBX_SMEP));
+    }
+
+    #[test]
+    fn cpuid_leaf1_logical_processors_bits() {
+        // EBX[23:16] = logical processors per package.
+        assert_eq!(cpuid_leaf1_logical_processors(4u32 << 16), 4);
+        assert_eq!(cpuid_leaf1_logical_processors(1u32 << 16), 1);
+        assert_eq!(cpuid_leaf1_logical_processors(16u32 << 16), 16);
+        assert_eq!(cpuid_leaf1_logical_processors(0), 0);
+    }
+
+    #[test]
+    fn cpuid_topology_level_decode() {
+        let e = cpuid_topology_level(8, 0x123, CPUID_TOPOLOGY_LEVEL_CORE);
+        assert_eq!(e.logical_processors, 8);
+        assert_eq!(e.x2apic_id, 0x123);
+        assert_eq!(e.level_type, CPUID_TOPOLOGY_LEVEL_CORE);
+        let t = cpuid_topology_level(2, 0, CPUID_TOPOLOGY_LEVEL_THREAD);
+        assert_eq!(t.level_type, CPUID_TOPOLOGY_LEVEL_THREAD);
+        assert_eq!(t.logical_processors, 2);
+        assert_eq!(t.x2apic_id, 0);
+    }
+
+    #[test]
+    fn cpuid_topology_constants() {
+        assert_eq!(CPUID_LEAF_1, 1);
+        assert_eq!(CPUID_LEAF_TOPOLOGY, 0x0B);
+        assert_eq!(CPUID_TOPOLOGY_LEVEL_THREAD, 0);
+        assert_eq!(CPUID_TOPOLOGY_LEVEL_CORE, 1);
     }
 }
