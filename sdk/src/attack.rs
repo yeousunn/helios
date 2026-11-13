@@ -50,12 +50,14 @@ pub fn run<R: RawSyscalls>(sys: &mut Syscalls<R>, pkg: &BootstrapPackage) -> i32
     // Append one entry per S-task as it lands. Keep the order stable: the
     // index is part of the failure status.
     //
-    // Still pending (no case yet): S6/S7 (CR4 supervisor bits and the kernel
-    // syscall/exception flag mask are not observable from ring 3; a bad call
-    // would fault, not return an error), S8 GRANT-check on THREAD_CREATE/
-    // NEW_THREAD, S9 oversized UNMAP count. S1's REGS_* path is covered where
-    // a child can reach it (case 1: the non-Frame cap rejection); the deeper
-    // masking lives in kernel tests (ADR-050).
+    // Not observable from ring 3 (no case; covered by host tests): S6/S7 (CR4
+    // supervisor bits and the kernel syscall/exception flag mask — a bad call
+    // would fault, not return an error) and S8 (NEW_THREAD's caps[1]/caps[2]
+    // transfer: a regular process holds no Factory cap, ADR-023 §3, so the
+    // invoke is denied at EBADCAP before the transfer; GLM's host test
+    // `s8_new_thread_ep_transfer_grant_checked_and_intersected` pins it). S1's
+    // REGS_* path is covered where a child can reach it (case 1: the non-Frame
+    // cap rejection); the deeper masking lives in kernel tests (ADR-050).
     let outcomes = [
         case_orphan_handle(sys),
         case_regs_write_non_frame_cap(sys, pkg),
@@ -66,6 +68,7 @@ pub fn run<R: RawSyscalls>(sys: &mut Syscalls<R>, pkg: &BootstrapPackage) -> i32
         case_unmap_kernel_window(sys, pkg),     // S4
         case_protect_kernel_window(sys, pkg),   // S4
         case_map_null(sys, pkg),                // S4
+        case_unmap_oversized_count(sys, pkg),   // S9
     ];
     classify(&outcomes)
 }
@@ -203,6 +206,21 @@ fn case_map_null<R: RawSyscalls>(sys: &mut Syscalls<R>, pkg: &BootstrapPackage) 
     sys.invoke(pkg.aspace, &m).is_err()
 }
 
+/// `AS::UNMAP` with an oversized page count must be rejected (S9). Pre-fix the
+/// count drove an unbounded loop with interrupts off (a machine hang for a
+/// huge count); post-fix it is capped (`MAX_UNMAP_PAGES`) and returns EBADARG.
+/// The VA is a valid, page-aligned user address and the range stays in user
+/// space, so only the page-count cap is at fault. Case 9.
+fn case_unmap_oversized_count<R: RawSyscalls>(
+    sys: &mut Syscalls<R>,
+    pkg: &BootstrapPackage,
+) -> bool {
+    let mut m = Message::new(crate::methods::aspace::UNMAP);
+    m.words[0] = 0x40_0000; // valid, page-aligned user VA
+    m.words[1] = 4096; // > 1024 (MAX_UNMAP_PAGES); end stays in user space
+    sys.invoke(pkg.aspace, &m).is_err()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,7 +230,7 @@ mod tests {
     /// number of raw calls (case 3 creates, suspends, sets the entry and
     /// revokes; the rest make one); the mock replays the matching statuses.
     struct MockKernel {
-        statuses: [i32; 13],
+        statuses: [i32; 14],
         len: usize,
         i: usize,
     }
@@ -223,15 +241,16 @@ mod tests {
         /// Index: 0 orphan, 1 non-Frame, 2 THREAD_CREATE(kernel pc),
         /// 3 THREAD_CREATE(valid), 4 SUSPEND, 5 SET_ENTRY(kernel pc),
         /// 6 KILL, 7 cap_revoke, 8 SET_TLS, 9 MAP(kernel window),
-        /// 10 UNMAP(kernel window), 11 PROTECT(kernel window), 12 MAP(null).
+        /// 10 UNMAP(kernel window), 11 PROTECT(kernel window), 12 MAP(null),
+        /// 13 UNMAP(oversized count).
         fn rejects() -> Self {
             use ipc::status::{EBADARG, EBADCAP, OK};
             MockKernel {
                 statuses: [
                     EBADCAP, EBADARG, EBADARG, OK, OK, EBADARG, OK, OK, EBADARG, EBADARG, EBADARG,
-                    EBADARG, EBADARG,
+                    EBADARG, EBADARG, EBADARG,
                 ],
-                len: 13,
+                len: 14,
                 i: 0,
             }
         }
@@ -239,8 +258,8 @@ mod tests {
         /// A kernel that accepts every bad call (a security regression).
         fn accepts() -> Self {
             MockKernel {
-                statuses: [ipc::status::OK; 13],
-                len: 13,
+                statuses: [ipc::status::OK; 14],
+                len: 14,
                 i: 0,
             }
         }
@@ -352,6 +371,15 @@ mod tests {
         k.statuses[12] = ipc::status::OK;
         let mut sys = Syscalls::new(&mut k);
         assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 9);
+    }
+
+    #[test]
+    fn accepted_unmap_oversized_is_case_10() {
+        // Kernel accepts UNMAP(oversized count) at index 13 (case 9).
+        let mut k = MockKernel::rejects();
+        k.statuses[13] = ipc::status::OK;
+        let mut sys = Syscalls::new(&mut k);
+        assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 10);
     }
 
     #[test]
