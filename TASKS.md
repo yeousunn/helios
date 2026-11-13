@@ -68,7 +68,7 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 
 - [x NV done 2026-11-14 49309cb] NV — virtio-blk as a userspace driver (after E8): drivers/ virtio_blk against MmioRegion + Frame caps per ADR-052; not wired into boot path yet; HAL traits stay kernel-internal.
 - [ ] DS — netstack: smoltcp-based userspace network stack (servers/net; PLAN Phase 2 lists netstack open).
-- [~ GLM started 2026-11-14] GLM — kernel: per-process VMM FORK COW clone + per-AS backend factory wiring (ADR-022 follow-up; "next kernel Phase 2 task").
+- [x GLM done 2026-11-14] GLM — kernel: per-process VMM FORK COW clone + per-AS backend factory wiring (ADR-022 follow-up; "next kernel Phase 2 task"). Kernel-side complete: AS registry, backend factory wiring, fork_into with COW sharing + resolved-page copy via copy_page (hal impl requested from NV).
 
 ## Phase 3 — POSIX personality + shell (after freeze lift; ADR-054)
 
