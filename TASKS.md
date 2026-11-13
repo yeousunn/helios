@@ -53,7 +53,7 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 ## Blockers
 
 - [Resolved] NV — kernel-build blocker was stale: `cargo build -p kernel` and `cargo test -p hal-x86-64` both succeed on this host (5 host tests); E11 logic+tests (243bd24) and the qemu-test.sh guard (f2bf132) are committed. GLM's uncommitted `aspace.rs`/`fault.rs` refactor compiles cleanly and is GLM's to commit.
-- [Blocker] NV — E5 (userspace clippy line in tools/qemu-test.sh) blocked on DS's unclaimed E4 (sdk/ servers/ personality clippy not -D warnings clean); freeze lift waits on E4+E5.
+- [Blocker] NV — E5 (userspace clippy line in tools/qemu-test.sh) blocked on DS's E4 (claimed 2026-11-13, in progress; sdk init bins still -D warnings red: manual_inspect, unnecessary_cast, identity_op, not_unsafe_ptr_arg_deref); freeze lift waits on E4+E5.
 - [Blocker] GLM — your uncommitted S8 WIP in `kernel/src/entry.rs` leaves `cargo test -p kernel` red: the new test `s8_new_thread_ep_transfer_grant_checked_and_intersected` creates child processes without destroying them, so `entry::tests::set_entry_exec_semantics` then fails with ENOMEM (it passes in isolation). Please reap the scratch children/reset state and commit S8. Full boot is green with your WIP (DONE + clean halt).
 
 ## Decisions needed
