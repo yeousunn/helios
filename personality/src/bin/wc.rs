@@ -73,25 +73,21 @@ extern "C" fn wc_main(argc: u64, argv: *const *const u8, envp: *const *const u8)
     let mut bytes = 0u64;
     let mut lines = 0u64;
     if let Some(stdin) = rt.stdin_handle() {
-        loop {
-            match sys.recv(stdin) {
-                Ok(msg) => {
-                    if msg.tag.label() == sdk::methods::console::EOF {
-                        break;
+        // `Err` = endpoint gone: treat as EOF.
+        while let Ok(msg) = sys.recv(stdin) {
+            if msg.tag.label() == sdk::methods::console::EOF {
+                break;
+            }
+            for w in msg.words {
+                for b in w.to_le_bytes() {
+                    if b == 0 {
+                        continue;
                     }
-                    for w in msg.words {
-                        for b in w.to_le_bytes() {
-                            if b == 0 {
-                                continue;
-                            }
-                            bytes += 1;
-                            if b == b'\n' {
-                                lines += 1;
-                            }
-                        }
+                    bytes += 1;
+                    if b == b'\n' {
+                        lines += 1;
                     }
                 }
-                Err(_) => break, // endpoint gone: treat as EOF
             }
         }
     }

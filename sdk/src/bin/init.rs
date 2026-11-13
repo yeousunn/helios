@@ -86,8 +86,13 @@ const STACK_FLAGS: u32 = 0b011; // R | W
 
 type Result<T> = core::result::Result<T, u64>;
 
+/// # Safety
+///
+/// Called by the kernel as init's entry point. `bootinfo_ptr` must point to
+/// the BootInfo block the kernel wrote into init's first stack page (ADR-018),
+/// bounded to `MAX_LEN` bytes.
 #[no_mangle]
-pub extern "C" fn _start(bootinfo_ptr: *const u8) -> ! {
+pub unsafe extern "C" fn _start(bootinfo_ptr: *const u8) -> ! {
     let info = match unsafe { read_bootinfo(bootinfo_ptr) } {
         Ok(info) => info,
         Err(errno) => exit_with(fail_code(STEP_BOOTINFO, errno)),
@@ -147,9 +152,8 @@ fn run(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
 
     // From here failures report their code on the serial BEFORE exiting (the
     // kernel's last-thread clean halt masks the exit status otherwise).
-    let stepped = heap_and_spawn(raw, info).map_err(|code| {
+    let stepped = heap_and_spawn(raw, info).inspect_err(|&code| {
         mark(raw, info.debug_ep, 0xEE, code);
-        code
     });
     stepped?;
     Ok(())
@@ -502,7 +506,7 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
                 // Encode the server status for diagnosis.
                 return Err(fail_code(
                     STEP_VFS_READ,
-                    0xE2 | ((reply.words[0] as u64 & 0xFFFF) << 8),
+                    0xE2 | ((reply.words[0] & 0xFFFF) << 8),
                 ));
             }
             reply
@@ -519,7 +523,7 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
             let mut sys = Syscalls::new(raw);
             let mut open = Message::new(methods::vfs::OPEN);
             open.words[0] = root_handle;
-            open.words[1] = (0u64 << 32) | 5; // name: Span { off 0, len 5 } in the arg window
+            open.words[1] = 5; // name: Span { off 0, len 5 } in the arg window
             open.words[2] = methods::vfs_open::READ as u64;
             let reply = sys
                 .call(conn_ep, &open)

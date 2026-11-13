@@ -91,8 +91,8 @@ fn register_child(pid: u64, cap: u32, notif: u32, as_cap: u32, vfs: u32) {
     // find the dead child's already-consumed notification (found via the
     // demo inheriting the child's pid and WAIT polling the wrong notif).
     let mut i = NEXT_CHILD.fetch_add(1, Ordering::Relaxed) % MAX_CHILDREN;
-    for k in 0..MAX_CHILDREN {
-        if CH_PIDS[k].load(Ordering::Relaxed) == pid {
+    for (k, slot) in CH_PIDS.iter().enumerate() {
+        if slot.load(Ordering::Relaxed) == pid {
             i = k;
             break;
         }
@@ -431,7 +431,7 @@ fn spawn_reply(
             (po, pl, ao, al, eo, el)
         }
     };
-    let span_ok = |off: usize, len: usize| off.checked_add(len).map_or(false, |e| e <= 4096);
+    let span_ok = |off: usize, len: usize| off.checked_add(len).is_some_and(|e| e <= 4096);
     if path_len == 0
         || !span_ok(path_off, path_len)
         || !span_ok(arg_off, arg_len)
@@ -613,7 +613,7 @@ fn load_via_vfs(
     path_len: usize,
     win_base: u64,
 ) -> Result<Vec<u8>, i32> {
-    if path_len == 0 || path_off.checked_add(path_len).map_or(true, |e| e > 4096) {
+    if path_len == 0 || path_off.checked_add(path_len).is_none_or(|e| e > 4096) {
         return Err(ipc::status::EBADARG);
     }
     // Dedicated load-window area, clear of the per-connection window pairs
@@ -939,7 +939,7 @@ fn exec_reply(
         reply.words[0] = e as i64 as u64;
         return Some(reply);
     }
-    let mut m = Message::new(methods::thread::RESUME);
+    let m = Message::new(methods::thread::RESUME);
     let _ = sys.invoke(thread_cap, &m);
     None
 }
@@ -958,7 +958,7 @@ fn parse_spawn_blob(win_base: u64) -> Option<(usize, usize, usize, usize, usize,
         let (eo, el) = span(rd(16));
         (po, pl, ao, al, eo, el)
     };
-    let ok = |off: usize, len: usize| off.checked_add(len).map_or(false, |e| e <= 4096);
+    let ok = |off: usize, len: usize| off.checked_add(len).is_some_and(|e| e <= 4096);
     if path_len == 0 || !ok(path_off, path_len) || !ok(arg_off, arg_len) || !ok(env_off, env_len) {
         return None;
     }
@@ -971,7 +971,7 @@ fn parse_spawn_blob(win_base: u64) -> Option<(usize, usize, usize, usize, usize,
 /// `Runtime::exit` sends before dying.
 fn pipe_reply(sys: &mut Syscalls<'_, X86_64Syscalls>, factory: u32) -> Message {
     let mut reply = Message::new(methods::process::PIPE);
-    let mut mint = |sys: &mut Syscalls<'_, X86_64Syscalls>| -> Result<u32, i32> {
+    let mint = |sys: &mut Syscalls<'_, X86_64Syscalls>| -> Result<u32, i32> {
         let r = sys.invoke(factory, &Message::new(methods::factory::NEW_ENDPOINT))?;
         let h = r.words[0] as u32;
         if h == 0 {

@@ -38,6 +38,9 @@ global_asm!(
     main = sym sh_main,
 );
 
+/// One pipeline stage: `(program path, argv, expected status)`.
+type Stage = (&'static [u8], &'static [&'static [u8]], i32);
+
 /// One script entry.
 enum Command {
     /// Write the text plus a newline to stdout.
@@ -67,9 +70,7 @@ enum Command {
     },
     /// `s0 | s1 | ... | sN`: each stage's stdout becomes the next stage's
     /// stdin. Each stage = `(path, argv, expected status)`.
-    Pipeline {
-        stages: &'static [(&'static [u8], &'static [&'static [u8]], i32)],
-    },
+    Pipeline { stages: &'static [Stage] },
     /// Spawn `path` with argv/env through PS; report `<path> -> <status>`;
     /// fail the script when the status differs from `expect`.
     Run {
@@ -347,9 +348,7 @@ extern "C" fn sh_main(argc: u64, argv: *const *const u8, envp: *const *const u8)
                     while path_len > 0 && path[path_len - 1] != b'/' {
                         path_len -= 1;
                     }
-                    if path_len > 0 {
-                        path_len -= 1; // drop the '/'
-                    }
+                    path_len = path_len.saturating_sub(1); // drop the '/'
                     if path_len == 0 {
                         path[0] = b'/';
                         path_len = 1;
@@ -563,21 +562,16 @@ extern "C" fn sh_main(argc: u64, argv: *const *const u8, envp: *const *const u8)
                 };
                 // Drain the child's stdout (console::WRITE chunks) until EOF.
                 let mut buf: Vec<u8> = Vec::new();
-                loop {
-                    match sys.recv(read_end) {
-                        Ok(m) => {
-                            if m.tag.label() == sdk::methods::console::EOF {
-                                break;
-                            }
-                            for w in m.words {
-                                for b in w.to_le_bytes() {
-                                    if b != 0 {
-                                        buf.push(b);
-                                    }
-                                }
+                while let Ok(m) = sys.recv(read_end) {
+                    if m.tag.label() == sdk::methods::console::EOF {
+                        break;
+                    }
+                    for w in m.words {
+                        for b in w.to_le_bytes() {
+                            if b != 0 {
+                                buf.push(b);
                             }
                         }
-                        Err(_) => break,
                     }
                 }
                 let status = match rt.ps.wait(&mut sys, pid) {

@@ -68,10 +68,7 @@ extern "C" fn child_main(argc: u64, argv: *const *const u8, envp: *const *const 
     // Consume the bootstrap package so the spawner's `deliver` completes.
     let package = {
         let mut sys = Syscalls::new(&mut raw);
-        match sdk::bootstrap::receive(&mut sys) {
-            Ok(p) => Some(p),
-            Err(_) => None,
-        }
+        sdk::bootstrap::receive(&mut sys).ok()
     };
     // Diagnostic: echo the crafted argv through a caller-supplied console
     // endpoint (package `optional[2]`) before exiting — makes stack-crafting

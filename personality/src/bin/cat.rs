@@ -76,24 +76,19 @@ extern "C" fn cat_main(argc: u64, argv: *const *const u8, envp: *const *const u8
     // padding. This makes `cmd | cat | ...` and `cat < file` work.
     if args.argc() <= 1 {
         if let Some(stdin) = rt.stdin_handle() {
-            loop {
-                match sys.recv(stdin) {
-                    Ok(m) => {
-                        if m.tag.label() == sdk::methods::console::EOF {
-                            break;
-                        }
-                        for w in m.words {
-                            let bytes = w.to_le_bytes();
-                            let mut end = 8;
-                            while end > 0 && bytes[end - 1] == 0 {
-                                end -= 1;
-                            }
-                            if end > 0 {
-                                let _ = rt.write_stdout(&mut sys, &bytes[..end]);
-                            }
-                        }
+            while let Ok(m) = sys.recv(stdin) {
+                if m.tag.label() == sdk::methods::console::EOF {
+                    break;
+                }
+                for w in m.words {
+                    let bytes = w.to_le_bytes();
+                    let mut end = 8;
+                    while end > 0 && bytes[end - 1] == 0 {
+                        end -= 1;
                     }
-                    Err(_) => break,
+                    if end > 0 {
+                        let _ = rt.write_stdout(&mut sys, &bytes[..end]);
+                    }
                 }
             }
         }
