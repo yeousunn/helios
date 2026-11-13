@@ -77,6 +77,12 @@ pub struct Thread {
     /// [num, cap, tag, w0, w1, w2, w3]; read by the emulator via
     /// Thread::TRAP_READ while the thread is parked on the route call.
     pub(crate) trap_frame: [u64; 7],
+    /// S1/ADR-050: the thread's user register image (10 qwords, init-context
+    /// indices: 0=arg, 1=user RSP, 2=entry PC, 3=RFLAGS (masked), 4..10 =
+    /// callee-saved). The ONLY storage REGS_READ/WRITE touch — user words
+    /// never reach the kernel stack. Snapshotted from each freshly built
+    /// init-context frame (slot 3 = the trampoline's constant 0x202).
+    pub(crate) user_regs: [u64; REG_IMAGE_QWORDS],
 }
 
 impl Thread {
@@ -96,6 +102,7 @@ impl Thread {
             foreign_ep: None,
             fs_base: 0,
             trap_frame: [0; 7],
+            user_regs: [0; REG_IMAGE_QWORDS],
         }
     }
 
@@ -286,6 +293,10 @@ pub fn set_initial_pc(id: ThreadId, pc: u64) -> SchedResult<()> {
         Some(t) => {
             t.initial_pc = pc;
             t.ksp = ksp;
+            // S1/ADR-050: mirror the freshly built context into the
+            // per-thread user register image (ksp != 0 ⇔ a real frame was
+            // built; the test mock builds none).
+            snapshot_user_regs(t);
             Ok(())
         }
         None => Err(SchedError::NoSuchThread),
@@ -662,57 +673,93 @@ pub fn resume(id: ThreadId) -> SchedResult<()> {
 /// after the rewrite it never resumes its old frames: the fresh trampoline
 /// context replaces the whole kernel context, so the rebuilt stack IS the
 /// thread's next resume. Running/Ready threads are still rejected).
-/// Register image for a SUSPENDED thread — the initial context frame
-/// `init_context` builds (hal-x86_64 layout, ADR-039 §regs): 10 qwords
-/// below kstack_top (index 0 = [top-1] = arg, 2 = entry, 3 = trampoline,
-/// 5..10 = callee-saved). REGS_READ/WRITE transfer this image.
+/// Register image for a SUSPENDED thread — the per-thread user register
+/// image (`Thread::user_regs`, S1/ADR-050): init-context indices
+/// (0 = [top-1] = arg, 2 = entry, 3 = RFLAGS (masked), 5..10 = callee-saved
+/// on the stack). REGS_READ/WRITE transfer this image; the kstack frame is
+/// never read or written with user words.
 pub const REG_IMAGE_QWORDS: usize = 10;
 
-/// Read a SUSPENDED thread's initial-context register image (REGS_READ,
-/// syscall-abi §7 id 9) into `out`.
+/// RFLAGS a fresh initial context enters userspace with (the trampoline's
+/// constant `push 0x202`): IOPL = 0, IF = 1.
+pub const FRESH_USER_RFLAGS: u64 = 0x202;
+
+/// S1: normalize a user-supplied RFLAGS value — IOPL (bits 12–13) forced to
+/// 0 (no ring-3 port I/O), IF (bit 9) forced to 1. The only RFLAGS value
+/// that can enter user state through REGS_WRITE is this masked form.
+pub fn mask_rflags(v: u64) -> u64 {
+    (v & !(0b11 << 12)) | (1 << 9)
+}
+
+/// Snapshot a freshly built init-context frame into the thread's per-thread
+/// user register image (S1/ADR-050). Slot 3 of the frame is the ring-0
+/// trampoline return address — kernel-owned, never exposed: the user-visible
+/// image carries RFLAGS there (the fresh-context constant).
+fn snapshot_user_regs(t: &mut Thread) {
+    if t.kstack_top != 0 && t.ksp != 0 {
+        crate::mem::read_reg_image(t.kstack_top, &mut t.user_regs);
+        t.user_regs[3] = FRESH_USER_RFLAGS;
+    }
+}
+
+/// Read a quiescent thread's user register image (REGS_READ, syscall-abi §7
+/// id 9) into `out`. S1/ADR-050: a pure copy of `Thread::user_regs` — the
+/// kernel stack is never read (the old kstack image leaked the trampoline
+/// address and, for parked threads, their live syscall frame).
 pub fn regs_read(id: ThreadId, out: &mut [u64; REG_IMAGE_QWORDS]) -> SchedResult<()> {
-    let mut guard = SCHED.lock();
-    let s = guard.as_mut().ok_or(SchedError::NoSuchThread)?;
+    let guard = SCHED.lock();
+    let s = guard.as_ref().ok_or(SchedError::NoSuchThread)?;
     let slot = find_slot(s, id)?;
     let t = s.slots.threads[slot].as_ref().unwrap();
     if t.state != State::Suspended && !matches!(t.state, State::Blocked(_)) {
         return Err(SchedError::NotRunnable);
     }
-    if t.kstack_top == 0 {
-        return Err(SchedError::NoSuchThread);
-    }
-    crate::mem::read_reg_image(t.kstack_top, out);
+    *out = t.user_regs;
     Ok(())
 }
 
-/// Write a SUSPENDED/BLOCKED thread's register image (REGS_WRITE, id 10).
-/// `pc_idx` selects the image qword that is the entry PC (hal layout: 2).
-pub fn regs_write(id: ThreadId, image: &[u64; REG_IMAGE_QWORDS], pc_idx: usize) -> SchedResult<()> {
+/// Write a quiescent thread's user register image (REGS_WRITE, id 10;
+/// S1/ADR-050 v1). The sanitized image is stored in `Thread::user_regs` and
+/// the kernel REBUILDS the thread's initial kernel context from it: user
+/// words never reach the kernel stack verbatim. The rebuild replaces the
+/// thread's ENTIRE kernel context (ADR-039-am2 safety argument) — a Blocked
+/// thread transitions to Suspended and resumes into the rebuilt frame, and a
+/// parked syscall's stub frame (its RCX/R11 exposure) is discarded wholesale,
+/// never edited. Frame slot 3 (the ring-0 trampoline return address) is
+/// written only by the backend's `init_context` — never from user words.
+pub fn regs_write(id: ThreadId, image: &[u64; REG_IMAGE_QWORDS]) -> SchedResult<()> {
     let mut guard = SCHED.lock();
     let s = guard.as_mut().ok_or(SchedError::NoSuchThread)?;
     let slot = find_slot(s, id)?;
-    let (quiescent, kstack_top, old_ksp) = {
+    let (quiescent, kstack_top) = {
         let t = s.slots.threads[slot].as_ref().unwrap();
         (
             matches!(t.state, State::Suspended | State::Blocked(_)),
             t.kstack_top,
-            t.ksp,
         )
     };
     if !quiescent || kstack_top == 0 {
         return Err(SchedError::NotRunnable);
     }
-    if pc_idx >= REG_IMAGE_QWORDS {
-        return Err(SchedError::NotRunnable);
-    }
-    crate::mem::write_reg_image(kstack_top, image);
+    // Sanitize: slot 3 is RFLAGS, masked (IOPL=0, IF=1) — S1.
+    let mut image = *image;
+    image[3] = mask_rflags(image[3]);
+    let backend = *CTX.lock();
+    let Some(b) = backend else {
+        return Err(SchedError::NoSuchThread);
+    };
+    // Fresh frame: kernel-generated slot 3 (trampoline) + entry PC.
+    let ksp = b.init_context(kstack_top, image[2]);
+    // Overlay the user-owned slots onto the fresh frame; slot 3 stays
+    // kernel-owned (write_reg_image_user skips it).
+    crate::mem::write_reg_image_user(kstack_top, &image);
     let t = s.slots.threads[slot].as_mut().unwrap();
-    t.initial_pc = image[pc_idx];
-    // Only rewrite ksp for a never-resumed (init-context) frame; a blocked
-    // thread's live ksp points into its own save area and is left alone.
-    if old_ksp == kstack_top - REG_IMAGE_QWORDS as u64 * 8 || old_ksp == 0 {
-        t.ksp = kstack_top - REG_IMAGE_QWORDS as u64 * 8;
+    t.initial_pc = image[2];
+    t.ksp = ksp;
+    if matches!(t.state, State::Blocked(_)) {
+        t.state = State::Suspended;
     }
+    t.user_regs = image;
     Ok(())
 }
 
@@ -743,6 +790,9 @@ pub fn set_entry(id: ThreadId, pc: u64) -> SchedResult<()> {
     let t = s.slots.threads[slot].as_mut().unwrap();
     t.initial_pc = pc;
     t.ksp = ksp;
+    // S1/ADR-050: the rebuilt context is the thread's whole user-register
+    // state — re-mirror it (ksp != 0 ⇔ a real frame was built).
+    snapshot_user_regs(t);
     Ok(())
 }
 
@@ -1374,9 +1424,100 @@ mod tests {
         assert_eq!(image[0], 0, "arg");
         image[0] = 0xdead;
         image[2] = 0x405000;
-        regs_write(t, &image, 2).unwrap();
+        regs_write(t, &image).unwrap();
 
         let t2 = get(t).unwrap();
+        assert_eq!(t2.initial_pc, 0x405000);
+    }
+
+    /// S1/ADR-050: REGS_WRITE must never write user words into frame slot 3
+    /// (the ring-0 trampoline return address) and must mask the RFLAGS slot
+    /// of the per-thread image. Fails on the pre-fix kernel, which copied
+    /// the image verbatim into the kstack.
+    #[test]
+    fn regs_write_never_writes_user_words_into_kstack_slot3() {
+        setup();
+        let p = ObjRef(1);
+        let t = spawn_with(p, 100, 0x401000).unwrap();
+        static FAKE: Mutex<[u64; 512]> = Mutex::new([0; 512]);
+        let fake = FAKE.lock();
+        let base = fake.as_ptr() as u64;
+        set_kstack(t, base, 1).unwrap();
+        // Paint the 10 image qwords below the top with a canary: the fake
+        // frame's pre-existing (kernel-generated) contents.
+        let top = base + crate::frame::FRAME_SIZE as u64;
+        crate::mem::seed_reg_image(top, &[0x1111; REG_IMAGE_QWORDS]);
+        drop(fake);
+        let _ = pick_next(); // t Running
+        suspend(t).unwrap();
+
+        // Poisoned image: slot 3 = IOPL=3/IF=0 (0x3002) — the takeover word.
+        let poison: [u64; REG_IMAGE_QWORDS] =
+            [0xAAAA, 0xBBBB, 0x405000, 0x3002, 0x8888, 0x9999, 0, 0, 0, 0];
+        regs_write(t, &poison).unwrap();
+
+        let mut after = [0u64; REG_IMAGE_QWORDS];
+        crate::mem::read_reg_image(top, &mut after);
+        // Slot 3 kept its kernel-generated value — the attacker word never
+        // landed in the frame (pre-fix: 0x3002 sat in the return slot).
+        assert_eq!(after[3], 0x1111, "trampoline slot untouched by user words");
+        // User-owned slots ARE applied (fork still works).
+        assert_eq!(after[0], 0xAAAA, "arg slot");
+        assert_eq!(after[1], 0xBBBB, "user RSP slot");
+        assert_eq!(after[2], 0x405000, "entry PC slot");
+        // The per-thread image carries the MASKED rflags (IOPL=0, IF=1).
+        let t2 = get(t).unwrap();
+        assert_eq!(t2.user_regs[3], 0x202, "RFLAGS masked");
+        assert_eq!(t2.initial_pc, 0x405000);
+    }
+
+    /// S1/ADR-050: REGS_WRITE on a BLOCKED thread must not edit its live
+    /// parked frame (the old code smashed the stub's pushed RCX/R11/user
+    /// RSP = cross-process syscall hijack). The fix rebuilds the whole
+    /// context; with the test mock the rebuild is a no-op, so the parked
+    /// frame's trampoline slot must survive unchanged and the attacker word
+    /// must never land in the frame.
+    #[test]
+    fn regs_write_on_blocked_thread_replaces_context_not_edits_frame() {
+        setup();
+        let p = ObjRef(1);
+        let t = spawn_with(p, 100, 0x401000).unwrap();
+        static FAKE: Mutex<[u64; 512]> = Mutex::new([0; 512]);
+        let fake = FAKE.lock();
+        let base = fake.as_ptr() as u64;
+        set_kstack(t, base, 1).unwrap();
+        // Emulate a parked syscall's stub frame below the top: the stub
+        // pushes user_rsp, rcx (user RIP), r11 (user RFLAGS), w3 — image
+        // slots 0..3 coincide with these while the thread is parked.
+        let top = base + crate::frame::FRAME_SIZE as u64;
+        crate::mem::seed_reg_image(
+            top,
+            &[
+                0x3333, // stub w3 (image slot 0)
+                0x4444, // stub r11 / user RFLAGS (slot 1)
+                0x5555, // stub rcx / user RIP (slot 2)
+                0x6666, // stub user RSP (slot 3 = trampoline)
+                0x7777, 0x7777, 0x7777, 0x7777, 0x7777, 0x7777, // dispatcher leftovers
+            ],
+        );
+        drop(fake);
+        let _ = pick_next(); // t Running
+        block(t, BlockReason::Recv(ObjRef(7))).unwrap();
+
+        // Poisoned write against the parked thread.
+        let poison: [u64; REG_IMAGE_QWORDS] = [0xAAAA, 0xBBBB, 0x405000, 0x3002, 0, 0, 0, 0, 0, 0];
+        regs_write(t, &poison).unwrap();
+
+        // The attacker's slot-3 word never lands in the frame (pre-fix: the
+        // parked syscall's user RSP slot was overwritten with 0x3002).
+        let mut after = [0u64; REG_IMAGE_QWORDS];
+        crate::mem::read_reg_image(top, &mut after);
+        assert_ne!(after[3], 0x3002, "attacker word never lands in the frame");
+
+        // Full-context replacement: Blocked → Suspended, image stored.
+        let t2 = get(t).unwrap();
+        assert_eq!(t2.state, State::Suspended, "blocked thread re-entered");
+        assert_eq!(t2.user_regs[3], 0x202, "masked rflags in the image");
         assert_eq!(t2.initial_pc, 0x405000);
     }
 }

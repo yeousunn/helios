@@ -54,10 +54,12 @@ pub fn alloc_zeroed() -> Option<PhysAddr> {
 }
 
 /// Read a kernel-context register image (10 qwords below kstack_top) into
-/// `out` — REGS_READ backing (ADR-039 §regs; debug/diag and fork contexts).
+/// `out` — used to snapshot freshly built init-context frames into
+/// `Thread::user_regs` (S1/ADR-050). Never fed user-visible state directly:
+/// REGS_READ serves from the per-thread image instead.
 pub fn read_reg_image(kstack_top: u64, out: &mut [u64; 10]) {
     // SAFETY: the kstack frame is kernel-owned, identity-mapped RAM; the
-    // thread is quiescent so nothing else writes it.
+    // context was just built by the backend and nothing else writes it.
     unsafe {
         let top = phys_to_virt(kstack_top) as *const u64;
         for (i, slot) in out.iter_mut().enumerate() {
@@ -66,12 +68,34 @@ pub fn read_reg_image(kstack_top: u64, out: &mut [u64; 10]) {
     }
 }
 
-/// Write a kernel-context register image (REGS_WRITE backing).
-pub fn write_reg_image(kstack_top: u64, image: &[u64; 10]) {
-    // SAFETY: as read_reg_image.
+/// Test-only: seed the 10 image qwords below `kstack_top` (host tests back
+/// fake kstacks with real RAM and paint canary/parked-stub contents).
+#[cfg(test)]
+pub fn seed_reg_image(kstack_top: u64, image: &[u64; 10]) {
+    // SAFETY: test-only — the fake kstack top addresses real host RAM the
+    // test owns; nothing else touches it.
     unsafe {
         let top = phys_to_virt(kstack_top) as *mut u64;
         for (i, val) in image.iter().enumerate() {
+            *top.sub(i + 1) = *val;
+        }
+    }
+}
+
+/// Write the user-owned slots of a FRESH init-context register image (all
+/// 10 qwords EXCEPT index 3 — the ring-0 trampoline return address, written
+/// only by the backend's `init_context`). S1/ADR-050: REGS_WRITE overlays
+/// these slots after a full context rebuild; user words never reach the
+/// trampoline slot or any live kernel frame.
+pub fn write_reg_image_user(kstack_top: u64, image: &[u64; 10]) {
+    // SAFETY: as read_reg_image — the frame is kernel-owned RAM of a
+    // quiescent thread whose context was just rebuilt.
+    unsafe {
+        let top = phys_to_virt(kstack_top) as *mut u64;
+        for (i, val) in image.iter().enumerate() {
+            if i == 3 {
+                continue;
+            }
             *top.sub(i + 1) = *val;
         }
     }

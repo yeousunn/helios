@@ -599,10 +599,12 @@ fn thread_invoke(
         }
         REGS_READ | REGS_WRITE => {
             // syscall-abi §7 ids 9/10: caps[0] = Frame validating the access.
-            // v0: the image lives in the TARGET's kernel-context frame (the
-            // suspended/forked child's own stack) — the Frame cap validates
-            // the caller's authority; the kernel reads/writes the target's
-            // kstack image directly.
+            // S1/ADR-050: the image is the TARGET's per-thread user register
+            // image (`Thread::user_regs`) — the kernel stack is never read
+            // or written with user words. Image slot 3 is RFLAGS, masked
+            // (IOPL=0, IF=1); REGS_WRITE rebuilds the target's initial
+            // context from the sanitized image (kernel-generated trampoline
+            // slot).
             let Some(cs) = msg.descriptor(0).filter(|cs| cs.handle() != 0) else {
                 return SyscallReturn::err(ipc::status::EBADARG);
             };
@@ -615,14 +617,14 @@ fn thread_invoke(
             let mut image = [0u64; crate::sched::REG_IMAGE_QWORDS];
             if msg.tag.label() == 9 {
                 match sched::regs_read(target, &mut image) {
-                    Ok(()) => SyscallReturn::ok(msg.tag, [image[0], image[2], image[1], 0]),
+                    Ok(()) => SyscallReturn::ok(msg.tag, [image[0], image[2], image[1], image[3]]),
                     Err(_) => SyscallReturn::err(ipc::status::EBADSTATE),
                 }
             } else {
                 for (dst, src) in image.iter_mut().zip(msg.words.iter()) {
                     *dst = *src;
                 }
-                match sched::regs_write(target, &image, 2) {
+                match sched::regs_write(target, &image) {
                     Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
                     Err(_) => SyscallReturn::err(ipc::status::EBADSTATE),
                 }
@@ -1339,6 +1341,90 @@ mod tests {
             crate::sched::get(child_tid).unwrap().state,
             crate::sched::State::Ready
         );
+    }
+
+    /// S1/ADR-050: the REGS_WRITE syscall masks RFLAGS (IOPL=0, IF=1) and
+    /// never writes caller words into the target's kernel stack — slot 3 of
+    /// the init-context frame (the ring-0 trampoline return address) stays
+    /// kernel-owned. REGS_READ exposes the masked RFLAGS in w3.
+    #[test]
+    fn regs_write_masks_rflags_and_spares_kstack_slot3() {
+        let (pid, _tid, _factory) = setup();
+        // Target thread with a fake-backed kstack, suspended.
+        let target = sched::spawn_with(ObjRef(1), 100, 0x401000).unwrap();
+        static FAKE: Mutex<[u64; 512]> = Mutex::new([0; 512]);
+        let base = FAKE.lock().as_ptr() as u64;
+        sched::set_kstack(target, base, 1).unwrap();
+        let top = base + crate::frame::FRAME_SIZE as u64;
+        crate::mem::seed_reg_image(top, &[0x1111; 10]);
+        let tc = proc::install_cap(
+            pid,
+            Capability {
+                obj: ObjId(target.0),
+                typ: ObjType::Thread,
+                rights: Rights::CONTROL.union(Rights::GRANT),
+            },
+        )
+        .unwrap();
+        // SUSPEND the target (Ready → Suspended) via the syscall layer.
+        let r = thread_invoke_for_test(pid, tc, Message::new(3));
+        assert_eq!(r.status, ipc::status::OK as i64, "SUSPEND");
+        // Frame cap for caps[0] (authority token only).
+        let frame_h = proc::install_cap(
+            pid,
+            Capability {
+                obj: ObjId(0xE0_0000),
+                typ: ObjType::Frame,
+                rights: Rights::READ.union(Rights::WRITE),
+            },
+        )
+        .unwrap();
+
+        // REGS_WRITE with slot 3 = 0x3002 (IOPL=3, IF=0): the takeover word.
+        let mut m = Message::new(10);
+        m.words = [0xAAAA, 0xBBBB, 0x405000, 0x3002];
+        m.tag = m.tag.with_caps(1);
+        m.set_descriptor(0, CapSlot::pack(frame_h, Rights::READ))
+            .unwrap();
+        let r = thread_invoke_for_test(pid, tc, m);
+        assert_eq!(r.status, ipc::status::OK as i64, "REGS_WRITE");
+
+        // The trampoline slot kept its kernel value; the image is masked.
+        let mut after = [0u64; 10];
+        crate::mem::read_reg_image(top, &mut after);
+        assert_eq!(after[3], 0x1111, "slot 3 kernel-owned");
+        assert_eq!(after[0], 0xAAAA, "arg slot applied");
+        let t = sched::get(target).unwrap();
+        // words[3] rides the Frame-cap descriptor (handle | rights<<32); the
+        // RFLAGS mask must still normalize it: IOPL (bits 12–13) cleared,
+        // IF (bit 9) set.
+        assert_eq!(
+            t.user_regs[3] & 0x3000,
+            0,
+            "IOPL cleared in the stored image"
+        );
+        assert_eq!(
+            t.user_regs[3] & 0x200,
+            0x200,
+            "IF forced in the stored image"
+        );
+        assert_eq!(t.initial_pc, 0x405000);
+
+        // REGS_READ: the image comes back with the masked RFLAGS in w3.
+        let mut m = Message::new(9);
+        m.tag = m.tag.with_caps(1);
+        m.set_descriptor(0, CapSlot::pack(frame_h, Rights::READ))
+            .unwrap();
+        let r = thread_invoke_for_test(pid, tc, m);
+        assert_eq!(r.status, ipc::status::OK as i64, "REGS_READ");
+        assert_eq!(r.w[0], 0xAAAA, "arg");
+        assert_eq!(r.w[1], 0x405000, "entry");
+        assert_eq!(r.w[2], 0xBBBB, "user RSP");
+        assert_eq!(r.w[3] & 0x3000, 0, "IOPL cleared on the wire");
+        assert_eq!(r.w[3] & 0x200, 0x200, "IF set on the wire");
+        // REGS_WRITE without a Frame cap → EBADARG.
+        let r = thread_invoke_for_test(pid, tc, Message::new(10));
+        assert_eq!(r.status, ipc::status::EBADARG as i64);
     }
 
     /// ADR-044: a foreign-flagged thread's syscall routes to the emulator
