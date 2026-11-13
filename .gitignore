@@ -7,3 +7,7 @@ Cargo.lock.orig
 
 # Unattended agent state (logs, per-agent build dirs, stop files)
 .agents/
+
+# Agent build outputs and graph scratch space
+build/
+graphify-out/
