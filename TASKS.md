@@ -68,7 +68,9 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 
 ## Phase 3 — POSIX personality + shell (after freeze lift; ADR-054)
 
-- [ ] DS — busybox: port/build busybox against the POSIX personality; run under init (static musl binaries already run).
+- [~ DS started 2026-11-14] DS — busybox: port/build busybox against the POSIX personality; run under init (static musl binaries already run).
+  - [ ] DS — BB1: build a minimal static busybox (pinned recipe + committed asset) and run one applet under `linrun` as a new init marker step; boot reaches DONE.
+  - [ ] DS — BB2: grow applet + syscall coverage (`cat`/`ls`/`pwd`/`uname`/`id`) as the emulator allows.
 - [ ] DS — interactive login (ADR-048): login program, /etc/passwd in ramfs, console-in as stdin; init LOGIN=1 path spawns login instead of sh.
 
 ## Phase 4 — Graphics & desktop (after freeze lift; ADR-054)
