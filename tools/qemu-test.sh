@@ -63,6 +63,13 @@ tools/build-all.sh || fail "E1 (tools/build-all.sh) failed"
 # 2. Sanity: kernel ELF must exist.
 [[ -f "$KERNEL_ELF" ]] || fail "kernel ELF not found: $KERNEL_ELF (build it first)"
 
+# E11: hal-x86-64 must host-test its pure logic on every host; never 0 tests.
+hal_test_out="$(cargo test -p hal-x86-64 2>&1)" || fail "hal-x86-64 tests did not build/run"
+if ! printf '%s\n' "$hal_test_out" | grep -Eq 'running [1-9][0-9]* tests'; then
+    fail "hal-x86-64 reports 0 host tests (E11: pure logic must be host-testable)"
+fi
+echo "[qemu-test] hal-x86-64 host tests present (E11)"
+
 rm -f "$SERIAL_LOG"
 
 echo "[qemu-test] --- QEMU boot: $QEMU (accel=$QEMU_ACCEL) ---"
