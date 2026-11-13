@@ -76,3 +76,7 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 ## Phase 4 — Graphics & desktop (after freeze lift; ADR-054)
 
 - [ ] NV — virtio-gpu as a userspace driver (graphics/): virtio-gpu against MmioRegion + Frame caps per ADR-052; not wired into boot path yet.
+
+## Phase 5 — Portability (after freeze lift; ADR-054)
+
+- [ ] NV — aarch64 HAL bring-up: TrapDecode + context backend + paging backend stubs (hal/aarch64 is an empty stub; PLAN Phase 5).
