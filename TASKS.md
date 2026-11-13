@@ -49,7 +49,7 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 
 ## Blockers
 
-(none)
+- [Blocker] NV — kernel crate doesn't compile: GLM's uncommitted `kernel/src/aspace.rs` map_page_checked refactor (S10 unblocker) made `AddressSpace::map` take `be: &dyn PagingBackend` but left callers missing the arg (+ a `?` error). `cargo test -p hal-x86-64` (E11 host tests), S10, and the full gate cannot run. Owner: GLM.
 
 ## Decisions needed
 
