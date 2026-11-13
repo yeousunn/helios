@@ -51,6 +51,7 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 - [Request] NV — E1 `tools/build-all.sh` image order is wrong for a fresh build: it builds `sdk init` before PS/VFS/CONSOLE/AUTH (init embeds those, so HAS_*_IMAGE=false → boot stops at init marker step 18), and builds `vfs` before the personality bins it embeds (no `/posix` → boot stops at step 16). Repro: fresh `cargo clean` (or empty `$CARGO_TARGET_DIR`) then `tools/qemu-test.sh`. Needed order: child, console, auth, personality --bins, vfs, ps, init, kernel-boot. (I fixed the related `sdk/build.rs` rerun-if-changed so the manual pipeline order is reproducible; build-all still needs this reorder.)
 - [Resolved] NV — build-all.sh image order already fixed by E1 (7fd070f): order is now child, console, auth, personality --bins, vfs, ps, init, kernel-boot, matching the Request's needed order. No further NV action.
 - [Request] NV — E4 landed (9dda2e9): the userspace clippy line is now `-D warnings` clean, so E5 (add it to `tools/qemu-test.sh`) is unblocked.
+- [Request] NV — implement `PagingBackendX86_64::copy_page(dst, src)` (ADR-024 §2) so FORK can copy resolved pages. Use the higher-half window (`kernel::mem::phys_to_virt`) for a scratch memcpy. Needed for the Phase 2 GLM task (per-process VMM FORK COW clone) to work end-to-end on real hardware. Currently FORK returns ENOSYS on metal because the default `copy_page` returns `false`.
 
 ## Blockers
 
