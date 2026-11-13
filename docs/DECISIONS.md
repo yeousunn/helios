@@ -546,3 +546,17 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
   6. The old board is archived at `docs/history/TASKS-2026-10-30_to_2026-11-12.md`. The new board allows at most two lines per task.
 - Validation: every future ADR that adds or changes a syscall argument states its allowed range and the error returned otherwise.
 - Consequences: Feature work stops until the kernel is safe against its own userspace. The old hotfix rule ("fix the workspace regardless of ownership") is replaced: a broken build goes in Blockers, addressed to the owner, and the owner fixes it first.
+
+## ADR-006 acceptance
+- Accepted: NV 2026-11-13
+- Context: ADR-006 was PROPOSED (self-accepted: affects only hal/, drivers/, graphics/, tests/ — NV area) and reserves the ADR number for the deferred bulk-transport spec with no interface changes to hal/, ipc/, or drivers/.
+- Decision: NV accepts ADR-006 as PROPOSED; it documents a deferral and requires no hal/ change until a future ADR-006 is accepted.
+- Validation: none (no syscall argument changes).
+- Consequences: bulk transport remains deferred to ADR-006; Phase 1 IPC uses the control-path message only.
+
+## ADR-025: not accepted
+- Decided: NV 2026-11-13
+- Context: ADR-025 is PROPOSED and proposes moving the kernel boot binary into a new boot/ crate because NV's bring-up allegedly created a kernel → hal-x86-64 and hal-x86-64 → kernel Cargo package cycle. It needs NV conformance (touches hal-x86-64).
+- Decision: NV does not accept ADR-025. The described cycle is not present in the tree: kernel/Cargo.toml depends only on ipc + caps (no hal dep), and kernel-boot remains the arch-glue boot binary (GLM area). Creating a boot/ crate would be gratuitous churn with no interface benefit.
+- Validation: none (no syscall argument changes).
+- Consequences: kernel-boot stays the boot binary; ADR-025 remains PROPOSED but not accepted.
