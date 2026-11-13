@@ -550,8 +550,15 @@ fn thread_invoke(
         SET_TLS => {
             // ADR-044/046 (musl TLS): w0 = the thread's FS base — musl's
             // arch_prctl(ARCH_SET_FS) lands here via the emulator. The arch
-            // switch loads it when the target is scheduled.
-            match sched::set_tls(target, msg.words[0]) {
+            // switch loads it when the target is scheduled. S3: the base
+            // must be a canonical user address (0 keeps its documented
+            // "clear" meaning) — a kernel or non-canonical value faults in
+            // ring 0 at the next switch, halting the machine.
+            let fs = msg.words[0];
+            if fs != 0 && !sched::is_user_addr(fs) {
+                return SyscallReturn::err(ipc::status::EBADARG);
+            }
+            match sched::set_tls(target, fs) {
                 Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
                 Err(_) => SyscallReturn::err(ipc::status::EBADSTATE),
             }
@@ -1851,6 +1858,61 @@ mod tests {
         );
         assert_eq!(ret.status, 0);
         assert_eq!(sched::fs_base_of(target), 0);
+    }
+
+    /// S3: SET_TLS must reject kernel-window / non-canonical FS bases with
+    /// EBADARG — such a base faults in ring 0 at the next context switch
+    /// (any process could halt the machine). 0 stays legal (clear).
+    #[test]
+    fn s3_set_tls_rejects_kernel_and_non_canonical_bases() {
+        let (pid, target, _ep_h) = setup();
+        let ctl = proc::install_cap(
+            pid,
+            caps::Capability {
+                obj: caps::ObjId(target.0),
+                typ: caps::ObjType::Thread,
+                rights: caps::Rights::CONTROL,
+            },
+        )
+        .unwrap();
+        for bad in [
+            0xFFFF_8000_0000_0000, // kernel window base (higher half)
+            0xFFFF_FFFF_FFFF_F000, // non-canonical
+            0x0000_8000_0000_0000, // the user/kernel split
+        ] {
+            let ret = invoke(
+                pid,
+                target,
+                SyscallArgs {
+                    num: num::INVOKE,
+                    cap: ctl as u64,
+                    tag: Tag::new(11), // SET_TLS
+                    w: [bad, 0, 0, 0],
+                    nonblock: false,
+                },
+            );
+            assert_eq!(ret.status, ipc::status::EBADARG as i64, "fs_base={bad:#x}");
+        }
+        // The rejected values never entered the thread's state.
+        assert_eq!(
+            sched::fs_base_of(target),
+            0,
+            "bad bases rejected, none stored"
+        );
+        // A valid user base still roundtrips; 0 still clears.
+        let ret = invoke(
+            pid,
+            target,
+            SyscallArgs {
+                num: num::INVOKE,
+                cap: ctl as u64,
+                tag: Tag::new(11),
+                w: [0x7E00_1234_5678, 0, 0, 0],
+                nonblock: false,
+            },
+        );
+        assert_eq!(ret.status, 0, "valid user FS base still ok");
+        assert_eq!(sched::fs_base_of(target), 0x7E00_1234_5678);
     }
 
     /// ADR-044 (DS's slice-33 corruption report): the EMULATOR does a
