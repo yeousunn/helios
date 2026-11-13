@@ -48,22 +48,28 @@ build_bin() {
 
 echo "[build-all] target=$TARGET target_dir=${CARGO_TARGET_DIR:-target}"
 
-# 1. sdk first — every userspace crate depends on it.
-build_bin sdk init
+# 1. sdk child first — its build script registers cargo:rerun-if-changed for
+#    every image path the init build script later watches (sdk/build.rs), so
+#    `sdk init` rebuilds once the server images exist on a fresh build.
 build_bin sdk child
 
-# 2. System servers (depend on sdk + ipc only; no inter-server deps).
-build_bin vfs vfs
-build_bin auth auth
-build_bin process ps
+# 2. Images init embeds (PS, VFS, CONSOLE, AUTH) — must exist before `sdk init`.
 build_bin console console
+build_bin auth auth
 
-# 3. Personality layer (depends on sdk).
+# 3. Personality layer (depends on sdk; vfs embeds these images).
 for bin in posix sh cat login ls echo wc linrun; do
     build_bin personality "$bin"
 done
 
-# 4. Kernel last (the `kernel-boot` bin requires the `boot` feature).
+# 4. System servers (depend on sdk + personality images; no inter-server deps).
+build_bin vfs vfs
+build_bin process ps
+
+# 5. init last among userspace — all its embedded images now exist.
+build_bin sdk init
+
+# 6. Kernel last (the `kernel-boot` bin requires the `boot` feature).
 cargo build -p kernel-boot --target "$TARGET" --release --features boot \
     || fail "cargo build -p kernel-boot --release --features boot failed"
 echo "[build-all] kernel-boot -> ${CARGO_TARGET_DIR:-target}/$TARGET/release/kernel-boot"
