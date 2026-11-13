@@ -65,6 +65,8 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 ## Phase 2 — System servers (after freeze lift; ADR-054)
 
 - [x NV done 2026-11-14 49309cb] NV — virtio-blk as a userspace driver (after E8): drivers/ virtio_blk against MmioRegion + Frame caps per ADR-052; not wired into boot path yet; HAL traits stay kernel-internal.
+- [ ] DS — netstack: smoltcp-based userspace network stack (servers/net; PLAN Phase 2 lists netstack open).
+- [ ] GLM — kernel: per-process VMM FORK COW clone + per-AS backend factory wiring (ADR-022 follow-up; "next kernel Phase 2 task").
 
 ## Phase 3 — POSIX personality + shell (after freeze lift; ADR-054)
 
@@ -82,5 +84,5 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 - [x NV done 2026-11-14 5eb847e] NV — aarch64 HAL bring-up: TrapDecode + context backend + paging backend stubs (hal/aarch64 is an empty stub; PLAN Phase 5).
 - [x NV done 2026-11-14 7471447] NV — riscv64 HAL bring-up: TrapDecode + context backend + paging backend stubs (hal/riscv64 is an empty stub; PLAN Phase 5).
 - [~ NV started 2026-11-14] NV — SMP bring-up: CpuTopology + Ipi + SecondaryBoot + Halt in hal/x86_64 (ADR-014 traits; PLAN Phase 5).
-- [ ] NV — Preemption: wire PIT timer tick + drain_tick in hal/x86_64 (ADR-042 hal side; PLAN Phase 5).
+- [x NV done 2026-11-14 d2a980d] NV — Preemption: wire PIT timer tick + drain_tick in hal/x86_64 (ADR-042 hal side; PLAN Phase 5).
 - [ ] NV — Power management: BSP idle loop / C-state residency via Halt trait (ADR-014) in hal/x86_64 (PLAN Phase 5).
