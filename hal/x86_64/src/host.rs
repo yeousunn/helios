@@ -46,6 +46,28 @@ pub const PCI_CONFIG_DATA: u16 = 0xCFC;
 pub const PML4_KERNEL_FIRST: usize = 256;
 pub const PML4_KERNEL_LAST: usize = 511;
 
+/// CPUID leaf: processor feature information (leaf 7, sub-leaf 0).
+pub const CPUID_LEAF_FEATURES: u32 = 0x0000_0007;
+/// Sub-leaf 0 of the features leaf: ECX holds SMEP/SMAP/UMIP etc.
+pub const CPUID_SUB_LEAF_0: u32 = 0x0000_0000;
+
+/// CPUID leaf 7, sub-leaf 0, ECX feature bit: Supervisor-Mode Execution
+/// Prevention (SMEP). CR4.SMEP is bit 20.
+pub const CPUID_ECX_SMEP: u32 = 1 << 20;
+/// CPUID leaf 7, sub-leaf 0, ECX feature bit: Supervisor-Mode Access
+/// Prevention (SMAP). CR4.SMAP is bit 21.
+pub const CPUID_ECX_SMAP: u32 = 1 << 21;
+/// CPUID leaf 7, sub-leaf 0, ECX feature bit: User-Mode Instruction
+/// Prevention (UMIP). CR4.UMIP is bit 11.
+pub const CPUID_ECX_UMIP: u32 = 1 << 11;
+
+/// True iff `bit` of `ecx` (the CPUID leaf-7 sub-leaf-0 ECX result) is set,
+/// i.e. the CPU advertises the corresponding feature. Pure: no CPU
+/// instructions, host-testable on any target.
+pub const fn cpuid_ecx_has(ecx: u32, bit: u32) -> bool {
+    ecx & bit != 0
+}
+
 /// True iff `vaddr` falls in a kernel-reserved PML4 slot (256..=511).
 pub const fn pml4_slot_is_kernel(vaddr: usize) -> bool {
     let idx = pt_index(vaddr, PML4_SHIFT);
@@ -122,5 +144,14 @@ mod tests {
         assert!(pml4_slot_is_kernel(256 << PML4_SHIFT));
         assert!(pml4_slot_is_kernel(511 << PML4_SHIFT));
         assert!(pml4_slot_is_kernel(0xFFFF_8000_0000_0000)); // higher-half base -> slot 511
+    }
+
+    #[test]
+    fn cpuid_ecx_has_bits() {
+        let ecx: u32 = CPUID_ECX_SMEP | CPUID_ECX_UMIP;
+        assert!(cpuid_ecx_has(ecx, CPUID_ECX_SMEP));
+        assert!(cpuid_ecx_has(ecx, CPUID_ECX_UMIP));
+        assert!(!cpuid_ecx_has(ecx, CPUID_ECX_SMAP));
+        assert!(!cpuid_ecx_has(0, CPUID_ECX_SMEP));
     }
 }

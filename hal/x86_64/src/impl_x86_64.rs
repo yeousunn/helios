@@ -1070,6 +1070,89 @@ pub fn write_fs_base(va: u64) {
     }
 }
 
+/// CR4 bit: Supervisor-Mode Execution Prevention (SMEP). Blocks supervisor
+/// execution of user-mode pages. CR4 bit 20.
+const CR4_SMEP: u64 = 1 << 20;
+/// CR4 bit: Supervisor-Mode Access Prevention (SMAP). Blocks supervisor
+/// data access to user-mode pages unless bracketed by STAC/CLAC. CR4 bit 21.
+///
+/// SMAP is CPUID-checked here but deliberately NOT enabled yet: the kernel has
+/// no user-copy helper (STAC/CLAC wrappers around user-memory access), so
+/// setting CR4.SMAP would fault on any existing kernel dereference of user
+/// pointers. Enablement waits for that helper — see ADR-051.
+#[allow(dead_code)] // SMAP enablement awaits the user-copy helper (ADR-051).
+const CR4_SMAP: u64 = 1 << 21;
+/// CR4 bit: User-Mode Instruction Prevention (UMIP). Blocks SGDT/SIDT/SLDT/
+/// SMSW/STR in user mode. CR4 bit 11.
+const CR4_UMIP: u64 = 1 << 11;
+
+/// Read the current CR4 register.
+fn cr4_read() -> u64 {
+    let v: u64;
+    // SAFETY: reading CR4 is architecturally safe; no memory side effects.
+    unsafe { core::arch::asm!("mov {0}, cr4", out(reg) v, options(nostack)) };
+    v
+}
+
+/// Write CR4 with `value`.
+///
+/// # Safety
+/// Writes architectural CPU state; call once at boot with only SMEP/SMAP/UMIP
+/// bits OR'd into the existing value.
+unsafe fn cr4_write(value: u64) {
+    // SAFETY: caller guarantees only SMEP/SMAP/UMIP bits are set; single-CPU
+    // boot, no concurrent CR4 users.
+    core::arch::asm!("mov cr4, {0}", in(reg) value, options(nostack));
+}
+
+/// CPUID leaf 7, sub-leaf 0: return ECX (SMEP/SMAP/UMIP feature bits).
+///
+/// RBX is callee-saved and used internally by LLVM, but `cpuid` clobbers EBX;
+// since RBX cannot be listed as an asm operand, save/restore it around the
+/// instruction so LLVM's "RBX preserved across inline asm" assumption holds.
+#[inline(never)]
+fn cpuid_leaf7_ecx() -> u32 {
+    let mut subleaf: u32 = crate::host::CPUID_SUB_LEAF_0; // in: 0, out: ECX
+    let rbx_save: u64;
+    // SAFETY: `cpuid` leaf 7 sub-leaf 0 is always valid on x86_64.
+    unsafe {
+        core::arch::asm!("mov {0}, rbx", out(reg) rbx_save, options(nostack));
+        core::arch::asm!("cpuid",
+            in("eax") crate::host::CPUID_LEAF_FEATURES,
+            inout("ecx") subleaf,
+            options(nostack));
+        core::arch::asm!("mov rbx, {0}", in(reg) rbx_save, options(nostack));
+    }
+    subleaf
+}
+
+/// Enable supervisor-mode protections (SMEP + UMIP now; SMAP once a user-copy
+/// helper exists — ADR-051). Each bit is set only if CPUID leaf 7 sub-leaf 0
+/// ECX advertises the feature, so the function is safe on CPUs that lack any
+/// of them. Returns the mask of features actually enabled.
+///
+/// # Safety
+/// Writes CR4 (architectural state); call once at boot, after paging is on.
+pub unsafe fn enable_supervisor_protections() -> u64 {
+    let ecx = cpuid_leaf7_ecx();
+    let mut mask: u64 = 0;
+    if crate::host::cpuid_ecx_has(ecx, crate::host::CPUID_ECX_SMEP) {
+        mask |= CR4_SMEP;
+    }
+    if crate::host::cpuid_ecx_has(ecx, crate::host::CPUID_ECX_UMIP) {
+        mask |= CR4_UMIP;
+    }
+    // SMAP: CPUID-checked and ready, but not set until a user-copy helper
+    // (STAC/CLAC around user-memory access) exists — ADR-051.
+    if mask == 0 {
+        return 0;
+    }
+    let cr4 = cr4_read();
+    // SAFETY: only SMEP/UMIP bits (verified CPUID-supported) are OR'd in.
+    cr4_write(cr4 | mask);
+    mask
+}
+
 /// Set the running thread's kernel stack top (boot: the initial boot stack).
 pub fn set_kstack(top: u64) {
     CURRENT_KSTACK.store(top, core::sync::atomic::Ordering::Relaxed);
