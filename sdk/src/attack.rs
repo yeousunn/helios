@@ -50,15 +50,22 @@ pub fn run<R: RawSyscalls>(sys: &mut Syscalls<R>, pkg: &BootstrapPackage) -> i32
     // Append one entry per S-task as it lands. Keep the order stable: the
     // index is part of the failure status.
     //
-    // Still pending (no case yet): S4 MAP/UNMAP/PROTECT kernel-window range
-    // (the attack child holds no Frame cap to reach MAP), S8 GRANT-check on
-    // THREAD_CREATE/NEW_THREAD, S9 oversized UNMAP count.
+    // Still pending (no case yet): S6/S7 (CR4 supervisor bits and the kernel
+    // syscall/exception flag mask are not observable from ring 3; a bad call
+    // would fault, not return an error), S8 GRANT-check on THREAD_CREATE/
+    // NEW_THREAD, S9 oversized UNMAP count. S1's REGS_* path is covered where
+    // a child can reach it (case 1: the non-Frame cap rejection); the deeper
+    // masking lives in kernel tests (ADR-050).
     let outcomes = [
         case_orphan_handle(sys),
         case_regs_write_non_frame_cap(sys, pkg),
         case_thread_create_kernel_pc(sys, pkg), // S2
         case_set_entry_kernel_pc(sys, pkg),     // S2
         case_set_tls_non_canonical(sys, pkg),   // S3
+        case_map_kernel_window(sys, pkg),       // S4/S5
+        case_unmap_kernel_window(sys, pkg),     // S4
+        case_protect_kernel_window(sys, pkg),   // S4
+        case_map_null(sys, pkg),                // S4
     ];
     classify(&outcomes)
 }
@@ -150,6 +157,52 @@ fn case_set_tls_non_canonical<R: RawSyscalls>(
     sys.invoke(pkg.thread, &m).is_err()
 }
 
+/// `AS::MAP` of a kernel-window VA must be rejected (S4) before any frame is
+/// allocated, and must never create a user-writable entry over the shared
+/// kernel window (S5, `walk_create`). The `ANON` flag makes the call reach the
+/// range check without a `Frame` cap, which the attack child does not hold.
+/// Pre-fix this mapped a user page into PML4[511]. Case 5.
+fn case_map_kernel_window<R: RawSyscalls>(sys: &mut Syscalls<R>, pkg: &BootstrapPackage) -> bool {
+    use crate::methods::map_flags;
+    let mut m = Message::new(crate::methods::aspace::MAP);
+    m.words[0] = KERNEL_PC;
+    m.words[1] = u64::from(map_flags::R | map_flags::W | map_flags::ANON);
+    sys.invoke(pkg.aspace, &m).is_err()
+}
+
+/// `AS::UNMAP` of a kernel-window VA must be rejected (S4): the range walk
+/// must never touch the shared kernel window. Uses a legal page count so only
+/// the address is at fault. Case 6.
+fn case_unmap_kernel_window<R: RawSyscalls>(sys: &mut Syscalls<R>, pkg: &BootstrapPackage) -> bool {
+    let mut m = Message::new(crate::methods::aspace::UNMAP);
+    m.words[0] = KERNEL_PC;
+    m.words[1] = 1;
+    sys.invoke(pkg.aspace, &m).is_err()
+}
+
+/// `AS::PROTECT` of a kernel-window VA must be rejected (S4): PROTECT must not
+/// reflag a kernel page. Case 7.
+fn case_protect_kernel_window<R: RawSyscalls>(
+    sys: &mut Syscalls<R>,
+    pkg: &BootstrapPackage,
+) -> bool {
+    use crate::methods::map_flags;
+    let mut m = Message::new(crate::methods::aspace::PROTECT);
+    m.words[0] = KERNEL_PC;
+    m.words[2] = u64::from(map_flags::R);
+    sys.invoke(pkg.aspace, &m).is_err()
+}
+
+/// `AS::MAP` at VA 0 must be rejected (S4): the null page is never mappable.
+/// Case 8.
+fn case_map_null<R: RawSyscalls>(sys: &mut Syscalls<R>, pkg: &BootstrapPackage) -> bool {
+    use crate::methods::map_flags;
+    let mut m = Message::new(crate::methods::aspace::MAP);
+    m.words[0] = 0;
+    m.words[1] = u64::from(map_flags::R | map_flags::W | map_flags::ANON);
+    sys.invoke(pkg.aspace, &m).is_err()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,7 +212,7 @@ mod tests {
     /// number of raw calls (case 3 creates, suspends, sets the entry and
     /// revokes; the rest make one); the mock replays the matching statuses.
     struct MockKernel {
-        statuses: [i32; 9],
+        statuses: [i32; 13],
         len: usize,
         i: usize,
     }
@@ -169,12 +222,16 @@ mod tests {
         ///
         /// Index: 0 orphan, 1 non-Frame, 2 THREAD_CREATE(kernel pc),
         /// 3 THREAD_CREATE(valid), 4 SUSPEND, 5 SET_ENTRY(kernel pc),
-        /// 6 KILL, 7 cap_revoke, 8 SET_TLS.
+        /// 6 KILL, 7 cap_revoke, 8 SET_TLS, 9 MAP(kernel window),
+        /// 10 UNMAP(kernel window), 11 PROTECT(kernel window), 12 MAP(null).
         fn rejects() -> Self {
             use ipc::status::{EBADARG, EBADCAP, OK};
             MockKernel {
-                statuses: [EBADCAP, EBADARG, EBADARG, OK, OK, EBADARG, OK, OK, EBADARG],
-                len: 9,
+                statuses: [
+                    EBADCAP, EBADARG, EBADARG, OK, OK, EBADARG, OK, OK, EBADARG, EBADARG, EBADARG,
+                    EBADARG, EBADARG,
+                ],
+                len: 13,
                 i: 0,
             }
         }
@@ -182,8 +239,8 @@ mod tests {
         /// A kernel that accepts every bad call (a security regression).
         fn accepts() -> Self {
             MockKernel {
-                statuses: [ipc::status::OK; 9],
-                len: 9,
+                statuses: [ipc::status::OK; 13],
+                len: 13,
                 i: 0,
             }
         }
@@ -259,6 +316,42 @@ mod tests {
         k.statuses[8] = ipc::status::OK;
         let mut sys = Syscalls::new(&mut k);
         assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 5);
+    }
+
+    #[test]
+    fn accepted_map_kernel_window_is_case_6() {
+        // Kernel accepts MAP(kernel window) at index 9 (case 5).
+        let mut k = MockKernel::rejects();
+        k.statuses[9] = ipc::status::OK;
+        let mut sys = Syscalls::new(&mut k);
+        assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 6);
+    }
+
+    #[test]
+    fn accepted_unmap_kernel_window_is_case_7() {
+        // Kernel accepts UNMAP(kernel window) at index 10 (case 6).
+        let mut k = MockKernel::rejects();
+        k.statuses[10] = ipc::status::OK;
+        let mut sys = Syscalls::new(&mut k);
+        assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 7);
+    }
+
+    #[test]
+    fn accepted_protect_kernel_window_is_case_8() {
+        // Kernel accepts PROTECT(kernel window) at index 11 (case 7).
+        let mut k = MockKernel::rejects();
+        k.statuses[11] = ipc::status::OK;
+        let mut sys = Syscalls::new(&mut k);
+        assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 8);
+    }
+
+    #[test]
+    fn accepted_map_null_is_case_9() {
+        // Kernel accepts MAP(null) at index 12 (case 8).
+        let mut k = MockKernel::rejects();
+        k.statuses[12] = ipc::status::OK;
+        let mut sys = Syscalls::new(&mut k);
+        assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 9);
     }
 
     #[test]
