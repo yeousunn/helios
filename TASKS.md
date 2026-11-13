@@ -17,7 +17,7 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 - [x GLM done 2026-11-13 1cd2a31] S4 GLM — MAP, UNMAP and PROTECT check only alignment, so a user can map over the shared kernel window PML4[511] (`kernel/src/aspace.rs:209`). Require the whole range in user space, with overflow-checked math, and reject VA 0.
 - [x NV done 2026-11-13 7ac6f6e] S5 NV — `walk_create` ORs PTE_USER into upper-level entries and splits kernel huge pages (`hal/x86_64/src/paging.rs:279`). Refuse walks into PML4 slots 256–511 and never set USER on a shared kernel entry.
 - [x NV done 2026-11-13 06d018b] S6 NV — SMEP, SMAP and UMIP are off (`kernel-boot/src/boot.S:119`). Write the CPUID-checked CR4 code as a HAL function and file a Request for GLM to call it from `kernel-boot`. SMAP waits for a user-copy helper: record that in an ADR.
-- [ ] S6b GLM — Call NV's CR4 hardening function from `kernel-boot` once S6 lands.
+- [~ GLM started 2026-11-13] S6b — Call NV's CR4 hardening function from `kernel-boot` once S6 lands.
 - [x NV done 2026-11-13 a865f5f] S7 NV — FMASK is `0x300`, so DF and AC reach the kernel (`hal/x86_64/src/syscall_entry.rs:46`). Clear IF, TF, DF, AC and NT (`0x47700`) and add `cld` to every interrupt and exception entry stub.
 - [ ] S8 GLM — NEW_THREAD copies caps[1] with full rights and no GRANT check, and adds SEND on caps[2] (`entry.rs:~801`, `~822`). Route both through the GRANT-checked, rights-intersecting transfer in `kernel/src/syscall.rs:112` and `:144`, and check the cap type.
 - [ ] S9 GLM — UNMAP with a huge page count loops with interrupts off (`aspace.rs:331`). Cap it at the region size and return EBADARG above that.
