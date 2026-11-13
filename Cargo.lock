@@ -244,6 +244,7 @@ name = "hal-riscv64"
 version = "0.1.0"
 dependencies = [
  "hal",
+ "kernel",
 ]
 
 [[package]]
