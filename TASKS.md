@@ -21,7 +21,7 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 - [x NV done 2026-11-13 a865f5f] S7 NV — FMASK is `0x300`, so DF and AC reach the kernel (`hal/x86_64/src/syscall_entry.rs:46`). Clear IF, TF, DF, AC and NT (`0x47700`) and add `cld` to every interrupt and exception entry stub.
 - [ ] S8 GLM — NEW_THREAD copies caps[1] with full rights and no GRANT check, and adds SEND on caps[2] (`entry.rs:~801`, `~822`). Route both through the GRANT-checked, rights-intersecting transfer in `kernel/src/syscall.rs:112` and `:144`, and check the cap type.
 - [ ] S9 GLM — UNMAP with a huge page count loops with interrupts off (`aspace.rs:331`). Cap it at the region size and return EBADARG above that.
-- [ ] S10 NV — `map_page` panics when no page-table frame is free (`hal/x86_64/src/paging.rs:~388`). Return an error.
+- [~ NV started 2026-11-13] S10 NV — `map_page` panics when no page-table frame is free (`hal/x86_64/src/paging.rs:~388`). Return an error.
 - [ ] S10b GLM — Audit every `unwrap()`/`expect()` reachable from `entry::dispatch` and turn each into an error code. Tests and boot code may keep theirs.
 - [~ DS started 2026-11-13] S11 — An `attack` userspace program (pattern: `sdk/src/bin/child.rs`) makes every bad call from S1–S10 and expects an error back. init runs it as a new marker step. The boot must still reach DONE. Add each case as soon as its S-task lands.
   - [~ DS started 2026-11-13] S11.1 — harness: `sdk::attack` runner + `child` argv "attack" mode + init marker step + baseline self-test cases (S1–S10 cases appended as they land).
