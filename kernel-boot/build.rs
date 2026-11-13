@@ -31,6 +31,12 @@ fn main() {
     println!("cargo:rustc-link-arg=-T{}", linker_script.display());
 
     println!("cargo:rerun-if-env-changed=INIT_IMAGE");
+    // Emitting any rerun-if-changed narrows cargo's watch set to exactly the
+    // named paths, so ALL real inputs must be listed or source edits stop
+    // triggering rebuilds (stale-kernel class; same fix as sdk/build.rs).
+    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=../kernel.ld");
+    println!("cargo:rerun-if-changed=Cargo.toml");
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let dest = out_dir.join("init_image.rs");
     let code = match resolve_init_image() {

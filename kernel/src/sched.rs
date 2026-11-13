@@ -315,6 +315,7 @@ pub const KSTACK_FRAMES: usize = 16;
 /// debug builds paint the unused tail of each kernel stack at thread start
 /// and measure the deepest touch at exit, so kstack sizing is measured, not
 /// guessed. Release builds skip the paint/check entirely.
+#[cfg(debug_assertions)]
 const KSTACK_PAINT: u8 = 0xA5;
 
 /// Paint the unused region of a freshly built kernel stack

@@ -104,6 +104,13 @@ pub extern "C" fn kernel_main() -> ! {
     // Enable NX (PTE bit 63 is reserved while EFER.NXE=0) and install fault
     // reporting stubs before any mapping/staging work.
     hal_x86_64::enable_nx();
+    // S6b (ADR-051): SMEP + UMIP from CR4, each bit CPUID-checked. Call once
+    // here, before any ring-3 code can exist; SMAP stays off until the
+    // kernel-side user-copy helper lands (ADR-051).
+    // SAFETY: boot-time, single-CPU, long mode (paging on) — the HAL contract
+    // for the one permitted CR4 write.
+    let smep_umip = unsafe { hal_x86_64::enable_supervisor_protections() };
+    kernel::kinfo!("boot: CR4 supervisor protections enabled: {:#x}", smep_umip);
     // SAFETY: boot-time, after early_init installed the GDT/IDT.
     unsafe {
         hal_x86_64::install_exception_stubs();
@@ -214,10 +221,6 @@ pub extern "C" fn kernel_main() -> ! {
         // window); the asm trampoline abandons the low boot stack before
         // any compiler frame exists on it.
         unsafe { enter_on_high_stack_trampoline(kernel::mem::phys_to_virt(boot_stack_top_pa)) };
-        #[cfg(not(any()))]
-        {
-            let _ = (entry, bootinfo_va);
-        }
     }
 
     // M1 terminus (no init image embedded): halt cleanly (ADR-028 → ADR-013).
