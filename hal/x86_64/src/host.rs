@@ -39,6 +39,19 @@ pub const PCI_CONFIG_ADDR: u16 = 0xCF8;
 /// PCI configuration data register (IO port).
 pub const PCI_CONFIG_DATA: u16 = 0xCFC;
 
+/// PML4 slots reserved for the kernel (S5). Userspace owns PML4[0..256) per
+/// ADR-045; the shared higher-half kernel window lives at slot 511 and slots
+/// 256..510 are reserved. A page-table walk into 256..=511 must be refused so
+/// a user process can never install PTE_USER on a shared kernel entry.
+pub const PML4_KERNEL_FIRST: usize = 256;
+pub const PML4_KERNEL_LAST: usize = 511;
+
+/// True iff `vaddr` falls in a kernel-reserved PML4 slot (256..=511).
+pub const fn pml4_slot_is_kernel(vaddr: usize) -> bool {
+    let idx = pt_index(vaddr, PML4_SHIFT);
+    idx >= PML4_KERNEL_FIRST && idx <= PML4_KERNEL_LAST
+}
+
 /// Build the PCI config-space address for `bus`/`device`/`function`/`offset`.
 ///
 /// `offset` must be 4-byte aligned; the low 2 bits are masked out.
@@ -97,5 +110,17 @@ mod tests {
                                     // Offset low 2 bits are masked out.
         assert_eq!(pci_config_addr(0, 0, 0, 3) & 0xFC, 0);
         assert_eq!(pci_config_addr(0, 0, 0, 3) & 0x3, 0);
+    }
+
+    #[test]
+    fn pml4_slot_is_kernel_bounds() {
+        // Userspace low half: PML4 slots 0..256 are not kernel slots.
+        assert!(!pml4_slot_is_kernel(0));
+        assert!(!pml4_slot_is_kernel(0x0000_7FFF_FFFF_F000)); // slot 255, top of user range
+                                                              // The FS-base user ceiling (S3) is exactly the first kernel slot.
+        assert!(pml4_slot_is_kernel(FS_BASE_USER_CEIL as usize)); // slot 256
+        assert!(pml4_slot_is_kernel(256 << PML4_SHIFT));
+        assert!(pml4_slot_is_kernel(511 << PML4_SHIFT));
+        assert!(pml4_slot_is_kernel(0xFFFF_8000_0000_0000)); // higher-half base -> slot 511
     }
 }

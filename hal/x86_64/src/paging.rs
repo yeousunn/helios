@@ -263,6 +263,13 @@ impl PagingBackendX86_64 {
     /// All reachable table pages must be identity-mapped and writable (true
     /// for kernel/frame memory in the v0 direct map), and `pml4_paddr` valid.
     unsafe fn walk_create(&self, vaddr: usize) -> Option<&mut Pte> {
+        // S5: refuse walks into the kernel-reserved PML4 range (slots
+        // 256..=511, incl. the shared higher-half window at slot 511) before
+        // touching any entry, so PTE_USER is never set on a shared kernel
+        // entry and no user walk ever enters the kernel window.
+        if crate::host::pml4_slot_is_kernel(vaddr) {
+            return None;
+        }
         // PML4 -> PDPT
         let pml4 = self.pml4_mut();
         let e = pml4.entry(pt_index(vaddr, PML4_SHIFT));

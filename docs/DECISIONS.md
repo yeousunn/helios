@@ -547,8 +547,13 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 - Validation: every future ADR that adds or changes a syscall argument states its allowed range and the error returned otherwise.
 - Consequences: Feature work stops until the kernel is safe against its own userspace. The old hotfix rule ("fix the workspace regardless of ownership") is replaced: a broken build goes in Blockers, addressed to the owner, and the owner fixes it first.
 
-## ADR-006 acceptance
-- Accepted: NV 2026-11-13
+## ADR-050: Refuse page-table walks into the kernel PML4 range (S5)
+- Proposed: NV 2026-11-13
+- Status: ACCEPTED 2026-11-13 (NV; affects only hal/x86_64, no syscall or HAL-trait interface change, self-accepted per AGENTS.md §4)
+- Context: S5. `PagingBackendX86_64::walk_create` ORs PTE_USER onto every intermediate page-table entry (PML4/PDPT/PD) and splits boot 2 MiB huge pages. Userspace owns PML4[0..256) per ADR-045; the shared higher-half kernel window lives at PML4[511] and slots 256..510 are reserved. A walk into 256..=511 would let a user process install PTE_USER on a shared kernel page-table entry and reach kernel memory at ring 3.
+- Decision: (1) Add a pure host-compilable predicate `hal::host::pml4_slot_is_kernel(vaddr)` (true for PML4 slots 256..=511) and constants `PML4_KERNEL_FIRST=256`, `PML4_KERNEL_LAST=511` in `hal/x86_64/src/host.rs`. (2) `walk_create` returns `None` (refuses) when `pml4_slot_is_kernel(vaddr)`, before touching any table entry, so PTE_USER is never set on a shared kernel entry and no walk ever enters the kernel window. (3) map_page's existing panic-on-None (allocation failure) is unchanged and is addressed separately by S10; the escalation is removed, leaving at most a DoS until S10 lands.
+- Validation: no syscall argument changes. The host unit test `pml4_slot_is_kernel_bounds` in host.rs fails to compile before the fix (predicate absent) and passes after; user-range addresses (slot 0..255) are not kernel slots, slot 256 and slot 511 / `0xFFFF_8000_0000_0000` are.
+- Consequences: MAP into kernel-reserved PML4 slots is refused instead of installing USER on kernel entries; `walk_create`'s `e.0 |= PTE_USER` now only runs on user slots. No trait or ABI change.
 - Context: ADR-006 was PROPOSED (self-accepted: affects only hal/, drivers/, graphics/, tests/ — NV area) and reserves the ADR number for the deferred bulk-transport spec with no interface changes to hal/, ipc/, or drivers/.
 - Decision: NV accepts ADR-006 as PROPOSED; it documents a deferral and requires no hal/ change until a future ADR-006 is accepted.
 - Validation: none (no syscall argument changes).
