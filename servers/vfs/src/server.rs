@@ -367,8 +367,14 @@ impl<K: VfsKernel, T: Transport> VfsServer<K, T> {
             if end > proto::WIN_SIZE as u64 {
                 return Err(status::ETOOBIG);
             }
-            let mut buf = alloc::vec![0u8; req.len as usize];
-            let n = self.fs.read(entry.node, req.offset, &mut buf)?;
+            // Stack buffer, not a heap Vec: the VFS heap is a bump allocator
+            // (sdk::heap) whose dealloc is a no-op, so a per-read allocation
+            // leaks 4 KiB for every chunk of every program load — reading a
+            // busybox-sized image exhausted the 1 MiB heap and panicked.
+            let mut buf = [0u8; proto::WIN_SIZE as usize];
+            let n = self
+                .fs
+                .read(entry.node, req.offset, &mut buf[..req.len as usize])?;
             let out = self.conns.get(&conn).ok_or(status::EBADCAP)?;
             windows.write(
                 out.result_window,

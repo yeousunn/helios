@@ -663,7 +663,12 @@ fn load_via_vfs(
     if file == 0 {
         return Err(ipc::status::EBADCAP);
     }
-    let mut out: Vec<u8> = Vec::new();
+    // OPEN carries the file size in w3. Reserve it once: PS's heap is a bump
+    // allocator with no realloc (sdk::heap), so a growing Vec would leak every
+    // doubling step, and a large program (busybox-sized) exhausted the 1 MiB
+    // heap and panicked PS. One up-front allocation keeps a load at file-size.
+    let size = (opened.words[3] as usize).min(1 << 20);
+    let mut out: Vec<u8> = Vec::with_capacity(size.max(4096));
     let mut offset = 0u64;
     loop {
         if out.len() > 1 << 20 {

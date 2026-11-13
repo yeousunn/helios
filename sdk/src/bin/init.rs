@@ -72,6 +72,9 @@ const STEP_LOGIN_WAIT: u64 = 28;
 /// S11: the attack program (`child` in `attack` mode) rejects every bad call.
 const STEP_ATTACK_SPAWN: u64 = 29;
 const STEP_ATTACK_WAIT: u64 = 30;
+/// Phase 3 busybox: `linrun` runs an embedded busybox applet (BB1).
+const STEP_BUSYBOX_SPAWN: u64 = 31;
+const STEP_BUSYBOX_WAIT: u64 = 32;
 const STEP_DONE: u64 = 0x0F;
 /// Failure marker family for exits: `0xDEAD_0000_00SS_EEEE` (step, errno).
 const FAIL: u64 = 0xDEAD_0000_0000_0000;
@@ -810,6 +813,79 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
             return Err(fail_code(STEP_LINRUN_WAIT, 0xE2 | (waited.words[1] << 8)));
         }
         mark(raw, info.debug_ep, STEP_LINRUN_WAIT, waited.words[1]);
+    }
+
+    // Steps 31–32 (Phase 3, BB1): busybox under the POSIX/Linux emulator.
+    // `linrun` run with native args selects its embedded busybox build instead
+    // of the default demo: argv[1] is the applet, argv[2..] its arguments (the
+    // multi-call invocation — busybox dispatches on basename(argv[0])). Here
+    // the `echo` applet prints `helios-busybox` and exits 0.
+    {
+        write_spawn_blob(b"linrun", &[b"linrun", b"echo", b"helios-busybox"]);
+        let route = mint(
+            raw,
+            info.factory,
+            methods::factory::NEW_ENDPOINT,
+            STEP_BUSYBOX_SPAWN,
+            0xE0,
+        )?;
+        let spawned = {
+            let mut sys = Syscalls::new(raw);
+            let mut m = Message::new(methods::process::SPAWN);
+            m.tag = m.tag.with_caps(4);
+            let _ = m.set_descriptor(
+                0,
+                ipc::CapSlot::pack(vfs_svc, ipc::Rights::SEND.union(ipc::Rights::GRANT)),
+            );
+            let _ = m.set_descriptor(1, ipc::CapSlot::NULL);
+            let _ = m.set_descriptor(
+                2,
+                ipc::CapSlot::pack(console_svc, ipc::Rights::SEND.union(ipc::Rights::GRANT)),
+            );
+            let _ = m.set_descriptor(
+                3,
+                ipc::CapSlot::pack(
+                    route,
+                    ipc::Rights::RECV
+                        .union(ipc::Rights::SEND)
+                        .union(ipc::Rights::GRANT),
+                ),
+            );
+            sys.call(session_ep, &m)
+                .map_err(|e| fail_code(STEP_BUSYBOX_SPAWN, e as u64))?
+        };
+        if spawned.words[0] != 0 || spawned.words[1] == 0 {
+            return Err(fail_code(
+                STEP_BUSYBOX_SPAWN,
+                0xE1 | ((spawned.words[0] as u64 & 0xFFFF) << 8),
+            ));
+        }
+        let bb_pid = spawned.words[1];
+        mark(raw, info.debug_ep, STEP_BUSYBOX_SPAWN, bb_pid);
+        let waited = loop {
+            let reply = {
+                let mut sys = Syscalls::new(raw);
+                let mut m = Message::new(methods::process::WAIT);
+                m.words[0] = bb_pid;
+                sys.call(session_ep, &m)
+                    .map_err(|e| fail_code(STEP_BUSYBOX_WAIT, e as u64))?
+            };
+            if reply.words[0] == 0 {
+                break reply;
+            }
+            if reply.words[0] == ipc::status::EWOULDBLOCK as i64 as u64 {
+                let _ = Syscalls::new(raw).yield_now();
+                continue;
+            }
+            return Err(fail_code(
+                STEP_BUSYBOX_WAIT,
+                0xE1 | ((reply.words[0] as u64 & 0xFF) << 8),
+            ));
+        };
+        if waited.words[1] != 0 {
+            return Err(fail_code(STEP_BUSYBOX_WAIT, 0xE2 | (waited.words[1] << 8)));
+        }
+        mark(raw, info.debug_ep, STEP_BUSYBOX_WAIT, waited.words[1]);
     }
 
     // Steps 29–30 (S11, Phase H): the attack program — `child` in `attack`

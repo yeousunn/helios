@@ -34,6 +34,15 @@ static HEAP: GlobalHeap = GlobalHeap::new();
 /// libc; raw `write`+`exit`). Loaded and executed like any Linux binary.
 static LIN_ELF: &[u8] = include_bytes!("../../assets/musl_cwd");
 
+/// The default demo program's argv[0].
+const DEFAULT_ARGV0: &[u8] = b"helios-linux-abi\n";
+
+/// busybox (Phase 3): a minimal static x86_64-linux-musl build (see
+/// `assets/busybox.build.sh`). When the launcher passes native args, they
+/// select a busybox applet instead of the default demo: the guest argv is
+/// `<applet> <args…>` (multi-call invocation, basename(argv[0])).
+static BUSYBOX_ELF: &[u8] = include_bytes!("../../assets/busybox");
+
 /// Load an ET_EXEC ELF into this process's own AS (shared with the emulated
 /// thread): carve + map a frame per page of every PT_LOAD, then copy the file
 /// bytes straight to the segment VA. Returns the entry PC.
@@ -392,8 +401,34 @@ impl personality::foreign::Host for Emu<'_> {
     }
 }
 
-extern "C" fn linrun_main() -> ! {
+extern "C" fn linrun_main(argc: u64, argv: *const *const u8, envp: *const *const u8) -> ! {
     let mut raw = X86_64Syscalls;
+    // Native argv (the v0.2 crafted stack, `sdk::args`). With no args we run
+    // the default musl_cwd demo; with args we run the embedded busybox, where
+    // argv[1..] selects an applet.
+    let nargs = unsafe { sdk::args::Args::new(argc, argv, envp) };
+    // Copy the launcher's args into this frame at once: the crafted strings
+    // live in the lower half of the top stack page, and the emulator's own
+    // deep call chain (VFS connect, heap setup, ELF load) descends far enough
+    // to overwrite them before the guest stack is built, so reading them later
+    // yields empty/short slices. The copy is a fixed local array (our frame).
+    let mut arg_buf = [[0u8; 48]; 8];
+    let mut arg_len = [0usize; 8];
+    let mut argn = 0usize;
+    {
+        let mut i = 1;
+        while i < nargs.argc() && argn < arg_buf.len() {
+            if let Some(a) = nargs.arg(i) {
+                let n = a.len().min(arg_buf[argn].len());
+                arg_buf[argn][..n].copy_from_slice(&a[..n]);
+                arg_len[argn] = n;
+                argn += 1;
+            }
+            i += 1;
+        }
+    }
+    let busybox = argn >= 1;
+    let elf: &[u8] = if busybox { BUSYBOX_ELF } else { LIN_ELF };
     let package = {
         let mut sys = Syscalls::new(&mut raw);
         match sdk::bootstrap::receive(&mut sys) {
@@ -471,7 +506,7 @@ extern "C" fn linrun_main() -> ! {
     // Create the emulated thread, quiesce it, flag it foreign, bind its death.
     let entry = {
         let mut sys = Syscalls::new(&mut raw);
-        match load_elf(&mut sys, package.aspace, package.region, LIN_ELF) {
+        match load_elf(&mut sys, package.aspace, package.region, elf) {
             Ok(e) => e,
             Err(e) => exit(&mut raw, 0x40 | (e & 0xF)),
         }
@@ -530,19 +565,44 @@ extern "C" fn linrun_main() -> ! {
         // SAFETY: the pages are mapped; write the Linux startup layout and the
         // stub (mov rsp, STACK_PAGE; mov rax, entry; jmp rax).
         unsafe {
-            let arg = b"helios-linux-abi\n\0";
-            let s = (STACK_BASE + 0x100) as *mut u8;
-            core::ptr::copy_nonoverlapping(arg.as_ptr(), s, arg.len());
+            // Guest argv. Default: the freestanding demo reads argv[0].
+            // busybox: argv[0]="busybox" selects applet-arg dispatch, and the
+            // launcher's native argv[1..] become the applet and its arguments.
+            let mut guest_argv: alloc::vec::Vec<&[u8]> = alloc::vec::Vec::new();
+            if busybox {
+                // Multi-call invocation: argv[0] is the applet name (busybox
+                // dispatches on basename(argv[0])), argv[1..] are its args.
+                // The slices come from the frame-local copy, not the crafted
+                // stack page (see `arg_buf` above).
+                for i in 0..argn {
+                    guest_argv.push(&arg_buf[i][..arg_len[i]]);
+                }
+            } else {
+                guest_argv.push(DEFAULT_ARGV0);
+            }
+            // Strings live in the lower half of the top stack page; AT_RANDOM
+            // sits at +0x200, so keep the string area below it.
+            let str_area = (STACK_BASE + 0x100) as *mut u8;
+            let mut off = 0usize;
+            let mut arg_ptrs: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+            for a in &guest_argv {
+                let p = str_area.add(off);
+                core::ptr::copy_nonoverlapping(a.as_ptr(), p, a.len());
+                *p.add(a.len()) = 0;
+                arg_ptrs.push(p as u64);
+                off += a.len() + 1;
+            }
+            debug_assert!(off <= 0x100, "guest argv strings overflow 0x100");
             let rnd = (STACK_BASE + 0x200) as *mut u8;
             for i in 0..16 {
                 *rnd.add(i) = (0xA5 ^ i) as u8;
             }
             // AT_PHDR/PHNUM/PHENT must describe ALL program headers (musl
             // walks them to find PT_TLS/PT_PHDR), not just the LOAD count.
-            let rd16 = |o: usize| u16::from_le_bytes([LIN_ELF[o], LIN_ELF[o + 1]]) as u64;
+            let rd16 = |o: usize| u16::from_le_bytes([elf[o], elf[o + 1]]) as u64;
             let rd64 = |o: usize| {
                 let mut b = [0u8; 8];
-                b.copy_from_slice(&LIN_ELF[o..o + 8]);
+                b.copy_from_slice(&elf[o..o + 8]);
                 u64::from_le_bytes(b)
             };
             let e_phoff = rd64(32);
@@ -551,7 +611,7 @@ extern "C" fn linrun_main() -> ! {
             // Virtual address of the phdrs: the LOAD segment covering e_phoff.
             let mut phdr_va = 0u64;
             for i in 0..6 {
-                if let Some(s) = sdk::elf::ElfImage::parse(LIN_ELF)
+                if let Some(s) = sdk::elf::ElfImage::parse(elf)
                     .ok()
                     .and_then(|e| e.segment(i))
                 {
@@ -574,14 +634,19 @@ extern "C" fn linrun_main() -> ! {
             ];
             // The initial block sits at the TOP of the stack with rsp pointing
             // at argc; the block runs upward, calls grow down into the pages.
-            let n_qwords = 4 + auxv.len() * 2;
+            // Layout: argc, argv…, NULL, envp…, NULL, auxv pairs (the program
+            // reads envp right after the argv NULL, then the auxv).
+            let n = arg_ptrs.len();
+            let n_qwords = 1 + (n + 1) + 1 + auxv.len() * 2;
             let rsp = STACK_BASE + STACK_PAGES * 4096 - (n_qwords as u64) * 8;
             let base = rsp as *mut u64;
-            *base.add(0) = 1; // argc
-            *base.add(1) = s as u64; // argv[0]
-            *base.add(2) = 0; // argv terminator
-            *base.add(3) = 0; // envp terminator
-            let mut k = 4;
+            *base.add(0) = n as u64; // argc
+            for (i, p) in arg_ptrs.iter().enumerate() {
+                *base.add(1 + i) = *p;
+            }
+            *base.add(1 + n) = 0; // argv terminator
+            *base.add(1 + n + 1) = 0; // envp terminator (v0: empty environment)
+            let mut k = 1 + n + 2;
             for (a, v) in auxv {
                 *base.add(k) = a;
                 *base.add(k + 1) = v;
@@ -746,10 +811,14 @@ fn exit(raw: &mut X86_64Syscalls, code: i32) -> ! {
 }
 
 // Entry: the SDK native path (PS delivers an ADR-009 package to handle 1 and
-// jumps here). No crafted-argv entry contract is needed for this demo.
+// jumps here). The v0.2 crafted stack carries argc/argv/envp at [rsp-8/-16/-24]
+// (sdk::args); capture them before touching rsp, exactly as other SDK bins do.
 global_asm!(
     ".global _start",
     "_start:",
+    "mov rdi, [rsp - 8]",
+    "mov rsi, [rsp - 16]",
+    "mov rdx, [rsp - 24]",
     "and rsp, -16",
     "call {main}",
     main = sym linrun_main,
@@ -757,7 +826,7 @@ global_asm!(
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
-    loop {
-        core::hint::spin_loop();
-    }
+    // Exit rather than spin: a panic in the emulator must surface as a process
+    // failure (the launcher reaps a nonzero status), not a hung boot.
+    exit(&mut X86_64Syscalls, 0x0BAD_0041)
 }

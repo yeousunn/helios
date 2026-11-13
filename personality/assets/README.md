@@ -67,3 +67,21 @@ exact originals were not retained, so they differ only cosmetically:
   program behavior.
 
 Both produce the outputs in the table above and exit the same way.
+
+## busybox (Phase 3)
+
+`busybox` is a minimal static `x86_64-linux-musl` busybox build used to run
+unmodified Linux multi-call applets through the POSIX emulator (`linrun`, which
+embeds it and dispatches on `argv[0]`). It is **not** one of the hand-written
+demo programs above; it is third-party software fetched and built by
+`busybox.build.sh` (pinned `busybox-1.36.1`, zig's bundled musl), with a small
+applet set (echo, cat, ls, pwd, uname, id, head, wc, printf, seq, cut, env,
+test, true/false, `[[`). `NUM_APPLETS` is 18; rebuild with:
+
+```sh
+personality/assets/busybox.build.sh            # writes ./busybox
+```
+
+**License:** busybox is **GPLv2** (© 2000-2024 Erik Andersen, Rob Landley,
+Denys Vlasenko et al.; see busybox's `LICENSE`). It is a build output, like the
+`musl_*` programs, and is statically linked against MIT-licensed musl libc.
