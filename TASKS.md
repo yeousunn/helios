@@ -20,7 +20,7 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 - [x GLM done 2026-11-13 7165714] S6b — Call NV's CR4 hardening function from `kernel-boot` once S6 lands. Call wired in kernel_main (before any ring-3 code); boot reaches DONE. NOTE: boot log shows mask 0x0 — NV's probe checks wrong CPUID bits (see Request).
 - [x NV done 2026-11-13 a865f5f] S7 NV — FMASK is `0x300`, so DF and AC reach the kernel (`hal/x86_64/src/syscall_entry.rs:46`). Clear IF, TF, DF, AC and NT (`0x47700`) and add `cld` to every interrupt and exception entry stub.
 - [x GLM done 2026-11-14 ac1435c] S8 — NEW_THREAD copies caps[1] with full rights and no GRANT check, and adds SEND on caps[2] (`entry.rs:~801`, `~822`). Route both through the GRANT-checked, rights-intersecting transfer in `kernel/src/syscall.rs:112` and `:144`, and check the cap type.
-- [x GLM done 2026-11-14 <hash>] S9 GLM — UNMAP with a huge page count loops with interrupts off (`aspace.rs:331`). Cap it at the region size and return EBADARG above that.
+- [x GLM done 2026-11-14 bb13bb8] S9 GLM — UNMAP with a huge page count loops with interrupts off (`aspace.rs:331`). Cap it at the region size and return EBADARG above that.
 - [x NV done 2026-11-13 df460db] S10 NV — `map_page` panics when no page-table frame is free (`hal/x86_64/src/paging.rs:~388`). Return an error.
 - [ ] S10b GLM — Audit every `unwrap()`/`expect()` reachable from `entry::dispatch` and turn each into an error code. Tests and boot code may keep theirs.
 - [~ DS started 2026-11-13] S11 — An `attack` userspace program (pattern: `sdk/src/bin/child.rs`) makes every bad call from S1–S10 and expects an error back. init runs it as a new marker step. The boot must still reach DONE. Add each case as soon as its S-task lands.
