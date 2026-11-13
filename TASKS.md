@@ -30,7 +30,7 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 
 - [x NV done 2026-11-13 90b345d] E1 NV — `tools/build-all.sh`: build every userspace image in dependency order, then `kernel-boot` release. Must honour `CARGO_TARGET_DIR` and the `*_IMAGE` variables.
 - [x NV done 2026-11-13 ca0dc44] E2 NV — `tools/qemu-test.sh`: call E1, boot the release kernel, require the DONE marker and `clean halt`, work on macOS (use `gtimeout` if present), and honour `SERIAL_LOG` and `CARGO_TARGET_DIR`.
-- [~ NV started 2026-11-13] E3 NV — CI (`.github/workflows/ci.yml`) runs E2, `cargo test` and the userspace clippy line. Pushing is for the human. Done when it runs locally through `tools/qemu-test.sh`.
+- [x NV done 2026-11-13 5766b07] E3 NV — CI (`.github/workflows/ci.yml`) runs E2, `cargo test` and the userspace clippy line. Pushing is for the human. Done when it runs locally through `tools/qemu-test.sh`.
 - [ ] E4 DS — Make the userspace clippy line in AGENTS.md section 5 pass with `-D warnings` (errors today in `sdk` bins `init`/`child`, and in `servers/process/src/bin/ps.rs:974`).
 - [ ] E5 NV — Add the userspace clippy line to `tools/qemu-test.sh` once E4 lands.
 - [ ] E6 DS — Source and build notes for every ELF in `personality/assets/` (one source file plus a reproducible build line each, and the musl MIT license noted), or a script that builds them.
