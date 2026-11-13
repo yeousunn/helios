@@ -63,9 +63,13 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 
 ## Phase 2 — System servers (after freeze lift; ADR-054)
 
-- [ ] NV — virtio-blk as a userspace driver (after E8): drivers/ virtio_blk against MmioRegion + Frame caps per ADR-052; not wired into boot path yet; HAL traits stay kernel-internal.
+- [~ NV started 2026-11-14] NV — virtio-blk as a userspace driver (after E8): drivers/ virtio_blk against MmioRegion + Frame caps per ADR-052; not wired into boot path yet; HAL traits stay kernel-internal.
 
 ## Phase 3 — POSIX personality + shell (after freeze lift; ADR-054)
 
 - [ ] DS — busybox: port/build busybox against the POSIX personality; run under init (static musl binaries already run).
 - [ ] DS — interactive login (ADR-048): login program, /etc/passwd in ramfs, console-in as stdin; init LOGIN=1 path spawns login instead of sh.
+
+## Phase 4 — Graphics & desktop (after freeze lift; ADR-054)
+
+- [ ] NV — virtio-gpu as a userspace driver (graphics/): virtio-gpu against MmioRegion + Frame caps per ADR-052; not wired into boot path yet.
