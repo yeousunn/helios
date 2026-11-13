@@ -134,7 +134,7 @@ micro-kernel-rs/
 ├── drivers/           # userspace drivers (std)              [Nemotron]
 ├── graphics/          # compositor & GPU stack               [Nemotron]
 ├── tools/             # build, mkimage, QEMU scripts, CI     [Nemotron]
-├── docs/              # PLAN.md, AGENTS.md, DECISIONS.md, TASKS.md
+├── docs/              # DECISIONS.md
 └── tests/             # integration tests (QEMU harness)     [shared]
 ```
 
