@@ -23,12 +23,13 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 - [ ] S9 GLM — UNMAP with a huge page count loops with interrupts off (`aspace.rs:331`). Cap it at the region size and return EBADARG above that.
 - [ ] S10 NV — `map_page` panics when no page-table frame is free (`hal/x86_64/src/paging.rs:~388`). Return an error.
 - [ ] S10b GLM — Audit every `unwrap()`/`expect()` reachable from `entry::dispatch` and turn each into an error code. Tests and boot code may keep theirs.
-- [ ] S11 DS — Add an `attack` userspace program (pattern: `sdk/src/bin/child.rs`) that makes every bad call from S1–S10 and expects an error back. init runs it as a new marker step. The boot must still reach DONE. Add each case as soon as its S-task lands.
+- [~ DS started 2026-11-13] S11 — An `attack` userspace program (pattern: `sdk/src/bin/child.rs`) makes every bad call from S1–S10 and expects an error back. init runs it as a new marker step. The boot must still reach DONE. Add each case as soon as its S-task lands.
+  - [~ DS started 2026-11-13] S11.1 — harness: `sdk::attack` runner + `child` argv "attack" mode + init marker step + baseline self-test cases (S1–S10 cases appended as they land).
 
 ## Phase H — Engineering
 
-- [ ] E1 NV — `tools/build-all.sh`: build every userspace image in dependency order, then `kernel-boot` release. Must honour `CARGO_TARGET_DIR` and the `*_IMAGE` variables.
-- [ ] E2 NV — `tools/qemu-test.sh`: call E1, boot the release kernel, require the DONE marker and `clean halt`, work on macOS (use `gtimeout` if present), and honour `SERIAL_LOG` and `CARGO_TARGET_DIR`.
+- [x NV done 2026-11-13 90b345d] E1 NV — `tools/build-all.sh`: build every userspace image in dependency order, then `kernel-boot` release. Must honour `CARGO_TARGET_DIR` and the `*_IMAGE` variables.
+- [~ NV started 2026-11-13] E2 NV — `tools/qemu-test.sh`: call E1, boot the release kernel, require the DONE marker and `clean halt`, work on macOS (use `gtimeout` if present), and honour `SERIAL_LOG` and `CARGO_TARGET_DIR`.
 - [ ] E3 NV — CI (`.github/workflows/ci.yml`) runs E2, `cargo test` and the userspace clippy line. Pushing is for the human. Done when it runs locally through `tools/qemu-test.sh`.
 - [ ] E4 DS — Make the userspace clippy line in AGENTS.md section 5 pass with `-D warnings` (errors today in `sdk` bins `init`/`child`, and in `servers/process/src/bin/ps.rs:974`).
 - [ ] E5 NV — Add the userspace clippy line to `tools/qemu-test.sh` once E4 lands.
