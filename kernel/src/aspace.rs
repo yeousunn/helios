@@ -106,6 +106,9 @@ pub enum VmmError {
     FrameNotOwned,
     TableFull,
     AlreadyExists,
+    /// Backend page-table install failed (S10): no free page-table frame or
+    /// a refused kernel-window walk. Surfaced to syscalls as ENOMEM.
+    MapFailed,
 }
 
 impl fmt::Display for VmmError {
@@ -118,8 +121,24 @@ impl fmt::Display for VmmError {
 /// address space, created through a `BackendFactory`. Arch implementations
 /// do raw MMIO — the safety burden is theirs, per hal/ ownership.
 pub trait PagingBackend: Sync + Send {
-    /// Install one page mapping.
+    /// Install one page mapping (v0 infallible form — panics on failure).
+    /// Kept so backends that have not migrated keep compiling; kernel code
+    /// calls only [`PagingBackend::map_page_checked`].
     fn map_page(&self, vaddr: Vaddr, paddr: PhysAddr, flags: MapFlags);
+    /// Fallible install (S10 request): the backend reports failure — no free
+    /// page-table frame, refused kernel-window walk — instead of panicking.
+    /// Default bridges to the v0 [`PagingBackend::map_page`] so un-migrated
+    /// backends keep their current (panicking) behavior until their owner
+    /// overrides this method (hal/x86_64, NV's S10).
+    fn map_page_checked(
+        &self,
+        vaddr: Vaddr,
+        paddr: PhysAddr,
+        flags: MapFlags,
+    ) -> Result<(), VmmError> {
+        self.map_page(vaddr, paddr, flags);
+        Ok(())
+    }
     /// Remove one page mapping (TLB flush is the backend's job).
     fn unmap_page(&self, vaddr: Vaddr);
     /// Change permissions of an existing mapping.
@@ -208,6 +227,7 @@ impl AddressSpace {
 
     fn map(
         &mut self,
+        be: &dyn PagingBackend,
         vaddr: Vaddr,
         pages: u64,
         base: Option<PhysAddr>,
@@ -241,6 +261,10 @@ impl AddressSpace {
             if !b.is_frame_aligned() {
                 return vmm_err(VmmError::BadVaddr);
             }
+            // S10: install the PTEs BEFORE the region is recorded and the
+            // mapping ref acquired — a backend failure (no free page-table
+            // frame) leaves the address space untouched.
+            self.map_backend(be, vaddr, pages, b, flags)?;
             FRAME_REFS.lock().acquire(b);
         }
         self.regions[slot] = Some(Mapping {
@@ -304,8 +328,10 @@ impl AddressSpace {
         }
     }
 
-    /// Install backend entries page by page (called by the registry layer
-    /// which owns the backend reference).
+    /// Install backend entries page by page (called with the backend
+    /// reference). S10: fallible — a backend failure rolls back the pages
+    /// installed so far and reports [`VmmError::MapFailed`], so the caller
+    /// records no region for a partially-installed range.
     fn map_backend(
         &self,
         be: &dyn PagingBackend,
@@ -313,13 +339,22 @@ impl AddressSpace {
         pages: u64,
         base: PhysAddr,
         flags: MapFlags,
-    ) {
+    ) -> Result<(), VmmError> {
         for i in 0..pages {
-            if let Some(pa) = base.checked_add(i * PAGE_SIZE as u64) {
-                let va = Vaddr(vaddr.as_u64() + i * PAGE_SIZE as u64);
-                be.map_page(va, pa, flags);
+            let Some(pa) = base.checked_add(i * PAGE_SIZE as u64) else {
+                continue;
+            };
+            let va = Vaddr(vaddr.as_u64() + i * PAGE_SIZE as u64);
+            if be.map_page_checked(va, pa, flags).is_err() {
+                // Roll back the PTEs installed before the failure; pages
+                // after it were never attempted.
+                for j in 0..i {
+                    be.unmap_page(Vaddr(vaddr.as_u64() + j * PAGE_SIZE as u64));
+                }
+                return vmm_err(VmmError::MapFailed);
             }
         }
+        Ok(())
     }
 
     /// Page-granular unmap with region splitting (v0.1, DS anomaly fix):
@@ -499,7 +534,16 @@ impl AddressSpace {
                 .iter()
                 .position(|(p, _)| *p == 0 || *p == idx)
                 .ok_or(VmmError::Overlap)?;
+            let prev_pf = self.page_frames[slot_pf];
             self.page_frames[slot_pf] = (idx, frame_addr);
+            // S10: backend failure — restore the previous per-page entry and
+            // the refcount; nothing recorded-but-unbacked may survive (a
+            // refault on such a page would loop forever).
+            if be.map_page_checked(vaddr, frame_addr, flags).is_err() {
+                self.page_frames[slot_pf] = prev_pf;
+                FRAME_REFS.lock().release(frame_addr);
+                return vmm_err(VmmError::MapFailed);
+            }
         } else {
             let slot = self
                 .regions
@@ -517,9 +561,15 @@ impl AddressSpace {
                 .iter()
                 .position(|(p, _)| *p == 0)
                 .ok_or(VmmError::Overlap)?;
+            let prev_pf = self.page_frames[slot_pf];
             self.page_frames[slot_pf] = (idx, frame_addr);
+            if be.map_page_checked(vaddr, frame_addr, flags).is_err() {
+                self.page_frames[slot_pf] = prev_pf;
+                self.regions[slot] = None;
+                FRAME_REFS.lock().release(frame_addr);
+                return vmm_err(VmmError::MapFailed);
+            }
         }
-        be.map_page(vaddr, frame_addr, flags);
         Ok(covered)
     }
 
@@ -560,7 +610,15 @@ impl AddressSpace {
                 .ok_or(VmmError::PoolEmpty)?;
             self.page_frames[slot_pf] = (page_idx, frame);
             let va = Vaddr(m.vaddr.as_u64() + m.offset(vaddr));
-            be.map_page(va, frame, m.flags);
+            // S10: backend failure — roll the per-page record back (a
+            // recorded but unbacked page would fault-loop forever). The pool
+            // frame is burned (Pool has no return path) — acceptable on the
+            // exhaustion path this error represents.
+            if be.map_page_checked(va, frame, m.flags).is_err() {
+                self.page_frames[slot_pf] = (0, PhysAddr::new(0));
+                FRAME_REFS.lock().release(frame);
+                return vmm_err(VmmError::MapFailed);
+            }
             return Ok(frame);
         }
 
@@ -595,7 +653,14 @@ impl AddressSpace {
                 .position(|(p, _)| *p == 0)
                 .ok_or(VmmError::PoolEmpty)?;
             self.page_frames[slot_pf] = (page_idx, fresh);
-            be.map_page(va, fresh, flags);
+            // S10: backend failure — restore refcounts and the per-page
+            // record; the fresh pool frame is burned (no Pool return path).
+            if be.map_page_checked(va, fresh, flags).is_err() {
+                self.page_frames[slot_pf] = (0, PhysAddr::new(0));
+                FRAME_REFS.lock().acquire(old);
+                FRAME_REFS.lock().release(fresh);
+                return vmm_err(VmmError::MapFailed);
+            }
             return Ok(fresh);
         }
 
@@ -618,7 +683,7 @@ impl AddressSpace {
             if m.base.is_none() {
                 // Unresolved ANON region: clone shape only (zero-fill faults).
                 child
-                    .map(m.vaddr, m.pages, None, m.flags)
+                    .map(child_be, m.vaddr, m.pages, None, m.flags)
                     .map_err(|_| VmmError::Overlap)?;
                 continue;
             }
@@ -627,13 +692,11 @@ impl AddressSpace {
             } else {
                 m.flags
             };
+            // S10: child.map installs the child's PTEs before recording the
+            // region, so a backend failure leaves no phantom child mapping.
             child
-                .map(m.vaddr, m.pages, m.base, child_flags)
+                .map(child_be, m.vaddr, m.pages, m.base, child_flags)
                 .map_err(|_| VmmError::Overlap)?;
-            // child.map() already acquired the mapping ref on the base.
-            if let Some(b) = m.base {
-                child.map_backend(child_be, m.vaddr, m.pages, b, child_flags);
-            }
             // Convert the source's writable region to COW (backend re-protect).
             if m.flags.contains(MapFlags::WRITE) && !m.flags.contains(MapFlags::COW) {
                 for i in 0..m.pages {
@@ -672,7 +735,18 @@ impl AddressSpace {
                 .position(|(p, _)| *p == 0)
                 .ok_or(VmmError::Overlap)?;
             child.page_frames[slot_pf] = (idx, fresh);
-            child_be.map_page(va, fresh, MapFlags::READ.union(MapFlags::WRITE));
+            // S10: backend failure — drop the per-page record, the ref and
+            // the fresh frame; fork fails cleanly (child is discarded by the
+            // caller's error path).
+            if child_be
+                .map_page_checked(va, fresh, MapFlags::READ.union(MapFlags::WRITE))
+                .is_err()
+            {
+                child.page_frames[slot_pf] = (0, PhysAddr::new(0));
+                FRAME_REFS.lock().release(fresh);
+                let _ = frame::free(fresh);
+                return vmm_err(VmmError::MapFailed);
+            }
         }
         Ok(())
     }
@@ -954,13 +1028,7 @@ pub fn map(
     base: Option<PhysAddr>,
     flags: MapFlags,
 ) -> Result<PhysAddr, VmmError> {
-    with_as(as_id, |space, be| {
-        let mapped = space.map(vaddr, pages, base, flags)?;
-        if let Some(b) = base {
-            space.map_backend(be, vaddr, pages, b, flags);
-        }
-        Ok(mapped)
-    })
+    with_as(as_id, |space, be| space.map(be, vaddr, pages, base, flags))
 }
 
 pub fn unmap(as_id: ObjId, vaddr: Vaddr, pages: u64) -> Result<(), VmmError> {
@@ -1095,6 +1163,93 @@ mod tests {
         fn create(&self, _as_id: u64) -> Option<&'static dyn PagingBackend> {
             Some(&TestBackend)
         }
+    }
+
+    /// S10 request: a backend whose page-table install fails (no free
+    /// page-table frame). Kernel callers must report `MapFailed` and leave
+    /// no phantom state behind.
+    struct FailBackend;
+    impl PagingBackend for FailBackend {
+        fn map_page(&self, _v: Vaddr, _p: PhysAddr, _f: MapFlags) {
+            REC.lock().push("map", 0);
+        }
+        fn map_page_checked(&self, _v: Vaddr, _p: PhysAddr, _f: MapFlags) -> Result<(), VmmError> {
+            Err(VmmError::MapFailed)
+        }
+        fn unmap_page(&self, v: Vaddr) {
+            REC.lock().push("unmap", v.as_u64());
+        }
+        fn protect_page(&self, _v: Vaddr, _f: MapFlags) {}
+    }
+
+    struct FailFactory;
+    impl BackendFactory for FailFactory {
+        fn create(&self, _as_id: u64) -> Option<&'static dyn PagingBackend> {
+            Some(&FailBackend)
+        }
+    }
+
+    /// Reset the registry with `FailFactory` as the backend source.
+    fn setup_failing() -> ObjId {
+        set_backend_factory(&FailFactory);
+        REC.lock().n = 0;
+        for i in 0..MAX_AS {
+            AS_TABLE.lock()[i] = None;
+        }
+        let _ = init_default();
+        DEFAULT_AS
+    }
+
+    #[test]
+    fn backend_map_failure_propagates_without_phantom_state() {
+        let as_id = setup_failing();
+
+        // Direct-frame MAP: the backend install fails → MapFailed, and the
+        // region + mapping ref recorded by the map path are discarded.
+        let base = PhysAddr::new(0x30_0000);
+        track_frame(base);
+        assert_eq!(
+            map(as_id, Vaddr(0x60_0000), 2, Some(base), MapFlags::READ),
+            Err(VmmError::MapFailed)
+        );
+        assert_eq!(
+            translate(as_id, Vaddr(0x60_0000)),
+            Err(VmmError::NotFound),
+            "no phantom region after a failed install"
+        );
+        assert_eq!(
+            frame_refs(base),
+            1,
+            "only the owner grant remains (mapping ref released)"
+        );
+        // The failed range is reusable — no stale Overlap from the rollback.
+        assert_eq!(
+            map(as_id, Vaddr(0x60_0000), 1, Some(base), MapFlags::READ),
+            Err(VmmError::MapFailed),
+            "retry reports the backend failure, not a stale Overlap"
+        );
+
+        // ANON resolve: the resolve reports MapFailed and rolls the per-page
+        // record back — a refault retries the backend instead of returning
+        // a recorded-but-unbacked frame forever.
+        set_pool(as_id, PhysAddr::new(0x31_0000), 2 * PAGE_SIZE as u64).unwrap();
+        map(
+            as_id,
+            Vaddr(0x62_0000),
+            1,
+            None,
+            MapFlags::ANON.union(MapFlags::READ),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_fault(as_id, Vaddr(0x62_0000), false),
+            Err(VmmError::MapFailed)
+        );
+        assert_eq!(
+            resolve_fault(as_id, Vaddr(0x62_0000), false),
+            Err(VmmError::MapFailed),
+            "refault reports the same failure (no phantom frame record)"
+        );
     }
 
     fn setup() -> ObjId {

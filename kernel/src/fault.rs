@@ -109,6 +109,12 @@ pub fn handle_page_fault(
             route_to_pager(pid, tid, vaddr, access, FAULT_POOL_EMPTY)
         }
         Err(aspace::VmmError::NoPool) => route_to_pager(pid, tid, vaddr, access, FAULT_WRITE_COW),
+        Err(aspace::VmmError::MapFailed) => {
+            // S10: backend install failure (no free page-table frame) — the
+            // fault cannot be resolved or retried; kill the faulting thread.
+            let _ = syscall::sys_exit(tid, -1);
+            Ok(FaultOutcome::Killed)
+        }
         Err(_) => Err(FaultError::BadVaddr),
     }
 }
