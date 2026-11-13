@@ -80,3 +80,4 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 ## Phase 5 — Portability (after freeze lift; ADR-054)
 
 - [ ] NV — aarch64 HAL bring-up: TrapDecode + context backend + paging backend stubs (hal/aarch64 is an empty stub; PLAN Phase 5).
+- [ ] NV — riscv64 HAL bring-up: TrapDecode + context backend + paging backend stubs (hal/riscv64 is an empty stub; PLAN Phase 5).
