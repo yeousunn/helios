@@ -535,7 +535,13 @@ fn thread_invoke(
         SET_ENTRY => {
             // ADR-039: rewrite a SUSPENDED thread's entry PC + rebuild its
             // initial kernel context. Racing a running thread is rejected.
+            // S2: the PC must be a canonical user address — a kernel or
+            // non-canonical value would execute ring 3 in the kernel window
+            // (SMEP blocks it only where the CPU supports it).
             let pc = msg.words[0];
+            if !sched::is_user_addr(pc) {
+                return SyscallReturn::err(ipc::status::EBADARG);
+            }
             match sched::set_entry(target, pc) {
                 Ok(()) => SyscallReturn::ok(msg.tag, [0, pc, 0, 0]),
                 Err(_) => SyscallReturn::err(ipc::status::EBADSTATE),
@@ -633,6 +639,10 @@ fn thread_invoke(
         THREAD_CREATE => {
             // ADR-033 §1: new thread in the TARGET's process (shares AS +
             // cap table). w0 = entry PC. CONTROL right already enforced.
+            // S2: the entry PC must be a canonical user address.
+            if !sched::is_user_addr(msg.words[0]) {
+                return SyscallReturn::err(ipc::status::EBADARG);
+            }
             let proc_ref = sched::get(target).map(|t| t.process).unwrap_or(ObjRef(0));
             let child_tid = match sched::spawn_with(proc_ref, sched::DEFAULT_PRIORITY, msg.words[0])
             {
@@ -790,6 +800,11 @@ fn new_thread(pid: ProcessId, cap: &Capability, msg: &Message) -> SyscallReturn 
         return SyscallReturn::err(ipc::status::ERIGHTS);
     }
     let entry_pc = msg.words[0];
+    // S2: reject kernel / non-canonical / null entry PCs before any child
+    // state is created, so a bad call costs no process slot.
+    if !sched::is_user_addr(entry_pc) {
+        return SyscallReturn::err(ipc::status::EBADARG);
+    }
 
     let child_pid = match proc::create() {
         Ok(p) => p,
@@ -1341,6 +1356,89 @@ mod tests {
             crate::sched::get(child_tid).unwrap().state,
             crate::sched::State::Ready
         );
+    }
+
+    /// S2: SET_ENTRY / THREAD_CREATE / NEW_THREAD must reject kernel-window,
+    /// non-canonical and null entry PCs with EBADARG — a ring-3 thread must
+    /// never be pointed into the shared kernel window (or anywhere outside
+    /// the canonical user half).
+    #[test]
+    fn s2_entry_pcs_must_be_canonical_user_addrs() {
+        let (pid, _tid, factory) = setup();
+        let r_as = dispatch(args(num::INVOKE, factory, Tag::new(3), [0; 4]));
+        let as_h = r_as.w[0] as u32;
+
+        // NEW_THREAD: kernel-window PC (higher half), the canonical split
+        // value itself, and null are all EBADARG; no child is spawned.
+        for bad in [
+            0xFFFF_8000_0100_0000, // kernel window (ADR-045)
+            0xFFFF_FFFF_FFFF_F000, // non-canonical
+            0x0000_8000_0000_0000, // the user/kernel split
+            0,                     // null
+        ] {
+            let mut m = Message::new(4);
+            m.words[0] = bad;
+            m.tag = m.tag.with_caps(1);
+            m.set_descriptor(0, CapSlot::pack(as_h, Rights::MAP))
+                .unwrap();
+            let r = dispatch(args(num::INVOKE, factory, m.tag, m.words));
+            assert_eq!(
+                r.status,
+                ipc::status::EBADARG as i64,
+                "NEW_THREAD pc={bad:#x}"
+            );
+        }
+        // A valid PC still works after the rejections (no state corrupted).
+        let mut m = Message::new(4);
+        m.words[0] = 0x401000;
+        m.tag = m.tag.with_caps(1);
+        m.set_descriptor(0, CapSlot::pack(as_h, Rights::MAP))
+            .unwrap();
+        let r = dispatch(args(num::INVOKE, factory, m.tag, m.words));
+        assert_eq!(r.status, ipc::status::OK as i64, "valid NEW_THREAD pc");
+        let thread_h = r.w[0] as u32;
+        let child_tid = ThreadId(r.w[3]);
+
+        // THREAD_CREATE with a kernel-window PC → EBADARG.
+        let tc = proc::install_cap(
+            pid,
+            Capability {
+                obj: ObjId(child_tid.0),
+                typ: ObjType::Thread,
+                rights: Rights::CONTROL.union(Rights::GRANT),
+            },
+        )
+        .unwrap();
+        let mut m = Message::new(13);
+        m.words[0] = 0xFFFF_8000_0100_0000;
+        let r = thread_invoke_for_test(pid, tc, m);
+        assert_eq!(
+            r.status,
+            ipc::status::EBADARG as i64,
+            "THREAD_CREATE kernel pc"
+        );
+
+        // SET_ENTRY with kernel-window / non-canonical / null PCs → EBADARG
+        // (the child is Ready, but the address check fires before the state
+        // check — either way the call must fail, and with EBADARG).
+        dispatch(args(num::INVOKE, thread_h, Tag::new(3), [0; 4])); // SUSPEND
+        for bad in [0xFFFF_8000_0100_0000, 0x0000_8000_0000_0000, 0] {
+            let r = dispatch(args(num::INVOKE, thread_h, Tag::new(14), [bad, 0, 0, 0]));
+            assert_eq!(
+                r.status,
+                ipc::status::EBADARG as i64,
+                "SET_ENTRY pc={bad:#x}"
+            );
+        }
+        // A valid user PC still lands (state machine intact).
+        let r = dispatch(args(
+            num::INVOKE,
+            thread_h,
+            Tag::new(14),
+            [0x500000, 0, 0, 0],
+        ));
+        assert_eq!(r.status, ipc::status::OK as i64, "valid SET_ENTRY pc");
+        assert_eq!(sched::get(child_tid).unwrap().initial_pc, 0x500000);
     }
 
     /// S1/ADR-050: the REGS_WRITE syscall masks RFLAGS (IOPL=0, IF=1) and

@@ -691,6 +691,16 @@ pub fn mask_rflags(v: u64) -> u64 {
     (v & !(0b11 << 12)) | (1 << 9)
 }
 
+/// S2: the only addresses a user-supplied PC / stack / TLS base may take.
+/// Userspace lives entirely in the canonical lower half (ADR-045: PML4[0]
+/// user space; the kernel window is the 0xFFFF_8000_0000_0000 higher half),
+/// and VA 0 is a null deref, never an entry point.
+pub const USER_ADDR_LIMIT: u64 = 0x0000_8000_0000_0000;
+
+pub fn is_user_addr(v: u64) -> bool {
+    v != 0 && v < USER_ADDR_LIMIT
+}
+
 /// Snapshot a freshly built init-context frame into the thread's per-thread
 /// user register image (S1/ADR-050). Slot 3 of the frame is the ring-0
 /// trampoline return address — kernel-owned, never exposed: the user-visible
@@ -1210,6 +1220,23 @@ pub fn start_first(next: ThreadId) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// S2: the user-address predicate — canonical lower half only, never 0.
+    /// Kernel-window (higher half) and non-canonical addresses are rejected.
+    #[test]
+    fn is_user_addr_bounds() {
+        assert!(is_user_addr(0x1), "lowest user address");
+        assert!(is_user_addr(0x401000), "typical user text");
+        assert!(is_user_addr(0x7E00_0000), "init image base");
+        assert!(is_user_addr(USER_ADDR_LIMIT - 1), "last user address");
+        assert!(!is_user_addr(0), "null is never an entry point");
+        assert!(!is_user_addr(USER_ADDR_LIMIT), "the split itself");
+        assert!(
+            !is_user_addr(0xFFFF_8000_0000_0000),
+            "kernel window base (ADR-045 higher half)"
+        );
+        assert!(!is_user_addr(0xFFFF_FFFF_FFFF_FFFF), "non-canonical top");
+    }
 
     struct MockCtx;
     impl ContextBackend for MockCtx {
