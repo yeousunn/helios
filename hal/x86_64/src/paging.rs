@@ -12,7 +12,7 @@
 #![allow(dead_code)]
 
 use crate::host::{pt_index, PDPT_SHIFT, PD_SHIFT, PML4_SHIFT, PT_SHIFT};
-use kernel::aspace::{BackendFactory, MapFlags, PagingBackend, Vaddr};
+use kernel::aspace::{BackendFactory, MapFlags, PagingBackend, Vaddr, VmmError};
 use kernel::frame::{self, PhysAddr};
 use spin::Mutex;
 
@@ -388,6 +388,33 @@ impl PagingBackend for PagingBackendX86_64 {
         }
     }
 
+    /// Fallible install (S10): returns [`VmmError::MapFailed`] instead of
+    /// panicking when `walk_create` refuses (no free page-table frame, or an
+    /// S5-refused kernel-window walk). The PML4 root is never dereferenced for
+    /// a refused walk — `walk_create` returns `None` before touching it — so
+    /// this is safe to call even with a dummy root address in unit tests.
+    fn map_page_checked(
+        &self,
+        vaddr: Vaddr,
+        paddr: PhysAddr,
+        flags: MapFlags,
+    ) -> Result<(), VmmError> {
+        let va = vaddr.as_u64() as usize;
+        let pa = paddr.as_u64() as usize;
+        let pte_flags = map_flags_to_pte(flags);
+        // SAFETY: Walk/create page tables and install the PTE.
+        unsafe {
+            let Some(pte) = self.walk_create(va) else {
+                return Err(VmmError::MapFailed);
+            };
+            pte.set_frame(pa);
+            pte.set_present();
+            pte.0 |= pte_flags;
+            flush_tlb_page(va);
+        }
+        Ok(())
+    }
+
     fn unmap_page(&self, vaddr: Vaddr) {
         let va = vaddr.as_u64() as usize;
         // Walk-only: an unmap must never allocate tables or split huge pages
@@ -610,5 +637,20 @@ mod tests {
         assert!(rw & PTE_WRITABLE != 0);
         let rx = map_flags_to_pte(MapFlags::READ.union(MapFlags::EXEC));
         assert!(rx & PTE_NX == 0); // executable -> NX clear
+    }
+
+    #[test]
+    fn map_page_checked_refuses_kernel_slot() {
+        // S10: map_page_checked returns an error instead of panicking when
+        // walk_create refuses a kernel-window walk (PML4 slots 256..=511).
+        // The PML4 root (0 here) is never dereferenced: walk_create returns
+        // None on the pml4_slot_is_kernel check before touching any table.
+        let backend = PagingBackendX86_64::new(0);
+        let res = backend.map_page_checked(
+            Vaddr(0xFFFF_8000_0000_0000), // PML4 slot 511, kernel-reserved
+            PhysAddr::new(0x1000),
+            MapFlags::READ,
+        );
+        assert!(matches!(res, Err(VmmError::MapFailed)));
     }
 }
