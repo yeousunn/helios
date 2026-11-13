@@ -195,6 +195,21 @@ fi
 fails=0
 cycle=0
 cd "$REPO" || exit 1
+DEFAULT_MODEL="$MODEL"
+# The owner can switch an agent's model without a commit by writing one model
+# id into $CTRL/model-<name> (outside the sandbox, so agents cannot change it).
+# It is read before every cycle. Delete the file to go back to the default.
+pick_model() {
+    MODEL="$DEFAULT_MODEL"
+    [ -f "$CTRL/model-$NAME" ] || return 0
+    local m
+    m="$(head -n 1 "$CTRL/model-$NAME" | tr -d '[:space:]')"
+    if ! printf '%s' "$m" | grep -Eq '^[A-Za-z0-9._/-]+$'; then
+        halt_all "$CTRL/model-$NAME does not hold a valid model id"
+    fi
+    MODEL="$m"
+}
+pick_model
 log "supervisor start ($LABEL, $MODEL)"
 
 while true; do
@@ -210,13 +225,14 @@ while true; do
         halt_all "a top-level entry in the repo has a name with characters other than letters, digits, '.', '_' or '-'"
     fi
 
+    pick_model
     cycle=$((cycle + 1))
     out="$CTRL/logs/$NAME-$(date +%Y%m%d-%H%M%S).log"
     prompt="$(sed -e "s|{{NAME}}|$LABEL|g" -e "s|{{TAG}}|$TAG|g" -e "s|{{ROLE}}|$ROLE|g" \
         -e "s|{{ROLE_NOTE}}|$ROLE_NOTE|g" -e "s|{{TARGET}}|$CARGO_TARGET_DIR|g" \
         -e "s|{{SERIAL}}|$SERIAL_LOG|g" "$CTRL/prompt.md")"
 
-    log "cycle $cycle start -> $(basename "$out")"
+    log "cycle $cycle start ($MODEL) -> $(basename "$out")"
     sandbox-exec -f "$profile" -D HOME="$HOME" -D CTRL="$CTRL" -D TMP="$TMP_REAL" \
         "$GTIMEOUT_BIN" --kill-after=60 "$CYCLE_TIMEOUT" \
         /usr/bin/env PATH="$AGENT_PATH" \
@@ -231,7 +247,8 @@ while true; do
         "CYCLE-RESULT: DONE" | "CYCLE-RESULT: PROGRESS")
             fails=0; sleep 30 ;;
         "CYCLE-RESULT: BLOCKED")
-            fails=0; sleep 600 ;;
+            # Blocked on another agent: wait long enough for that agent to move.
+            fails=0; sleep 1800 ;;
         "CYCLE-RESULT: IDLE")
             fails=0; sleep "$IDLE_SLEEP" ;;
         *)

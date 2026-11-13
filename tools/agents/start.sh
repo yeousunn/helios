@@ -56,11 +56,18 @@ if [ -n "$busy" ] && [ "${FORCE:-0}" != 1 ]; then
     exit 1
 fi
 
+# Uncommitted changes are usually an agent's unfinished work from a cycle that
+# was stopped. Its owner picks them up next cycle, and the commit hook keeps
+# every other agent from committing them. Edits of my own would be committed by
+# whichever agent owns the path, so the owner confirms the list first.
 if [ -n "$(git -C "$REPO" status --porcelain --untracked-files=no)" ]; then
-    echo "The repo has uncommitted changes. Commit or discard them first, so no agent" >&2
-    echo "commits them under its own tag." >&2
-    git -C "$REPO" status --short --untracked-files=no >&2
-    exit 1
+    echo "Uncommitted changes in the repo:" >&2
+    git -C "$REPO" status --short --untracked-files=no | LC_ALL=C tr -cd '[:print:]\n' >&2
+    if [ "${ACCEPT_WIP:-0}" != 1 ]; then
+        printf 'The owning agent will continue and commit these. Type yes if none of them are yours: '
+        read -r answer </dev/tty
+        [ "$answer" = "yes" ] || { echo "nothing started" >&2; exit 1; }
+    fi
 fi
 
 mkdir -p "$CTRL/logs" "$REPO/.agents"
