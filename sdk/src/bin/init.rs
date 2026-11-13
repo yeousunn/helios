@@ -198,7 +198,7 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
         if !HAS_CONSOLE_IMAGE {
             return Err(fail_code(STEP_CONSOLE_SPAWN, 0xE1));
         }
-        let pid = spawn_server(
+        let spawned = spawn_server(
             raw,
             info,
             self_as,
@@ -207,12 +207,10 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
             STEP_CONSOLE_SPAWN,
             Some(CapSlot::pack(info.debug_ep, Rights::SEND)),
         )?;
-        let ready_ep = SP_INIT_EP.load(SpOrdering::Relaxed);
-        let death = SP_DEATH.load(SpOrdering::Relaxed);
-        mark(raw, info.debug_ep, STEP_CONSOLE_SPAWN, pid);
+        mark(raw, info.debug_ep, STEP_CONSOLE_SPAWN, spawned.pid);
         let ready = {
             let mut sys = Syscalls::new(raw);
-            sys.recv(ready_ep)
+            sys.recv(spawned.init_ep)
                 .map_err(|e| fail_code(STEP_CONSOLE_READY, e as u64))?
         };
         if ready.tag.label() != bootstrap::READY_LABEL || ready.words[0] != bootstrap::READY_MAGIC {
@@ -224,7 +222,7 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
             .filter(|h| *h != 0)
             .ok_or(fail_code(STEP_CONSOLE_READY, 0xE2))?;
         mark(raw, info.debug_ep, STEP_CONSOLE_READY, svc as u64);
-        (svc, death)
+        (svc, spawned.death)
     };
 
     // Steps 24–26 (ADR-048 v0): the auth server. Spawned with the Factory cap
@@ -235,7 +233,7 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
         if !HAS_AUTH_IMAGE {
             return Err(fail_code(STEP_AUTH_SPAWN, 0xE1));
         }
-        let pid = spawn_server(
+        let spawned = spawn_server(
             raw,
             info,
             self_as,
@@ -244,12 +242,10 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
             STEP_AUTH_SPAWN,
             None,
         )?;
-        let ready_ep = SP_INIT_EP.load(SpOrdering::Relaxed);
-        let death = SP_DEATH.load(SpOrdering::Relaxed);
-        mark(raw, info.debug_ep, STEP_AUTH_SPAWN, pid);
+        mark(raw, info.debug_ep, STEP_AUTH_SPAWN, spawned.pid);
         let ready = {
             let mut sys = Syscalls::new(raw);
-            sys.recv(ready_ep)
+            sys.recv(spawned.init_ep)
                 .map_err(|e| fail_code(STEP_AUTH_READY, e as u64))?
         };
         if ready.tag.label() != bootstrap::READY_LABEL || ready.words[0] != bootstrap::READY_MAGIC {
@@ -278,7 +274,7 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
             return Err(fail_code(STEP_AUTH_CHECK, 0xE1));
         }
         mark(raw, info.debug_ep, STEP_AUTH_CHECK, checked.words[1]);
-        (svc, death)
+        (svc, spawned.death)
     };
 
     // Steps 7–8: the first system server — spawn the VFS from its embedded
@@ -288,7 +284,7 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
     if !HAS_VFS_IMAGE {
         return Err(fail_code(STEP_VFS_SPAWNED, 0xE1));
     }
-    let vfs_pid = spawn_server(
+    let vfs = spawn_server(
         raw,
         info,
         self_as,
@@ -297,13 +293,11 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
         STEP_VFS_SPAWNED,
         None,
     )?;
-    let vfs_ready_ep = SP_INIT_EP.load(SpOrdering::Relaxed);
-    let vfs_death = SP_DEATH.load(SpOrdering::Relaxed);
-    mark(raw, info.debug_ep, STEP_VFS_SPAWNED, vfs_pid);
+    mark(raw, info.debug_ep, STEP_VFS_SPAWNED, vfs.pid);
     let vfs_svc = {
         let ready = {
             let mut sys = Syscalls::new(raw);
-            sys.recv(vfs_ready_ep)
+            sys.recv(vfs.init_ep)
                 .map_err(|e| fail_code(STEP_VFS_READY, e as u64))?
         };
         if ready.tag.label() != bootstrap::READY_LABEL || ready.words[0] != bootstrap::READY_MAGIC {
@@ -324,14 +318,12 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
         mark(raw, info.debug_ep, STEP_SPAWNED, SPAWN_SKIPPED);
         return Ok(());
     }
-    let ps_pid = spawn_server(raw, info, self_as, region, PS_IMAGE, STEP_SPAWNED, None)?;
-    let ps_ready_ep = SP_INIT_EP.load(SpOrdering::Relaxed);
-    let ps_death = SP_DEATH.load(SpOrdering::Relaxed);
-    mark(raw, info.debug_ep, STEP_SPAWNED, ps_pid);
+    let ps = spawn_server(raw, info, self_as, region, PS_IMAGE, STEP_SPAWNED, None)?;
+    mark(raw, info.debug_ep, STEP_SPAWNED, ps.pid);
     let svc = {
         let ready = {
             let mut sys = Syscalls::new(raw);
-            sys.recv(ps_ready_ep)
+            sys.recv(ps.init_ep)
                 .map_err(|e| fail_code(STEP_CHILD_READY, e as u64))?
         };
         if ready.tag.label() != bootstrap::READY_LABEL || ready.words[0] != bootstrap::READY_MAGIC {
@@ -899,7 +891,7 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
     }
     {
         let mut sys = Syscalls::new(raw);
-        sys.recv(vfs_death)
+        sys.recv(vfs.death)
             .map_err(|e| fail_code(STEP_CHILD_EXIT, e as u64))?;
     }
     // Shutdown: auth down (KILL acks, then it exits) and reap.
@@ -924,7 +916,7 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
     {
         let mut sys = Syscalls::new(raw);
         let mut kill = Message::new(methods::process::KILL);
-        kill.words[0] = ps_pid;
+        kill.words[0] = ps.pid;
         let ack = sys
             .call(session_ep, &kill)
             .map_err(|e| fail_code(STEP_CHILD_EXIT, e as u64))?;
@@ -934,7 +926,7 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
     }
     {
         let mut sys = Syscalls::new(raw);
-        sys.recv(ps_death)
+        sys.recv(ps.death)
             .map_err(|e| fail_code(STEP_CHILD_EXIT, e as u64))?;
     }
     Ok(())
@@ -956,24 +948,15 @@ fn carve_frame(raw: &mut X86_64Syscalls, region: Handle) -> Result<Handle> {
     Ok(handle)
 }
 
-/// What a spawned server hands back to the launcher: everything lives in the
-/// pinned `.data` atomics (SP_INIT_EP/SP_DEATH) and the function returns only
-/// the pid — a scalar return goes in registers, avoiding the compiler's
-/// struct-return (sret) slot entirely (it was observed corrupted across the
-/// spawn's syscalls; harness pins alone could not protect a compiler temp).
-// Pinned spawn handles, in .data (live locals across this inlined spawn path
-// were observed clobbered — a stale value silently mis-delivers caps and
-// misbinds death notifications; atomics are immune. Same fix as PS).
-use core::sync::atomic::Ordering as SpOrdering;
-static SP_BOOT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-static SP_INIT_EP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-static SP_DEATH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-static SP_S0: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-static SP_S1: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-static SP_S2: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-static SP_S3: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-static SP_THREAD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-static SP_REGION: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Handles a spawned server hands back to the launcher: its pid, the endpoint
+/// it publishes its ready callback on, and the notification that fires when it
+/// dies. Plain locals now that the real corruption causes (kstack overflow,
+/// the `enter_user` asm clobber) are fixed (E7).
+struct Spawned {
+    pid: u64,
+    init_ep: Handle,
+    death: Handle,
+}
 
 /// Spawn a system server from an embedded image: fresh AS + ELF load,
 /// endpoints/notifications, thread, ADR-009 package (with Factory tail),
@@ -986,8 +969,7 @@ fn spawn_server(
     image: &[u8],
     step: u64,
     extra: Option<CapSlot>,
-) -> Result<u64> {
-    SP_REGION.store(region, SpOrdering::Relaxed);
+) -> Result<Spawned> {
     let elf = ElfImage::parse(image).map_err(|e| fail_code(step, e as u64))?;
     let ops = loader::plan(&elf, INIT_SCRATCH_VA_BASE)
         .map_err(|e| fail_code(step, 0xE0_00 | (e as u64 & 0xFF)))?;
@@ -1027,9 +1009,7 @@ fn spawn_server(
         .map_err(|e| fail_code(step, 0xE1_01 | (e as u64 & 0xFF)))?;
     }
 
-    // Endpoints + notifications for the package. Every handle travels through
-    // a .data atomic: live locals across this inlined spawn path were observed
-    // clobbered (a stale value silently misbinds/mis-delivers; same fix as PS).
+    // Endpoints + notifications for the package.
     let bootstrap_ep = mint(
         raw,
         info.factory,
@@ -1037,7 +1017,6 @@ fn spawn_server(
         step,
         0xE2,
     )?;
-    SP_BOOT.store(bootstrap_ep, SpOrdering::Relaxed);
     let init_ep = mint(
         raw,
         info.factory,
@@ -1045,7 +1024,6 @@ fn spawn_server(
         step,
         0xE3,
     )?;
-    SP_INIT_EP.store(init_ep, SpOrdering::Relaxed);
     let death = mint(
         raw,
         info.factory,
@@ -1053,21 +1031,15 @@ fn spawn_server(
         step,
         0xE4,
     )?;
-    SP_DEATH.store(death, SpOrdering::Relaxed);
-    for slot in 0..bootstrap::SESSION_POOL {
-        let s = mint(
+    let mut sessions = [0 as Handle; bootstrap::SESSION_POOL];
+    for slot in sessions.iter_mut() {
+        *slot = mint(
             raw,
             info.factory,
             methods::factory::NEW_NOTIFICATION,
             step,
             0xE5,
         )?;
-        match slot {
-            0 => SP_S0.store(s, SpOrdering::Relaxed),
-            1 => SP_S1.store(s, SpOrdering::Relaxed),
-            2 => SP_S2.store(s, SpOrdering::Relaxed),
-            _ => SP_S3.store(s, SpOrdering::Relaxed),
-        }
     }
 
     // Child thread (ADR-017 packing): w0 = entry; caps[0] = AS (input),
@@ -1079,10 +1051,7 @@ fn spawn_server(
         m.words[0] = elf.entry;
         let _ = m.set_descriptor(0, CapSlot::pack(child_as, Rights::MAP.union(Rights::GRANT)));
         let _ = m.set_descriptor(1, CapSlot::NULL);
-        let _ = m.set_descriptor(
-            2,
-            CapSlot::pack(SP_BOOT.load(SpOrdering::Relaxed), Rights::RECV),
-        );
+        let _ = m.set_descriptor(2, CapSlot::pack(bootstrap_ep, Rights::RECV));
         let reply = sys
             .invoke(info.factory, &m)
             .map_err(|e| fail_code(step, 0xE6_00 | (e as u64 & 0xFF)))?;
@@ -1091,29 +1060,20 @@ fn spawn_server(
     if thread_cap == 0 {
         return Err(fail_code(step, 0xE6_01));
     }
-    SP_THREAD.store(thread_cap, SpOrdering::Relaxed);
 
     // Bind the child's death notification to its thread (ADR-007 §6).
     {
         let mut sys = Syscalls::new(raw);
         let mut m = Message::new(methods::thread::BIND_DEATH_NOTIFICATION);
         m.tag = m.tag.with_caps(1);
-        let _ = m.set_descriptor(
-            0,
-            CapSlot::pack(SP_DEATH.load(SpOrdering::Relaxed), Rights::SIGNAL),
-        );
-        sys.invoke(SP_THREAD.load(SpOrdering::Relaxed), &m)
+        let _ = m.set_descriptor(0, CapSlot::pack(death, Rights::SIGNAL));
+        sys.invoke(thread_cap, &m)
             .map_err(|e| fail_code(step, 0xE7_00 | (e as u64 & 0xFF)))?;
     }
 
     // ADR-009 package: §2.3 prefix + ADR-023 tail[0] = Factory.
-    // Manual chunked delivery: values are loaded from `.data` atomics and
-    // packed into the outgoing Message immediately before each send, so no
-    // stack structure spans a syscall (a live-local clobbering kernel bug —
-    // see TASKS.md — corrupts anything that does; proven by the four
-    // spawn-handle pins).
     let sr = Rights::SIGNAL.union(Rights::RECV).union(Rights::GRANT);
-    let boot = SP_BOOT.load(SpOrdering::Relaxed);
+    let boot = bootstrap_ep;
     {
         let mut sys = Syscalls::new(raw);
         let mut hdr = Message::new(bootstrap::PACKAGE_LABEL);
@@ -1125,30 +1085,18 @@ fn spawn_server(
         let mut c1 = Message::new(bootstrap::PACKAGE_LABEL);
         c1.tag = c1.tag.with_caps(4);
         let _ = c1.set_descriptor(0, CapSlot::pack(child_as, Rights::MAP.union(Rights::GRANT)));
-        let _ = c1.set_descriptor(
-            1,
-            CapSlot::pack(SP_THREAD.load(SpOrdering::Relaxed), Rights::CONTROL),
-        );
-        let _ = c1.set_descriptor(
-            2,
-            CapSlot::pack(SP_REGION.load(SpOrdering::Relaxed), Rights::GRANT),
-        );
-        let _ = c1.set_descriptor(3, CapSlot::pack(SP_S0.load(SpOrdering::Relaxed), sr));
+        let _ = c1.set_descriptor(1, CapSlot::pack(thread_cap, Rights::CONTROL));
+        let _ = c1.set_descriptor(2, CapSlot::pack(region, Rights::GRANT));
+        let _ = c1.set_descriptor(3, CapSlot::pack(sessions[0], sr));
         sys.send(boot, &c1)
             .map_err(|e| fail_code(step, 0xE8_01 | (e as u64 & 0xFF)))?;
 
         let mut c2 = Message::new(bootstrap::PACKAGE_LABEL);
         c2.tag = c2.tag.with_caps(4);
-        let _ = c2.set_descriptor(0, CapSlot::pack(SP_S1.load(SpOrdering::Relaxed), sr));
-        let _ = c2.set_descriptor(1, CapSlot::pack(SP_S2.load(SpOrdering::Relaxed), sr));
-        let _ = c2.set_descriptor(2, CapSlot::pack(SP_S3.load(SpOrdering::Relaxed), sr));
-        let _ = c2.set_descriptor(
-            3,
-            CapSlot::pack(
-                SP_INIT_EP.load(SpOrdering::Relaxed),
-                Rights::SEND.union(Rights::GRANT),
-            ),
-        );
+        let _ = c2.set_descriptor(0, CapSlot::pack(sessions[1], sr));
+        let _ = c2.set_descriptor(1, CapSlot::pack(sessions[2], sr));
+        let _ = c2.set_descriptor(2, CapSlot::pack(sessions[3], sr));
+        let _ = c2.set_descriptor(3, CapSlot::pack(init_ep, Rights::SEND.union(Rights::GRANT)));
         sys.send(boot, &c2)
             .map_err(|e| fail_code(step, 0xE8_02 | (e as u64 & 0xFF)))?;
 
@@ -1163,7 +1111,11 @@ fn spawn_server(
             .map_err(|e| fail_code(step, 0xE8_03 | (e as u64 & 0xFF)))?;
     }
 
-    Ok(pid)
+    Ok(Spawned {
+        pid,
+        init_ep,
+        death,
+    })
 }
 
 /// v0.2 SPAWN payload (see `sdk::spawn`): the path and argv/env areas live

@@ -110,23 +110,6 @@ fn register_conn(ep: u32, pid: u64) {
     CONN_PIDS[i].store(pid, Ordering::Relaxed);
 }
 
-/// Pin the child's package handles immediately at mint time: register/spill
-/// reuse in the inlined spawn path has proven unreliable, so every value
-/// travels through a volatile atomic instead of a plain local.
-static CH_BOOT: AtomicU32 = AtomicU32::new(0);
-static CH_S0: AtomicU32 = AtomicU32::new(0);
-static CH_S1: AtomicU32 = AtomicU32::new(0);
-static CH_S2: AtomicU32 = AtomicU32::new(0);
-static CH_S3: AtomicU32 = AtomicU32::new(0);
-/// The last pinned spawn handle: the child's thread-control cap. Lived on the
-/// stack across the same heavy inlined path; a stale (still thread-typed)
-/// value made BIND_DEATH_NOTIFICATION silently bind the wrong thread.
-static CH_THREAD: AtomicU32 = AtomicU32::new(0);
-/// And the death notification that the BIND descriptor carries: a stale
-/// value silently turns BIND into a clear (non-notification descriptor ->
-/// bound=None -> Ok), so the child's death never fires.
-static CH_EXIT_NOTIF: AtomicU32 = AtomicU32::new(0);
-
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     let mut raw = X86_64Syscalls;
@@ -527,20 +510,13 @@ fn spawn_child(
         0b011,
     )?;
     craft_stack(sys, package, child_as, argv_span, env_span, win_base)?;
-    // 4. Endpoints + notifications for the child's package (straight-line
-    // mints; no arrays — spill-slot reuse made the old form unreliable).
+    // 4. Endpoints + notifications for the child's package.
     let bootstrap_ep = invoke_w0(sys, factory, methods::factory::NEW_ENDPOINT, [0; 4])? as u32;
-    CH_BOOT.store(bootstrap_ep, Ordering::Relaxed);
     let s0 = invoke_w0(sys, factory, methods::factory::NEW_NOTIFICATION, [0; 4])? as u32;
-    CH_S0.store(s0, Ordering::Relaxed);
     let s1 = invoke_w0(sys, factory, methods::factory::NEW_NOTIFICATION, [0; 4])? as u32;
-    CH_S1.store(s1, Ordering::Relaxed);
     let s2 = invoke_w0(sys, factory, methods::factory::NEW_NOTIFICATION, [0; 4])? as u32;
-    CH_S2.store(s2, Ordering::Relaxed);
     let s3 = invoke_w0(sys, factory, methods::factory::NEW_NOTIFICATION, [0; 4])? as u32;
-    CH_S3.store(s3, Ordering::Relaxed);
     let exit_notif = invoke_w0(sys, factory, methods::factory::NEW_NOTIFICATION, [0; 4])? as u32;
-    CH_EXIT_NOTIF.store(exit_notif, Ordering::Relaxed);
     // 5. Child thread (ADR-017 packing; ADR-009 bootstrap at child handle 1).
     let mut m = Message::new(methods::factory::NEW_THREAD);
     m.tag = m.tag.with_caps(3);
@@ -554,20 +530,18 @@ fn spawn_child(
     if thread_cap == 0 {
         return Err(ipc::status::ENOMEM);
     }
-    CH_THREAD.store(thread_cap, Ordering::Relaxed);
     // 7. ADR-009 package: fixed prefix + the optional tail (design §2.3
     //    order: vfs, stdin, stdout, stderr), holes preserved positionally.
-    //    Regular processes get no Factory. Stack array: the Vec form was
-    //    silently corrupted (heap aliasing).
+    //    Regular processes get no Factory.
     let session_rights = Rights::SIGNAL.union(Rights::RECV).union(Rights::GRANT);
     let mut caps = [CapSlot::NULL; bootstrap::FIXED_CAPS + 4];
     caps[0] = CapSlot::pack(child_as, Rights::MAP.union(Rights::GRANT));
-    caps[1] = CapSlot::pack(CH_THREAD.load(Ordering::Relaxed), Rights::CONTROL);
+    caps[1] = CapSlot::pack(thread_cap, Rights::CONTROL);
     caps[2] = CapSlot::pack(package.region, Rights::GRANT);
-    caps[3] = CapSlot::pack(CH_S0.load(Ordering::Relaxed), session_rights);
-    caps[4] = CapSlot::pack(CH_S1.load(Ordering::Relaxed), session_rights);
-    caps[5] = CapSlot::pack(CH_S2.load(Ordering::Relaxed), session_rights);
-    caps[6] = CapSlot::pack(CH_S3.load(Ordering::Relaxed), session_rights);
+    caps[3] = CapSlot::pack(s0, session_rights);
+    caps[4] = CapSlot::pack(s1, session_rights);
+    caps[5] = CapSlot::pack(s2, session_rights);
+    caps[6] = CapSlot::pack(s3, session_rights);
     caps[7] = CapSlot::pack(service_ep, Rights::SEND.union(Rights::GRANT));
     let mut total = bootstrap::FIXED_CAPS;
     for (i, extra) in extras.iter().enumerate() {
@@ -582,13 +556,10 @@ fn spawn_child(
     // 6. PS's death binding on the child thread.
     let mut bind = Message::new(methods::thread::BIND_DEATH_NOTIFICATION);
     bind.tag = bind.tag.with_caps(1);
-    let _ = bind.set_descriptor(
-        0,
-        CapSlot::pack(CH_EXIT_NOTIF.load(Ordering::Relaxed), Rights::SIGNAL),
-    );
-    sys.invoke(CH_THREAD.load(Ordering::Relaxed), &bind)?;
+    let _ = bind.set_descriptor(0, CapSlot::pack(exit_notif, Rights::SIGNAL));
+    sys.invoke(thread_cap, &bind)?;
 
-    bootstrap::deliver(sys, CH_BOOT.load(Ordering::Relaxed), &caps[..total], pid)?;
+    bootstrap::deliver(sys, bootstrap_ep, &caps[..total], pid)?;
     // 8. Publish for WAIT/KILL/EXEC (per-client table slot; round-robin).
     register_child(
         pid,
