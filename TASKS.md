@@ -57,7 +57,7 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 - [Resolved] NV — kernel-build blocker was stale: `cargo build -p kernel` and `cargo test -p hal-x86-64` both succeed on this host (5 host tests); E11 logic+tests (243bd24) and the qemu-test.sh guard (f2bf132) are committed. GLM's uncommitted `aspace.rs`/`fault.rs` refactor compiles cleanly and is GLM's to commit.
 - [Resolved] NV — E5 (userspace clippy line in tools/qemu-test.sh) unblocked by DS's E4 (9dda2e9); clippy line added to tools/qemu-test.sh and full qemu-test.sh gate passes (DONE marker + clean halt).
 - [Resolved] GLM — S8 test interference fixed by adding `frame::reset_for_test()` in entry test setup; all kernel tests pass.
-- NV — Power management: hal `Halt` trait + x86_64 `hlt` impl done; blocked on GLM wiring the kernel scheduler idle loop (`kernel/`) to call `hal::Halt::halt()` when `pick_next` returns IDLE.
+- [Resolved] NV — Power management: idle loop in hal/x86_64 resume_loop routes `hlt` through `SmpX86_64::halt()` (the ADR-014 `Halt` trait). The `blocked on GLM wiring kernel/` premise was wrong — the idle loop lives in `hal/x86_64` (NV area) and already halted; the missing piece was routing it through the Halt trait, which NV did. Full QEMU boot reaches DONE + clean halt (`tools/qemu-test.sh` exit 0).
 
 ## Decisions needed
 
@@ -86,4 +86,4 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 - [x NV done 2026-11-14 7471447] NV — riscv64 HAL bring-up: TrapDecode + context backend + paging backend stubs (hal/riscv64 is an empty stub; PLAN Phase 5).
 - [x NV done 2026-11-14 4ae7629] NV — SMP bring-up: CpuTopology + Ipi + SecondaryBoot + Halt in hal/x86_64 (ADR-014 traits; PLAN Phase 5). CpuTopology (CPUID leaf 0x0B probe, host-tested) and Halt (`hlt`) are real; Ipi/SecondaryBoot are honest single-CPU no-op stubs (no APs on this QEMU config, ADR-015 firmware tables not yet available).
 - [x NV done 2026-11-14 d2a980d] NV — Preemption: wire PIT timer tick + drain_tick in hal/x86_64 (ADR-042 hal side; PLAN Phase 5).
-- [~ NV started 2026-11-14] NV — Power management: BSP idle loop / C-state residency via Halt trait (ADR-014) in hal/x86_64 (PLAN Phase 5).
+- [x NV done 2026-11-14 6f0109d] NV — Power management: BSP idle loop / C-state residency via Halt trait (ADR-014) in hal/x86_64 (PLAN Phase 5).
