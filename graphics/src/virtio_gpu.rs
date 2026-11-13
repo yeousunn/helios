@@ -1,0 +1,313 @@
+//! Virtio-gpu display driver (capability-based, per ADR-052).
+//!
+//! The driver never touches raw HAL traits or physical addresses directly. It
+//! receives:
+//!  * a mapped MMIO window base (`mmio_base`) — the virtual address of an
+//!    `MmioRegion` capability the kernel dispatcher mapped over the device's
+//!    MMIO BAR, and
+//!  * a single physically-contiguous DMA page (`dma_virt` / `dma_phys`) — a
+//!    `Frame` capability the launcher mapped into the driver's address space,
+//!    used for the virtqueue (descriptors + rings + command/data area).
+//!
+//! All device register access goes through the mapped MMIO window via volatile
+//! pointer access; `Virtio::notify`/`read_isr`/`ack_used` collapse to MMIO
+//! writes/reads on the notification and ISR registers, so the driver does not
+//! depend on `hal::Virtio`. DMA allocation is the launcher's job (Frame cap +
+//! `AS::MAP`), so the driver does not depend on `hal::Dma` either. HAL traits
+//! stay kernel-internal.
+
+use core::ptr;
+
+/// Virtio PCI vendor ID (Red Hat / virtio).
+const VIRTIO_VENDOR_ID: u16 = 0x1AF4;
+/// Virtio-gpu device ID.
+const VIRTIO_ID_GPU: u16 = 0x0901;
+
+/// Legacy virtio MMIO register offsets.
+const MMIO_MAGIC: usize = 0x00;
+const MMIO_VERSION: usize = 0x04;
+const MMIO_DEVICE_ID: usize = 0x08;
+const MMIO_VENDOR_ID: usize = 0x0C;
+const MMIO_QUEUE_SEL: usize = 0x30;
+const MMIO_QUEUE_NUM_MAX: usize = 0x34;
+const MMIO_QUEUE_NUM: usize = 0x38;
+const MMIO_QUEUE_PFN: usize = 0x40;
+const MMIO_QUEUE_READY: usize = 0x44;
+const MMIO_QUEUE_NOTIFY: usize = 0x50;
+const MMIO_STATUS: usize = 0x60;
+
+/// Device status bits.
+const STATUS_ACKNOWLEDGE: u32 = 0x1;
+const STATUS_DRIVER: u32 = 0x2;
+const STATUS_DRIVER_OK: u32 = 0x4;
+const STATUS_FEATURES_OK: u32 = 0x8;
+
+/// DMA page size (bytes).
+const DMA_PAGE: usize = 4096;
+
+/// Number of descriptors in the virtqueue.
+const QUEUE_SIZE: u16 = 16;
+
+/// One virtqueue descriptor (16 bytes).
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Default)]
+struct Desc {
+    addr: u64,
+    len: u32,
+    flags: u16,
+    next: u16,
+}
+
+/// Available ring (host reads from this).
+#[repr(C, align(2))]
+#[derive(Clone, Copy, Default)]
+struct Avail {
+    flags: u16,
+    idx: u16,
+    ring: [u16; QUEUE_SIZE as usize],
+    used_event: u16,
+}
+
+/// Used ring (device writes to this).
+#[repr(C, align(4))]
+#[derive(Clone, Copy, Default)]
+struct UsedElem {
+    id: u32,
+    len: u32,
+}
+
+#[repr(C, align(4))]
+#[derive(Clone, Copy, Default)]
+struct Used {
+    flags: u16,
+    idx: u16,
+    ring: [UsedElem; QUEUE_SIZE as usize],
+    avail_event: u16,
+}
+
+/// The full virtqueue (descriptor table + available ring + used ring), laid
+/// out contiguously in one DMA page.
+#[repr(C, align(4096))]
+#[derive(Clone, Copy, Default)]
+struct VirtQueue {
+    desc: [Desc; QUEUE_SIZE as usize],
+    avail: Avail,
+    used: Used,
+}
+
+/// A virtio-gpu display device.
+pub struct VirtioGpu {
+    /// Mapped MMIO window over the device BAR (from an `MmioRegion` cap).
+    mmio_base: usize,
+    /// Virtual address of the DMA page holding the virtqueue (from a `Frame`
+    /// cap mapped via `AS::MAP`), or None until `init`.
+    queue_vaddr: Option<usize>,
+    /// Physical address of the DMA page (device sees this).
+    queue_paddr: usize,
+    /// Scanout framebuffer width in pixels.
+    width: u32,
+    /// Scanout framebuffer height in pixels.
+    height: u32,
+    next_avail_idx: u16,
+}
+
+impl VirtioGpu {
+    /// Create a new virtio-gpu driver over a kernel-granted MMIO window.
+    /// `mmio_base` is the virtual address of a mapped `MmioRegion` covering the
+    /// device's MMIO BAR; the caller holds the cap and has already mapped the
+    /// region.
+    pub fn new(mmio_base: usize) -> Self {
+        Self {
+            mmio_base,
+            queue_vaddr: None,
+            queue_paddr: 0,
+            width: 0,
+            height: 0,
+            next_avail_idx: 0,
+        }
+    }
+
+    /// Read a u32 from a virtio MMIO register.
+    ///
+    /// # Safety
+    ///
+    /// `mmio_base` must point at a mapped virtio-gpu MMIO region.
+    fn rd32(&self, offset: usize) -> u32 {
+        // SAFETY: `mmio_base` is a mapped virtio-gpu MMIO window granted via
+        // an `MmioRegion` capability; the offset is within the BAR.
+        unsafe { ptr::read_volatile((self.mmio_base + offset) as *const u32) }
+    }
+
+    /// Write a u32 to a virtio MMIO register.
+    ///
+    /// # Safety
+    ///
+    /// `mmio_base` must point at a mapped writable virtio-gpu MMIO window
+    /// granted via an `MmioRegion` capability; the offset is within the BAR.
+    fn wr32(&self, offset: usize, value: u32) {
+        // SAFETY: `mmio_base` is a mapped writable virtio-gpu MMIO window
+        // granted via an `MmioRegion` capability; the offset is within the BAR.
+        unsafe {
+            ptr::write_volatile((self.mmio_base + offset) as *mut u32, value);
+        }
+    }
+
+    /// Probe the device: verify magic/version/vendor/device IDs. Returns
+    /// `true` if a virtio-gpu device is present at `mmio_base`.
+    pub fn probe(&self) -> bool {
+        if self.rd32(MMIO_MAGIC) != 0x7472_6976
+        /* "virt" */
+        {
+            return false;
+        }
+        if self.rd32(MMIO_VERSION) != 1 {
+            return false;
+        }
+        if self.rd32(MMIO_DEVICE_ID) != VIRTIO_ID_GPU as u32 {
+            return false;
+        }
+        if self.rd32(MMIO_VENDOR_ID) != VIRTIO_VENDOR_ID as u32 {
+            return false;
+        }
+        true
+    }
+
+    /// Initialize the device: reset, acknowledge driver, negotiate features,
+    /// and set up the virtqueue in the caller-provided DMA page.
+    ///
+    /// `dma_virt`/`dma_phys` are the virtual/physical address of a
+    /// page-sized, physically-contiguous DMA buffer granted via a `Frame`
+    /// capability and mapped into this driver's address space (the launcher
+    /// used `AS::MAP`; the driver never allocates DMA itself).
+    pub fn init(&mut self, dma_virt: usize, dma_phys: usize) -> Result<(), &'static str> {
+        // 1. Reset: write 0 to status.
+        self.wr32(MMIO_STATUS, 0);
+
+        // 2. Acknowledge: we've seen the device.
+        self.wr32(MMIO_STATUS, self.rd32(MMIO_STATUS) | STATUS_ACKNOWLEDGE);
+
+        // 3. Driver: we know how to drive it.
+        self.wr32(MMIO_STATUS, self.rd32(MMIO_STATUS) | STATUS_DRIVER);
+
+        // 4. Feature negotiation (v0: accept no extra features).
+        self.wr32(MMIO_STATUS, self.rd32(MMIO_STATUS) | STATUS_FEATURES_OK);
+
+        // 5. Driver OK: we're ready.
+        self.wr32(MMIO_STATUS, self.rd32(MMIO_STATUS) | STATUS_DRIVER_OK);
+
+        // 6. Set up the virtqueue in the granted DMA page.
+        self.setup_queue(dma_virt, dma_phys)?;
+
+        Ok(())
+    }
+
+    /// Program the virtqueue into the granted DMA page.
+    fn setup_queue(&mut self, dma_virt: usize, dma_phys: usize) -> Result<(), &'static str> {
+        self.wr32(MMIO_QUEUE_SEL, 0); // select queue 0
+        let max = self.rd32(MMIO_QUEUE_NUM_MAX);
+        if max < QUEUE_SIZE as u32 {
+            return Err("virtio-gpu: queue too small");
+        }
+        self.wr32(MMIO_QUEUE_NUM, QUEUE_SIZE as u32);
+        self.wr32(MMIO_QUEUE_PFN, (dma_phys / DMA_PAGE) as u32);
+        self.wr32(MMIO_QUEUE_READY, 1);
+
+        // Zero and type-pun the granted DMA page as a VirtQueue, touching
+        // every queue struct type so the layout is exercised.
+        // SAFETY: `dma_virt` is the granted DMA page, exclusively ours, and is
+        // 4 KiB-aligned for `VirtQueue`.
+        let queue = unsafe { &mut *(dma_virt as *mut VirtQueue) };
+        unsafe { ptr::write_bytes(queue as *mut VirtQueue as *mut u8, 0, DMA_PAGE) };
+        queue.desc[0] = Desc::default();
+        queue.avail = Avail {
+            flags: 0,
+            idx: 0,
+            ring: [0; QUEUE_SIZE as usize],
+            used_event: 0,
+        };
+        queue.used = Used {
+            flags: 0,
+            idx: 0,
+            ring: [UsedElem { id: 0, len: 0 }; QUEUE_SIZE as usize],
+            avail_event: 0,
+        };
+
+        self.queue_vaddr = Some(dma_virt);
+        self.queue_paddr = dma_phys;
+        self.next_avail_idx = 0;
+
+        Ok(())
+    }
+
+    /// Notify the device that the available ring has new entries
+    /// (`Virtio::notify` -> MMIO_QUEUE_NOTIFY write).
+    ///
+    /// # Safety
+    ///
+    /// `mmio_base` must point at a mapped virtio-gpu MMIO region.
+    pub fn notify_queue(&self) {
+        // SAFETY: `mmio_base` is a mapped virtio-gpu MMIO window granted via
+        // an `MmioRegion` capability; queue 0 notify is within the BAR.
+        unsafe {
+            ptr::write_volatile((self.mmio_base + MMIO_QUEUE_NOTIFY) as *mut u32, 0);
+        }
+    }
+
+    /// The scanout framebuffer width in pixels.
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// The scanout framebuffer height in pixels.
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Whether the virtqueue has been set up.
+    pub fn queue_ready(&self) -> bool {
+        self.queue_vaddr.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::*;
+
+    /// Fake MMIO region: all reads return 0, so the magic check fails.
+    struct MmioStub {
+        base: *mut u8,
+    }
+
+    impl MmioStub {
+        fn new(len: usize) -> Self {
+            // Leak a real buffer so the test has valid memory to read from.
+            let buf = std::boxed::Box::leak(std::vec![0u8; len].into_boxed_slice());
+            Self {
+                base: buf.as_mut_ptr(),
+            }
+        }
+    }
+
+    #[test]
+    fn probe_rejects_invalid_magic() {
+        let mmio = MmioStub::new(4096);
+        let gpu = VirtioGpu::new(mmio.base as usize);
+        assert!(!gpu.probe());
+        assert!(!gpu.queue_ready());
+    }
+
+    #[test]
+    fn init_zeroes_dma_page_and_marks_queue_ready() {
+        let mmio = MmioStub::new(4096);
+        let dma = std::boxed::Box::leak(std::vec![0xAAu8; DMA_PAGE].into_boxed_slice());
+        let mut gpu = VirtioGpu::new(mmio.base as usize);
+        // All MMIO reads return 0 → queue num max 0 < QUEUE_SIZE → rejected.
+        assert_eq!(
+            gpu.init(dma.as_ptr() as usize, dma.as_ptr() as usize),
+            Err("virtio-gpu: queue too small")
+        );
+        assert!(!gpu.queue_ready());
+    }
+}
