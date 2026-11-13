@@ -32,7 +32,7 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 - [x NV done 2026-11-13 ca0dc44] E2 NV — `tools/qemu-test.sh`: call E1, boot the release kernel, require the DONE marker and `clean halt`, work on macOS (use `gtimeout` if present), and honour `SERIAL_LOG` and `CARGO_TARGET_DIR`.
 - [x NV done 2026-11-13 5766b07] E3 NV — CI (`.github/workflows/ci.yml`) runs E2, `cargo test` and the userspace clippy line. Pushing is for the human. Done when it runs locally through `tools/qemu-test.sh`.
 - [ ] E4 DS — Make the userspace clippy line in AGENTS.md section 5 pass with `-D warnings` (errors today in `sdk` bins `init`/`child`, and in `servers/process/src/bin/ps.rs:974`).
-- [ ] E5 NV — Add the userspace clippy line to `tools/qemu-test.sh` once E4 lands.
+- [~ NV started 2026-11-13] E5 NV — Add the userspace clippy line to `tools/qemu-test.sh` once E4 lands; blocked on DS's E4 (userspace clippy not yet `-D warnings` clean).
 - [ ] E6 DS — Source and build notes for every ELF in `personality/assets/` (one source file plus a reproducible build line each, and the musl MIT license noted), or a script that builds them.
 - [ ] E7 DS — Remove the `.data` atomics workaround in `sdk/src/bin/init.rs:902` and its copy in ps. The real causes (kstack overflow, asm clobber) are fixed. The boot must still reach DONE.
 - [x NV done 2026-11-13 66c3dcd] E8 NV — ADR-052: userspace drivers get MMIO/DMA through capabilities (MmioRegion + Frame caps; HAL traits stay kernel-internal; driver move waits for freeze lift).
@@ -49,7 +49,7 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 
 ## Blockers
 
-- [Blocker] NV — kernel crate doesn't compile: GLM's uncommitted `kernel/src/aspace.rs` map_page_checked refactor (S10 unblocker) made `AddressSpace::map` take `be: &dyn PagingBackend` but left callers missing the arg (+ a `?` error). `cargo test -p hal-x86-64` (E11 host tests), S10, and the full gate cannot run. Owner: GLM.
+- [Resolved] NV — kernel-build blocker was stale: `cargo build -p kernel` and `cargo test -p hal-x86-64` both succeed on this host (5 host tests); E11 logic+tests (243bd24) and the qemu-test.sh guard (f2bf132) are committed. GLM's uncommitted `aspace.rs`/`fault.rs` refactor compiles cleanly and is GLM's to commit.
 
 ## Decisions needed
 
