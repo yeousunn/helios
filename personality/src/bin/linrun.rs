@@ -25,6 +25,7 @@ use ipc::Message;
 use personality::layout::HEAP_VA_BASE;
 use sdk::heap::{GlobalHeap, RegionSource};
 use sdk::layout::{HEAP_CHUNK, HEAP_CHUNKS};
+use sdk::sys::{raw_copy_from_va, raw_copy_to_va, raw_cstr_from_va};
 use sdk::syscall::{Syscalls, X86_64Syscalls};
 
 #[global_allocator]
@@ -76,15 +77,17 @@ fn load_elf<R: sdk::syscall::RawSyscalls>(
             );
             sys.invoke(as_cap, &map)?;
         }
-        // SAFETY: the segment VAs are mapped in this AS. Zero the whole
-        // region (BSS = memsz - filesz), then copy the file contents.
-        unsafe {
-            core::ptr::write_bytes(first as *mut u8, 0, pages as usize * 4096);
-            core::ptr::copy_nonoverlapping(
-                bytes.as_ptr().add(seg.offset as usize),
-                seg.vaddr as *mut u8,
-                seg.filesz as usize,
-            );
+        // The segment pages are mapped R|W|X in this AS by the loop above.
+        // Zero the whole region (BSS = memsz - filesz) one page at a time,
+        // then copy the file contents over it.
+        const ZERO_PAGE: [u8; 4096] = [0; 4096];
+        for p in 0..pages {
+            raw_copy_to_va(first + p * 4096, &ZERO_PAGE);
+        }
+        let off = seg.offset as usize;
+        let filesz = seg.filesz as usize;
+        if let Some(src) = bytes.get(off..).and_then(|s| s.get(..filesz)) {
+            raw_copy_to_va(seg.vaddr, src);
         }
     }
     Ok(elf.entry)
@@ -144,17 +147,15 @@ impl Emu<'_> {
 
 impl personality::foreign::Host for Emu<'_> {
     fn mem_read(&mut self, addr: u64, buf: &mut [u8]) -> i64 {
-        // SAFETY: the emulated image shares this AS; addr is a valid pointer.
-        unsafe {
-            core::ptr::copy_nonoverlapping(addr as *const u8, buf.as_mut_ptr(), buf.len());
-        }
+        // The emulated image shares this AS, and `addr` is a guest VA the
+        // emulator mapped itself (load_elf / map_pages), so the copy target
+        // is valid and `buf.len()` bytes fit inside the mapped span.
+        raw_copy_from_va(addr, buf);
         buf.len() as i64
     }
     fn mem_write(&mut self, addr: u64, data: &[u8]) -> i64 {
-        // SAFETY: as above.
-        unsafe {
-            core::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, data.len());
-        }
+        // As `mem_read`: the emulator owns every guest page it maps.
+        raw_copy_to_va(addr, data);
         data.len() as i64
     }
     fn write_fd(&mut self, fd: i32, data: &[u8]) -> i64 {
@@ -401,29 +402,38 @@ impl personality::foreign::Host for Emu<'_> {
     }
 }
 
-extern "C" fn linrun_main(argc: u64, argv: *const *const u8, envp: *const *const u8) -> ! {
+extern "C" fn linrun_main(argc: u64, argv_va: u64, _envp_va: u64) -> ! {
     let mut raw = X86_64Syscalls;
-    // Native argv (the v0.2 crafted stack, `sdk::args`). With no args we run
-    // the default musl_cwd demo; with args we run the embedded busybox, where
-    // argv[1..] selects an applet.
-    let nargs = unsafe { sdk::args::Args::new(argc, argv, envp) };
     // Copy the launcher's args into this frame at once: the crafted strings
     // live in the lower half of the top stack page, and the emulator's own
     // deep call chain (VFS connect, heap setup, ELF load) descends far enough
     // to overwrite them before the guest stack is built, so reading them later
-    // yields empty/short slices. The copy is a fixed local array (our frame).
+    // yields empty/short slices. The copy is a fixed local array (our frame)
+    // and it runs BEFORE the heap is up: `sdk::args::Args::new` copies every
+    // argument into an owned Vec, which is an allocation failure (a panic)
+    // on the uninitialized allocator. With no args we run the default
+    // musl_cwd demo; with args we run the embedded busybox, where argv[1..]
+    // selects an applet.
     let mut arg_buf = [[0u8; 48]; 8];
     let mut arg_len = [0usize; 8];
     let mut argn = 0usize;
     {
-        let mut i = 1;
-        while i < nargs.argc() && argn < arg_buf.len() {
-            if let Some(a) = nargs.arg(i) {
-                let n = a.len().min(arg_buf[argn].len());
-                arg_buf[argn][..n].copy_from_slice(&a[..n]);
-                arg_len[argn] = n;
-                argn += 1;
+        // The v0.2 crafted stack (`sdk::args`): `argc` pointers at `argv_va`.
+        let mut ptr_bytes = [0u8; 8];
+        let mut i = 1usize;
+        while i < argc as usize && argn < arg_buf.len() {
+            raw_copy_from_va(argv_va + (i as u64) * 8, &mut ptr_bytes);
+            let p = u64::from_le_bytes(ptr_bytes);
+            if p == 0 {
+                break;
             }
+            let Some(a) = raw_cstr_from_va(p) else {
+                break;
+            };
+            let n = a.len().min(arg_buf[argn].len());
+            arg_buf[argn][..n].copy_from_slice(&a[..n]);
+            arg_len[argn] = n;
+            argn += 1;
             i += 1;
         }
     }
@@ -562,108 +572,109 @@ extern "C" fn linrun_main(argc: u64, argv: *const *const u8, envp: *const *const
         if let Err(e) = sys.invoke(package.aspace, &smap) {
             exit(&mut raw, 0x63 | (e & 0xF));
         }
-        // SAFETY: the pages are mapped; write the Linux startup layout and the
-        // stub (mov rsp, STACK_PAGE; mov rax, entry; jmp rax).
-        unsafe {
-            // Guest argv. Default: the freestanding demo reads argv[0].
-            // busybox: argv[0]="busybox" selects applet-arg dispatch, and the
-            // launcher's native argv[1..] become the applet and its arguments.
-            let mut guest_argv: alloc::vec::Vec<&[u8]> = alloc::vec::Vec::new();
-            if busybox {
-                // Multi-call invocation: argv[0] is the applet name (busybox
-                // dispatches on basename(argv[0])), argv[1..] are its args.
-                // The slices come from the frame-local copy, not the crafted
-                // stack page (see `arg_buf` above).
-                for i in 0..argn {
-                    guest_argv.push(&arg_buf[i][..arg_len[i]]);
-                }
-            } else {
-                guest_argv.push(DEFAULT_ARGV0);
+        // The guest stack pages and the stub page are mapped R|W|X in this AS
+        // by the loops above, so every VA written here is valid: the Linux
+        // startup layout (argv strings, envp/auxv block) and the RSP-switch
+        // stub (mov rsp, rsp; mov rax, entry; jmp rax) go through the SDK's
+        // raw VA writers instead of raw pointers (U4c).
+        // Guest argv. Default: the freestanding demo reads argv[0].
+        // busybox: argv[0]="busybox" selects applet-arg dispatch, and the
+        // launcher's native argv[1..] become the applet and its arguments.
+        let mut guest_argv: alloc::vec::Vec<&[u8]> = alloc::vec::Vec::new();
+        if busybox {
+            // Multi-call invocation: argv[0] is the applet name (busybox
+            // dispatches on basename(argv[0])), argv[1..] are its args.
+            // The slices come from the frame-local copy, not the crafted
+            // stack page (see `arg_buf` above).
+            for i in 0..argn {
+                guest_argv.push(&arg_buf[i][..arg_len[i]]);
             }
-            // Strings live in the lower half of the top stack page; AT_RANDOM
-            // sits at +0x200, so keep the string area below it.
-            let str_area = (STACK_BASE + 0x100) as *mut u8;
-            let mut off = 0usize;
-            let mut arg_ptrs: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
-            for a in &guest_argv {
-                let p = str_area.add(off);
-                core::ptr::copy_nonoverlapping(a.as_ptr(), p, a.len());
-                *p.add(a.len()) = 0;
-                arg_ptrs.push(p as u64);
-                off += a.len() + 1;
-            }
-            debug_assert!(off <= 0x100, "guest argv strings overflow 0x100");
-            let rnd = (STACK_BASE + 0x200) as *mut u8;
-            for i in 0..16 {
-                *rnd.add(i) = (0xA5 ^ i) as u8;
-            }
-            // AT_PHDR/PHNUM/PHENT must describe ALL program headers (musl
-            // walks them to find PT_TLS/PT_PHDR), not just the LOAD count.
-            let rd16 = |o: usize| u16::from_le_bytes([elf[o], elf[o + 1]]) as u64;
-            let rd64 = |o: usize| {
-                let mut b = [0u8; 8];
-                b.copy_from_slice(&elf[o..o + 8]);
-                u64::from_le_bytes(b)
-            };
-            let e_phoff = rd64(32);
-            let e_phentsize = rd16(54);
-            let e_phnum = rd16(56);
-            // Virtual address of the phdrs: the LOAD segment covering e_phoff.
-            let mut phdr_va = 0u64;
-            for i in 0..6 {
-                if let Some(s) = sdk::elf::ElfImage::parse(elf)
-                    .ok()
-                    .and_then(|e| e.segment(i))
-                {
-                    if e_phoff >= s.offset && e_phoff < s.offset + s.filesz {
-                        phdr_va = s.vaddr + (e_phoff - s.offset);
-                        break;
-                    }
-                }
-            }
-            let auxv = [
-                (3u64, phdr_va),  // AT_PHDR
-                (4, e_phentsize), // AT_PHENT
-                (5, e_phnum),     // AT_PHNUM
-                (6, 4096),        // AT_PAGESZ
-                (7, 0),           // AT_BASE (static)
-                (9, entry),       // AT_ENTRY
-                (16, 0),          // AT_HWCAP
-                (25, rnd as u64), // AT_RANDOM
-                (0, 0),           // AT_NULL
-            ];
-            // The initial block sits at the TOP of the stack with rsp pointing
-            // at argc; the block runs upward, calls grow down into the pages.
-            // Layout: argc, argv…, NULL, envp…, NULL, auxv pairs (the program
-            // reads envp right after the argv NULL, then the auxv).
-            let n = arg_ptrs.len();
-            let n_qwords = 1 + (n + 1) + 1 + auxv.len() * 2;
-            let rsp = STACK_BASE + STACK_PAGES * 4096 - (n_qwords as u64) * 8;
-            let base = rsp as *mut u64;
-            *base.add(0) = n as u64; // argc
-            for (i, p) in arg_ptrs.iter().enumerate() {
-                *base.add(1 + i) = *p;
-            }
-            *base.add(1 + n) = 0; // argv terminator
-            *base.add(1 + n + 1) = 0; // envp terminator (v0: empty environment)
-            let mut k = 1 + n + 2;
-            for (a, v) in auxv {
-                *base.add(k) = a;
-                *base.add(k + 1) = v;
-                k += 2;
-            }
-            // The stub: mov rsp, <rsp> (48 BC imm64); mov rax, entry
-            // (48 B8 imm64); jmp rax (FF E0).
-            let stub = STUB_PAGE as *mut u8;
-            *stub.add(0) = 0x48;
-            *stub.add(1) = 0xBC;
-            core::ptr::copy_nonoverlapping(rsp.to_le_bytes().as_ptr(), stub.add(2), 8);
-            *stub.add(10) = 0x48;
-            *stub.add(11) = 0xB8;
-            core::ptr::copy_nonoverlapping(entry.to_le_bytes().as_ptr(), stub.add(12), 8);
-            *stub.add(20) = 0xFF;
-            *stub.add(21) = 0xE0;
+        } else {
+            guest_argv.push(DEFAULT_ARGV0);
         }
+        // Strings live in the lower half of the top stack page; AT_RANDOM
+        // sits at +0x200, so keep the string area below it.
+        let str_area = STACK_BASE + 0x100;
+        let mut off = 0usize;
+        let mut arg_ptrs: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+        for a in &guest_argv {
+            let p = str_area + off as u64;
+            raw_copy_to_va(p, a);
+            raw_copy_to_va(p + a.len() as u64, &[0u8]); // NUL terminator
+            arg_ptrs.push(p);
+            off += a.len() + 1;
+        }
+        debug_assert!(off <= 0x100, "guest argv strings overflow 0x100");
+        let rnd = STACK_BASE + 0x200;
+        for i in 0..16u64 {
+            raw_copy_to_va(rnd + i, &[(0xA5 ^ i as u8)]);
+        }
+        // AT_PHDR/PHNUM/PHENT must describe ALL program headers (musl
+        // walks them to find PT_TLS/PT_PHDR), not just the LOAD count.
+        let rd16 = |o: usize| u16::from_le_bytes([elf[o], elf[o + 1]]) as u64;
+        let rd64 = |o: usize| {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&elf[o..o + 8]);
+            u64::from_le_bytes(b)
+        };
+        let e_phoff = rd64(32);
+        let e_phentsize = rd16(54);
+        let e_phnum = rd16(56);
+        // Virtual address of the phdrs: the LOAD segment covering e_phoff.
+        let mut phdr_va = 0u64;
+        for i in 0..6 {
+            if let Some(s) = sdk::elf::ElfImage::parse(elf)
+                .ok()
+                .and_then(|e| e.segment(i))
+            {
+                if e_phoff >= s.offset && e_phoff < s.offset + s.filesz {
+                    phdr_va = s.vaddr + (e_phoff - s.offset);
+                    break;
+                }
+            }
+        }
+        let auxv = [
+            (3u64, phdr_va),  // AT_PHDR
+            (4, e_phentsize), // AT_PHENT
+            (5, e_phnum),     // AT_PHNUM
+            (6, 4096),        // AT_PAGESZ
+            (7, 0),           // AT_BASE (static)
+            (9, entry),       // AT_ENTRY
+            (16, 0),          // AT_HWCAP
+            (25, rnd),        // AT_RANDOM
+            (0, 0),           // AT_NULL
+        ];
+        // The initial block sits at the TOP of the stack with rsp pointing
+        // at argc; the block runs upward, calls grow down into the pages.
+        // Layout: argc, argv…, NULL, envp…, NULL, auxv pairs (the program
+        // reads envp right after the argv NULL, then the auxv).
+        let n = arg_ptrs.len();
+        let n_qwords = 1 + (n + 1) + 1 + auxv.len() * 2;
+        let rsp = STACK_BASE + STACK_PAGES * 4096 - (n_qwords as u64) * 8;
+        let mut k = 0usize;
+        let put = |at: usize, v: u64| raw_copy_to_va(rsp + (at as u64) * 8, &v.to_le_bytes());
+        put(k, n as u64); // argc
+        k += 1;
+        for p in &arg_ptrs {
+            put(k, *p);
+            k += 1;
+        }
+        put(k, 0); // argv terminator
+        k += 1;
+        put(k, 0); // envp terminator (v0: empty environment)
+        k += 1;
+        for (a, v) in auxv {
+            put(k, a);
+            put(k + 1, v);
+            k += 2;
+        }
+        // The stub: mov rsp, <rsp> (48 BC imm64); mov rax, entry
+        // (48 B8 imm64); jmp rax (FF E0).
+        raw_copy_to_va(STUB_PAGE, &[0x48, 0xBC]);
+        raw_copy_to_va(STUB_PAGE + 2, &rsp.to_le_bytes());
+        raw_copy_to_va(STUB_PAGE + 10, &[0x48, 0xB8]);
+        raw_copy_to_va(STUB_PAGE + 12, &entry.to_le_bytes());
+        raw_copy_to_va(STUB_PAGE + 20, &[0xFF, 0xE0]);
     }
     let child = {
         let mut sys = Syscalls::new(&mut raw);

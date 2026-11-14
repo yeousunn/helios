@@ -263,8 +263,7 @@ const SCRIPT: &[Command] = &[
     },
 ];
 
-extern "C" fn sh_main(argc: u64, argv: *const *const u8, envp: *const *const u8) -> ! {
-    let _args = unsafe { Args::new(argc, argv, envp) };
+extern "C" fn sh_main(argc: u64, argv_va: u64, envp_va: u64) -> ! {
     let mut raw = X86_64Syscalls;
 
     let package = {
@@ -292,6 +291,13 @@ extern "C" fn sh_main(argc: u64, argv: *const *const u8, envp: *const *const u8)
     if HEAP.init(start, len).is_err() {
         exit(&mut Syscalls::new(&mut raw), 0xE2);
     }
+    // The heap must be up before the argv parse: `sdk::args::Args::new`
+    // copies every argument into an owned Vec, so running it against the
+    // uninitialized allocator is an allocation failure (a panic, not an
+    // error code). The crafted strings sit in the lower half of the top
+    // stack page, well below this shallow call chain (ADR-055's clobbering
+    // only bites linrun's deep chain).
+    let _args = Args::new(argc as usize, argv_va, envp_va);
 
     let mut sys = Syscalls::new(&mut raw);
     let mut rt = match Runtime::new(&mut sys, package) {

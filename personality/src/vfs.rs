@@ -9,6 +9,7 @@
 
 use ipc::{status, CapSlot, Message, Rights};
 use sdk::methods;
+use sdk::sys::{raw_copy_from_va, raw_copy_to_va};
 use sdk::syscall::{Handle, RawSyscalls, Status, Syscalls};
 
 use crate::layout::{ARG_WINDOW_VA, RESULT_WINDOW_VA};
@@ -134,10 +135,9 @@ impl VfsClient {
         if name.is_empty() || name.len() > WINDOW {
             return Err(EINVAL);
         }
-        // SAFETY: arg window mapped R|W by `connect`.
-        unsafe {
-            core::ptr::copy_nonoverlapping(name.as_ptr(), ARG_WINDOW_VA as *mut u8, name.len());
-        }
+        // The arg window is mapped R|W into this AS by `connect`, and
+        // `name.len() <= WINDOW` was checked above, so the span fits the frame.
+        raw_copy_to_va(ARG_WINDOW_VA, name);
         let mut req = Message::new(methods::vfs::WALK);
         req.words[0] = dir;
         req.words[1] = name.len() as u64;
@@ -270,11 +270,9 @@ impl VfsClient {
         let slot = self.fds.iter().position(|f| f.is_none()).ok_or(EMFILE)?;
         let mut last = [0u8; 64];
         let (dir, len) = self.resolve(sys, name, &mut last)?;
-        // SAFETY: the arg window is mapped R|W into this process's AS by
-        // `connect` (frames carved + MAP-invoked before use).
-        unsafe {
-            core::ptr::copy_nonoverlapping(last.as_ptr(), ARG_WINDOW_VA as *mut u8, len);
-        }
+        // The arg window is mapped R|W into this AS by `connect`; `len` is at
+        // most `last.len()` (64) and well inside the 4 KiB frame.
+        raw_copy_to_va(ARG_WINDOW_VA, &last[..len]);
         // Both create-if-missing and truncate are open *flags* (the server's
         // OPEN path handles them); a dedicated CREATE label would EEXIST on an
         // existing file and could not truncate, which `>` redirection needs.
@@ -332,14 +330,9 @@ impl VfsClient {
             if count == 0 {
                 break;
             }
-            // SAFETY: result window mapped R|W by `connect`.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    RESULT_WINDOW_VA as *const u8,
-                    buf[got..].as_mut_ptr(),
-                    count,
-                );
-            }
+            // Result window mapped R|W by `connect`; `count <= WINDOW` was
+            // clamped above, so the destination slice is fully written.
+            raw_copy_from_va(RESULT_WINDOW_VA, &mut buf[got..got + count]);
             got += count;
             entry.offset += count as u64;
             if count < want {
@@ -361,14 +354,9 @@ impl VfsClient {
         let mut sent = 0usize;
         while sent < data.len() {
             let chunk = (data.len() - sent).min(WINDOW);
-            // SAFETY: arg window mapped R|W by `connect`.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    data[sent..].as_ptr(),
-                    ARG_WINDOW_VA as *mut u8,
-                    chunk,
-                );
-            }
+            // Arg window mapped R|W by `connect`; `chunk <= WINDOW`, so the
+            // span fits the frame.
+            raw_copy_to_va(ARG_WINDOW_VA, &data[sent..sent + chunk]);
             let mut req = Message::new(methods::vfs::WRITE);
             req.words[0] = entry.handle;
             req.words[1] = entry.offset;
@@ -491,10 +479,8 @@ impl VfsClient {
         }
         let mut last = [0u8; 64];
         let (dir, len) = self.resolve(sys, name, &mut last)?;
-        // SAFETY: arg window mapped R|W by `connect`.
-        unsafe {
-            core::ptr::copy_nonoverlapping(last.as_ptr(), ARG_WINDOW_VA as *mut u8, len);
-        }
+        // Arg window mapped R|W by `connect`; `len <= 64` fits the frame.
+        raw_copy_to_va(ARG_WINDOW_VA, &last[..len]);
         let mut req = Message::new(methods::vfs::STAT);
         req.words[0] = dir;
         req.words[1] = len as u64; // Span { off 0, len }
@@ -522,10 +508,8 @@ impl VfsClient {
         }
         let mut last = [0u8; 64];
         let (dir, len) = self.resolve(sys, name, &mut last)?;
-        // SAFETY: arg window mapped R|W by `connect`.
-        unsafe {
-            core::ptr::copy_nonoverlapping(last.as_ptr(), ARG_WINDOW_VA as *mut u8, len);
-        }
+        // Arg window mapped R|W by `connect`; `len <= 64` fits the frame.
+        raw_copy_to_va(ARG_WINDOW_VA, &last[..len]);
         let mut req = Message::new(methods::vfs::MKDIR);
         req.words[0] = dir;
         req.words[1] = len as u64;
@@ -552,15 +536,9 @@ impl VfsClient {
         let (src_dir, src_len) = self.resolve(sys, src, &mut src_last)?;
         let (dst_dir, dst_len) = self.resolve(sys, dst, &mut dst_last)?;
         // Both names travel in the arg window: source at 0, destination at 64.
-        // SAFETY: arg window mapped R|W by `connect` (64+64 < 4096).
-        unsafe {
-            core::ptr::copy_nonoverlapping(src_last.as_ptr(), ARG_WINDOW_VA as *mut u8, src_len);
-            core::ptr::copy_nonoverlapping(
-                dst_last.as_ptr(),
-                (ARG_WINDOW_VA + 64) as *mut u8,
-                dst_len,
-            );
-        }
+        // Arg window mapped R|W by `connect`; 64+64 < 4096.
+        raw_copy_to_va(ARG_WINDOW_VA, &src_last[..src_len]);
+        raw_copy_to_va(ARG_WINDOW_VA + 64, &dst_last[..dst_len]);
         let mut req = Message::new(methods::vfs::RENAME);
         req.words[0] = src_dir;
         req.words[1] = src_len as u64; // Span { off 0, len }
@@ -584,10 +562,8 @@ impl VfsClient {
         }
         let mut last = [0u8; 64];
         let (dir, len) = self.resolve(sys, path, &mut last)?;
-        // SAFETY: arg window mapped R|W by `connect`.
-        unsafe {
-            core::ptr::copy_nonoverlapping(last.as_ptr(), ARG_WINDOW_VA as *mut u8, len);
-        }
+        // Arg window mapped R|W by `connect`; `len <= 64` fits the frame.
+        raw_copy_to_va(ARG_WINDOW_VA, &last[..len]);
         let mut req = Message::new(methods::vfs::RMDIR);
         req.words[0] = dir;
         req.words[1] = len as u64;
@@ -609,10 +585,8 @@ impl VfsClient {
         }
         let mut last = [0u8; 64];
         let (dir, len) = self.resolve(sys, path, &mut last)?;
-        // SAFETY: arg window mapped R|W by `connect`.
-        unsafe {
-            core::ptr::copy_nonoverlapping(last.as_ptr(), ARG_WINDOW_VA as *mut u8, len);
-        }
+        // Arg window mapped R|W by `connect`; `len <= 64` fits the frame.
+        raw_copy_to_va(ARG_WINDOW_VA, &last[..len]);
         let mut req = Message::new(methods::vfs::UNLINK);
         req.words[0] = dir;
         req.words[1] = len as u64;
@@ -651,14 +625,9 @@ impl VfsClient {
         if len > WINDOW || len > name_out.len() {
             return Err(status::ETOOBIG);
         }
-        // SAFETY: result window mapped R|W by `connect`.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                RESULT_WINDOW_VA as *const u8,
-                name_out.as_mut_ptr(),
-                len,
-            );
-        }
+        // Result window mapped R|W by `connect`; `len <= WINDOW` and
+        // `len <= name_out.len()` were checked above.
+        raw_copy_from_va(RESULT_WINDOW_VA, &mut name_out[..len]);
         Ok(Some((next, reply.words[3] as u8, len)))
     }
     /// Open a **directory** by path into an fd slot (the emulator's
