@@ -27,7 +27,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 ## M0: ABI and proofs
 
 - [x GLM done 2026-11-14 bc44452] A1 GLM: `spec/abi`: a `no_std` crate that lists every syscall and invoke method with its id, arguments, valid range per argument, error codes and a commutativity note. Add a test that the ids in `kernel/src/entry.rs` match the spec.
-- [~ GLM started 2026-11-14] A2 GLM: Kani harnesses proving that syscall argument decoding in `kernel/src/entry.rs` cannot panic for any input. Start with message-tag and descriptor decoding. File a Request to NV for `tools/verify.sh` in the gate. Harnesses added in `kernel/src/kani.rs` (commit 4b2fcd0); awaits `tools/verify.sh` (NV).
+- [ ] A2 GLM: Kani harnesses proving that syscall argument decoding in `kernel/src/entry.rs` cannot panic for any input. Start with message-tag and descriptor decoding. File a Request to NV for `tools/verify.sh` in the gate. Harnesses added in `kernel/src/kani.rs` (commit 4b2fcd0); awaits `tools/verify.sh` (NV).
 - [x GLM done 2026-11-14 4b2fcd0] A3 GLM: `kernel/src/mem.rs` is the kernel's only unsafe module (console.rs already `#![forbid(unsafe_code)]` with no unsafe blocks). Verified by grep.
 
 ## M0: Unsafe migration (PLAN.md 7.1)
@@ -63,7 +63,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
 - G2 DRV: NV provided safe MMIO wrappers (`hal/src/mmio.rs`, 3a9134a); DRV unblocked to migrate graphics/drivers to `#![forbid(unsafe_code)]` (U2/U3).
 - Build broken: DS's uncommitted `sdk/` changes (U1) break the workspace build — `syscall.rs` imports cfg-gated `X86_64Syscalls` unconditionally (host is aarch64), and `args.rs` has `unsafe` under `#![forbid(unsafe_code)]`. Owned by DS (`sdk/`). Waiting on DS to fix.
-- G2 NV waits on `cargo-vet` installed and a bootable image before `deny.toml`/`cargo vet` join the gate.
+- G2 NV: `deny.toml` created and `cargo deny check` passes; `cargo vet` blocked — `cargo-vet` not installed and cannot be installed in the sandbox (`~/.cargo` read-only). Waiting on `cargo-vet` availability before `cargo vet` joins the gate.
 - G3 NV: `tools/bench.sh` needs a working workspace build (blocked on DS's sdk build break above) and B1 (DS's `sdk/src/bin/bench.rs` producing parseable output).
 
 ## Decisions needed

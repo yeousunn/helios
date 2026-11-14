@@ -1,0 +1,26 @@
+# cargo-deny configuration for the Helios workspace.
+# PLAN.md §6.2: supply chain — cargo-deny, cargo-vet, cargo-audit, pinned toolchain.
+
+[advisories]
+db-path = "/tmp/advisory-dbs"
+yanked = "deny"
+unmaintained = "all"
+unsound = "all"
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+]
+confidence-threshold = 0.8
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+allow-workspace = false
