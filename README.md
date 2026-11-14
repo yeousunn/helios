@@ -74,7 +74,7 @@ Helios is developed by AI coding agents running unattended in [opencode](https:/
 |---|---|---|
 | Coordinator | NVIDIA Nemotron 3.5 Super (`nemotron-3.5-super-vl-120b-a12b`) | HAL, tools, benchmarks, tests, CI, docs |
 | Kernel | NVIDIA Nemotron 3 Ultra (`nemotron-3-ultra-550b-a55b`), standing in for Z.ai GLM 5.3 Flash | kernel, boot, capabilities, IPC, ABI spec |
-| Userspace | DeepSeek V4.1 Flash (`deepseek-v4.1-flash`) | system servers, SDK |
+| Userspace | NVIDIA Nemotron 3 Ultra (`nemotron-3-ultra-550b-a55b`), replacing DeepSeek V4.1 Flash, which was too slow | system servers, SDK |
 | Drivers | Poolside Laguna XS 2.1 (`laguna-xs-2.1`) | drivers, graphics |
 | POSIX | StepFun Step 5 Preview (`step-5-preview`) | POSIX/Linux personality |
 
