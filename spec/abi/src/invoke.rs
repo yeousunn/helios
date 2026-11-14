@@ -44,6 +44,7 @@ pub struct InvokeSpec {
 // Factory methods (ObjType::Factory)
 // ============================================================================
 
+/// FACTORY_NEW_ENDPOINT invoke specification
 pub const FACTORY_NEW_ENDPOINT: InvokeSpec = InvokeSpec {
     obj_type: ObjType::Factory,
     label: 1,
@@ -56,6 +57,7 @@ pub const FACTORY_NEW_ENDPOINT: InvokeSpec = InvokeSpec {
     description: "Create a new endpoint. Returns capability with SEND|RECV|GRANT rights.",
 };
 
+/// FACTORY_NEW_NOTIFICATION invoke specification
 pub const FACTORY_NEW_NOTIFICATION: InvokeSpec = InvokeSpec {
     obj_type: ObjType::Factory,
     label: 2,
@@ -68,6 +70,7 @@ pub const FACTORY_NEW_NOTIFICATION: InvokeSpec = InvokeSpec {
     description: "Create a new notification. Returns capability with SIGNAL|RECV|GRANT rights.",
 };
 
+/// FACTORY_NEW_ADDRESS_SPACE invoke specification
 pub const FACTORY_NEW_ADDRESS_SPACE: InvokeSpec = InvokeSpec {
     obj_type: ObjType::Factory,
     label: 3,
@@ -80,6 +83,7 @@ pub const FACTORY_NEW_ADDRESS_SPACE: InvokeSpec = InvokeSpec {
     description: "Create a new address space. Returns capability with MAP|GRANT rights.",
 };
 
+/// FACTORY_NEW_THREAD invoke specification
 pub const FACTORY_NEW_THREAD: InvokeSpec = InvokeSpec {
     obj_type: ObjType::Factory,
     label: 4,
@@ -114,6 +118,7 @@ pub const FACTORY_NEW_THREAD: InvokeSpec = InvokeSpec {
 // Thread methods (ObjType::Thread)
 // ============================================================================
 
+/// THREAD_EXIT invoke specification
 pub const THREAD_EXIT: InvokeSpec = InvokeSpec {
     obj_type: ObjType::Thread,
     label: 1,
@@ -136,6 +141,7 @@ pub const THREAD_EXIT: InvokeSpec = InvokeSpec {
     description: "Exit the target thread with the given status.",
 };
 
+/// THREAD_KILL invoke specification
 pub const THREAD_KILL: InvokeSpec = InvokeSpec {
     obj_type: ObjType::Thread,
     label: 2,
@@ -153,6 +159,7 @@ pub const THREAD_KILL: InvokeSpec = InvokeSpec {
     description: "Kill the target thread (exit status -1).",
 };
 
+/// THREAD_SUSPEND invoke specification
 pub const THREAD_SUSPEND: InvokeSpec = InvokeSpec {
     obj_type: ObjType::Thread,
     label: 3,
@@ -170,6 +177,7 @@ pub const THREAD_SUSPEND: InvokeSpec = InvokeSpec {
     description: "Suspend the target thread.",
 };
 
+/// THREAD_RESUME invoke specification
 pub const THREAD_RESUME: InvokeSpec = InvokeSpec {
     obj_type: ObjType::Thread,
     label: 4,
@@ -187,6 +195,7 @@ pub const THREAD_RESUME: InvokeSpec = InvokeSpec {
     description: "Resume a suspended thread.",
 };
 
+/// THREAD_SET_PRIORITY invoke specification
 pub const THREAD_SET_PRIORITY: InvokeSpec = InvokeSpec {
     obj_type: ObjType::Thread,
     label: 5,
@@ -210,6 +219,7 @@ pub const THREAD_SET_PRIORITY: InvokeSpec = InvokeSpec {
     description: "Set the target thread's scheduling priority.",
 };
 
+/// THREAD_SET_TLS invoke specification
 pub const THREAD_SET_TLS: InvokeSpec = InvokeSpec {
     obj_type: ObjType::Thread,
     label: 11,
@@ -233,6 +243,7 @@ pub const THREAD_SET_TLS: InvokeSpec = InvokeSpec {
     description: "Set the target thread's TLS base (FS register on x86_64). 0 clears it.",
 };
 
+/// THREAD_BIND_DEATH_NOTIFICATION invoke specification
 pub const THREAD_BIND_DEATH_NOTIFICATION: InvokeSpec = InvokeSpec {
     obj_type: ObjType::Thread,
     label: 12,
@@ -247,6 +258,7 @@ pub const THREAD_BIND_DEATH_NOTIFICATION: InvokeSpec = InvokeSpec {
     description: "Bind a notification to be signalled when the thread exits. caps[0] = Notification or NULL to clear.",
 };
 
+/// THREAD_CREATE invoke specification
 pub const THREAD_CREATE: InvokeSpec = InvokeSpec {
     obj_type: ObjType::Thread,
     label: 13,
@@ -266,6 +278,7 @@ pub const THREAD_CREATE: InvokeSpec = InvokeSpec {
     description: "Create a new thread in the same process as the target (shares AS and cap table). Returns thread cap with CONTROL|GRANT.",
 };
 
+/// THREAD_SET_ENTRY invoke specification
 pub const THREAD_SET_ENTRY: InvokeSpec = InvokeSpec {
     obj_type: ObjType::Thread,
     label: 14,
@@ -289,6 +302,7 @@ pub const THREAD_SET_ENTRY: InvokeSpec = InvokeSpec {
     description: "Rewrite a SUSPENDED thread's entry PC and rebuild its initial kernel context.",
 };
 
+/// THREAD_SET_FOREIGN invoke specification
 pub const THREAD_SET_FOREIGN: InvokeSpec = InvokeSpec {
     obj_type: ObjType::Thread,
     label: 15,
@@ -313,6 +327,7 @@ pub const THREAD_SET_FOREIGN: InvokeSpec = InvokeSpec {
         "Flag the thread for foreign syscall routing. w0 = endpoint handle in caller's cap table.",
 };
 
+/// THREAD_TRAP_READ invoke specification
 pub const THREAD_TRAP_READ: InvokeSpec = InvokeSpec {
     obj_type: ObjType::Thread,
     label: 16,
@@ -331,6 +346,7 @@ pub const THREAD_TRAP_READ: InvokeSpec = InvokeSpec {
         "Read the routed syscall frame from a foreign-parked thread. Returns [tag, w0, w1, w2].",
 };
 
+/// THREAD_DEFER invoke specification
 pub const THREAD_DEFER: InvokeSpec = InvokeSpec {
     obj_type: ObjType::Thread,
     label: 17,
@@ -343,6 +359,7 @@ pub const THREAD_DEFER: InvokeSpec = InvokeSpec {
     description: "Mint a one-shot Reply cap from the thread's implicit reply slot (self only). Returns handle.",
 };
 
+/// THREAD_REGS_READ invoke specification
 pub const THREAD_REGS_READ: InvokeSpec = InvokeSpec {
     obj_type: ObjType::Thread,
     label: 9,
@@ -357,6 +374,7 @@ pub const THREAD_REGS_READ: InvokeSpec = InvokeSpec {
     description: "Read the target thread's user register image. caps[0] = Frame cap (validating access). Returns [rax, rdi, rsi, rdx].",
 };
 
+/// THREAD_REGS_WRITE invoke specification
 pub const THREAD_REGS_WRITE: InvokeSpec = InvokeSpec {
     obj_type: ObjType::Thread,
     label: 10,
@@ -382,6 +400,7 @@ pub const THREAD_REGS_WRITE: InvokeSpec = InvokeSpec {
 // AddressSpace methods (ObjType::AddressSpace)
 // ============================================================================
 
+/// AS_MAP invoke specification
 pub const AS_MAP: InvokeSpec = InvokeSpec {
     obj_type: ObjType::AddressSpace,
     label: 1,
@@ -416,6 +435,7 @@ pub const AS_MAP: InvokeSpec = InvokeSpec {
     description: "Map a frame into the address space. If ANON flag is set and no fault pool attached, resolves eagerly with a zeroed frame. Frame cap rights must cover requested MapFlags (READ->R, WRITE->W, EXEC->X).",
 };
 
+/// AS_UNMAP invoke specification
 pub const AS_UNMAP: InvokeSpec = InvokeSpec {
     obj_type: ObjType::AddressSpace,
     label: 2,
@@ -446,6 +466,7 @@ pub const AS_UNMAP: InvokeSpec = InvokeSpec {
     description: "Unmap a range of pages from the address space.",
 };
 
+/// AS_PROTECT invoke specification
 pub const AS_PROTECT: InvokeSpec = InvokeSpec {
     obj_type: ObjType::AddressSpace,
     label: 3,
@@ -476,6 +497,7 @@ pub const AS_PROTECT: InvokeSpec = InvokeSpec {
     description: "Change protection flags on a mapped page.",
 };
 
+/// AS_SET_FAULT_POOL invoke specification
 pub const AS_SET_FAULT_POOL: InvokeSpec = InvokeSpec {
     obj_type: ObjType::AddressSpace,
     label: 4,
@@ -490,6 +512,7 @@ pub const AS_SET_FAULT_POOL: InvokeSpec = InvokeSpec {
     description: "Dedicate a Region's remaining space as the address space's fault pool for lazy ANON/COW resolution.",
 };
 
+/// AS_FORK invoke specification
 pub const AS_FORK: InvokeSpec = InvokeSpec {
     obj_type: ObjType::AddressSpace,
     label: 5,
@@ -502,6 +525,7 @@ pub const AS_FORK: InvokeSpec = InvokeSpec {
     description: "Fork the address space (COW clone). Returns child AS cap with MAP|GRANT. Requires backend copy_page support.",
 };
 
+/// AS_DESTROY invoke specification
 pub const AS_DESTROY: InvokeSpec = InvokeSpec {
     obj_type: ObjType::AddressSpace,
     label: 6,
@@ -523,6 +547,7 @@ pub const AS_DESTROY: InvokeSpec = InvokeSpec {
 // Reply methods (ObjType::Reply)
 // ============================================================================
 
+/// REPLY_SEND invoke specification
 pub const REPLY_SEND: InvokeSpec = InvokeSpec {
     obj_type: ObjType::Reply,
     label: 1,

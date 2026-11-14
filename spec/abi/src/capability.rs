@@ -105,17 +105,28 @@ pub struct Rights(pub u16);
 
 impl Rights {
     // SeL4-style rights (syscall-abi §5)
-    pub const READ: Rights = Rights(1 << 0); // bit 0: read memory / receive
-    pub const WRITE: Rights = Rights(1 << 1); // bit 1: write memory
-    pub const EXEC: Rights = Rights(1 << 2); // bit 2: execute memory
-    pub const GRANT: Rights = Rights(1 << 3); // bit 3: can delegate/mint
-    pub const SEND: Rights = Rights(1 << 4); // bit 4: can send to endpoint
-    pub const RECV: Rights = Rights(1 << 5); // bit 5: can receive from endpoint
-    pub const SIGNAL: Rights = Rights(1 << 6); // bit 6: can signal notification
-    pub const MAP: Rights = Rights(1 << 7); // bit 7: can map in address space
-    pub const CONTROL: Rights = Rights(1 << 8); // bit 8: thread control (kill, suspend, etc.)
-    pub const REVOKE: Rights = Rights(1 << 9); // bit 9: can revoke
-    pub const ACK: Rights = Rights(1 << 10); // bit 10: can acknowledge IRQ
+    /// Read memory / receive from endpoint
+    pub const READ: Rights = Rights(1 << 0);
+    /// Write memory
+    pub const WRITE: Rights = Rights(1 << 1);
+    /// Execute memory
+    pub const EXEC: Rights = Rights(1 << 2);
+    /// Can delegate/mint capabilities
+    pub const GRANT: Rights = Rights(1 << 3);
+    /// Can send to endpoint
+    pub const SEND: Rights = Rights(1 << 4);
+    /// Can receive from endpoint
+    pub const RECV: Rights = Rights(1 << 5);
+    /// Can signal notification
+    pub const SIGNAL: Rights = Rights(1 << 6);
+    /// Can map in address space
+    pub const MAP: Rights = Rights(1 << 7);
+    /// Thread control (kill, suspend, etc.)
+    pub const CONTROL: Rights = Rights(1 << 8);
+    /// Can revoke capabilities
+    pub const REVOKE: Rights = Rights(1 << 9);
+    /// Can acknowledge IRQ
+    pub const ACK: Rights = Rights(1 << 10);
 
     /// All defined rights bits
     pub const ALL: Rights = Rights(

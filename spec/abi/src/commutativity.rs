@@ -57,11 +57,26 @@ impl fmt::Display for Commutativity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ResourceKey {
     /// Virtual address range: (base, pages)
-    VaddrRange { base: u64, pages: u64 },
+    VaddrRange {
+        /// Base virtual address
+        base: u64,
+        /// Number of pages
+        pages: u64,
+    },
     /// Capability slot: (process_id, slot)
-    CapSlot { pid: u64, slot: u32 },
+    CapSlot {
+        /// Process ID
+        pid: u64,
+        /// Capability slot index
+        slot: u32,
+    },
     /// Object ID: (object_type, object_id)
-    ObjId { obj_type: u8, obj_id: u64 },
+    ObjId {
+        /// Object type
+        obj_type: u8,
+        /// Object ID
+        obj_id: u64,
+    },
     /// Global kernel resource (e.g., root CNode, scheduler)
     Global,
 }
@@ -128,7 +143,12 @@ pub enum ResourceExtractor {
     /// No resource key (for Commutes or Conflicts)
     None,
     /// Virtual address range from w0 (vaddr) and w1 (pages)
-    VaddrRange { vaddr_arg: usize, pages_arg: usize },
+    VaddrRange {
+        /// Argument index for virtual address
+        vaddr_arg: usize,
+        /// Argument index for page count
+        pages_arg: usize,
+    },
     /// Capability slot from cap argument
     CapSlot,
     /// Object ID from capability's obj_id
@@ -143,42 +163,49 @@ pub enum ResourceExtractor {
 pub mod syscall_commutativity {
     use super::{Commutativity, CommutativitySpec, ResourceExtractor};
 
+    /// YIELD syscall commutativity
     pub const YIELD: CommutativitySpec = CommutativitySpec {
         class: Commutativity::Commutes,
         resource_extractor: ResourceExtractor::None,
         notes: "YIELD only affects the calling thread's scheduling state",
     };
 
+    /// SEND syscall commutativity
     pub const SEND: CommutativitySpec = CommutativitySpec {
         class: Commutativity::Commutes,
         resource_extractor: ResourceExtractor::CapSlot,
         notes: "SEND to different endpoints commutes. SEND to same endpoint serializes on the endpoint's mailbox lock.",
     };
 
+    /// CALL syscall commutativity
     pub const CALL: CommutativitySpec = CommutativitySpec {
         class: Commutativity::Commutes,
         resource_extractor: ResourceExtractor::CapSlot,
         notes: "CALL to different endpoints commutes. Same endpoint serializes.",
     };
 
+    /// RECV syscall commutativity
     pub const RECV: CommutativitySpec = CommutativitySpec {
         class: Commutativity::Commutes,
         resource_extractor: ResourceExtractor::CapSlot,
         notes: "RECV from different endpoints commutes. Same endpoint serializes.",
     };
 
+    /// REPLY_RECV syscall commutativity
     pub const REPLY_RECV: CommutativitySpec = CommutativitySpec {
         class: Commutativity::Commutes,
         resource_extractor: ResourceExtractor::CapSlot,
         notes: "REPLY_RECV on different endpoints commutes. Same endpoint serializes.",
     };
 
+    /// INVOKE syscall commutativity
     pub const INVOKE: CommutativitySpec = CommutativitySpec {
         class: Commutativity::DependsOnMethod,
         resource_extractor: ResourceExtractor::MethodDependent,
         notes: "Commutativity depends on the invoke method. See invoke_commutativity module.",
     };
 
+    /// CAP_MINT syscall commutativity
     pub const CAP_MINT: CommutativitySpec = CommutativitySpec {
         class: Commutativity::Commutes,
         resource_extractor: ResourceExtractor::CapSlot,
@@ -186,12 +213,14 @@ pub mod syscall_commutativity {
             "Minting caps in different slots/processes commutes. Same destination slot serializes.",
     };
 
+    /// CAP_REVOKE syscall commutativity
     pub const CAP_REVOKE: CommutativitySpec = CommutativitySpec {
         class: Commutativity::Conflicts,
         resource_extractor: ResourceExtractor::Global,
         notes: "Revocation walks the global derivation tree. Must be serialized.",
     };
 
+    /// EXIT syscall commutativity
     pub const EXIT: CommutativitySpec = CommutativitySpec {
         class: Commutativity::Commutes,
         resource_extractor: ResourceExtractor::None,
@@ -204,24 +233,28 @@ pub mod invoke_commutativity {
     use super::{Commutativity, CommutativitySpec, ResourceExtractor};
 
     // Factory methods
+    /// FACTORY_NEW_ENDPOINT invoke commutativity
     pub const FACTORY_NEW_ENDPOINT: CommutativitySpec = CommutativitySpec {
         class: Commutativity::Commutes,
         resource_extractor: ResourceExtractor::None,
         notes: "Creates independent endpoint objects",
     };
 
+    /// FACTORY_NEW_NOTIFICATION invoke commutativity
     pub const FACTORY_NEW_NOTIFICATION: CommutativitySpec = CommutativitySpec {
         class: Commutativity::Commutes,
         resource_extractor: ResourceExtractor::None,
         notes: "Creates independent notification objects",
     };
 
+    /// FACTORY_NEW_ADDRESS_SPACE invoke commutativity
     pub const FACTORY_NEW_ADDRESS_SPACE: CommutativitySpec = CommutativitySpec {
         class: Commutativity::Commutes,
         resource_extractor: ResourceExtractor::None,
         notes: "Creates independent address space objects",
     };
 
+    /// FACTORY_NEW_THREAD invoke commutativity
     pub const FACTORY_NEW_THREAD: CommutativitySpec = CommutativitySpec {
         class: Commutativity::Commutes,
         resource_extractor: ResourceExtractor::CapSlot, // destination cap slot for thread cap
@@ -229,84 +262,98 @@ pub mod invoke_commutativity {
     };
 
     // Thread methods
+    /// THREAD_EXIT invoke commutativity
     pub const THREAD_EXIT: CommutativitySpec = CommutativitySpec {
         class: Commutativity::Commutes,
         resource_extractor: ResourceExtractor::ObjId,
         notes: "Only affects the target thread",
     };
 
+    /// THREAD_KILL invoke commutativity
     pub const THREAD_KILL: CommutativitySpec = CommutativitySpec {
         class: Commutativity::Commutes,
         resource_extractor: ResourceExtractor::ObjId,
         notes: "Only affects the target thread",
     };
 
+    /// THREAD_SUSPEND invoke commutativity
     pub const THREAD_SUSPEND: CommutativitySpec = CommutativitySpec {
         class: Commutativity::Commutes,
         resource_extractor: ResourceExtractor::ObjId,
         notes: "Only affects the target thread",
     };
 
+    /// THREAD_RESUME invoke commutativity
     pub const THREAD_RESUME: CommutativitySpec = CommutativitySpec {
         class: Commutativity::Commutes,
         resource_extractor: ResourceExtractor::ObjId,
         notes: "Only affects the target thread",
     };
 
+    /// THREAD_SET_PRIORITY invoke commutativity
     pub const THREAD_SET_PRIORITY: CommutativitySpec = CommutativitySpec {
         class: Commutativity::Commutes,
         resource_extractor: ResourceExtractor::ObjId,
         notes: "Only affects the target thread",
     };
 
+    /// THREAD_SET_TLS invoke commutativity
     pub const THREAD_SET_TLS: CommutativitySpec = CommutativitySpec {
         class: Commutativity::Commutes,
         resource_extractor: ResourceExtractor::ObjId,
         notes: "Only affects the target thread",
     };
 
+    /// THREAD_BIND_DEATH_NOTIFICATION invoke commutativity
     pub const THREAD_BIND_DEATH_NOTIFICATION: CommutativitySpec = CommutativitySpec {
         class: Commutativity::Commutes,
         resource_extractor: ResourceExtractor::ObjId,
         notes: "Only affects the target thread's notification binding",
     };
 
+    /// THREAD_CREATE invoke commutativity
     pub const THREAD_CREATE: CommutativitySpec = CommutativitySpec {
         class: Commutativity::Commutes,
         resource_extractor: ResourceExtractor::CapSlot, // destination cap slot
         notes: "Creates a new thread in the same process. Only the target process's thread table is modified.",
     };
 
+    /// THREAD_SET_ENTRY invoke commutativity
     pub const THREAD_SET_ENTRY: CommutativitySpec = CommutativitySpec {
         class: Commutativity::Commutes,
         resource_extractor: ResourceExtractor::ObjId,
         notes: "Only affects the target thread (must be SUSPENDED)",
     };
 
+    /// THREAD_SET_FOREIGN invoke commutativity
     pub const THREAD_SET_FOREIGN: CommutativitySpec = CommutativitySpec {
         class: Commutativity::Commutes,
         resource_extractor: ResourceExtractor::ObjId,
         notes: "Only affects the target thread",
     };
 
+    /// THREAD_TRAP_READ invoke commutativity
     pub const THREAD_TRAP_READ: CommutativitySpec = CommutativitySpec {
         class: Commutativity::Commutes,
         resource_extractor: ResourceExtractor::ObjId,
         notes: "Read-only operation on the target thread",
     };
 
+    /// THREAD_DEFER invoke commutativity
     pub const THREAD_DEFER: CommutativitySpec = CommutativitySpec {
         class: Commutativity::Commutes,
         resource_extractor: ResourceExtractor::ObjId,
         notes: "Only affects the calling thread's reply slot",
     };
 
+    /// THREAD_REGS_READ invoke commutativity
     pub const THREAD_REGS_READ: CommutativitySpec = CommutativitySpec {
         class: Commutativity::Commutes,
         resource_extractor: ResourceExtractor::ObjId,
         notes: "Read-only operation on the target thread",
     };
 
+    /// THREAD_REGS_WRITE invoke commutativity
     pub const THREAD_REGS_WRITE: CommutativitySpec = CommutativitySpec {
         class: Commutativity::Commutes,
         resource_extractor: ResourceExtractor::ObjId,
@@ -314,6 +361,7 @@ pub mod invoke_commutativity {
     };
 
     // AddressSpace methods
+    /// AS_MAP invoke commutativity
     pub const AS_MAP: CommutativitySpec = CommutativitySpec {
         class: Commutativity::CommutesDisjointRanges,
         resource_extractor: ResourceExtractor::VaddrRange {
@@ -324,6 +372,7 @@ pub mod invoke_commutativity {
             "MAP on disjoint virtual address ranges commutes. Overlapping ranges conflict (EEXIST).",
     };
 
+    /// AS_UNMAP invoke commutativity
     pub const AS_UNMAP: CommutativitySpec = CommutativitySpec {
         class: Commutativity::CommutesDisjointRanges,
         resource_extractor: ResourceExtractor::VaddrRange {
@@ -333,6 +382,7 @@ pub mod invoke_commutativity {
         notes: "UNMAP on disjoint ranges commutes. Overlapping ranges conflict.",
     };
 
+    /// AS_PROTECT invoke commutativity
     pub const AS_PROTECT: CommutativitySpec = CommutativitySpec {
         class: Commutativity::CommutesDisjointRanges,
         resource_extractor: ResourceExtractor::VaddrRange {
@@ -342,18 +392,21 @@ pub mod invoke_commutativity {
         notes: "PROTECT on disjoint pages commutes. Same page conflicts.",
     };
 
+    /// AS_SET_FAULT_POOL invoke commutativity
     pub const AS_SET_FAULT_POOL: CommutativitySpec = CommutativitySpec {
         class: Commutativity::Conflicts,
         resource_extractor: ResourceExtractor::ObjId, // the AS object
         notes: "Modifies the AS's fault pool pointer. Serialized per AS.",
     };
 
+    /// AS_FORK invoke commutativity
     pub const AS_FORK: CommutativitySpec = CommutativitySpec {
         class: Commutativity::Conflicts,
         resource_extractor: ResourceExtractor::ObjId,
         notes: "FORK clones the entire AS page table. Must be serialized per source AS.",
     };
 
+    /// AS_DESTROY invoke commutativity
     pub const AS_DESTROY: CommutativitySpec = CommutativitySpec {
         class: Commutativity::Conflicts,
         resource_extractor: ResourceExtractor::ObjId,
@@ -361,6 +414,7 @@ pub mod invoke_commutativity {
     };
 
     // Reply methods
+    /// REPLY_SEND invoke commutativity
     pub const REPLY_SEND: CommutativitySpec = CommutativitySpec {
         class: Commutativity::Commutes,
         resource_extractor: ResourceExtractor::ObjId, // the Reply cap's ObjId = caller TID
