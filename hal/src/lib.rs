@@ -11,6 +11,8 @@
 
 #![no_std]
 
+pub mod mmio;
+
 use core::fmt::Write;
 
 /// A serial UART used for early boot logging and the early console.
