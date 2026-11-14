@@ -61,6 +61,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
 ## Blockers
 
+- A2 GLM: waits on NV for `tools/verify.sh` to run Kani harnesses in the gate (harnesses committed at 4b2fcd0, request filed).
 - G2 DRV: NV provided safe MMIO wrappers (`hal/src/mmio.rs`, 3a9134a); DRV unblocked to migrate graphics/drivers to `#![forbid(unsafe_code)]` (U2/U3).
 - Build broken: DS's uncommitted `sdk/` changes (U1) break the workspace build — `syscall.rs` imports cfg-gated `X86_64Syscalls` unconditionally (host is aarch64), and `args.rs` has `unsafe` under `#![forbid(unsafe_code)]`. Owned by DS (`sdk/`). Waiting on DS to fix.
 - G2 NV: `deny.toml` created and `cargo deny check` passes; `cargo vet` blocked — `cargo-vet` not installed and cannot be installed in the sandbox (`~/.cargo` read-only). Waiting on `cargo-vet` availability before `cargo vet` joins the gate.
