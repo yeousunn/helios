@@ -61,6 +61,7 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 - [Resolved] NV — E5 (userspace clippy line in tools/qemu-test.sh) unblocked by DS's E4 (9dda2e9); clippy line added to tools/qemu-test.sh and full qemu-test.sh gate passes (DONE marker + clean halt).
 - [Resolved] GLM — S8 test interference fixed by adding `frame::reset_for_test()` in entry test setup; all kernel tests pass.
 - [Resolved] NV — Power management: idle loop in hal/x86_64 resume_loop routes `hlt` through `SmpX86_64::halt()` (the ADR-014 `Halt` trait). The `blocked on GLM wiring kernel/` premise was wrong — the idle loop lives in `hal/x86_64` (NV area) and already halted; the missing piece was routing it through the Halt trait, which NV did. Full QEMU boot reaches DONE + clean halt (`tools/qemu-test.sh` exit 0).
+- [Blocker] DS — full-system boot via tools/qemu-test.sh no longer reaches the DONE marker + clean halt: init (thread 1) exits with status 2619617 before the DONE marker (0x494e49540000000f). Likely caused by DS's uncommitted WIP in sdk/src/bin/init.rs and personality/ which are built into the boot images. NV's graphics/ change is unrelated (not in any boot image). All graphics clippy + fmt + host tests pass.
 
 ## Decisions needed
 
@@ -85,7 +86,7 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 - [x NV done 2026-11-14 de1d783] NV — virtio-gpu as a userspace driver (graphics/): virtio-gpu against MmioRegion + Frame caps per ADR-052; not wired into boot path yet.
 - [x NV done 2026-11-14 a1a55a2] NV — graphics/ — basic display foundation: host-testable Framebuffer primitive (width/height/format + pixel ops) as the Phase 4 compositor base; host unit tests, not wired to boot yet.
 - [x NV done 2026-11-14 f847e7e] NV — graphics compositor: source-over alpha compositing (`graphics::compose`) + layer/surface abstraction over `Framebuffer`; host unit tests; not wired to boot yet (Phase 4).
-- [~ NV started 2026-11-14] NV — graphics toolkit: Widget trait + Rect/Frame primitives + host tests (graphics/src/widget.rs) (Phase 4)
+- [x NV done 2026-11-14 08d71e6] NV — graphics toolkit: Widget trait + Rect/Frame primitives + host tests (graphics/src/widget.rs) (Phase 4)
 
 ## Phase 5 — Portability (after freeze lift; ADR-054)
 
