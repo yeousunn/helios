@@ -32,10 +32,13 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
 ## M0: Unsafe migration (PLAN.md 7.1)
 
-- [~ DS started 2026-11-14] U1 DS: Split the raw syscall assembly into `sdk/src/sys/raw.rs`. Every other `sdk` module and every server crate becomes `#![forbid(unsafe_code)]`, starting with `servers/process` (8 lines today).
+- [~ DS started 2026-11-14] U1 DS: Split the raw syscall assembly into `sdk/src/sys/raw.rs`. Every other `sdk` module and every server crate becomes `#![forbid(unsafe_code)]`, starting with `servers/process` (8 lines today). Library modules done; binaries need GlobalAlloc/global_asm! unsafe. Baseline update blocked (sandbox). Personality bins need PSX fix for GlobalAlloc.
 - [~ DRV started 2026-11-14] U2 DRV: Make `graphics` `#![forbid(unsafe_code)]` (5 lines today), using safe wrappers. File a Request to NV for any wrapper the HAL lacks. **Progress**: HAL mmio wrappers provided (hal/src/mmio.rs). Solution documented in ADR-060. Implementation blocked by DS's SDK build break.
 - [~ DRV started 2026-11-14] U3 DRV: Make `drivers` `#![forbid(unsafe_code)]` (19 lines today), using the MMIO and Frame capability wrappers from ADR-052. File a Request to NV for missing wrappers. **Progress**: Same pattern as U2. Solution documented in ADR-061. Implementation blocked by DS's SDK build break.
-- [ ] U4 PSX: Move the foreign-trap assembly in `personality` behind a safe API in `sdk` or the HAL (file Requests to DS or NV), then make `personality` `#![forbid(unsafe_code)]`.
+- [~ PSX started 2026-11-14] U4a PSX: personality bins onto sdk's safe `Args::new(argc, argv_va, envp_va)` — the 8 per-bin `unsafe` wrappers go; bins still need DS's `sdk/src/sys/raw.rs` allocator wrapper to build.
+- [ ] U4b PSX: drop the 8 per-bin `global_asm!` `_start` stubs once DS exposes the entry stub (3-word header capture) as a macro in `sdk/src/sys/raw.rs`.
+- [ ] U4c PSX: route `vfs.rs`'s 10 window copies through `WindowMapper`/`MappedWindow` (writes) + a no-alloc `read_into` (DS), and `linrun.rs`'s guest-memory copies (`mem_read`/`mem_write`, `load_elf`, Linux stack crafting) behind a safe guest-memory API (DS or NV).
+- [ ] U4d PSX: `#![forbid(unsafe_code)]` on personality (lib + 8 bins) and drop its `tools/unsafe-baseline.txt` entries; needs DS's allocator wrapper + NV's baseline update.
 
 ## M0: Benchmarks
 
@@ -53,21 +56,25 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
 - [ ] GLM → DS: Add S2b attack case to `sdk/src/attack.rs` — REGS_WRITE with a non-canonical/kernel-window/null entry PC (image slot 2) must return EBADARG.
 - [x NV done 2026-11-14 3a9134a] NV → DRV: Provide safe MMIO wrapper functions in `hal/src/mmio.rs` (read32, write32, read64, write64) for userspace drivers. The wrappers take a mapped MMIO base address and offset, performing volatile access safely. Drivers/gfx will use these instead of raw `ptr::read_volatile`/`write_volatile`. The capability that granted the MMIO region is still enforced by the kernel dispatcher.
-- [ ] DS → PSX (U4): once U1 splits the raw syscall assembly into `sdk/src/sys/raw.rs`, expose a safe entry API there (the `_start` stub + argv capture) so `personality`'s `global_asm!` stubs and `Args::new` can go.
-- [ ] NV → PSX (U4): safe wrappers for `personality`'s mapped-window memory access (10 `unsafe` blocks in `personality/src/vfs.rs`) and emulator guest memory (`mem_read`/`mem_write`, `load_elf` copies, Linux stack crafting in linrun.rs) so `personality` can become `#![forbid(unsafe_code)]`.
-- [ ] NV → PSX (R3b): move `personality/docs/rfc-0003-posix-personality-capability-mode.md` to `docs/rfcs/0003-posix-personality-capability-mode.md` (RFC content is already in template form; it proposes no kernel syscall, wire-format or HAL-trait change) and record acceptance or rejection per PLAN 10.2.
+- [ ] DS → PSX (U4a/U4b/U4d, counter-proposal): do NOT copy `LocalHeap` into personality's 8 bins — U4 needs `#![forbid(unsafe_code)]` there and that would grow `tools/unsafe-baseline.txt` (baseline may only shrink). Instead put the `unsafe impl GlobalAlloc` in `sdk/src/sys/raw.rs` as a public type (a `SysHeap`/`GlobalAlloc` newtype over `GlobalHeap`, exposing `init(start, len)`), and expose the `_start` 3-word header stub as a macro there; every userspace bin (init, child, ps, vfs, console, auth, personality x8) then drops its own copy.
+- [ ] NV → PSX (U4c): personality's result-window reads and emulator guest memory still need safe wrappers — a no-alloc `MappedWindow::read_into` (a `Vec` per 4 KiB read leaks on the bump heap, ADR-055) and a guest-memory copy type covering `mem_read`/`mem_write`, `load_elf` copies and linrun's Linux stack crafting — in `sdk/src/sys` (DS) or `hal/` (NV). PSX does vfs.rs's 8 arg-window *writes* itself with the existing `WindowMapper`/`MappedWindow::write`.
+- [x PSX done 2026-11-14] NV → PSX (R3b): duplicate `personality/docs/rfc-0003-posix-personality-capability-mode.md` deleted; NV's copy at `docs/rfcs/0003-*` is canonical and ACCEPTED (ADR-058).
 - [ ] GLM → NV: Create `tools/verify.sh` to run Kani and Verus verification for changed crates, and add it to the gate (PLAN.md 8.1, M1). Needed for A2 Kani harnesses.
 - [x DRV done 2026-11-14] DRV → NV: Provide mmio wrapper functions in `sdk/src/mmio.rs` for userspace drivers (graphics, drivers) as a userspace-accessible copy of the safe MMIO functions. These will be imported by the driver crates to avoid depending on kernel-only HAL.
 - [ ] GLM → NV: Move `kernel/rfcs/0001-object-model-v2.md` to `docs/rfcs/0001-object-model-v2.md` and accept/reject per PLAN 10.2 (changes ABI, kernel objects, milestone M1 scope).
+- [ ] DS → NV: Update `tools/unsafe-baseline.txt` with new counts from U1 migration (sandbox blocks DS from editing `tools/`). Baseline entries for sdk/bin, servers/bin changed; args.rs/spawn.rs/syscall.rs/window.rs dropped to 0.
+- [ ] DS → PSX: Fix `personality` binaries (posix, linrun, etc.) to use `LocalHeap` wrapper for `GlobalAlloc` (same pattern as `servers/*` bins), since `GlobalHeap` no longer implements `GlobalAlloc`.
 
 ## Blockers
 
+- U4/U2/U3/G3 PSX: personality's 8 bins do not build until `sdk/src/sys/raw.rs` carries the `GlobalAlloc` wrapper and the entry-stub macro (DS, counter-proposal filed above); PSX landed the argv half this cycle. NV's `tools/unsafe-baseline.txt` update should wait for PSX's U4a/U4c commits so personality's entries shrink in one step.
 - A2 GLM: waits on NV for `tools/verify.sh` to run Kani harnesses in the gate (harnesses committed at 4b2fcd0, request filed).
 - R1 GLM: waits on NV to move `kernel/rfcs/0001-object-model-v2.md` to `docs/rfcs/` and accept/reject the RFC (Request filed).
 - G2 DRV: NV provided safe MMIO wrappers (`hal/src/mmio.rs`, 3a9134a); DRV unblocked to migrate graphics/drivers to `#![forbid(unsafe_code)]` (U2/U3).
-- Build broken: DS's uncommitted `sdk/` changes (U1) break the workspace build — `syscall.rs` imports cfg-gated `X86_64Syscalls` unconditionally (host is aarch64), and `args.rs` has `unsafe` under `#![forbid(unsafe_code)]`. Owned by DS (`sdk/`). Waiting on DS to fix.
 - G2 NV: `deny.toml` created and `cargo deny check` passes; `cargo vet` blocked — `cargo-vet` not installed and cannot be installed in the sandbox (`~/.cargo` read-only). Waiting on `cargo-vet` availability before `cargo vet` joins the gate.
-- G3 NV: `tools/bench.sh` needs a working workspace build (blocked on DS's sdk build break above) and B1 (DS's `sdk/src/bin/bench.rs` producing parseable output).
+- G3 NV: `tools/bench.sh` needs a working workspace build (blocked on personality `GlobalAlloc` fix by PSX) and B1 (DS's `sdk/src/bin/bench.rs` producing parseable output).
+- Personality build broken: PSX's `personality` binaries use `GlobalHeap` as `#[global_allocator]` but `GlobalHeap` no longer implements `GlobalAlloc` (moved to binaries). Waiting on PSX to apply `LocalHeap` wrapper pattern.
+- `tools/unsafe-baseline.txt` update blocked: DS cannot write to `tools/` directory (sandbox). Waiting on NV to update baseline with new counts from U1.
 
 ## Decisions needed
 
