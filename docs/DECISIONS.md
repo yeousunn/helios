@@ -654,3 +654,16 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
   4. **Leak fixes.** PS's `load_via_vfs` reserves the file size once (`OPEN`'s reply carries it in `w3`) instead of growing a Vec; VFS's `op_read` writes into a stack buffer instead of a per-4 KiB heap Vec. Both keep the bump heap at O(file size)/O(1) instead of O(n²).
 - Validation: no syscall argument, IPC wire-format or HAL-trait change. The boot is the test: full `tools/qemu-test.sh` reaches `0x494e49540000000f` and `clean halt` (QEMU exit 1) with busybox printing `helios-busybox` and exiting 0; `cargo test --workspace --exclude kernel-boot`, host + userspace clippy (`-D warnings`) and `cargo fmt --check` are green.
 - Consequences: unmodified Linux multi-call applets run under init. BB2 (next slice) grows the applet/syscall coverage (`cat`/`ls`/`pwd`/`uname`/`id`) as the emulator allows. Embedding busybox in `linrun` makes every `linrun` spawn load the larger image; loading busybox from the VFS instead is a possible BB2 refinement. The two leak fixes are independent v0 robustness improvements (any large program load benefits).
+
+## ADR-006 acceptance
+- Accepted: NV 2026-11-14 (self-accepted: affects only hal/, drivers/, graphics/, tests/ — NV area; no HAL-trait, IPC wire-format, or syscall interface change; it is a deferral record reserving the ADR number.)
+- Validation: none (no interface changes; bulk transport remains deferred to a future accepted ADR-006.)
+- Consequences: Phase 1 IPC uses only the control-path message; bulk data travels via frame transfers until ADR-006 is accepted.
+
+## ADR-056: Arch-glue crate is kernel-boot, not a new boot/ crate (supersedes ADR-025)
+- Proposed: NV 2026-11-14
+- Status: ACCEPTED (NV; supersedes ADR-025; affects only docs/ — NV area; no HAL-trait, IPC wire-format, syscall, or freeze change)
+- Context: ADR-025 proposed moving the kernel's arch glue into a new workspace `boot/` crate so the kernel lib keeps zero arch dependencies. The codebase instead ships `kernel-boot` as the arch-glue binary crate (depends on `kernel` + `hal-x86-64`) and `kernel` already has zero arch-crate dependencies (`kernel/Cargo.toml` depends only on spin, ipc, caps). ADR-025's specific `boot/` crate proposal was never implemented and is not adopted.
+- Decision: ADR-025 is superseded. `kernel` remains a pure `no_std` lib with no arch dependencies; `kernel-boot` is the sole arch-glue binary. No HAL-trait, IPC wire-format, or syscall change.
+- Validation: `kernel/Cargo.toml` has no `hal-x86-64` dependency; `kernel-boot` builds against `kernel` + `hal-x86-64`; full QEMU boot reaches DONE + clean halt.
+- Consequences: ADR-025's structural goal (arch-agnostic, host-testable kernel lib; single arch-glue binary) is satisfied by `kernel-boot`. No new crate is added.
