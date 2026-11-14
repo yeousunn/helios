@@ -44,6 +44,10 @@ pub mod linux {
     pub const GETGID: u64 = 104;
     pub const GETEUID: u64 = 107;
     pub const GETEGID: u64 = 108;
+    pub const GETPPID: u64 = 110;
+    pub const GETGROUPS: u64 = 115;
+    pub const GETRESUID: u64 = 118;
+    pub const GETRESGID: u64 = 120;
     pub const NANOSLEEP: u64 = 35;
     pub const RT_SIGRETURN: u64 = 15;
     pub const CLOCK_GETTIME: u64 = 228;
@@ -381,6 +385,19 @@ pub fn dispatch<H: Host>(num: u64, args: [u64; 6], host: &mut H) -> Action {
         linux::NANOSLEEP => Action::Return(0),
         linux::RT_SIGRETURN => Action::Return(0),
         linux::GETUID | linux::GETGID | linux::GETEUID | linux::GETEGID => Action::Return(0),
+        linux::GETPPID => Action::Return(1),
+        // v0 is single-process with no supplementary groups: `getgroups(0, NULL)`
+        // (the busybox `id` probe) returns 0 and no list is written.
+        linux::GETGROUPS => Action::Return(0),
+        // getresuid/getresgid(buf) -> write three u32 zeros (all ids are 0).
+        linux::GETRESUID | linux::GETRESGID => {
+            let b = [0u8; 12];
+            if host.mem_write(args[0], &b) < 0 {
+                Action::Return(EFAULT)
+            } else {
+                Action::Return(0)
+            }
+        }
         linux::CLOCK_GETTIME => {
             let ts = [0u64; 2];
             let mut bytes = [0u8; 16];
@@ -693,6 +710,28 @@ mod tests {
         let a = dispatch(linux::SET_TID_ADDRESS, [32, 0, 0, 0, 0, 0], &mut m);
         assert_eq!(a, Action::Return(7));
         assert_eq!(&m.mem[32..36], &7i32.to_le_bytes());
+    }
+
+    #[test]
+    fn id_syscalls_getppid_getgroups_getresuid() {
+        let mut m = Mock::new();
+        assert_eq!(dispatch(linux::GETPPID, [0; 6], &mut m), Action::Return(1));
+        // getgroups(0, NULL) probes the count: zero groups, nothing written.
+        assert_eq!(
+            dispatch(linux::GETGROUPS, [0, 0, 0, 0, 0, 0], &mut m),
+            Action::Return(0)
+        );
+        // getresuid(buf) writes ruid/euid/suid = 0,0,0.
+        assert_eq!(
+            dispatch(linux::GETRESUID, [64, 0, 0, 0, 0, 0], &mut m),
+            Action::Return(0)
+        );
+        assert_eq!(&m.mem[64..76], &[0u8; 12]);
+        assert_eq!(
+            dispatch(linux::GETRESGID, [80, 0, 0, 0, 0, 0], &mut m),
+            Action::Return(0)
+        );
+        assert_eq!(&m.mem[80..92], &[0u8; 12]);
     }
 
     #[test]

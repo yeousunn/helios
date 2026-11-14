@@ -179,7 +179,7 @@ impl personality::foreign::Host for Emu<'_> {
         let mut sys = Syscalls::new(self.raw);
         match vfs.read(&mut sys, (fd as u32) - 3, out) {
             Ok(n) => n as i64,
-            Err(e) => -(e as i64),
+            Err(e) => e as i64,
         }
     }
     fn close_fd(&mut self, fd: i32) -> i64 {
@@ -192,7 +192,7 @@ impl personality::foreign::Host for Emu<'_> {
         let mut sys = Syscalls::new(self.raw);
         match vfs.close(&mut sys, (fd as u32) - 3) {
             Ok(()) => 0,
-            Err(e) => -(e as i64),
+            Err(e) => e as i64,
         }
     }
     fn getpid(&mut self) -> i64 {
@@ -268,7 +268,7 @@ impl personality::foreign::Host for Emu<'_> {
         };
         match r {
             Ok(slot) => slot as i64 + 3,
-            Err(e) => -(e as i64),
+            Err(e) => e as i64,
         }
     }
     fn getdents(&mut self, fd: i32, out: &mut [u8]) -> i64 {
@@ -321,7 +321,7 @@ impl personality::foreign::Host for Emu<'_> {
                     self.dents_cookie[slot] = next;
                 }
                 Ok(None) => break,
-                Err(e) => return if off > 0 { off as i64 } else { -(e as i64) },
+                Err(e) => return if off > 0 { off as i64 } else { e as i64 },
             }
         }
         off as i64
@@ -340,7 +340,7 @@ impl personality::foreign::Host for Emu<'_> {
                 mode: s.mode,
                 size: s.size,
             })
-            .map_err(|e| -(e as i64))
+            .map_err(|e| e as i64)
     }
     fn stat_path(&mut self, path: &[u8]) -> Result<personality::foreign::FileStat, i64> {
         let Some(vfs) = self.vfs.as_deref_mut() else {
@@ -357,7 +357,7 @@ impl personality::foreign::Host for Emu<'_> {
                 mode: s.mode,
                 size: s.size,
             }),
-            Err(e) => Err(-(e as i64)),
+            Err(e) => Err(e as i64),
         }
     }
     fn chdir(&mut self, path: &[u8]) -> i64 {
@@ -371,7 +371,7 @@ impl personality::foreign::Host for Emu<'_> {
         let mut sys = Syscalls::new(self.raw);
         vfs.chdir(&mut sys, name)
             .map(|_| 0)
-            .unwrap_or_else(|e| -(e as i64))
+            .unwrap_or_else(|e| e as i64)
     }
     fn getcwd(&mut self, out: &mut [u8]) -> i64 {
         // v0: the emulated program's cwd is always the VFS root.
