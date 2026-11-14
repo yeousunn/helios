@@ -193,6 +193,12 @@ pub extern "C" fn _start() -> ! {
     //    like the VFS's. `WAIT` is non-blocking (the caller polls): deferring
     //    a reply needs a kernel reply-handle primitive the v0 ABI lacks
     //    (board: ADR candidate).
+    // Persistent program-load buffer, reused across every SPAWN/EXEC. PS's heap
+    // is a bump allocator whose dealloc is a no-op (sdk::heap), so a fresh
+    // `Vec` per load leaked the whole image every time: repeated 200 KiB
+    // `linrun` loads exhausted the 1 MiB heap and panicked PS. One buffer,
+    // cleared and re-reserved per load, bounds heap use to the largest image.
+    let mut load_buf: Vec<u8> = Vec::new();
     let mut sys = Syscalls::new(&mut raw);
     loop {
         let mut served = false;
@@ -237,7 +243,13 @@ pub extern "C" fn _start() -> ! {
                     // The caller's spawn blob sits in ITS window pair (slot i).
                     let win_base = PS_WINDOW_VA_BASE + ((i - 1) as u64) * 0x2000;
                     Some(spawn_reply(
-                        &mut sys, &package, &req, factory, service_ep, win_base,
+                        &mut sys,
+                        &package,
+                        &req,
+                        factory,
+                        service_ep,
+                        win_base,
+                        &mut load_buf,
                     ))
                 }
                 methods::process::WAIT => Some(wait_reply(&mut sys, &req)),
@@ -250,6 +262,7 @@ pub extern "C" fn _start() -> ! {
                     factory,
                     CONN_PIDS[i - 1].load(Ordering::Relaxed),
                     PS_WINDOW_VA_BASE + ((i - 1) as u64) * 0x2000,
+                    &mut load_buf,
                 ),
                 methods::process::KILL => Some({
                     let target = req.words[0];
@@ -380,6 +393,7 @@ fn spawn_reply(
     factory: u32,
     service_ep: u32,
     win_base: u64,
+    load_buf: &mut Vec<u8>,
 ) -> Message {
     let mut reply = Message::new(methods::process::SPAWN);
 
@@ -423,10 +437,20 @@ fn spawn_reply(
         reply.words[0] = ipc::status::EBADARG as i64 as u64;
         return reply;
     }
-    let loaded: Option<Vec<u8>> = match vfs_svc {
+    let loaded: usize = match vfs_svc {
         Some(svc) if path_len != 0 => {
-            match load_via_vfs(sys, package, factory, svc, path_off, path_len, win_base) {
-                Ok(bytes) => Some(bytes),
+            match load_via_vfs(
+                sys,
+                package,
+                factory,
+                VfsLoadParams {
+                    vfs_svc: svc,
+                    path_span: (path_off, path_len),
+                    win_base,
+                },
+                load_buf,
+            ) {
+                Ok(n) => n,
                 Err(e) => {
                     reply.words[0] = e as i64 as u64;
                     return reply;
@@ -438,10 +462,14 @@ fn spawn_reply(
                 reply.words[0] = ipc::status::ENOSYS as i64 as u64;
                 return reply;
             }
-            None
+            0
         }
     };
-    let image: &[u8] = loaded.as_deref().unwrap_or(CHILD_IMAGE);
+    let image: &[u8] = if loaded == 0 {
+        CHILD_IMAGE
+    } else {
+        &load_buf[..loaded]
+    };
     match spawn_child(
         sys,
         package,
@@ -571,6 +599,13 @@ fn spawn_child(
     Ok((pid, thread_cap, exit_notif))
 }
 
+/// VFS load parameters grouped to reduce argument count.
+struct VfsLoadParams {
+    vfs_svc: u32,
+    path_span: (usize, usize),
+    win_base: u64,
+}
+
 /// Load a program image through the VFS (design §2.6/§3.3): CONNECT (fresh
 /// session + arg/result windows at PS_WINDOW_VA_BASE + 0x2000/+0x3000), OPEN
 /// the path (read from the CONNECT arg window at `path_off`), then READ 4 KiB
@@ -579,11 +614,10 @@ fn load_via_vfs(
     sys: &mut Syscalls<'_, X86_64Syscalls>,
     package: &BootstrapPackage,
     factory: u32,
-    vfs_svc: u32,
-    path_off: usize,
-    path_len: usize,
-    win_base: u64,
-) -> Result<Vec<u8>, i32> {
+    params: VfsLoadParams,
+    buf: &mut Vec<u8>,
+) -> Result<usize, i32> {
+    let (path_off, path_len) = params.path_span;
     if path_len == 0 || path_off.checked_add(path_len).is_none_or(|e| e > 4096) {
         return Err(ipc::status::EBADARG);
     }
@@ -629,7 +663,7 @@ fn load_via_vfs(
                 Rights::READ.union(Rights::WRITE).union(Rights::MAP),
             ),
         );
-        let conn = sys.call(vfs_svc, &connect)?;
+        let conn = sys.call(params.vfs_svc, &connect)?;
         if conn.words[0] != 0 {
             return Err(conn.words[0] as i64 as i32);
         }
@@ -647,7 +681,7 @@ fn load_via_vfs(
     }
     // Copy the path into the VFS arg window (its first bytes) and OPEN it.
     let path =
-        unsafe { core::slice::from_raw_parts((win_base + path_off as u64) as *const u8, path_len) };
+        unsafe { core::slice::from_raw_parts((params.win_base + path_off as u64) as *const u8, path_len) };
     unsafe {
         core::ptr::copy_nonoverlapping(path.as_ptr(), arg_va as *mut u8, path_len);
     }
@@ -663,15 +697,18 @@ fn load_via_vfs(
     if file == 0 {
         return Err(ipc::status::EBADCAP);
     }
-    // OPEN carries the file size in w3. Reserve it once: PS's heap is a bump
-    // allocator with no realloc (sdk::heap), so a growing Vec would leak every
-    // doubling step, and a large program (busybox-sized) exhausted the 1 MiB
-    // heap and panicked PS. One up-front allocation keeps a load at file-size.
+    // OPEN carries the file size in w3. Reuse the caller's buffer: clear it and
+    // reserve up-front so the reads never grow it (a grow would reallocate and
+    // leak the old buffer on PS's bump heap, `sdk::heap`). A 256 KiB floor
+    // covers every v0 image in one allocation.
     let size = (opened.words[3] as usize).min(1 << 20);
-    let mut out: Vec<u8> = Vec::with_capacity(size.max(4096));
+    buf.clear();
+    if buf.capacity() < size {
+        buf.reserve(size.max(256 * 1024));
+    }
     let mut offset = 0u64;
     loop {
-        if out.len() > 1 << 20 {
+        if buf.len() > 1 << 20 {
             return Err(ipc::status::ENOMEM); // v0 bound: 1 MiB images
         }
         let mut read = Message::new(methods::vfs::READ);
@@ -688,16 +725,16 @@ fn load_via_vfs(
             break;
         }
         let chunk = unsafe { core::slice::from_raw_parts(result_va as *const u8, count) };
-        out.extend_from_slice(chunk);
+        buf.extend_from_slice(chunk);
         offset += count as u64;
         if count < 4096 {
             break;
         }
     }
-    if out.is_empty() {
+    if buf.is_empty() {
         return Err(ipc::status::EBADARG);
     }
-    Ok(out)
+    Ok(buf.len())
 }
 
 /// Carve one frame, write the crafted initial stack page (argc + argv blob +
@@ -826,6 +863,7 @@ fn exec_reply(
     factory: u32,
     caller_pid: u64,
     win_base: u64,
+    load_buf: &mut Vec<u8>,
 ) -> Option<Message> {
     let mut reply = Message::new(methods::process::EXEC);
     let Some(slot) = child_slot(caller_pid) else {
@@ -847,14 +885,25 @@ fn exec_reply(
         reply.words[0] = ipc::status::EBADCAP as i64 as u64;
         return Some(reply);
     }
-    let image = match load_via_vfs(sys, package, factory, vfs_cap, path_off, path_len, win_base) {
-        Ok(bytes) => bytes,
+    let len = match load_via_vfs(
+        sys,
+        package,
+        factory,
+        VfsLoadParams {
+            vfs_svc: vfs_cap,
+            path_span: (path_off, path_len),
+            win_base,
+        },
+        load_buf,
+    ) {
+        Ok(n) => n,
         Err(e) => {
             reply.words[0] = e as i64 as u64;
             return Some(reply);
         }
     };
-    let elf = match ElfImage::parse(&image) {
+    let image: &[u8] = &load_buf[..len];
+    let elf = match ElfImage::parse(image) {
         Ok(el) => el,
         Err(e) => {
             reply.words[0] = ipc::status::EBADARG as i64 as u64;
@@ -887,7 +936,7 @@ fn exec_reply(
             as_cap,
             package.region,
             package.aspace,
-            &image,
+            image,
         )?;
         craft_stack(
             sys,
