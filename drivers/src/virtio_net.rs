@@ -256,11 +256,7 @@ impl VirtioNet {
     /// is the receive destination (written by the device, may be empty).
     /// Exactly one of them should be non-empty. Returns the byte count the
     /// device wrote on the used ring (0 for a pure transmit).
-    fn submit(
-        &mut self,
-        tx: &[u8],
-        rx: &mut [u8],
-    ) -> Result<usize, &'static str> {
+    fn submit(&mut self, tx: &[u8], rx: &mut [u8]) -> Result<usize, &'static str> {
         let queue_vaddr = self.queue_vaddr.ok_or("virtio-net: queue not set up")?;
         let queue_paddr = self.queue_paddr as u64;
 
@@ -424,24 +420,31 @@ mod tests {
 
     #[test]
     fn probe_rejects_wrong_device_id() {
-        let mmio = MmioStub::new(4096)
-            .with_device(0x7472_6976, 1, 0x9999, VIRTIO_VENDOR_ID as u32);
+        let mmio = MmioStub::new(4096).with_device(0x7472_6976, 1, 0x9999, VIRTIO_VENDOR_ID as u32);
         let driver = VirtioNet::new(mmio.base());
         assert!(!driver.probe());
     }
 
     #[test]
     fn probe_accepts_valid_device() {
-        let mmio = MmioStub::new(4096)
-            .with_device(0x7472_6976, 1, VIRTIO_ID_NET as u32, VIRTIO_VENDOR_ID as u32);
+        let mmio = MmioStub::new(4096).with_device(
+            0x7472_6976,
+            1,
+            VIRTIO_ID_NET as u32,
+            VIRTIO_VENDOR_ID as u32,
+        );
         let driver = VirtioNet::new(mmio.base());
         assert!(driver.probe());
     }
 
     #[test]
     fn init_reads_mac_and_mtu() {
-        let mut mmio = MmioStub::new(4096)
-            .with_device(0x7472_6976, 1, VIRTIO_ID_NET as u32, VIRTIO_VENDOR_ID as u32);
+        let mut mmio = MmioStub::new(4096).with_device(
+            0x7472_6976,
+            1,
+            VIRTIO_ID_NET as u32,
+            VIRTIO_VENDOR_ID as u32,
+        );
         // MAC 02:03:04:05:06:07 at config bytes 0..5, MTU 1500 at bytes 6..7.
         mmio.wr32(MMIO_CONFIG_GEN + 4, 0x05040302);
         mmio.wr32(MMIO_CONFIG_GEN + 8, 0x05DC_0706);
@@ -450,7 +453,9 @@ mod tests {
         let dma = std::boxed::Box::leak(std::vec![0u8; DMA_PAGE].into_boxed_slice());
 
         let mut driver = VirtioNet::new(mmio.base());
-        assert!(driver.init(dma.as_ptr() as usize, dma.as_ptr() as usize).is_ok());
+        assert!(driver
+            .init(dma.as_ptr() as usize, dma.as_ptr() as usize)
+            .is_ok());
         assert_eq!(driver.mac_address(), [0x02, 0x03, 0x04, 0x05, 0x06, 0x07]);
         assert_eq!(driver.mtu(), 1500);
         assert!(driver.queue_vaddr.is_some());
@@ -458,14 +463,15 @@ mod tests {
 
     #[test]
     fn init_rejects_queue_too_small() {
-        let mut mmio = MmioStub::new(4096)
-            .with_device(0x7472_6976, 1, VIRTIO_ID_NET as u32, VIRTIO_VENDOR_ID as u32);
+        let mut mmio = MmioStub::new(4096).with_device(
+            0x7472_6976,
+            1,
+            VIRTIO_ID_NET as u32,
+            VIRTIO_VENDOR_ID as u32,
+        );
         mmio.wr32(MMIO_QUEUE_NUM_MAX, 8);
         let mut driver = VirtioNet::new(mmio.base());
-        assert_eq!(
-            driver.init(0, 0),
-            Err("virtio-net: queue too small")
-        );
+        assert_eq!(driver.init(0, 0), Err("virtio-net: queue too small"));
         assert!(!driver.queue_vaddr.is_some());
     }
 }
