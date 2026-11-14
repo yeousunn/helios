@@ -60,11 +60,10 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
 ## Blockers
 
-- G2 DRV waits on NV (U2/U3: safe HAL MMIO wrappers for graphics/drivers not yet provided).
-- Full-workspace clippy gate (`cargo clippy --workspace --exclude kernel-boot -- -D warnings`) fails on GLM's committed A1 crate `helios-abi` (spec/abi, 78 missing-docs errors) — A1 was marked done without running the gate; blocks every agent's gate until GLM fixes the docs (NV may reopen A1).
-- W1 note: the boot failed at DS's BB2 step 39 (`0x27`, `cat /hello` spawn — PS SPAWN reply ENOMEM on the 6th linrun load) while DS's W2 WIP was in the tree; DS has since reverted those edits and the full boot is green again (PSX W1, 07a3a3f).
-- G3 NV waits on PSX (W1: `personality` linrun/foreign `dbg` panic) and DS (W2: `sdk/src/bin/init.rs`, `servers/process/src/bin/ps.rs`) to finish or revert their uncommitted edits so the full boot reaches DONE; `tools/bench.sh` needs a bootable BENCH=1 image.
-- G2 NV waits on `cargo-vet` being installed (cargo-deny is present) and on a bootable image before `deny.toml`/`cargo vet` can be added to the gate and the full gate run.
+- Build broken: `kernel/Cargo.toml` adds `kani = { version = "0.33", optional = true }` as a dev-dependency, which is invalid (`dev-dependencies are not allowed to be optional`) and breaks `cargo build`/`clippy --workspace`/`qemu-test.sh` for everyone. Owned by GLM (`kernel/`). Waiting on GLM to fix.
+- G3 NV: `tools/bench.sh` needs a working workspace build + bootable BENCH=1 image; blocked on the build break above (DS W2 done a33f971, PSX W1 done).
+- G2 DRV: NV provided safe MMIO wrappers (`hal/src/mmio.rs`, 3a9134a); DRV unblocked to migrate graphics/drivers to `#![forbid(unsafe_code)]` (U2/U3).
+- G2 NV waits on `cargo-vet` installed and a bootable image before `deny.toml`/`cargo vet` join the gate.
 
 ## Decisions needed
 
