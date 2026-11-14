@@ -85,6 +85,7 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 - [x NV done 2026-11-14 de1d783] NV — virtio-gpu as a userspace driver (graphics/): virtio-gpu against MmioRegion + Frame caps per ADR-052; not wired into boot path yet.
 - [x NV done 2026-11-14 a1a55a2] NV — graphics/ — basic display foundation: host-testable Framebuffer primitive (width/height/format + pixel ops) as the Phase 4 compositor base; host unit tests, not wired to boot yet.
 - [x NV done 2026-11-14 f847e7e] NV — graphics compositor: source-over alpha compositing (`graphics::compose`) + layer/surface abstraction over `Framebuffer`; host unit tests; not wired to boot yet (Phase 4).
+- [~ NV started 2026-11-14] NV — graphics toolkit: Widget trait + Rect/Frame primitives + host tests (graphics/src/widget.rs) (Phase 4)
 
 ## Phase 5 — Portability (after freeze lift; ADR-054)
 
@@ -93,3 +94,5 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 - [x NV done 2026-11-14 4ae7629] NV — SMP bring-up: CpuTopology + Ipi + SecondaryBoot + Halt in hal/x86_64 (ADR-014 traits; PLAN Phase 5). CpuTopology (CPUID leaf 0x0B probe, host-tested) and Halt (`hlt`) are real; Ipi/SecondaryBoot are honest single-CPU no-op stubs (no APs on this QEMU config, ADR-015 firmware tables not yet available).
 - [x NV done 2026-11-14 d2a980d] NV — Preemption: wire PIT timer tick + drain_tick in hal/x86_64 (ADR-042 hal side; PLAN Phase 5).
 - [x NV done 2026-11-14 6f0109d] NV — Power management: BSP idle loop / C-state residency via Halt trait (ADR-014) in hal/x86_64 (PLAN Phase 5).
+- [ ] NV — hal/aarch64: functional TrapDecode + context + paging backend (beyond stubs) (Phase 5, hal/aarch64)
+- [ ] NV — hal/riscv64: functional TrapDecode + context + paging backend (beyond stubs) (Phase 5, hal/riscv64)
