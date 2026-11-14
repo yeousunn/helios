@@ -96,4 +96,4 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 - [x NV done 2026-11-14 d2a980d] NV — Preemption: wire PIT timer tick + drain_tick in hal/x86_64 (ADR-042 hal side; PLAN Phase 5).
 - [x NV done 2026-11-14 6f0109d] NV — Power management: BSP idle loop / C-state residency via Halt trait (ADR-014) in hal/x86_64 (PLAN Phase 5).
 - [x NV done 2026-11-14 42c0441] NV — hal/aarch64: functional TrapDecode + context + paging backend (beyond stubs) (Phase 5, hal/aarch64)
-- [~ NV started 2026-11-14] NV — hal/riscv64: functional TrapDecode + context + paging backend (beyond stubs) (Phase 5, hal/riscv64)
+- [x NV done 2026-11-14 843a70a] NV — hal/riscv64: functional TrapDecode + context + paging backend (beyond stubs) (Phase 5, hal/riscv64)
