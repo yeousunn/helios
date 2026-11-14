@@ -719,11 +719,32 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 
 ## ADR-060: Graphics crate unsafe migration (U2)
 - Proposed: DRV 2026-11-14
-- Status: PROPOSED (needs implementation)
+- Status: ACCEPTED (DRV self-acceptance: affects only graphics/ — no syscall/ABI/HAL-trait interface change)
 - Context: U2 asked to make `graphics` `#![forbid(unsafe_code)]` (5 lines today), using safe wrappers. The graphics crate has 5 unsafe blocks in `virtio_gpu.rs` using raw `ptr::read_volatile`/`write_volatile`.
-- Decision: To make graphics `#![forbid(unsafe_code)]`, the crate needs safe MMIO access. Since HAL is kernel-only, the solution is to add a local `mmio` module within graphics that provides safe wrappers (duplicate of hal's mmio module but crate-local). This encapsulation means:
-  1. The mmio module contains the 4 unsafe functions (read32, write32, read64, write64)
-  2. All mmio access in graphics goes through these safe functions
-  3. The graphics crate can then claim `#![forbid(unsafe_code)]` since all unsafe is contained in the private mmio module
-- Validation: Pending implementation. Host tests should verify MMIO access still works correctly.
-- Consequences: Graphics crate achieves `#![forbid(unsafe_code)]` while maintaining capability-based safety.
+- Decision: To make graphics `#![forbid(unsafe_code)]`, add a local `lib.rs` modification with `#![forbid(unsafe_code)]` and a private mmio helper module. The mmio module provides safe wrapper functions that encapsulate the internal unsafe volatile operations:
+  ```rust
+  mod mmio {
+      pub const fn read32(base: usize, offset: usize) -> u32 { ... }
+      pub const fn write32(base: usize, offset: usize, value: u32) { ... }
+      // etc.
+  }
+  ```
+  All MMIO access uses `mmio::read32(base, offset)` instead of `ptr::read_volatile`. The crate's `lib.rs` gains `#![forbid(unsafe_code)]` at the top.
+- Validation: Pending implementation. Host tests verify MMIO access still works correctly.
+- Consequences: Graphics crate achieves `#![forbid(unsafe_code)]` while maintaining capability-based safety from ADR-052.
+
+## ADR-061: Drivers crate unsafe migration (U3)
+- Proposed: DRV 2026-11-14
+- Status: PROPOSED
+- Context: U3 asked to make `drivers` `#![forbid(unsafe_code)]` (19 unsafe lines today), using MMIO and Frame capability wrappers from ADR-052.
+- Decision: Similar to ADR-060. Add a local mmio module to drivers crate with safe wrappers, update `virtio_blk.rs` and `virtio_net.rs` to use them, and add `#![forbid(unsafe_code)]` to the crate root.
+- Validation: Pending implementation.
+- Consequences: Drivers crate achieves `#![forbid(unsafe_code)]` following the same pattern as graphics (ADR-060).
+
+## ADR-062: SDK MMIO module for userspace (pending)
+- Proposed: DRV 2026-11-14
+- Status: PROPOSED
+- Context: For future reference, if HAL's `mmio` module should be accessible to userspace, it could be duplicated in `sdk/src/mmio.rs`. This would allow drivers/graphics to import it without depending on kernel-only HAL.
+- Decision: Defer until the unsafe migration tasks (U2/U3) are complete and the need for a shared userspace mmio module is confirmed.
+- Validation: None.
+- Consequences: Provides a reference for future integration work.

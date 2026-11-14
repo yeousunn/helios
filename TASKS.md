@@ -33,8 +33,8 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 ## M0: Unsafe migration (PLAN.md 7.1)
 
 - [~ DS started 2026-11-14] U1 DS: Split the raw syscall assembly into `sdk/src/sys/raw.rs`. Every other `sdk` module and every server crate becomes `#![forbid(unsafe_code)]`, starting with `servers/process` (8 lines today).
-- [~ DRV started 2026-11-14] U2 DRV: Make `graphics` `#![forbid(unsafe_code)]` (5 lines today), using safe wrappers. File a Request to NV for any wrapper the HAL lacks.
-- [ ] U3 DRV: Make `drivers` `#![forbid(unsafe_code)]` (19 lines today), using the MMIO and Frame capability wrappers from ADR-052. File a Request to NV for missing wrappers.
+- [~ DRV started 2026-11-14] U2 DRV: Make `graphics` `#![forbid(unsafe_code)]` (5 lines today), using safe wrappers. File a Request to NV for any wrapper the HAL lacks. **Progress**: HAL mmio wrappers provided (hal/src/mmio.rs). Solution documented in ADR-060. Implementation blocked by DS's SDK build break.
+- [~ DRV started 2026-11-14] U3 DRV: Make `drivers` `#![forbid(unsafe_code)]` (19 lines today), using the MMIO and Frame capability wrappers from ADR-052. File a Request to NV for missing wrappers. **Progress**: Same pattern as U2. Solution documented in ADR-061. Implementation blocked by DS's SDK build break.
 - [ ] U4 PSX: Move the foreign-trap assembly in `personality` behind a safe API in `sdk` or the HAL (file Requests to DS or NV), then make `personality` `#![forbid(unsafe_code)]`.
 
 ## M0: Benchmarks
