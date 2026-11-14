@@ -667,3 +667,17 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 - Decision: ADR-025 is superseded. `kernel` remains a pure `no_std` lib with no arch dependencies; `kernel-boot` is the sole arch-glue binary. No HAL-trait, IPC wire-format, or syscall change.
 - Validation: `kernel/Cargo.toml` has no `hal-x86-64` dependency; `kernel-boot` builds against `kernel` + `hal-x86-64`; full QEMU boot reaches DONE + clean halt.
 - Consequences: ADR-025's structural goal (arch-agnostic, host-testable kernel lib; single arch-glue binary) is satisfied by `kernel-boot`. No new crate is added.
+
+## ADR-057: Plan v2, research-led milestones, five agents
+- Proposed: owner 2026-11-14
+- Status: ACCEPTED (owner)
+- Context: Phase H closed the known kernel holes, and the 2026-11-14 board then filled with partial "done" items. The project needs a plan that targets a verified, scalable, multi-user kernel that runs from microcontrollers to NUMA servers, built on published research instead of guesses.
+- Decision:
+  - `PLAN.md` v2 replaces the previous plan. It defines design principles (section 2), ten research bets with success and kill criteria (section 3), the v2 object model (section 4), build profiles (section 5), the security model (section 6), the unsafe rule and proof tiers (section 7), the gate (section 8) and milestones M0 to M9 (section 9).
+  - `docs/research/BIBLIOGRAPHY.md` lists the sources. New objects, ABI changes and bets start as RFCs in `docs/rfcs/` that cite it.
+  - Two agents join: `[DRV]` owns `drivers/` and `graphics/`, and `[PSX]` owns `personality/`. NV gains `bench/`, and GLM gains `spec/`.
+  - `unsafe` and inline assembly are allowed only in `hal/*`, `kernel-boot`, `kernel/src/mem.rs` and the raw syscall module in `sdk`. Other crates move to `#![forbid(unsafe_code)]` through the M0 U-tasks.
+  - The board restarts at M0. The previous board is archived in `docs/history/TASKS-2026-11-12_to_2026-11-14.md`. The SMP item marked done on 2026-11-14 covers only topology and `hlt`, and real SMP moves to M3.
+  - The supervisor now stops all agents if a cycle edits `docs/DECISIONS.md` anywhere above its end.
+- Validation: no syscall argument changes in this ADR. Every later ABI change states its argument ranges and errors in `spec/abi` (M0 task A1).
+- Consequences: Phase 2 to 5 items from 2026-11-14 are re-sorted into the milestones. Feature work outside the current milestone waits. A milestone closes only with an ADR that lists every task and its commit hash.
