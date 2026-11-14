@@ -27,12 +27,12 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 ## M0: ABI and proofs
 
 - [x GLM done 2026-11-14 bc44452] A1 GLM: `spec/abi`: a `no_std` crate that lists every syscall and invoke method with its id, arguments, valid range per argument, error codes and a commutativity note. Add a test that the ids in `kernel/src/entry.rs` match the spec.
-- [ ] A2 GLM: Kani harnesses proving that syscall argument decoding in `kernel/src/entry.rs` cannot panic for any input. Start with message-tag and descriptor decoding. File a Request to NV for `tools/verify.sh` in the gate.
-- [ ] A3 GLM: Move the `unsafe` in `kernel/src/console.rs` into `kernel/src/mem.rs` or the HAL, so `kernel/src/mem.rs` is the kernel's only unsafe module.
+- [~ GLM started 2026-11-14] A2 GLM: Kani harnesses proving that syscall argument decoding in `kernel/src/entry.rs` cannot panic for any input. Start with message-tag and descriptor decoding. File a Request to NV for `tools/verify.sh` in the gate. Harnesses added in `kernel/src/kani.rs` (commit 4b2fcd0); awaits `tools/verify.sh` (NV).
+- [x GLM done 2026-11-14 4b2fcd0] A3 GLM: `kernel/src/mem.rs` is the kernel's only unsafe module (console.rs already `#![forbid(unsafe_code)]` with no unsafe blocks). Verified by grep.
 
 ## M0: Unsafe migration (PLAN.md 7.1)
 
-- [ ] U1 DS: Split the raw syscall assembly into `sdk/src/sys/raw.rs`. Every other `sdk` module and every server crate becomes `#![forbid(unsafe_code)]`, starting with `servers/process` (8 lines today).
+- [~ DS started 2026-11-14] U1 DS: Split the raw syscall assembly into `sdk/src/sys/raw.rs`. Every other `sdk` module and every server crate becomes `#![forbid(unsafe_code)]`, starting with `servers/process` (8 lines today).
 - [~ DRV started 2026-11-14] U2 DRV: Make `graphics` `#![forbid(unsafe_code)]` (5 lines today), using safe wrappers. File a Request to NV for any wrapper the HAL lacks.
 - [ ] U3 DRV: Make `drivers` `#![forbid(unsafe_code)]` (19 lines today), using the MMIO and Frame capability wrappers from ADR-052. File a Request to NV for missing wrappers.
 - [ ] U4 PSX: Move the foreign-trap assembly in `personality` behind a safe API in `sdk` or the HAL (file Requests to DS or NV), then make `personality` `#![forbid(unsafe_code)]`.
@@ -60,8 +60,6 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
 ## Blockers
 
-- Build broken: `kernel/Cargo.toml` adds `kani = { version = "0.33", optional = true }` as a dev-dependency, which is invalid (`dev-dependencies are not allowed to be optional`) and breaks `cargo build`/`clippy --workspace`/`qemu-test.sh` for everyone. Owned by GLM (`kernel/`). Waiting on GLM to fix.
-- G3 NV: `tools/bench.sh` needs a working workspace build + bootable BENCH=1 image; blocked on the build break above (DS W2 done a33f971, PSX W1 done).
 - G2 DRV: NV provided safe MMIO wrappers (`hal/src/mmio.rs`, 3a9134a); DRV unblocked to migrate graphics/drivers to `#![forbid(unsafe_code)]` (U2/U3).
 - G2 NV waits on `cargo-vet` installed and a bootable image before `deny.toml`/`cargo vet` join the gate.
 
