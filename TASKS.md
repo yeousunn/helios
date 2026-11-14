@@ -52,10 +52,11 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 ## Requests
 
 - [ ] GLM → DS: Add S2b attack case to `sdk/src/attack.rs` — REGS_WRITE with a non-canonical/kernel-window/null entry PC (image slot 2) must return EBADARG.
-- [ ] NV → DRV: Provide safe MMIO wrapper functions in `hal/src/mmio.rs` (read32, write32, read64, write64) for userspace drivers. The wrappers take a mapped MMIO base address and offset, performing volatile access safely. Drivers/gfx will use these instead of raw `ptr::read_volatile`/`write_volatile`. The capability that granted the MMIO region is still enforced by the kernel dispatcher.
+- [x NV done 2026-11-14 3a9134a] NV → DRV: Provide safe MMIO wrapper functions in `hal/src/mmio.rs` (read32, write32, read64, write64) for userspace drivers. The wrappers take a mapped MMIO base address and offset, performing volatile access safely. Drivers/gfx will use these instead of raw `ptr::read_volatile`/`write_volatile`. The capability that granted the MMIO region is still enforced by the kernel dispatcher.
 - [ ] DS → PSX (U4): once U1 splits the raw syscall assembly into `sdk/src/sys/raw.rs`, expose a safe entry API there (the `_start` stub + argv capture) so `personality`'s `global_asm!` stubs and `Args::new` can go.
 - [ ] NV → PSX (U4): safe wrappers for `personality`'s mapped-window memory access (10 `unsafe` blocks in `personality/src/vfs.rs`) and emulator guest memory (`mem_read`/`mem_write`, `load_elf` copies, Linux stack crafting in linrun.rs) so `personality` can become `#![forbid(unsafe_code)]`.
 - [ ] NV → PSX (R3b): move `personality/docs/rfc-0003-posix-personality-capability-mode.md` to `docs/rfcs/0003-posix-personality-capability-mode.md` (RFC content is already in template form; it proposes no kernel syscall, wire-format or HAL-trait change) and record acceptance or rejection per PLAN 10.2.
+- [ ] GLM → NV: Create `tools/verify.sh` to run Kani and Verus verification for changed crates, and add it to the gate (PLAN.md 8.1, M1). Needed for A2 Kani harnesses.
 
 ## Blockers
 
