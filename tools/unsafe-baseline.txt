@@ -1,0 +1,28 @@
+# PLAN.md §7.1 unsafe allowlist baseline (today's exceptions).
+# Format: <path relative to repo root> <count of unsafe/asm/extern-C usage>.
+# This list may only shrink (migrations remove entries / lower counts); it may
+# never grow. All other unsafe/asm/extern-C must live in hal/*, kernel-boot/,
+# kernel/src/mem.rs or sdk/src/sys/raw.rs.
+drivers/src/virtio_blk.rs 10
+drivers/src/virtio_net.rs 9
+graphics/src/virtio_gpu.rs 5
+personality/src/bin/cat.rs 3
+personality/src/bin/echo.rs 3
+personality/src/bin/linrun.rs 7
+personality/src/bin/login.rs 3
+personality/src/bin/ls.rs 3
+personality/src/bin/posix.rs 1
+personality/src/bin/sh.rs 3
+personality/src/bin/wc.rs 3
+personality/src/vfs.rs 10
+sdk/src/args.rs 7
+sdk/src/bin/child.rs 3
+sdk/src/bin/init.rs 7
+sdk/src/heap.rs 3
+sdk/src/spawn.rs 1
+sdk/src/syscall.rs 2
+sdk/src/window.rs 2
+servers/auth/src/bin/auth.rs 1
+servers/console/src/bin/console.rs 1
+servers/process/src/bin/ps.rs 9
+servers/vfs/src/bin/vfs.rs 1

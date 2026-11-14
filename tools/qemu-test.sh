@@ -77,6 +77,9 @@ cargo clippy -p sdk -p process -p vfs -p console -p auth -p personality \
     || fail "userspace clippy is not -D warnings clean (E4/E5)"
 echo "[qemu-test] userspace clippy clean (E5)"
 
+# G1 (M0 gate): unsafe/asm only in the PLAN §7.1 allowlist.
+tools/check-unsafe.sh || fail "unsafe/asm/extern-C outside the PLAN §7.1 allowlist (G1)"
+
 rm -f "$SERIAL_LOG"
 
 echo "[qemu-test] --- QEMU boot: $QEMU (accel=$QEMU_ACCEL) ---"
