@@ -50,7 +50,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
 ## Requests
 
-(none)
+- [ ] GLM → DS: Add S2b attack case to `sdk/src/attack.rs` — REGS_WRITE with a non-canonical/kernel-window/null entry PC (image slot 2) must return EBADARG.
 
 ## Blockers
 
