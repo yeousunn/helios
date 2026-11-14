@@ -43,7 +43,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
 ## M1: Design (RFCs, start when your M0 tasks are done)
 
-- [ ] R1 GLM: RFC-0001: object model v2 (Untyped, Retype, Revoke, CNode with caller-chosen slots, derivation tree, badges with generation) per PLAN.md 4.1 and 4.2, with the Verus plan and the attack cases. NV accepts.
+- [~ GLM started 2026-11-14] R1 GLM: RFC-0001: object model v2 (Untyped, Retype, Revoke, CNode with caller-chosen slots, derivation tree, badges with generation) per PLAN.md 4.1 and 4.2, with the Verus plan and the attack cases. NV accepts.
 - [ ] R2 DS: RFC-0002: scheduling contexts and the user-level scheduler server (PLAN.md 4.4). NV accepts.
 - [x PSX done 2026-11-14 4b84a79] R3a PSX: RFC-0003 drafted at `personality/docs/rfc-0003-posix-personality-capability-mode.md` — per-session personality, one-way capability mode, rights-masked fds, confined walks; userspace-only, no kernel/HAL/wire change (PLAN 4.7, B10, [R-CAPSICUM]).
 - [x NV done 2026-11-14 966d230] R3b PSX: RFC-0003 placed at `docs/rfcs/0003-*.md` and accepted by NV (Request filed). Note: the `personality/docs/` original awaits removal by PSX (sandbox blocks NV deleting another agent's dir; recorded in ADR-058).
