@@ -177,19 +177,16 @@ audit() { # start-commit refs-before
 
 # docs/DECISIONS.md is append-only (AGENTS.md section 4): the file as it was
 # before the cycle must still be the exact start of the file at HEAD.
+# Compared through pipes, with no temp files: the temp directory is writable by
+# every sandboxed agent, so a file there could be swapped mid-check.
 decisions_append_only() { # start-commit
-    local before after n
-    before="$(mktemp)"; after="$(mktemp)"
-    if g cat-file -e "$1:docs/DECISIONS.md" 2>/dev/null; then
-        g cat-file blob "$1:docs/DECISIONS.md" >"$before"
-        g cat-file blob "HEAD:docs/DECISIONS.md" >"$after" 2>/dev/null || : >"$after"
-        n="$(wc -c <"$before" | tr -d ' ')"
-        if ! head -c "$n" "$after" | cmp -s "$before" -; then
-            rm -f "$before" "$after"
-            halt_all "docs/DECISIONS.md was edited above its end during the cycle (append-only)"
-        fi
+    local n
+    g cat-file -e "$1:docs/DECISIONS.md" 2>/dev/null || return 0
+    n="$(g cat-file -s "$1:docs/DECISIONS.md")"
+    if ! cmp -s <(g cat-file blob "$1:docs/DECISIONS.md") \
+        <(g cat-file blob "HEAD:docs/DECISIONS.md" 2>/dev/null | head -c "$n"); then
+        halt_all "docs/DECISIONS.md was edited above its end during the cycle (append-only)"
     fi
-    rm -f "$before" "$after"
 }
 
 blob_or_none() { g rev-parse -q --verify "$1" 2>/dev/null || echo none; }
