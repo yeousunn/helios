@@ -9,6 +9,9 @@
 use crate::compose::compose;
 use crate::display::Framebuffer;
 
+extern crate alloc;
+use alloc::vec::Vec;
+
 /// A single compositing layer: a surface plus where it lands on the output.
 ///
 /// `z` orders layers during composite: lower z is painted first, so higher-z
@@ -170,7 +173,7 @@ mod tests {
     fn empty_composite_is_noop() {
         let mut dst = Framebuffer::new(4, 4, PixelFormat::Rgba8888);
         dst.fill(Pixel::rgb(10, 20, 30));
-        let mut c = Compositor::new();
+        let c = Compositor::new();
         c.composite(&mut dst);
         assert_eq!(dst.pixel(0, 0), Some(Pixel::rgb(10, 20, 30)));
     }

@@ -97,7 +97,7 @@ impl Framebuffer {
             width,
             height,
             format,
-            buf: vec![0; (width as usize) * (height as usize) * bpp],
+            buf: alloc::vec![0; (width as usize) * (height as usize) * bpp],
         }
     }
 
