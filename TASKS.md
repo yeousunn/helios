@@ -84,6 +84,7 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 
 - [x NV done 2026-11-14 de1d783] NV — virtio-gpu as a userspace driver (graphics/): virtio-gpu against MmioRegion + Frame caps per ADR-052; not wired into boot path yet.
 - [x NV done 2026-11-14 a1a55a2] NV — graphics/ — basic display foundation: host-testable Framebuffer primitive (width/height/format + pixel ops) as the Phase 4 compositor base; host unit tests, not wired to boot yet.
+- [~ NV started 2026-11-14] NV — graphics compositor: source-over alpha compositing (`graphics::compose`) + layer/surface abstraction over `Framebuffer`; host unit tests; not wired to boot yet (Phase 4).
 
 ## Phase 5 — Portability (after freeze lift; ADR-054)
 
