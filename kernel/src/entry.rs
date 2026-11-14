@@ -627,7 +627,9 @@ fn thread_invoke(
             // or written with user words. Image slot 3 is RFLAGS, masked
             // (IOPL=0, IF=1); REGS_WRITE rebuilds the target's initial
             // context from the sanitized image (kernel-generated trampoline
-            // slot).
+            // slot). S2b: the entry PC (image[2]) must be a canonical user
+            // address — a kernel or non-canonical value would fault in ring 0
+            // at iretq.
             let Some(cs) = msg.descriptor(0).filter(|cs| cs.handle() != 0) else {
                 return SyscallReturn::err(ipc::status::EBADARG);
             };
@@ -646,6 +648,10 @@ fn thread_invoke(
             } else {
                 for (dst, src) in image.iter_mut().zip(msg.words.iter()) {
                     *dst = *src;
+                }
+                // S2b: validate the entry PC (image slot 2) before any state change
+                if !sched::is_user_addr(image[2]) {
+                    return SyscallReturn::err(ipc::status::EBADARG);
                 }
                 match sched::regs_write(target, &image) {
                     Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
@@ -1749,6 +1755,78 @@ mod tests {
         let r = thread_invoke_for_test(pid, tc, Message::new(10));
         assert_eq!(r.status, ipc::status::EBADARG as i64);
         // Clean up for subsequent tests.
+        crate::proc::reset_for_test();
+        *crate::sched::SCHED.lock() = None;
+    }
+
+    /// S2b: REGS_WRITE must reject kernel-window, non-canonical and null
+    /// entry PCs (image slot 2) with EBADARG — the target's rebuilt init
+    /// context would fault at iretq if the PC is not a canonical user address.
+    #[test]
+    fn s2b_regs_write_rejects_invalid_entry_pc() {
+        let (pid, _tid, _factory) = setup();
+        let target = sched::spawn_with(ObjRef(1), 100, 0x401000).unwrap();
+        static FAKE: Mutex<[u64; 512]> = Mutex::new([0; 512]);
+        let base = FAKE.lock().as_ptr() as u64;
+        sched::set_kstack(target, base, 1).unwrap();
+        let top = base + crate::frame::FRAME_SIZE as u64;
+        crate::mem::seed_reg_image(top, &[0x1111; 10]);
+        let tc = proc::install_cap(
+            pid,
+            Capability {
+                obj: ObjId(target.0),
+                typ: ObjType::Thread,
+                rights: Rights::CONTROL.union(Rights::GRANT),
+            },
+        )
+        .unwrap();
+        let r = thread_invoke_for_test(pid, tc, Message::new(3));
+        assert_eq!(r.status, ipc::status::OK as i64, "SUSPEND");
+        let frame_h = proc::install_cap(
+            pid,
+            Capability {
+                obj: ObjId(0xE0_0000),
+                typ: ObjType::Frame,
+                rights: Rights::READ.union(Rights::WRITE),
+            },
+        )
+        .unwrap();
+
+        // REGS_WRITE with invalid entry PCs in image[2]: kernel window,
+        // non-canonical, the split value itself, and null → all EBADARG.
+        for bad in [
+            0xFFFF_8000_0100_0000, // kernel window (ADR-045)
+            0xFFFF_FFFF_FFFF_F000, // non-canonical
+            0x0000_8000_0000_0000, // user/kernel split
+            0,                     // null
+        ] {
+            let mut m = Message::new(10);
+            m.words = [0xAAAA, 0xBBBB, bad, 0x3002];
+            m.tag = m.tag.with_caps(1);
+            m.set_descriptor(0, CapSlot::pack(frame_h, Rights::READ))
+                .unwrap();
+            let r = thread_invoke_for_test(pid, tc, m);
+            assert_eq!(
+                r.status,
+                ipc::status::EBADARG as i64,
+                "REGS_WRITE pc={bad:#x}"
+            );
+            // The target's state must not change on rejection.
+            let t = sched::get(target).unwrap();
+            assert_eq!(t.state, crate::sched::State::Suspended);
+            assert_eq!(t.initial_pc, 0x401000, "pc unchanged after rejection");
+        }
+
+        // A valid user PC still works after the rejections.
+        let mut m = Message::new(10);
+        m.words = [0xAAAA, 0xBBBB, 0x405000, 0x3002];
+        m.tag = m.tag.with_caps(1);
+        m.set_descriptor(0, CapSlot::pack(frame_h, Rights::READ))
+            .unwrap();
+        let r = thread_invoke_for_test(pid, tc, m);
+        assert_eq!(r.status, ipc::status::OK as i64, "valid REGS_WRITE pc");
+        assert_eq!(sched::get(target).unwrap().initial_pc, 0x405000);
+
         crate::proc::reset_for_test();
         *crate::sched::SCHED.lock() = None;
     }
