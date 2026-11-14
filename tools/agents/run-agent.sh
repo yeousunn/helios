@@ -5,7 +5,7 @@
 # The loop ends when $CTRL/STOP or $CTRL/STOP-<name> exists, or on any
 # integrity or ownership violation (fail closed).
 #
-# Usage: run-agent.sh nv|glm|ds
+# Usage: run-agent.sh nv|glm|ds|drv|psx
 set -uo pipefail
 
 # The supervisor never runs programs from PATH entries an agent could reach.
@@ -13,7 +13,7 @@ set -uo pipefail
 # sandbox, where every directory on it is read-only.
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
 
-NAME="${1:?usage: run-agent.sh nv|glm|ds}"
+NAME="${1:?usage: run-agent.sh nv|glm|ds|drv|psx}"
 CTRL="${HELIOS_CTRL:-$HOME/.local/state/helios-agents}"
 REPO="$(cat "$CTRL/repo-path")"
 AGENT_PATH="$(cat "$CTRL/agent-path")"
@@ -42,6 +42,18 @@ case "$NAME" in
         ROLE_NOTE="You are a worker. Nemotron [NV] is the coordinator. Work your own tasks in board order."
         IDLE_SLEEP=1200
         ;;
+    drv)
+        TAG="[DRV]"; LABEL="Drivers"; ROLE="drivers and graphics worker"
+        MODEL="nvidia/poolside/laguna-xs-2.1"
+        ROLE_NOTE="You are a worker. Nemotron [NV] is the coordinator. Work your own tasks in board order."
+        IDLE_SLEEP=1200
+        ;;
+    psx)
+        TAG="[PSX]"; LABEL="POSIX"; ROLE="POSIX personality worker"
+        MODEL="nvidia/stepfun-ai/step-5-preview"
+        ROLE_NOTE="You are a worker. Nemotron [NV] is the coordinator. Work your own tasks in board order."
+        IDLE_SLEEP=1200
+        ;;
     *) echo "unknown agent: $NAME" >&2; exit 2 ;;
 esac
 
@@ -67,9 +79,11 @@ g() { git -C "$REPO" -c core.hooksPath=/dev/null -c core.fsmonitor= "$@"; }
 # Per-agent sandbox profile: the base rules plus write access to the agent's
 # own directories only. Ownership is enforced by the file system, not by tags.
 case "$NAME" in
-    glm) OWN_DIRS="kernel kernel-boot caps ipc"; OWN_ROOT="kernel.ld" ;;
-    ds) OWN_DIRS="servers personality sdk"; OWN_ROOT="" ;;
-    nv) OWN_DIRS="hal drivers graphics tools tests .github docs .cargo"
+    glm) OWN_DIRS="kernel kernel-boot caps ipc spec"; OWN_ROOT="kernel.ld" ;;
+    ds) OWN_DIRS="servers sdk"; OWN_ROOT="" ;;
+    drv) OWN_DIRS="drivers graphics"; OWN_ROOT="" ;;
+    psx) OWN_DIRS="personality"; OWN_ROOT="" ;;
+    nv) OWN_DIRS="hal tools bench tests .github docs .cargo"
         OWN_ROOT="PLAN.md Cargo.toml .gitignore .gitattributes README.md LICENSE LICENSE-MIT LICENSE-APACHE" ;;
 esac
 ALL_ROOT="kernel.ld PLAN.md Cargo.toml .gitignore .gitattributes README.md LICENSE LICENSE-MIT LICENSE-APACHE"
@@ -151,13 +165,31 @@ audit() { # start-commit refs-before
     for c in $(g rev-list --reverse "$1"..HEAD); do
         subject="$(g log -1 --format=%s "$c")"
         case "$subject" in
-            "[NV]"* | "[GLM]"* | "[DS]"*) ;;
+            "[NV]"* | "[GLM]"* | "[DS]"* | "[DRV]"* | "[PSX]"*) ;;
             *) halt_all "untagged commit $c during a $TAG cycle: $subject" ;;
         esac
         (cd "$REPO" && env -u HELIOS_AGENT "$CTRL/commit-msg" --audit "$c" 2>>"$CTRL/violations.log") ||
             halt_all "commit $c breaks directory ownership"
     done
+    decisions_append_only "$1"
     worktree_check "$1"
+}
+
+# docs/DECISIONS.md is append-only (AGENTS.md section 4): the file as it was
+# before the cycle must still be the exact start of the file at HEAD.
+decisions_append_only() { # start-commit
+    local before after n
+    before="$(mktemp)"; after="$(mktemp)"
+    if g cat-file -e "$1:docs/DECISIONS.md" 2>/dev/null; then
+        g cat-file blob "$1:docs/DECISIONS.md" >"$before"
+        g cat-file blob "HEAD:docs/DECISIONS.md" >"$after" 2>/dev/null || : >"$after"
+        n="$(wc -c <"$before" | tr -d ' ')"
+        if ! head -c "$n" "$after" | cmp -s "$before" -; then
+            rm -f "$before" "$after"
+            halt_all "docs/DECISIONS.md was edited above its end during the cycle (append-only)"
+        fi
+    fi
+    rm -f "$before" "$after"
 }
 
 blob_or_none() { g rev-parse -q --verify "$1" 2>/dev/null || echo none; }
