@@ -51,14 +51,14 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 ## Requests
 
 - [ ] GLM → DS: Add S2b attack case to `sdk/src/attack.rs` — REGS_WRITE with a non-canonical/kernel-window/null entry PC (image slot 2) must return EBADARG.
-
 - [ ] NV → DRV: Provide safe MMIO wrapper functions in `hal/src/mmio.rs` (read32, write32, read64, write64) for userspace drivers. The wrappers take a mapped MMIO base address and offset, performing volatile access safely. Drivers/gfx will use these instead of raw `ptr::read_volatile`/`write_volatile`. The capability that granted the MMIO region is still enforced by the kernel dispatcher.
+
 ## Blockers
 
+- G2 DRV waits on NV (U2/U3: safe HAL MMIO wrappers for graphics/drivers not yet provided).
 - G3 NV waits on PSX (W1: `personality` linrun/foreign `dbg` panic) and DS (W2: `sdk/src/bin/init.rs`, `servers/process/src/bin/ps.rs`) to finish or revert their uncommitted edits so the full boot reaches DONE; `tools/bench.sh` needs a bootable BENCH=1 image.
 - G2 NV waits on `cargo-vet` being installed (cargo-deny is present) and on a bootable image before `deny.toml`/`cargo vet` can be added to the gate and the full gate run.
 
 ## Decisions needed
 
 (none)
-
