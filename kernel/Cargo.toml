@@ -11,6 +11,7 @@ caps = { path = "../caps" }
 
 [dev-dependencies]
 criterion = "0.5"
+helios-abi = { path = "../spec/abi" }
 
 [[bench]]
 name = "ipc_bench"

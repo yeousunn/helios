@@ -2355,4 +2355,28 @@ mod tests {
             sched::State::Ready | sched::State::Blocked(_)
         ));
     }
+
+    /// ABI conformance test: syscall numbers in entry.rs must match spec/abi
+    #[test]
+    fn abi_syscall_numbers_match_spec() {
+        use helios_abi::{syscall_count, syscall_spec};
+        let expected = [
+            (num::YIELD, "YIELD"),
+            (num::SEND, "SEND"),
+            (num::CALL, "CALL"),
+            (num::RECV, "RECV"),
+            (num::REPLY_RECV, "REPLY_RECV"),
+            (num::INVOKE, "INVOKE"),
+            (num::CAP_MINT, "CAP_MINT"),
+            (num::CAP_REVOKE, "CAP_REVOKE"),
+            (num::EXIT, "EXIT"),
+        ];
+        assert_eq!(expected.len(), syscall_count(), "syscall count mismatch");
+        for (num, name) in expected {
+            let spec = syscall_spec(num).expect("syscall not in spec");
+            assert_eq!(spec.name, name, "syscall {num} name mismatch");
+            assert_eq!(spec.num, num, "syscall {num} number mismatch");
+        }
+        assert_eq!(syscall_count(), 9, "spec should have exactly 9 syscalls");
+    }
 }

@@ -1,0 +1,24 @@
+[package]
+name = "helios-abi"
+version = "0.1.0"
+edition = "2021"
+description = "Helios kernel ABI specification: syscalls, invoke methods, arguments, validation ranges, errors, and commutativity"
+categories = ["os", "embedded"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/helios-kernel/helios"
+
+[lib]
+name = "helios_abi"
+path = "src/lib.rs"
+
+[dependencies]
+# no_std crate with no dependencies
+
+[features]
+default = []
+# no features
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
