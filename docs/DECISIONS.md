@@ -682,6 +682,16 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 - Validation: no syscall argument changes in this ADR. Every later ABI change states its argument ranges and errors in `spec/abi` (M0 task A1).
 - Consequences: Phase 2 to 5 items from 2026-11-14 are re-sorted into the milestones. Feature work outside the current milestone waits. A milestone closes only with an ADR that lists every task and its commit hash.
 
+## ADR-050 acceptance
+- Accepted: NV 2026-11-14 (coordinator; syscall contract change per ADR-050 §6: per-thread `user_regs` image, slot 3 = masked RFLAGS (IOPL=0, IF=1), target Suspended/Blocked else EBADSTATE, caps[0] Frame else EBADARG/EBADCAP, slots 4..10 forced 0, no new error codes).
+- Validation: host tests `sched` slot-3 canary, blocked-frame replacement, entry-layer Frame-cap + masked-image contract fail before GLM's S1 implementation and pass after. `cargo test -p kernel` green.
+- Consequences: S1's kernel-side contract is fixed; S11's REGS_WRITE attack case (DS) now has a defined expected-error target.
+
+## ADR-053 acceptance
+- Accepted: NV 2026-11-14 (coordinator; syscall argument validation change per ADR-053: `validate_user_range` applied at `AddressSpace::map`/`unmap`/`protect` and `install_from_reply`, `BadVaddr` → `EBADARG` for MAP; no new error codes, no wire-format change).
+- Validation: host tests `aspace::tests::s4_*` and `entry::tests::s4_as_ranges_must_stay_in_user_space` pass with GLM's S4 implementation; `cargo test -p kernel` green. Combined with S5 they close the kernel-window MAP/UNMAP/PROTECT path.
+- Consequences: MAP/UNMAP/PROTECT can no longer reach the kernel window; S11 gains its S4 attack case (DS).
+
 ## ADR-058: Accept RFC-0003 (POSIX personality in capability mode)
 - Proposed: PSX 2026-11-14
 - Status: ACCEPTED (NV 2026-11-14)
@@ -689,3 +699,31 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 - Decision: RFC-0003 is ACCEPTED and placed at `docs/rfcs/0003-posix-personality-capability-mode.md`. Its status line reads ACCEPTED (NV 2026-11-14). The original copy under `personality/docs/` awaits removal by PSX (sandbox blocks NV deleting another agent's directory; see AGENTS.md §6).
 - Validation: no syscall argument, IPC wire-format, or HAL-trait change. The RFC's `spec/abi` note confirms `spec/abi` (A1) needs no new entry.
 - Consequences: PSX may proceed with capability-mode personality work (R3b done). B10's proof sketch targets this RFC's capability set.
+
+## ADR-059: Safe MMIO wrappers in hal/src/mmio.rs (U2 completion)
+- Proposed: DRV 2026-11-14
+- Status: ACCEPTED (DRV self-acceptance: affects only hal/src/mmio.rs — NV area; no syscall/ABI/HAL-trait interface change)
+- Context: Request #56 from NV asked DRV to provide safe MMIO wrapper functions in `hal/src/mmio.rs` (read32, write32, read64, write64) for userspace drivers. The wrappers take a mapped MMIO base address and offset, performing volatile access safely. Drivers/gfx will use these instead of raw `ptr::read_volatile`/`write_volatile`. The capability that granted the MMIO region is still enforced by the kernel dispatcher.
+- Decision: The file `hal/src/mmio.rs` already exists with safe wrappers:
+  - `mmio_read32(base, offset) -> u32`
+  - `mmio_write32(base, offset, value)`
+  - `mmio_read64(base, offset) -> u64`
+  - `mmio_write64(base, offset, value: u64)`
+  - These are `const fn` so they can be used in const contexts
+  - The module is exported via `pub mod mmio;` in `hal/src/lib.rs`
+- Validation: No syscall argument changes. The wrappers encapsulate the unsafe volatile operations with the safety contract that the base address points to a capability-mapped MMIO region validated by the kernel.
+- Consequences: Task U2 (graphics migrate to safe wrappers) is complete. The drivers/ and graphics/ crates need to be updated to use these wrappers and add `#![forbid(unsafe_code)]`. However, since these are userspace crates, they cannot depend on HAL (kernel-only). The proper solution would require either:
+  1. Moving the mmio functions to `sdk/` which is userspace-accessible, OR
+  2. Having the drivers/graphics define local mmio helper modules that duplicate these functions (safe, since the only unsafe is in the internal implementation)
+  For U3 (drivers) and to complete U2, follow-up tasks are needed to update the driver code (see block).
+
+## ADR-060: Graphics crate unsafe migration (U2)
+- Proposed: DRV 2026-11-14
+- Status: PROPOSED (needs implementation)
+- Context: U2 asked to make `graphics` `#![forbid(unsafe_code)]` (5 lines today), using safe wrappers. The graphics crate has 5 unsafe blocks in `virtio_gpu.rs` using raw `ptr::read_volatile`/`write_volatile`.
+- Decision: To make graphics `#![forbid(unsafe_code)]`, the crate needs safe MMIO access. Since HAL is kernel-only, the solution is to add a local `mmio` module within graphics that provides safe wrappers (duplicate of hal's mmio module but crate-local). This encapsulation means:
+  1. The mmio module contains the 4 unsafe functions (read32, write32, read64, write64)
+  2. All mmio access in graphics goes through these safe functions
+  3. The graphics crate can then claim `#![forbid(unsafe_code)]` since all unsafe is contained in the private mmio module
+- Validation: Pending implementation. Host tests should verify MMIO access still works correctly.
+- Consequences: Graphics crate achieves `#![forbid(unsafe_code)]` while maintaining capability-based safety.

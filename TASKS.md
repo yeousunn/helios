@@ -19,7 +19,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 ## M0: Gates and tools
 
 - [x NV done 2026-11-14 a707f18] G1 NV: `tools/check-unsafe.sh`: fail when `unsafe`, `asm!`, `global_asm!` or `extern "C"` appear outside the PLAN.md 7.1 allowlist. Keep today's exceptions in `tools/unsafe-baseline.txt` (file and count), which may only shrink. Add it to `tools/qemu-test.sh`.
-- [ ] G2 NV: Supply chain: `deny.toml` for cargo-deny (advisories, licences, sources) and `cargo vet init`. Add both to the gate once they pass.
+- [~ NV started 2026-11-14] G2 NV: Supply chain: `deny.toml` for cargo-deny (advisories, licences, sources) and `cargo vet init`. Add both to the gate once they pass.
 - [ ] G3 NV: `tools/bench.sh`: boot a `BENCH=1` image, parse the cycle counts the bench program prints, store them as `bench/results/<commit>.json`, and with `--compare` fail on a regression above 5% against the previous result.
 - [x NV done 2026-11-14 281cd2f] G4 NV: `docs/rfcs/README.md` and `docs/rfcs/0000-template.md` with the RFC sections from PLAN.md 10.2.
 - [x NV done 2026-11-14 4ae7629] G5 NV: SMP today (4ae7629): x86_64 `CpuTopology` via CPUID leaf 0x0B and `Halt` (`hlt`) are implemented; `Ipi` and `SecondaryBoot` are no-op stubs — real SMP (AP bring-up, IPI) deferred to M3.
@@ -61,7 +61,9 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 ## Blockers
 
 - G2 DRV: NV provided safe MMIO wrappers (`hal/src/mmio.rs`, 3a9134a); DRV unblocked to migrate graphics/drivers to `#![forbid(unsafe_code)]` (U2/U3).
+- Build broken: DS's uncommitted `sdk/` changes (U1) break the workspace build — `syscall.rs` imports cfg-gated `X86_64Syscalls` unconditionally (host is aarch64), and `args.rs` has `unsafe` under `#![forbid(unsafe_code)]`. Owned by DS (`sdk/`). Waiting on DS to fix.
 - G2 NV waits on `cargo-vet` installed and a bootable image before `deny.toml`/`cargo vet` join the gate.
+- G3 NV: `tools/bench.sh` needs a working workspace build (blocked on DS's sdk build break above) and B1 (DS's `sdk/src/bin/bench.rs` producing parseable output).
 
 ## Decisions needed
 
