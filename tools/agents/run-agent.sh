@@ -180,14 +180,20 @@ audit() { # start-commit refs-before
 # the allowlist, with a count each (PLAN.md 7.1). It may only shrink: no new
 # file, no higher count. Lines are "<path> <count>", comments start with '#'.
 unsafe_baseline_shrinks() { # start-commit
-    local bad
-    g cat-file -e "$1:tools/unsafe-baseline.txt" 2>/dev/null || return 0
-    bad="$(awk 'FNR == NR { if ($0 !~ /^#/ && NF >= 2) old[$1] = $2; next }
+    local f=tools/unsafe-baseline.txt bad
+    # Deleting the baseline is a change to it, not an exemption.
+    if g cat-file -e "$1:$f" 2>/dev/null && ! g cat-file -e "HEAD:$f" 2>/dev/null; then
+        halt_all "$f was deleted during the cycle"
+    fi
+    # A baseline missing or empty at the start allows no entries. The file
+    # switch is detected by name, so an empty first input cannot make awk
+    # read the HEAD copy as the old one.
+    bad="$(awk 'FILENAME == ARGV[1] { if ($0 !~ /^#/ && NF >= 2) old[$1] = $2; next }
                 $0 ~ /^#/ || NF < 2 { next }
                 !($1 in old) || $2 + 0 > old[$1] + 0 { print $1 }' \
-        <(g cat-file blob "$1:tools/unsafe-baseline.txt") \
-        <(g cat-file blob "HEAD:tools/unsafe-baseline.txt" 2>/dev/null))"
-    [ -z "$bad" ] || halt_all "tools/unsafe-baseline.txt grew during the cycle: $(echo $bad)"
+        <(g cat-file blob "$1:$f" 2>/dev/null) \
+        <(g cat-file blob "HEAD:$f" 2>/dev/null))"
+    [ -z "$bad" ] || halt_all "$f grew during the cycle: $(echo $bad)"
 }
 
 # docs/DECISIONS.md is append-only (AGENTS.md section 4): the file as it was
