@@ -31,4 +31,4 @@ echo "== board"
 printf '  open %s   claimed %s   done %s\n' \
     "$(grep -c '^- \[ \]' TASKS.md)" "$(grep -c '^- \[~' TASKS.md)" "$(grep -c '^- \[x' TASKS.md)"
 grep -E '^- \[~' TASKS.md | clean | cut -c1-110 | sed 's/^/  /'
-grep -qi 'freeze lifted' docs/DECISIONS.md && echo "  freeze: lifted" || echo "  freeze: active (Phase H)"
+grep -m1 '^\*\*Milestone:' TASKS.md | clean | cut -c1-110 | sed 's/^/  /'

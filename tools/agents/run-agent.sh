@@ -172,7 +172,22 @@ audit() { # start-commit refs-before
             halt_all "commit $c breaks directory ownership"
     done
     decisions_append_only "$1"
+    unsafe_baseline_shrinks "$1"
     worktree_check "$1"
+}
+
+# tools/unsafe-baseline.txt lists the files allowed to keep unsafe code outside
+# the allowlist, with a count each (PLAN.md 7.1). It may only shrink: no new
+# file, no higher count. Lines are "<path> <count>", comments start with '#'.
+unsafe_baseline_shrinks() { # start-commit
+    local bad
+    g cat-file -e "$1:tools/unsafe-baseline.txt" 2>/dev/null || return 0
+    bad="$(awk 'FNR == NR { if ($0 !~ /^#/ && NF >= 2) old[$1] = $2; next }
+                $0 ~ /^#/ || NF < 2 { next }
+                !($1 in old) || $2 + 0 > old[$1] + 0 { print $1 }' \
+        <(g cat-file blob "$1:tools/unsafe-baseline.txt") \
+        <(g cat-file blob "HEAD:tools/unsafe-baseline.txt" 2>/dev/null))"
+    [ -z "$bad" ] || halt_all "tools/unsafe-baseline.txt grew during the cycle: $(echo $bad)"
 }
 
 # docs/DECISIONS.md is append-only (AGENTS.md section 4): the file as it was
