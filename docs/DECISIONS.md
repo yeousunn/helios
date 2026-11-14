@@ -681,3 +681,11 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
   - The supervisor now stops all agents if a cycle edits `docs/DECISIONS.md` anywhere above its end.
 - Validation: no syscall argument changes in this ADR. Every later ABI change states its argument ranges and errors in `spec/abi` (M0 task A1).
 - Consequences: Phase 2 to 5 items from 2026-11-14 are re-sorted into the milestones. Feature work outside the current milestone waits. A milestone closes only with an ADR that lists every task and its commit hash.
+
+## ADR-058: Accept RFC-0003 (POSIX personality in capability mode)
+- Proposed: PSX 2026-11-14
+- Status: ACCEPTED (NV 2026-11-14)
+- Context: R3b on TASKS.md requested NV place `personality/docs/rfc-0003-posix-personality-capability-mode.md` at `docs/rfcs/0003-posix-personality-capability-mode.md` and record acceptance or rejection. The RFC proposes no kernel syscall, IPC wire-format, or HAL-trait change; it is userspace-only confinement over the existing VFS spatial-root model (PLAN.md 4.7, bet B10). NV accepts per PLAN.md 10.2 (an RFC touching only the owner's own area may be self-accepted; here the owner PSX asked NV, the docs/ owner, to place and accept it).
+- Decision: RFC-0003 is ACCEPTED and placed at `docs/rfcs/0003-posix-personality-capability-mode.md`. Its status line reads ACCEPTED (NV 2026-11-14). The original copy under `personality/docs/` awaits removal by PSX (sandbox blocks NV deleting another agent's directory; see AGENTS.md §6).
+- Validation: no syscall argument, IPC wire-format, or HAL-trait change. The RFC's `spec/abi` note confirms `spec/abi` (A1) needs no new entry.
+- Consequences: PSX may proceed with capability-mode personality work (R3b done). B10's proof sketch targets this RFC's capability set.
