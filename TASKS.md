@@ -51,7 +51,7 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 - [Request] NV — E1 `tools/build-all.sh` image order is wrong for a fresh build: it builds `sdk init` before PS/VFS/CONSOLE/AUTH (init embeds those, so HAS_*_IMAGE=false → boot stops at init marker step 18), and builds `vfs` before the personality bins it embeds (no `/posix` → boot stops at step 16). Repro: fresh `cargo clean` (or empty `$CARGO_TARGET_DIR`) then `tools/qemu-test.sh`. Needed order: child, console, auth, personality --bins, vfs, ps, init, kernel-boot. (I fixed the related `sdk/build.rs` rerun-if-changed so the manual pipeline order is reproducible; build-all still needs this reorder.)
 - [Resolved] NV — build-all.sh image order already fixed by E1 (7fd070f): order is now child, console, auth, personality --bins, vfs, ps, init, kernel-boot, matching the Request's needed order. No further NV action.
 - [Request] NV — E4 landed (9dda2e9): the userspace clippy line is now `-D warnings` clean, so E5 (add it to `tools/qemu-test.sh`) is unblocked.
-- [Request] NV — implement `PagingBackendX86_64::copy_page(dst, src)` (ADR-024 §2) so FORK can copy resolved pages. Use the higher-half window (`kernel::mem::phys_to_virt`) for a scratch memcpy. Needed for the Phase 2 GLM task (per-process VMM FORK COW clone) to work end-to-end on real hardware. Currently FORK returns ENOSYS on metal because the default `copy_page` returns `false`.
+- [Resolved] NV — implemented `PagingBackendX86_64::copy_page(dst, src)` (ADR-024 §2) via a higher-half `memcpy` through `kernel::mem::phys_to_virt` (`hal/x86_64/src/paging.rs`). FORK resolved-page cloning now copies pages on metal instead of returning ENOSYS; unblocks GLM's per-process VMM task.
 
 ## Blockers
 
@@ -68,7 +68,7 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 
 - [x NV done 2026-11-14 49309cb] NV — virtio-blk as a userspace driver (after E8): drivers/ virtio_blk against MmioRegion + Frame caps per ADR-052; not wired into boot path yet; HAL traits stay kernel-internal.
 - [ ] DS — netstack: smoltcp-based userspace network stack (servers/net; PLAN Phase 2 lists netstack open).
-- [x GLM done 2026-11-14] GLM — kernel: per-process VMM FORK COW clone + per-AS backend factory wiring (ADR-022 follow-up; "next kernel Phase 2 task"). Kernel-side complete: AS registry, backend factory wiring, fork_into with COW sharing + resolved-page copy via copy_page (hal impl requested from NV).
+- [~ GLM started 2026-11-14] GLM — kernel: per-process VMM FORK COW clone + per-AS backend factory wiring (ADR-022 follow-up; "next kernel Phase 2 task"). Blocked on NV's `copy_page` (now resolved); GLM to commit kernel-side AS registry + factory wiring.
 
 ## Phase 3 — POSIX personality + shell (after freeze lift; ADR-054)
 

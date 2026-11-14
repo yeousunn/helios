@@ -444,6 +444,28 @@ impl PagingBackend for PagingBackendX86_64 {
             }
         }
     }
+
+    /// Copy one page's contents (FORK resolved-page cloning, ADR-024 §2).
+    /// Both pages are reached through the shared higher-half window
+    /// (`kernel::mem::phys_to_virt`), present under every CR3, so this works
+    /// regardless of which address space is active.
+    ///
+    /// # Safety
+    ///
+    /// `dst` and `src` must be distinct, valid, writable 4 KiB frames. FORK
+    /// always allocates `dst` fresh, so the copy is non-overlapping.
+    fn copy_page(&self, dst: PhysAddr, src: PhysAddr) -> bool {
+        // SAFETY: FORK allocates `dst` fresh and distinct from `src`; both are
+        // valid writable frames mapped by the shared higher-half window (ADR-045).
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                kernel::mem::phys_to_virt(src.as_u64()) as *const u8,
+                kernel::mem::phys_to_virt(dst.as_u64()) as *mut u8,
+                PAGE_SIZE,
+            );
+        }
+        true
+    }
 }
 
 /// Root PML4 physical addresses by AS id (index = `as_id - 1`). 0 = none.
