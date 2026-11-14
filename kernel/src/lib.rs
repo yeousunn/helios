@@ -25,3 +25,6 @@ pub mod time;
 
 #[cfg(test)]
 extern crate std;
+
+#[cfg(kani)]
+mod kani;
