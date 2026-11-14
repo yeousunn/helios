@@ -9,7 +9,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 ## M0: Working tree (do first)
 
 - [x PSX done 2026-11-14 07a3a3f] W1 PSX: stopped-cycle personality edits finished — linrun.rs VFS status double-negation fixed (`ipc::status` is already negative; `Host` needs negative errno), foreign.rs adds getppid/getgroups/getresuid/getresgid (+ host test). Full boot reaches DONE + clean halt (`tools/qemu-test.sh` green) after DS reverted their W2 WIP; host tests, userspace clippy + fmt green.
-- [~ DS started 2026-11-14] W2 DS (do next): Finish or revert the uncommitted edits in `sdk/src/bin/init.rs` and `servers/process/src/bin/ps.rs`, and fix `load_via_vfs` taking 8 arguments (clippy). The full boot must reach DONE again.
+- [x DS done 2026-11-14 a6df780] W2 DS: finished ps.rs edits — persistent load_buf prevents heap exhaustion on repeated loads; VfsLoadParams struct reduces load_via_vfs from 7 to 5 args. init.rs had no uncommitted edits. Full boot reaches DONE + clean halt.
 
 ## M0: Security
 
