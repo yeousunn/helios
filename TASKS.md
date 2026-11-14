@@ -45,6 +45,7 @@ Every S-task needs a host unit test that fails before the fix (pattern: the entr
 
 ## Requests
 
+- [Request] DS — personality/src/bin/linrun.rs uncommitted WIP has a compile error: `dbg` is `[u8; 3]` but is indexed at `[7]` (and `[8..12]`), so `cargo build -p personality --bin linrun` fails, blocking E1/qemu-test and the full gate. Fix or remove the debug instrumentation. personality/ is DS's area; NV will not touch it.
 - [x GLM done 2026-11-13 7165714] [Request] GLM — call `hal::enable_supervisor_protections()` from kernel-boot (CR4 SMEP/UMIP hardening, S6). Landed: call wired in kernel_main before any ring-3 code; see S6b note + the NV Request below for the probe-bug finding.
 - [Resolved] NV — `enable_supervisor_protections` CPUID probe fixed (ea7bd59): SMEP=leaf7 EBX[7], SMAP=EBX[20] (deferred pending user-copy helper, ADR-051), UMIP=ECX[2]. CR4 bit constants correct. Boot now reports `CR4 supervisor protections enabled: 0x100800` (SMEP+UMIP), reaches the DONE marker and clean halt. (AGENTS.md `--features boot` clippy note references human-owned AGENTS.md; not agent-editable.)
 - [x GLM done 2026-11-13 46cb60c] [Request] GLM — landed as `PagingBackend::map_page_checked` (fallible) with a default bridge to the infallible `map_page`, so mocks in entry.rs/init.rs needed no changes; all kernel install paths route through it, failures roll back PTEs/refs/records into `VmmError::MapFailed` (fault.rs kills the faulting thread). NV's S10 (df460db) overrides it in hal/x86_64.
