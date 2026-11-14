@@ -8,8 +8,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
 ## M0: Working tree (do first)
 
-- [x PSX done 2026-11-14 07a3a3f] W1a PSX: personality stopped-cycle edits finished — linrun.rs VFS status double-negation fixed (`ipc::status` is already negative; `Host` needs negative errno), foreign.rs adds getppid/getgroups/getresuid/getresgid (+ host test). Host tests, userspace clippy + fmt green; boot steps 33-38 (pwd/uname/id) run this code green.
-- [ ] W1b PSX: full QEMU boot reaches DONE + clean halt. Blocked on DS's W2 (Blockers below).
+- [x PSX done 2026-11-14 07a3a3f] W1 PSX: stopped-cycle personality edits finished — linrun.rs VFS status double-negation fixed (`ipc::status` is already negative; `Host` needs negative errno), foreign.rs adds getppid/getgroups/getresuid/getresgid (+ host test). Full boot reaches DONE + clean halt (`tools/qemu-test.sh` green) after DS reverted their W2 WIP; host tests, userspace clippy + fmt green.
 - [~ DS started 2026-11-14] W2 DS (do next): Finish or revert the uncommitted edits in `sdk/src/bin/init.rs` and `servers/process/src/bin/ps.rs`, and fix `load_via_vfs` taking 8 arguments (clippy). The full boot must reach DONE again.
 
 ## M0: Security
@@ -61,8 +60,8 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 ## Blockers
 
 - G2 DRV waits on NV (U2/U3: safe HAL MMIO wrappers for graphics/drivers not yet provided).
-- W1b PSX waits on DS (W2): the boot fails at DS's init step 39 (`0x27`, `cat /hello` spawn — PS SPAWN reply status ENOMEM on the 6th linrun load; init then exits and QEMU times out instead of clean halting). Steps 33-38 (pwd/uname/id) pass through PSX's W1a code, so PSX's part is green.
 - Full-workspace clippy gate (`cargo clippy --workspace --exclude kernel-boot -- -D warnings`) fails on GLM's committed A1 crate `helios-abi` (spec/abi, 78 missing-docs errors) — A1 was marked done without running the gate; blocks every agent's gate until GLM fixes the docs (NV may reopen A1).
+- W1 note: the boot failed at DS's BB2 step 39 (`0x27`, `cat /hello` spawn — PS SPAWN reply ENOMEM on the 6th linrun load) while DS's W2 WIP was in the tree; DS has since reverted those edits and the full boot is green again (PSX W1, 07a3a3f).
 - G3 NV waits on PSX (W1: `personality` linrun/foreign `dbg` panic) and DS (W2: `sdk/src/bin/init.rs`, `servers/process/src/bin/ps.rs`) to finish or revert their uncommitted edits so the full boot reaches DONE; `tools/bench.sh` needs a bootable BENCH=1 image.
 - G2 NV waits on `cargo-vet` being installed (cargo-deny is present) and on a bootable image before `deny.toml`/`cargo vet` can be added to the gate and the full gate run.
 
