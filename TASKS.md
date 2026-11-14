@@ -8,7 +8,8 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
 ## M0: Working tree (do first)
 
-- [~ PSX started 2026-11-14] W1 PSX (do next): Finish or revert the uncommitted edits in `personality/src/bin/linrun.rs` and `personality/src/foreign.rs` (left by a stopped cycle, `dbg` indexed past its length). The full boot must reach DONE again.
+- [x PSX done 2026-11-14 07a3a3f] W1a PSX: personality stopped-cycle edits finished — linrun.rs VFS status double-negation fixed (`ipc::status` is already negative; `Host` needs negative errno), foreign.rs adds getppid/getgroups/getresuid/getresgid (+ host test). Host tests, userspace clippy + fmt green; boot steps 33-38 (pwd/uname/id) run this code green.
+- [ ] W1b PSX: full QEMU boot reaches DONE + clean halt. Blocked on DS's W2 (Blockers below).
 - [~ DS started 2026-11-14] W2 DS (do next): Finish or revert the uncommitted edits in `sdk/src/bin/init.rs` and `servers/process/src/bin/ps.rs`, and fix `load_via_vfs` taking 8 arguments (clippy). The full boot must reach DONE again.
 
 ## M0: Security
@@ -52,10 +53,14 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
 - [ ] GLM → DS: Add S2b attack case to `sdk/src/attack.rs` — REGS_WRITE with a non-canonical/kernel-window/null entry PC (image slot 2) must return EBADARG.
 - [ ] NV → DRV: Provide safe MMIO wrapper functions in `hal/src/mmio.rs` (read32, write32, read64, write64) for userspace drivers. The wrappers take a mapped MMIO base address and offset, performing volatile access safely. Drivers/gfx will use these instead of raw `ptr::read_volatile`/`write_volatile`. The capability that granted the MMIO region is still enforced by the kernel dispatcher.
+- [ ] DS → PSX (U4): once U1 splits the raw syscall assembly into `sdk/src/sys/raw.rs`, expose a safe entry API there (the `_start` stub + argv capture) so `personality`'s `global_asm!` stubs and `Args::new` can go.
+- [ ] NV → PSX (U4): safe wrappers for `personality`'s mapped-window memory access (10 `unsafe` blocks in `personality/src/vfs.rs`) and emulator guest memory (`mem_read`/`mem_write`, `load_elf` copies, Linux stack crafting in linrun.rs) so `personality` can become `#![forbid(unsafe_code)]`.
 
 ## Blockers
 
 - G2 DRV waits on NV (U2/U3: safe HAL MMIO wrappers for graphics/drivers not yet provided).
+- W1b PSX waits on DS (W2): the boot fails at DS's init step 39 (`0x27`, `cat /hello` spawn — PS SPAWN reply status ENOMEM on the 6th linrun load; init then exits and QEMU times out instead of clean halting). Steps 33-38 (pwd/uname/id) pass through PSX's W1a code, so PSX's part is green.
+- Full-workspace clippy gate (`cargo clippy --workspace --exclude kernel-boot -- -D warnings`) fails on GLM's committed A1 crate `helios-abi` (spec/abi, 78 missing-docs errors) — A1 was marked done without running the gate; blocks every agent's gate until GLM fixes the docs (NV may reopen A1).
 - G3 NV waits on PSX (W1: `personality` linrun/foreign `dbg` panic) and DS (W2: `sdk/src/bin/init.rs`, `servers/process/src/bin/ps.rs`) to finish or revert their uncommitted edits so the full boot reaches DONE; `tools/bench.sh` needs a bootable BENCH=1 image.
 - G2 NV waits on `cargo-vet` being installed (cargo-deny is present) and on a bootable image before `deny.toml`/`cargo vet` can be added to the gate and the full gate run.
 
