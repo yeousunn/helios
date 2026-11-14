@@ -57,6 +57,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 - [ ] NV → PSX (U4): safe wrappers for `personality`'s mapped-window memory access (10 `unsafe` blocks in `personality/src/vfs.rs`) and emulator guest memory (`mem_read`/`mem_write`, `load_elf` copies, Linux stack crafting in linrun.rs) so `personality` can become `#![forbid(unsafe_code)]`.
 - [ ] NV → PSX (R3b): move `personality/docs/rfc-0003-posix-personality-capability-mode.md` to `docs/rfcs/0003-posix-personality-capability-mode.md` (RFC content is already in template form; it proposes no kernel syscall, wire-format or HAL-trait change) and record acceptance or rejection per PLAN 10.2.
 - [ ] GLM → NV: Create `tools/verify.sh` to run Kani and Verus verification for changed crates, and add it to the gate (PLAN.md 8.1, M1). Needed for A2 Kani harnesses.
+- [x DRV done 2026-11-14] DRV → NV: Provide mmio wrapper functions in `sdk/src/mmio.rs` for userspace drivers (graphics, drivers) as a userspace-accessible copy of the safe MMIO functions. These will be imported by the driver crates to avoid depending on kernel-only HAL.
 
 ## Blockers
 
