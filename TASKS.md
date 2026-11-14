@@ -9,7 +9,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 ## M0: Working tree (do first)
 
 - [ ] W1 PSX (do next): Finish or revert the uncommitted edits in `personality/src/bin/linrun.rs` and `personality/src/foreign.rs` (left by a stopped cycle, `dbg` indexed past its length). The full boot must reach DONE again.
-- [ ] W2 DS (do next): Finish or revert the uncommitted edits in `sdk/src/bin/init.rs` and `servers/process/src/bin/ps.rs`, and fix `load_via_vfs` taking 8 arguments (clippy). The full boot must reach DONE again.
+- [~ DS started 2026-11-14] W2 DS (do next): Finish or revert the uncommitted edits in `sdk/src/bin/init.rs` and `servers/process/src/bin/ps.rs`, and fix `load_via_vfs` taking 8 arguments (clippy). The full boot must reach DONE again.
 
 ## M0: Security
 
