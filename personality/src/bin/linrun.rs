@@ -14,22 +14,21 @@
 
 #![no_std]
 #![no_main]
-#![deny(unsafe_op_in_unsafe_fn)]
+#![forbid(unsafe_code)]
 
 extern crate alloc;
 
-use core::arch::global_asm;
 use core::panic::PanicInfo;
 
 use ipc::Message;
 use personality::layout::HEAP_VA_BASE;
-use sdk::heap::{GlobalHeap, RegionSource};
+use sdk::heap::RegionSource;
 use sdk::layout::{HEAP_CHUNK, HEAP_CHUNKS};
-use sdk::sys::{raw_copy_from_va, raw_copy_to_va, raw_cstr_from_va};
+use sdk::sys::{raw_copy_from_va, raw_copy_to_va, raw_cstr_from_va, SysHeap};
 use sdk::syscall::{Syscalls, X86_64Syscalls};
 
 #[global_allocator]
-static HEAP: GlobalHeap = GlobalHeap::new();
+static HEAP: SysHeap = SysHeap::new();
 
 /// The foreign program to run: a freestanding static x86_64-linux ELF (no
 /// libc; raw `write`+`exit`). Loaded and executed like any Linux binary.
@@ -822,18 +821,10 @@ fn exit(raw: &mut X86_64Syscalls, code: i32) -> ! {
 }
 
 // Entry: the SDK native path (PS delivers an ADR-009 package to handle 1 and
-// jumps here). The v0.2 crafted stack carries argc/argv/envp at [rsp-8/-16/-24]
-// (sdk::args); capture them before touching rsp, exactly as other SDK bins do.
-global_asm!(
-    ".global _start",
-    "_start:",
-    "mov rdi, [rsp - 8]",
-    "mov rsi, [rsp - 16]",
-    "mov rdx, [rsp - 24]",
-    "and rsp, -16",
-    "call {main}",
-    main = sym linrun_main,
-);
+// jumps here). The shared `sdk::sys::entry_point!` stub captures the v0.2
+// crafted stack (argc/argv/envp at [rsp-8/-16/-24], sdk::args) before touching
+// rsp, exactly as the other userspace bins do; no copy lives here any more.
+sdk::sys::entry_point!(linrun_main);
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {

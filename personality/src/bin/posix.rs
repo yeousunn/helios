@@ -12,7 +12,7 @@
 
 #![no_std]
 #![no_main]
-#![deny(unsafe_op_in_unsafe_fn)]
+#![forbid(unsafe_code)]
 
 extern crate alloc;
 
@@ -22,18 +22,22 @@ use personality::layout::HEAP_VA_BASE;
 use personality::posix::O_RDONLY;
 use personality::runtime::{exit, Runtime};
 use sdk::bootstrap::receive;
-use sdk::heap::{GlobalHeap, RegionSource};
+use sdk::heap::RegionSource;
 use sdk::layout::{HEAP_CHUNK, HEAP_CHUNKS};
+use sdk::sys::SysHeap;
 use sdk::syscall::{Syscalls, X86_64Syscalls};
 
 #[global_allocator]
-static HEAP: GlobalHeap = GlobalHeap::new();
+static HEAP: SysHeap = SysHeap::new();
+
+sdk::sys::entry_point!(posix_main);
 
 /// Success status asserted by init's `WAIT` (marker 17).
 const OK: i32 = 77;
 
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
+/// The crafted header (argc/argv/envp) is captured by the shared entry stub;
+/// this demo takes no arguments, so they are ignored here.
+extern "C" fn posix_main(_argc: u64, _argv_va: u64, _envp_va: u64) -> ! {
     let mut raw = X86_64Syscalls;
 
     // Bootstrap package (handle 1): [as, thread, region, sessions x4, ps_ep]

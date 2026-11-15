@@ -6,11 +6,10 @@
 
 #![no_std]
 #![no_main]
-#![deny(unsafe_op_in_unsafe_fn)]
+#![forbid(unsafe_code)]
 
 extern crate alloc;
 
-use core::arch::global_asm;
 use core::panic::PanicInfo;
 
 use alloc::vec::Vec;
@@ -19,24 +18,15 @@ use personality::layout::HEAP_VA_BASE;
 use personality::runtime::{exit, Runtime};
 use sdk::args::Args;
 use sdk::bootstrap::receive;
-use sdk::heap::{GlobalHeap, RegionSource};
+use sdk::heap::RegionSource;
 use sdk::layout::{HEAP_CHUNK, HEAP_CHUNKS};
+use sdk::sys::SysHeap;
 use sdk::syscall::{RawSyscalls, Syscalls, X86_64Syscalls};
 
 #[global_allocator]
-static HEAP: GlobalHeap = GlobalHeap::new();
+static HEAP: SysHeap = SysHeap::new();
 
-global_asm!(
-    ".global _start",
-    "_start:",
-    "mov rdi, [rsp - 8]",
-    "mov rsi, [rsp - 16]",
-    "mov rdx, [rsp - 24]",
-    "sub rsp, 64",
-    "and rsp, -16",
-    "jmp {main}",
-    main = sym sh_main,
-);
+sdk::sys::entry_point!(sh_main);
 
 /// One pipeline stage: `(program path, argv, expected status)`.
 type Stage = (&'static [u8], &'static [&'static [u8]], i32);

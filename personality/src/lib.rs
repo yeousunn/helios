@@ -9,7 +9,7 @@
 //! design keeps POSIX semantics out of the kernel and servers, so this is
 //! the only layer that needs to grow for compatibility.
 #![no_std]
-#![deny(unsafe_op_in_unsafe_fn)]
+#![forbid(unsafe_code)]
 
 pub mod foreign;
 pub mod layout;

@@ -9,8 +9,9 @@
 
 use ipc::{status, CapSlot, Message, Rights};
 use sdk::methods;
-use sdk::sys::{raw_copy_from_va, raw_copy_to_va};
+use sdk::sys::raw_copy_from_va;
 use sdk::syscall::{Handle, RawSyscalls, Status, Syscalls};
+use sdk::window::{MappedWindow, WindowMapper, FLAG_READ, FLAG_WRITE};
 
 use crate::layout::{ARG_WINDOW_VA, RESULT_WINDOW_VA};
 use crate::posix::{EBADF, EINVAL, O_CREAT};
@@ -35,6 +36,10 @@ pub struct VfsClient {
     cwd_stack: [u64; MAX_CWD_DEPTH],
     cwd_depth: usize,
     fds: [Option<Fd>; MAX_FDS],
+    /// The connection's arg window, mapped R|W at [`ARG_WINDOW_VA`]: every
+    /// request payload travels through [`MappedWindow::write`], which bounds
+    /// the copy against the frame.
+    arg: MappedWindow,
 }
 
 /// Maximum `cd` nesting the client tracks for `cd ..`.
@@ -53,7 +58,7 @@ impl VfsClient {
         session: Handle,
     ) -> Result<Self, Status> {
         let mut frames = [0 as Handle; 2];
-        for (i, va) in [ARG_WINDOW_VA, RESULT_WINDOW_VA].iter().enumerate() {
+        for slot in frames.iter_mut() {
             let mut carve = Message::new(methods::region::CARVE);
             carve.words[0] = WINDOW as u64;
             carve.words[1] = WINDOW as u64;
@@ -62,15 +67,18 @@ impl VfsClient {
             if frame == 0 {
                 return Err(status::ENOMEM);
             }
-            frames[i] = frame;
-
-            let mut map = Message::new(methods::aspace::MAP);
-            map.tag = map.tag.with_caps(1);
-            map.words[0] = *va;
-            map.words[1] = 0b011; // R | W
-            let _ = map.set_descriptor(0, CapSlot::pack(frame, Rights::READ.union(Rights::WRITE)));
-            sys.invoke(aspace, &map)?;
+            *slot = frame;
         }
+
+        // Map both windows through the SDK's `WindowMapper` (the same type the
+        // servers use): it performs the `AS::MAP` and hands back a bounds-
+        // checked `MappedWindow`. The mapper lays windows out consecutively
+        // from `ARG_WINDOW_VA`, and `layout.rs` puts `RESULT_WINDOW_VA` exactly
+        // one frame above it, so the arg window lands at `ARG_WINDOW_VA` and
+        // the result window at `RESULT_WINDOW_VA` as before.
+        let mut windows = WindowMapper::new(aspace, ARG_WINDOW_VA, frames.len());
+        let arg = windows.window_of(sys, frames[0], FLAG_READ | FLAG_WRITE)?;
+        let _result = windows.window_of(sys, frames[1], FLAG_READ | FLAG_WRITE)?;
 
         let mut connect = Message::new(methods::vfs::CONNECT);
         connect.tag = connect.tag.with_caps(3);
@@ -107,6 +115,7 @@ impl VfsClient {
             cwd_stack: [0; MAX_CWD_DEPTH],
             cwd_depth: 0,
             fds: [None; MAX_FDS],
+            arg,
         })
     }
 
@@ -137,7 +146,7 @@ impl VfsClient {
         }
         // The arg window is mapped R|W into this AS by `connect`, and
         // `name.len() <= WINDOW` was checked above, so the span fits the frame.
-        raw_copy_to_va(ARG_WINDOW_VA, name);
+        self.arg.write(0, name)?;
         let mut req = Message::new(methods::vfs::WALK);
         req.words[0] = dir;
         req.words[1] = name.len() as u64;
@@ -272,7 +281,7 @@ impl VfsClient {
         let (dir, len) = self.resolve(sys, name, &mut last)?;
         // The arg window is mapped R|W into this AS by `connect`; `len` is at
         // most `last.len()` (64) and well inside the 4 KiB frame.
-        raw_copy_to_va(ARG_WINDOW_VA, &last[..len]);
+        self.arg.write(0, &last[..len])?;
         // Both create-if-missing and truncate are open *flags* (the server's
         // OPEN path handles them); a dedicated CREATE label would EEXIST on an
         // existing file and could not truncate, which `>` redirection needs.
@@ -356,7 +365,7 @@ impl VfsClient {
             let chunk = (data.len() - sent).min(WINDOW);
             // Arg window mapped R|W by `connect`; `chunk <= WINDOW`, so the
             // span fits the frame.
-            raw_copy_to_va(ARG_WINDOW_VA, &data[sent..sent + chunk]);
+            self.arg.write(0, &data[sent..sent + chunk])?;
             let mut req = Message::new(methods::vfs::WRITE);
             req.words[0] = entry.handle;
             req.words[1] = entry.offset;
@@ -480,7 +489,7 @@ impl VfsClient {
         let mut last = [0u8; 64];
         let (dir, len) = self.resolve(sys, name, &mut last)?;
         // Arg window mapped R|W by `connect`; `len <= 64` fits the frame.
-        raw_copy_to_va(ARG_WINDOW_VA, &last[..len]);
+        self.arg.write(0, &last[..len])?;
         let mut req = Message::new(methods::vfs::STAT);
         req.words[0] = dir;
         req.words[1] = len as u64; // Span { off 0, len }
@@ -509,7 +518,7 @@ impl VfsClient {
         let mut last = [0u8; 64];
         let (dir, len) = self.resolve(sys, name, &mut last)?;
         // Arg window mapped R|W by `connect`; `len <= 64` fits the frame.
-        raw_copy_to_va(ARG_WINDOW_VA, &last[..len]);
+        self.arg.write(0, &last[..len])?;
         let mut req = Message::new(methods::vfs::MKDIR);
         req.words[0] = dir;
         req.words[1] = len as u64;
@@ -537,8 +546,8 @@ impl VfsClient {
         let (dst_dir, dst_len) = self.resolve(sys, dst, &mut dst_last)?;
         // Both names travel in the arg window: source at 0, destination at 64.
         // Arg window mapped R|W by `connect`; 64+64 < 4096.
-        raw_copy_to_va(ARG_WINDOW_VA, &src_last[..src_len]);
-        raw_copy_to_va(ARG_WINDOW_VA + 64, &dst_last[..dst_len]);
+        self.arg.write(0, &src_last[..src_len])?;
+        self.arg.write(64, &dst_last[..dst_len])?;
         let mut req = Message::new(methods::vfs::RENAME);
         req.words[0] = src_dir;
         req.words[1] = src_len as u64; // Span { off 0, len }
@@ -563,7 +572,7 @@ impl VfsClient {
         let mut last = [0u8; 64];
         let (dir, len) = self.resolve(sys, path, &mut last)?;
         // Arg window mapped R|W by `connect`; `len <= 64` fits the frame.
-        raw_copy_to_va(ARG_WINDOW_VA, &last[..len]);
+        self.arg.write(0, &last[..len])?;
         let mut req = Message::new(methods::vfs::RMDIR);
         req.words[0] = dir;
         req.words[1] = len as u64;
@@ -586,7 +595,7 @@ impl VfsClient {
         let mut last = [0u8; 64];
         let (dir, len) = self.resolve(sys, path, &mut last)?;
         // Arg window mapped R|W by `connect`; `len <= 64` fits the frame.
-        raw_copy_to_va(ARG_WINDOW_VA, &last[..len]);
+        self.arg.write(0, &last[..len])?;
         let mut req = Message::new(methods::vfs::UNLINK);
         req.words[0] = dir;
         req.words[1] = len as u64;
