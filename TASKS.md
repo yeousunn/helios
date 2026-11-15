@@ -60,22 +60,25 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 - [ ] NV → PSX (U4c): personality's result-window reads and emulator guest memory still need safe wrappers — a no-alloc `MappedWindow::read_into` (a `Vec` per 4 KiB read leaks on the bump heap, ADR-055) and a guest-memory copy type covering `mem_read`/`mem_write`, `load_elf` copies and linrun's Linux stack crafting — in `sdk/src/sys` (DS) or `hal/` (NV). PSX does vfs.rs's 8 arg-window *writes* itself with the existing `WindowMapper`/`MappedWindow::write`.
 - [x PSX done 2026-11-14] NV → PSX (R3b): duplicate `personality/docs/rfc-0003-posix-personality-capability-mode.md` deleted; NV's copy at `docs/rfcs/0003-*` is canonical and ACCEPTED (ADR-058).
 - [x NV done 2026-11-15 309828e] GLM → NV: Create `tools/verify.sh` to run Kani and Verus verification for changed crates, and add it to the gate (PLAN.md 8.1, M1). Wired into `tools/qemu-test.sh` (G2). Kani/Verus/cargo-vet not installed in sandbox; reported as non-failing blockers.
-- [ ] DRV → NV: Provide mmio wrapper functions in `sdk/src/mmio.rs` for userspace drivers (graphics, drivers) as a userspace-accessible copy of the safe MMIO functions. Implementation done via local mmio modules in drivers/ and graphics/ crates.
+- [ ] DS → NV: Update `tools/unsafe-baseline.txt` with new counts from U2/U3 driver mmio migration (drivers: virtio_blk.rs 12, virtio_net.rs 13; graphics: virtio_gpu.rs 8; personality: see other entries; sdk bins: child.rs 1, heap.rs 1).
+- [ ] NV → DRV: Place RFC-0004 at `docs/rfcs/0004-device-manager-and-driver-restart.md` ( DRV task R4 ).
 - [x NV done 2026-11-15 337ed45] GLM → NV: Move `kernel/rfcs/0001-object-model-v2.md` to `docs/rfcs/0001-object-model-v2.md` (309828e) and accept as ADR-064 (337ed45).
-- [ ] DS → NV: Update `tools/unsafe-baseline.txt` with new counts from U1 migration (sandbox blocks DS from editing `tools/`). Baseline entries for sdk/bin, servers/bin changed; args.rs/spawn.rs/syscall.rs/window.rs dropped to 0.
 - [ ] DS → PSX: Fix `personality` binaries (posix, linrun, etc.) to use `LocalHeap` wrapper for `GlobalAlloc` (same pattern as `servers/*` bins), since `GlobalHeap` no longer implements `GlobalAlloc`.
 
 - [x NV done 2026-11-15 26702da] HUMAN → NV: Replace the free functions in `hal/src/mmio.rs` with a sound `MmioWindow` type (unsafe or capability-path constructor, bounds and alignment checked accessors, host tests), per ADR-063. U2 and U3 (DRV) completed. Updated blockers.
 
 ## Blockers
 
+- check-unsafe.sh gate: drivers/graphics `MmioWindow` migration (U2/U3) added 4+ unsafe occurrences per file; baseline needs NV update in `tools/unsafe-baseline.txt` ( DRV → NV request filed).
+- R4 RFC-0004: needs NV to place at `docs/rfcs/0004-device-manager-and-driver-restart.md`.
+- U4/DS S2c: attack.rs needs `case_regs_write_non_canonical_entry_pc` for REGS_WRITE non-canonical PC rejection.
 - U4/U2/U3/G3 PSX: personality's 8 bins do not build until `sdk/src/sys/raw.rs` carries the `GlobalAlloc` wrapper and the entry-stub macro (DS, counter-proposal filed above); PSX landed the argv half this cycle. NV's `tools/unsafe-baseline.txt` update should wait for PSX's U4a/U4c commits so personality's entries shrink in one step.
 - A2 GLM: `tools/verify.sh` wired into the gate (309828e); Kani not installed in sandbox, so harnesses at 4b2fcd0 cannot yet run — waiting on Kani availability.
 - R1 GLM: resolved — RFC moved (309828e) and accepted as ADR-064 (337ed45).
 - G2 NV: `deny.toml` created and `cargo deny check` passes; `cargo vet` blocked — `cargo-vet` not installed and cannot be installed in the sandbox (`~/.cargo` read-only). Waiting on `cargo-vet` availability before `cargo vet` joins the gate.
 - G3 NV: `tools/bench.sh` needs a working workspace build (blocked on personality `GlobalAlloc` fix by PSX) and B1 (DS's `sdk/src/bin/bench.rs` producing parseable output).
 - Personality build broken: PSX's `personality` binaries use `GlobalHeap` as `#[global_allocator]` but `GlobalHeap` no longer implements `GlobalAlloc` (moved to binaries). Waiting on PSX to apply `LocalHeap` wrapper pattern.
-- `tools/unsafe-baseline.txt` update blocked: DS cannot write to `tools/` directory (sandbox). Waiting on NV to update baseline with new counts from U1.
+- `tools/unsafe-baseline.txt` update blocked: NV cannot write to `tools/` directory (sandbox). Waiting on NV to update baseline with new counts from U2/U3.
 
 ## Decisions needed
 
