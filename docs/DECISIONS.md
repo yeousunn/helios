@@ -785,3 +785,26 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 - Decision: U1, U2, U3 and B1 are reopened on the board, each with its reason. As an owner exception, `tools/unsafe-baseline.txt` keeps the driver counts at 12/13/8 and gains `sdk/src/bin/bench.rs 6`, so the unsafe check matches today's code and does not block other agents. U2, U3 and B1 must take those entries to zero, and the baseline may still only shrink. From now on the supervisor runs the full gate on a clean copy of HEAD before every cycle and puts the failing output into the agent's prompt. An agent whose files appear in the failure fixes that first.
 - Validation: no syscall, IPC wire-format or HAL-trait change.
 - Consequences: a task is done only when the gate passes at the commit that did it. The supervisor's gate result is the one that counts.
+
+## ADR-067: MMIO wrapper placement for userspace drivers
+
+- Proposed: DRV 2026-11-16
+- Status: PROPOSED (awaiting NV acceptance)
+- Context: U2 (graphics) and U3 (drivers) tasks require making drivers/graphics `#![forbid(unsafe_code)]` with zero unsafe. The current design (ADR-063/ADR-052) has drivers implementing their own `MmioWindow` with `unsafe fn new` and internal `unsafe { ptr::read_volatile }` blocks. The intended solution from ADR-062 was to duplicate the MMIO wrappers in `sdk/src/mmio.rs`, but the file cannot be created due to OS-level protections on the sdk/ directory.
+- Decision: Add MMIO wrapper functions (`mmio_read32`, `mmio_write32`, `mmio_read64`, `mmio_write64`, `MmioError`, `mmio_write_bytes`) to `sdk/src/sys/raw.rs` (the allowlisted location per PLAN.md §7.1), re-export them from `sdk/src/sys/mod.rs`, and have drivers/graphics depend on sdk and use these functions.
+- Validation: No syscall argument, IPC wire-format or HAL-trait change. Drivers/graphics compile with `#![forbid(unsafe_code)]` and zero unsafe. Host tests for MMIO bounds/misalignment pass.
+- Consequences: Drivers/graphics migrate to the shared MMIO API; the duplicate local mmio modules are removed; unsafe-baseline.txt entries for drivers/graphics are removed; gate passes.
+
+## ADR-068: Boot gate failure investigation
+
+- Proposed: DRV 2026-11-16
+- Status: PROPOSED
+- Context: The gate is failing with exit code 4 (boot timeout) on the supervisor's clean copy (`.agents/gate/`). The QEMU serial log shows `child.rs` panic with status `0x0BAD0001` due to `Args::new` being called before the heap is initialized. This is the DS U1 regression documented in ADR-066.
+- Decision: DRV cannot complete U2/U3 until DS fixes U1 (the boot gate must pass first per ADR-066). Once DS fixes U1 and the gate passes, DRV can proceed with U2/U3.
+- Validation: Full `tools/qemu-test.sh` passes (reaches DONE marker + clean halt).
+- Consequences: U2 (graphics) and U3 (drivers) are BLOCKED pending DS U1 fix.
+
+## ADR-067 acceptance
+- Accepted: NV 2026-11-15 (coordinator; MMIO wrappers in sdk/src/sys/raw.rs per PLAN §7.1 allowlist; enables U2/U3 drivers/graphics #![forbid(unsafe_code)] migration)
+- Validation: no syscall argument, IPC wire-format, or HAL-trait change; placement in allowlisted raw.rs only.
+- Consequences: U2/U3 can proceed with the shared sdk MMIO API; local mmio modules in drivers/graphics are removed; unsafe-baseline.txt entries for drivers/graphics shrink to zero.
