@@ -15,6 +15,7 @@
 //! then the bad call cannot be asserted (it would either succeed or, worse,
 //! fault the machine). Case 0 is a harness self-test that holds on any kernel
 //! and proves the runner detects a rejection correctly.
+#![forbid(unsafe_code)]
 
 use crate::bootstrap::BootstrapPackage;
 use crate::syscall::{RawSyscalls, Syscalls};
@@ -61,14 +62,15 @@ pub fn run<R: RawSyscalls>(sys: &mut Syscalls<R>, pkg: &BootstrapPackage) -> i32
     let outcomes = [
         case_orphan_handle(sys),
         case_regs_write_non_frame_cap(sys, pkg),
-        case_thread_create_kernel_pc(sys, pkg), // S2
-        case_set_entry_kernel_pc(sys, pkg),     // S2
-        case_set_tls_non_canonical(sys, pkg),   // S3
-        case_map_kernel_window(sys, pkg),       // S4/S5
-        case_unmap_kernel_window(sys, pkg),     // S4
-        case_protect_kernel_window(sys, pkg),   // S4
-        case_map_null(sys, pkg),                // S4
-        case_unmap_oversized_count(sys, pkg),   // S9
+        case_regs_write_invalid_entry_pc(sys, pkg), // S2b
+        case_thread_create_kernel_pc(sys, pkg),     // S2
+        case_set_entry_kernel_pc(sys, pkg),         // S2
+        case_set_tls_non_canonical(sys, pkg),       // S3
+        case_map_kernel_window(sys, pkg),           // S4/S5
+        case_unmap_kernel_window(sys, pkg),         // S4
+        case_protect_kernel_window(sys, pkg),       // S4
+        case_map_null(sys, pkg),                    // S4
+        case_unmap_oversized_count(sys, pkg),       // S9
     ];
     classify(&outcomes)
 }
@@ -103,9 +105,37 @@ fn case_regs_write_non_frame_cap<R: RawSyscalls>(
     sys.invoke(pkg.thread, &m).is_err()
 }
 
+/// `REGS_WRITE` with a valid `Frame` cap but an invalid entry PC in `words[2]`
+/// must be rejected with EBADARG (S2b). The kernel checks `is_user_addr` on the
+/// entry PC (image slot 2) before writing the register image; a non-canonical
+/// or kernel-window PC would fault at `iretq`. Case 2.
+fn case_regs_write_invalid_entry_pc<R: RawSyscalls>(
+    sys: &mut Syscalls<R>,
+    pkg: &BootstrapPackage,
+) -> bool {
+    // Carve a frame from the bootstrap region to use as the register image.
+    let mut carve = Message::new(crate::methods::region::CARVE);
+    carve.words[0] = 4096;
+    carve.words[1] = 4096;
+    let Ok(reply) = sys.invoke(pkg.region, &carve) else {
+        return false;
+    };
+    let frame = reply.words[0] as u32;
+    if frame == 0 {
+        return false;
+    }
+    // REGS_WRITE with a non-canonical entry PC in words[2].
+    // w0 = rflags (with IOPL=0, IF=1), w1 = rsp, w2 = entry PC, w3 = rflags raw.
+    let mut m = Message::new(crate::methods::thread::REGS_WRITE);
+    m.tag = m.tag.with_caps(1);
+    m.words = [0x3002, 0x405000, NON_CANONICAL, 0x3002];
+    let _ = m.set_descriptor(0, CapSlot::pack(frame, Rights::READ));
+    sys.invoke(pkg.thread, &m).is_err()
+}
+
 /// `THREAD_CREATE` with a kernel-window entry PC must be rejected before any
 /// thread is created (S2). Pre-fix the call returned OK and the new thread
-/// entered ring 3 at a kernel address. Case 2.
+/// entered ring 3 at a kernel address. Case 3.
 fn case_thread_create_kernel_pc<R: RawSyscalls>(
     sys: &mut Syscalls<R>,
     pkg: &BootstrapPackage,
@@ -227,10 +257,11 @@ mod tests {
     use crate::syscall::SysReply;
 
     /// Replays one status per raw syscall, in order. The cases make a fixed
-    /// number of raw calls (case 3 creates, suspends, sets the entry and
-    /// revokes; the rest make one); the mock replays the matching statuses.
+    /// number of raw calls (case 2 makes 2 calls: CARVE + REGS_WRITE;
+    /// case 4 makes 5 calls: create, suspend, set_entry, kill, cap_revoke;
+    /// the rest make one); the mock replays the matching statuses.
     struct MockKernel {
-        statuses: [i32; 14],
+        statuses: [i32; 16],
         len: usize,
         i: usize,
     }
@@ -238,19 +269,31 @@ mod tests {
     impl MockKernel {
         /// A kernel that rejects each bad call with the error the case names.
         ///
-        /// Index: 0 orphan, 1 non-Frame, 2 THREAD_CREATE(kernel pc),
-        /// 3 THREAD_CREATE(valid), 4 SUSPEND, 5 SET_ENTRY(kernel pc),
-        /// 6 KILL, 7 cap_revoke, 8 SET_TLS, 9 MAP(kernel window),
-        /// 10 UNMAP(kernel window), 11 PROTECT(kernel window), 12 MAP(null),
-        /// 13 UNMAP(oversized count).
+        /// Index mapping (raw call sequence):
+        /// 0: orphan handle (invoke) -> EBADCAP
+        /// 1: regs_write_non_frame_cap (invoke) -> EBADARG
+        /// 2: regs_write_invalid_entry_pc CARVE (invoke region) -> OK (returns frame handle)
+        /// 3: regs_write_invalid_entry_pc REGS_WRITE (invoke thread) -> EBADARG
+        /// 4: thread_create_kernel_pc (invoke) -> EBADARG
+        /// 5: set_entry_kernel_pc THREAD_CREATE (invoke) -> OK (scratch thread)
+        /// 6: set_entry_kernel_pc SUSPEND (invoke) -> OK
+        /// 7: set_entry_kernel_pc SET_ENTRY (invoke) -> EBADARG
+        /// 8: set_entry_kernel_pc KILL (invoke) -> OK
+        /// 9: set_entry_kernel_pc cap_revoke (invoke) -> OK
+        /// 10: set_tls_non_canonical (invoke) -> EBADARG
+        /// 11: map_kernel_window (invoke) -> EBADARG
+        /// 12: unmap_kernel_window (invoke) -> EBADARG
+        /// 13: protect_kernel_window (invoke) -> EBADARG
+        /// 14: map_null (invoke) -> EBADARG
+        /// 15: unmap_oversized_count (invoke) -> EBADARG
         fn rejects() -> Self {
             use ipc::status::{EBADARG, EBADCAP, OK};
             MockKernel {
                 statuses: [
-                    EBADCAP, EBADARG, EBADARG, OK, OK, EBADARG, OK, OK, EBADARG, EBADARG, EBADARG,
-                    EBADARG, EBADARG, EBADARG,
+                    EBADCAP, EBADARG, OK, EBADARG, EBADARG, OK, OK, EBADARG, OK, OK, EBADARG,
+                    EBADARG, EBADARG, EBADARG, EBADARG, EBADARG,
                 ],
-                len: 14,
+                len: 16,
                 i: 0,
             }
         }
@@ -258,8 +301,8 @@ mod tests {
         /// A kernel that accepts every bad call (a security regression).
         fn accepts() -> Self {
             MockKernel {
-                statuses: [ipc::status::OK; 14],
-                len: 14,
+                statuses: [ipc::status::OK; 16],
+                len: 16,
                 i: 0,
             }
         }
@@ -309,77 +352,96 @@ mod tests {
     }
 
     #[test]
-    fn accepted_thread_create_kernel_pc_is_case_3() {
-        // Kernel accepts THREAD_CREATE(kernel pc) at index 2; cases 0/1 still
-        // reject → first non-rejected case is index 2.
+    fn accepted_regs_write_invalid_entry_pc_is_case_3() {
+        // Kernel accepts REGS_WRITE(invalid entry pc) at case index 2; cases
+        // 0/1 still reject → first non-rejected case is index 2.
+        // The REGS_WRITE call is at statuses[3] (CARVE at [2] is already OK).
         let mut k = MockKernel::rejects();
-        k.statuses[2] = ipc::status::OK;
+        k.statuses[3] = ipc::status::OK;
         let mut sys = Syscalls::new(&mut k);
         assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 3);
     }
 
     #[test]
-    fn accepted_set_entry_kernel_pc_is_case_4() {
-        // Kernel accepts SET_ENTRY(kernel pc) at index 5 (case 3) while all
-        // earlier cases reject → failure at case index 3.
+    fn accepted_thread_create_kernel_pc_is_case_4() {
+        // Kernel accepts THREAD_CREATE(kernel pc) at case index 3; cases
+        // 0-2 still reject → first non-rejected case is index 3.
+        // THREAD_CREATE call is at statuses[4].
         let mut k = MockKernel::rejects();
-        k.statuses[5] = ipc::status::OK;
+        k.statuses[4] = ipc::status::OK;
         let mut sys = Syscalls::new(&mut k);
         assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 4);
     }
 
     #[test]
-    fn accepted_set_tls_is_case_5() {
-        // Kernel accepts SET_TLS(non-canonical) at index 8 (case 4).
+    fn accepted_set_entry_kernel_pc_is_case_5() {
+        // Kernel accepts SET_ENTRY(kernel pc) at case index 4; cases
+        // 0-3 still reject → failure at case index 4.
+        // SET_ENTRY call is at statuses[7].
         let mut k = MockKernel::rejects();
-        k.statuses[8] = ipc::status::OK;
+        k.statuses[7] = ipc::status::OK;
         let mut sys = Syscalls::new(&mut k);
         assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 5);
     }
 
     #[test]
-    fn accepted_map_kernel_window_is_case_6() {
-        // Kernel accepts MAP(kernel window) at index 9 (case 5).
+    fn accepted_set_tls_is_case_6() {
+        // Kernel accepts SET_TLS(non-canonical) at case index 5.
+        // SET_TLS call is at statuses[10].
         let mut k = MockKernel::rejects();
-        k.statuses[9] = ipc::status::OK;
+        k.statuses[10] = ipc::status::OK;
         let mut sys = Syscalls::new(&mut k);
         assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 6);
     }
 
     #[test]
-    fn accepted_unmap_kernel_window_is_case_7() {
-        // Kernel accepts UNMAP(kernel window) at index 10 (case 6).
+    fn accepted_map_kernel_window_is_case_7() {
+        // Kernel accepts MAP(kernel window) at case index 6.
+        // MAP call is at statuses[11].
         let mut k = MockKernel::rejects();
-        k.statuses[10] = ipc::status::OK;
+        k.statuses[11] = ipc::status::OK;
         let mut sys = Syscalls::new(&mut k);
         assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 7);
     }
 
     #[test]
-    fn accepted_protect_kernel_window_is_case_8() {
-        // Kernel accepts PROTECT(kernel window) at index 11 (case 7).
+    fn accepted_unmap_kernel_window_is_case_8() {
+        // Kernel accepts UNMAP(kernel window) at case index 7.
+        // UNMAP call is at statuses[12].
         let mut k = MockKernel::rejects();
-        k.statuses[11] = ipc::status::OK;
+        k.statuses[12] = ipc::status::OK;
         let mut sys = Syscalls::new(&mut k);
         assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 8);
     }
 
     #[test]
-    fn accepted_map_null_is_case_9() {
-        // Kernel accepts MAP(null) at index 12 (case 8).
+    fn accepted_protect_kernel_window_is_case_9() {
+        // Kernel accepts PROTECT(kernel window) at case index 8.
+        // PROTECT call is at statuses[13].
         let mut k = MockKernel::rejects();
-        k.statuses[12] = ipc::status::OK;
+        k.statuses[13] = ipc::status::OK;
         let mut sys = Syscalls::new(&mut k);
         assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 9);
     }
 
     #[test]
-    fn accepted_unmap_oversized_is_case_10() {
-        // Kernel accepts UNMAP(oversized count) at index 13 (case 9).
+    fn accepted_map_null_is_case_10() {
+        // Kernel accepts MAP(null) at case index 9.
+        // MAP call is at statuses[14].
         let mut k = MockKernel::rejects();
-        k.statuses[13] = ipc::status::OK;
+        k.statuses[14] = ipc::status::OK;
         let mut sys = Syscalls::new(&mut k);
         assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 10);
+    }
+
+    #[test]
+    fn accepted_unmap_oversized_is_case_11() {
+        // Kernel accepts UNMAP(oversized count) at case index 10.
+        // UNMAP call is at statuses[15].
+        let mut k = MockKernel::rejects();
+        k.statuses[15] = ipc::status::OK;
+        let mut sys = Syscalls::new(&mut k);
+        assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 11);
     }
 
     #[test]

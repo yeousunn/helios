@@ -12,6 +12,7 @@
 //! v0 constraints: `ET_EXEC`, 4 KiB pages, and segments obeying the ELF ABI's
 //! `p_vaddr ≡ p_offset (mod PAGE)` congruence (linkers guarantee this; the
 //! loader page-splits segments, so unaligned segment vaddrs are fine).
+#![forbid(unsafe_code)]
 
 use alloc::vec::Vec;
 

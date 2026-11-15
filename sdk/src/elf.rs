@@ -5,6 +5,7 @@
 //! Pure logic, fully host-testable; the frame carving/mapping that consumes
 //! [`ElfImage`] lives in the launcher (process server / init) via
 //! `AS::MAP` (ADR-021/022).
+#![forbid(unsafe_code)]
 
 use ipc::status;
 

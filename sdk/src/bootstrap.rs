@@ -10,6 +10,7 @@
 //! `[aspace, thread, region, session x4, ps_service_ep]`, then the optional
 //! trailing caps in caller order: `[vfs, stdin, stdout, stderr]` (nulls from
 //! partial grants or trimmed tails appear as absent).
+#![forbid(unsafe_code)]
 
 use ipc::{status, CapSlot};
 

@@ -12,6 +12,9 @@
 //! PS splits the areas on NULs and crafts a real initial stack:
 //! `[TOP-8] = argc`, `[TOP-16] = argv*`, `[TOP-24] = envp*`; the pointer
 //! arrays and string bytes live in the lower half of the top stack page.
+#![forbid(unsafe_code)]
+
+use crate::sys::raw_copy_to_va;
 
 /// Byte offset where the payload areas begin (after the three spans).
 pub const BLOB_HEADER: usize = 24;
@@ -30,26 +33,31 @@ pub fn write_spawn_blob(window_va: u64, path: &[u8], argv: &[&[u8]], env: &[&[u8
     let path_span = ((path_off as u64) << 32) | path.len() as u64;
     let argv_span = ((argv_off as u64) << 32) | argv_len as u64;
     let env_span = ((env_off as u64) << 32) | env_len as u64;
-    // SAFETY: the window is mapped R|W into the caller's AS (its CONNECT arg
-    // frame); `end` was bounds-checked against the 4 KiB window.
-    unsafe {
-        let w = window_va as *mut u8;
-        core::ptr::copy_nonoverlapping(path_span.to_le_bytes().as_ptr(), w, 8);
-        core::ptr::copy_nonoverlapping(argv_span.to_le_bytes().as_ptr(), w.add(8), 8);
-        core::ptr::copy_nonoverlapping(env_span.to_le_bytes().as_ptr(), w.add(16), 8);
-        core::ptr::copy_nonoverlapping(path.as_ptr(), w.add(path_off), path.len());
-        let mut o = argv_off;
-        for a in argv {
-            core::ptr::copy_nonoverlapping(a.as_ptr(), w.add(o), a.len());
-            *w.add(o + a.len()) = 0;
-            o += a.len() + 1;
-        }
-        let mut o = env_off;
-        for e in env {
-            core::ptr::copy_nonoverlapping(e.as_ptr(), w.add(o), e.len());
-            *w.add(o + e.len()) = 0;
-            o += e.len() + 1;
-        }
+
+    // Write the three span headers (8 bytes each)
+    raw_copy_to_va(window_va, &path_span.to_le_bytes());
+    raw_copy_to_va(window_va + 8, &argv_span.to_le_bytes());
+    raw_copy_to_va(window_va + 16, &env_span.to_le_bytes());
+
+    // Write path
+    raw_copy_to_va(window_va + path_off as u64, path);
+
+    // Write argv area
+    let mut o = argv_off;
+    for a in argv {
+        raw_copy_to_va(window_va + o as u64, a);
+        // Write NUL terminator
+        raw_copy_to_va(window_va + o as u64 + a.len() as u64, &[0]);
+        o += a.len() + 1;
     }
+
+    // Write env area
+    let mut o = env_off;
+    for e in env {
+        raw_copy_to_va(window_va + o as u64, e);
+        raw_copy_to_va(window_va + o as u64 + e.len() as u64, &[0]);
+        o += e.len() + 1;
+    }
+
     Some(())
 }

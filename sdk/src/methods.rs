@@ -4,6 +4,7 @@
 //! These mirror the ratified tables; the kernel dispatch is authoritative.
 //! Cross-check with GLM when the syscall entry lands (candidates for moving
 //! into `ipc/` if the kernel exposes them).
+#![forbid(unsafe_code)]
 
 pub mod factory {
     pub const NEW_ENDPOINT: u16 = 1;

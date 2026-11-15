@@ -4,14 +4,17 @@
 //! Division of labor:
 //! - [`BumpAlloc`] — the pure allocation core (host-tested),
 //! - [`RegionSource`] — the carve + map glue (tested against mock syscalls),
-//! - [`GlobalHeap`] — the `GlobalAlloc` wrapper; **each binary declares its own
-//!   `#[global_allocator]`** (init deliberately declares a failing one — it is
-//!   allocation-free).
+//! - [`GlobalHeap`] — a thread-safe bump allocator wrapper. **Binaries that need
+//!   a global allocator should implement `GlobalAlloc` themselves** (the `GlobalAlloc`
+//!   trait requires `unsafe impl`, which is not allowed in this crate per
+//!   PLAN.md §7.1). Init and child declare a failing allocator — they are
+//!   allocation-free.
 //!
 //! v0 heaps are fixed-size: the binary maps its chunks once at startup. Growth
 //! (allocator hooks) is future work.
+#![forbid(unsafe_code)]
 
-use core::alloc::{GlobalAlloc, Layout};
+use core::alloc::Layout;
 use core::ptr::NonNull;
 
 use ipc::{status, CapSlot, Message, Rights};
@@ -178,21 +181,12 @@ impl Default for GlobalHeap {
     }
 }
 
-// SAFETY: `alloc` returns either a non-null, in-bounds, correctly-aligned
-// pointer into the mapped heap span or null (allocation failure); `dealloc`
-// is a no-op (bump semantics — memory is reclaimed only at process exit),
-// which is sound for a GlobalAlloc as long as `alloc` never hands out the
-// same region twice, guaranteed by the bump pointer under the mutex.
-unsafe impl GlobalAlloc for GlobalHeap {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        self.inner
-            .lock()
-            .as_mut()
-            .and_then(|b| b.alloc(layout))
-            .map_or(core::ptr::null_mut(), |p| p.as_ptr())
+impl GlobalHeap {
+    /// Allocate memory using the inner bump allocator.
+    /// Returns `None` on allocation failure (OOM or uninitialized).
+    pub fn alloc(&self, layout: Layout) -> Option<NonNull<u8>> {
+        self.inner.lock().as_mut().and_then(|b| b.alloc(layout))
     }
-
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
 }
 
 #[cfg(test)]
@@ -329,11 +323,8 @@ mod tests {
         heap.init(0x1000, 4096).unwrap();
         assert_eq!(heap.capacity(), 4096);
         assert_eq!(heap.init(0x2000, 4096), Err(status::EBADSTATE));
-        // Allocations go through the bump core.
-        let p = {
-            let mut g = heap.inner.lock();
-            g.as_mut().unwrap().alloc(layout(8, 1)).unwrap()
-        };
+        // Allocations go through the safe alloc method.
+        let p = heap.alloc(layout(8, 1)).unwrap();
         assert_eq!(p.as_ptr() as usize, 0x1000);
     }
 }

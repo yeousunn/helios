@@ -13,57 +13,65 @@
 //! The arrays and their NUL-terminated strings live in the lower half of the
 //! top stack page (below any early push traffic only after the stub lowers
 //! `rsp`).
+#![forbid(unsafe_code)]
 
-/// Borrowed view of the initial argv/envp arrays.
-#[derive(Clone, Copy)]
+use crate::sys::{raw_cstr_from_va, raw_ptr_array_from_va};
+use alloc::vec::Vec;
+
+/// Owned view of the initial argv/envp arrays, parsed from the entry stack.
 pub struct Args {
-    argc: usize,
-    argv: *const *const u8,
-    envp: *const *const u8,
+    argv: Vec<Vec<u8>>,
+    envp: Vec<Vec<u8>>,
 }
 
 impl Args {
-    /// # Safety
-    /// `argc`/`argv`/`envp` must come from the entry stub exactly as the
-    /// stack was crafted (see the module docs).
-    pub const unsafe fn new(argc: u64, argv: *const *const u8, envp: *const *const u8) -> Self {
-        Self {
-            argc: argc as usize,
-            argv,
-            envp,
+    /// Parse the initial stack pointers into owned string vectors.
+    ///
+    /// `argc` is the argument count from the stack header.
+    /// `argv_va` and `envp_va` are the virtual addresses of the argv/envp
+    /// pointer arrays (as captured by the entry stub).
+    pub fn new(argc: usize, argv_va: u64, envp_va: u64) -> Self {
+        let argv_ptrs = raw_ptr_array_from_va(argv_va, argc).unwrap_or(&[]);
+        let mut argv = Vec::with_capacity(argc);
+        for &ptr in argv_ptrs {
+            if ptr == 0 {
+                break;
+            }
+            argv.push(raw_cstr_from_va(ptr).unwrap_or(&[]).to_vec());
         }
+
+        // envp is NULL-terminated, so we read until we hit a null pointer.
+        // We don't know the count in advance, so read a reasonable maximum.
+        const MAX_ENVP: usize = 64;
+        let envp_ptrs = raw_ptr_array_from_va(envp_va, MAX_ENVP).unwrap_or(&[]);
+        let mut envp = Vec::new();
+        for &ptr in envp_ptrs {
+            if ptr == 0 {
+                break;
+            }
+            envp.push(raw_cstr_from_va(ptr).unwrap_or(&[]).to_vec());
+        }
+
+        Self { argv, envp }
     }
 
     pub fn argc(&self) -> usize {
-        self.argc
+        self.argv.len()
     }
 
     /// The `i`-th argument as a byte slice (without the NUL).
     pub fn arg(&self, i: usize) -> Option<&[u8]> {
-        if i >= self.argc {
-            return None;
-        }
-        Some(unsafe { cstr(*self.argv.add(i)) })
+        self.argv.get(i).map(|v| v.as_slice())
     }
 
     /// Number of environment entries.
     pub fn envc(&self) -> usize {
-        let mut n = 0;
-        loop {
-            let p = unsafe { *self.envp.add(n) };
-            if p.is_null() {
-                return n;
-            }
-            n += 1;
-        }
+        self.envp.len()
     }
 
     /// The `i`-th environment entry ("K=V" bytes without the NUL).
     pub fn env(&self, i: usize) -> Option<&[u8]> {
-        if i >= self.envc() {
-            return None;
-        }
-        Some(unsafe { cstr(*self.envp.add(i)) })
+        self.envp.get(i).map(|v| v.as_slice())
     }
 
     /// Parse `argv[0]` as a decimal exit status (the v0 smoke convention).
@@ -83,17 +91,4 @@ impl Args {
         }
         v
     }
-}
-
-/// # Safety
-/// `p` must point at a NUL-terminated byte string (or be null, rejected).
-unsafe fn cstr(p: *const u8) -> &'static [u8] {
-    if p.is_null() {
-        return &[];
-    }
-    let mut n = 0usize;
-    while unsafe { *p.add(n) } != 0 {
-        n += 1;
-    }
-    unsafe { core::slice::from_raw_parts(p, n) }
 }

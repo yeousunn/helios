@@ -1,8 +1,10 @@
-//! Raw syscall layer (syscall-abi §2/§3). Exactly one inline-asm site on
-//! x86_64; every wrapper is generic over [`RawSyscalls`] and host-testable.
+//! Raw syscall layer (syscall-abi §2/§3). Every wrapper is generic over
+//! [`RawSyscalls`] and host-testable. The x86_64 `syscall` instruction lives
+//! in [`crate::sys::raw::X86_64Syscalls`] (the only `unsafe` module in `sdk`).
 //!
 //! Argument layout for every syscall: `(cap, tag, w0..w3)`.
 //! Return layout: `rax` = status, `rdx` = tag, `rsi/rdi/r8/r9` = w0..w3.
+#![forbid(unsafe_code)]
 
 use ipc::{Message, Rights, Tag};
 
@@ -178,44 +180,8 @@ impl<'a, R: RawSyscalls> Syscalls<'a, R> {
     }
 }
 
-/// x86_64 backend: the `syscall` instruction with the register conventions of
-/// syscall-abi §2 (`rcx`/`r11` are clobbered by the instruction; args arrive
-/// in `rdi/rsi/rdx/r10/r8/r9`, returns in `rax/rdx/rsi/rdi/r8/r9`).
-#[cfg(target_arch = "x86_64")]
-pub struct X86_64Syscalls;
-
-#[cfg(target_arch = "x86_64")]
-impl RawSyscalls for X86_64Syscalls {
-    fn raw(&mut self, number: u32, args: [u64; 6]) -> SysReply {
-        let (status, tag, w0, w1, w2, w3): (u64, u64, u64, u64, u64, u64);
-        // SAFETY: `syscall` transfers control to the kernel's syscall entry,
-        // which per the ratified ABI (sdk/docs/syscall-abi.md §2) reads the
-        // number from rax and arguments from rdi/rsi/rdx/r10/r8/r9, returns
-        // status in rax and tag/words in rdx/rsi/rdi/r8/r9, and clobbers
-        // rcx/r11. It touches no user memory for register-sized messages, so
-        // the stack is not used.
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                inlateout("rax") number as u64 => status,
-                inlateout("rdi") args[0] => w1,
-                inlateout("rsi") args[1] => w0,
-                inlateout("rdx") args[2] => tag,
-                inlateout("r10") args[3] => _,
-                inlateout("r8") args[4] => w2,
-                inlateout("r9") args[5] => w3,
-                lateout("rcx") _,
-                lateout("r11") _,
-                options(nostack)
-            );
-        }
-        SysReply {
-            status: status as i32,
-            tag,
-            words: [w0, w1, w2, w3],
-        }
-    }
-}
+/// Re-export the x86_64 raw syscall backend and unsafe primitives from the `sys` module.
+pub use crate::sys::{raw_copy_from_va, raw_copy_to_va, raw_cstr_from_va, X86_64Syscalls};
 
 #[cfg(test)]
 mod tests {

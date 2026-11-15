@@ -17,6 +17,7 @@
 //! o 28: u32 reserved
 //! o 32: region_count × { u32 handle; u32 reserved; u64 base; u64 len }
 //! ```
+#![forbid(unsafe_code)]
 
 use ipc::status;
 

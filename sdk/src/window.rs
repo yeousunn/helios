@@ -6,15 +6,17 @@
 //! cache the mapping.
 //!
 //! Safety model: [`WindowMapper`] is the only producer of [`MappedWindow`],
-//! and it performs the `AS::MAP` invoke before handing one out, so the byte
-//! access methods are safe APIs holding all `unsafe` here (server crates stay
-//! `forbid(unsafe_code)`).
+//! and it performs the `AS::MAP` invoke before handing one out. The byte
+//! access methods use safe wrappers from `crate::sys` for raw pointer access.
+#![forbid(unsafe_code)]
 
+use alloc::vec;
 use alloc::vec::Vec;
 
 use ipc::{status, CapSlot, Message};
 
 use crate::methods;
+use crate::sys::{raw_copy_from_va, raw_copy_to_va};
 use crate::syscall::{Handle, RawSyscalls, Status, Syscalls};
 
 /// v0 window size: one frame / one page.
@@ -44,11 +46,11 @@ impl MappedWindow {
         if offset + len > WINDOW_SIZE {
             return Err(status::ETOOBIG);
         }
-        let ptr = (self.va + offset as u64) as *const u8;
-        // SAFETY: `self` can only come from `WindowMapper`, which ran `AS::MAP`
-        // for exactly one frame at this VA in our address space; the bounds
-        // check above keeps the access inside that frame.
-        Ok(unsafe { core::slice::from_raw_parts(ptr, len as usize) }.to_vec())
+        let mut buf = vec![0u8; len as usize];
+        // SAFETY: The window VA is valid and mapped (guaranteed by WindowMapper).
+        // The bounds check keeps the access inside the frame.
+        raw_copy_from_va(self.va + offset as u64, &mut buf);
+        Ok(buf)
     }
 
     /// Write `data` at `offset` inside the window.
@@ -56,11 +58,9 @@ impl MappedWindow {
         if offset + data.len() as u32 > WINDOW_SIZE {
             return Err(status::ETOOBIG);
         }
-        let ptr = (self.va + offset as u64) as *mut u8;
-        // SAFETY: as above; result windows are mapped with the WRITE flag, so
-        // the destination is writable. The bounds check keeps the copy inside
-        // the mapped frame.
-        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len()) };
+        // SAFETY: The window VA is valid and mapped with WRITE flag (guaranteed by WindowMapper).
+        // The bounds check keeps the copy inside the frame.
+        raw_copy_to_va(self.va + offset as u64, data);
         Ok(())
     }
 }

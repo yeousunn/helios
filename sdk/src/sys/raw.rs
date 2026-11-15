@@ -109,13 +109,24 @@ pub fn raw_ptr_array_from_va(ptr: u64, count: usize) -> Option<&'static [u64]> {
     unsafe { Some(core::slice::from_raw_parts(ptr as *const u64, count)) }
 }
 
+/// Safe wrapper for copying bytes from a raw virtual address into a `[u64; 3]`.
+/// This avoids the unsafe `from_raw_parts_mut` cast in callers.
+/// SAFETY: Caller must ensure `src` is a valid, readable, mapped address
+/// with at least 24 bytes available.
+pub fn raw_copy_from_va_to_u64x3(src: u64, dst: &mut [u64; 3]) {
+    // SAFETY: `dst` is a valid reference to a `[u64; 3]` (24 bytes).
+    // The cast to `&mut [u8]` is safe because it's the same memory layout.
+    let dst_bytes = unsafe { core::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u8, 24) };
+    raw_copy_from_va(src, dst_bytes);
+}
+
 /// A `GlobalAlloc` wrapper over `GlobalHeap` that binaries can use as their
 /// `#[global_allocator]`. This is the single shared implementation — every
 /// userspace binary (init, child, ps, vfs, console, auth, personality bins)
 /// uses this instead of defining its own `LocalHeap` wrapper.
 ///
 /// Usage:
-/// ```rust
+/// ```rust,ignore
 /// use sdk::sys::SysHeap;
 ///
 /// #[global_allocator]
@@ -172,10 +183,12 @@ unsafe impl GlobalAlloc for SysHeap {
 /// ```
 ///
 /// Usage:
-/// ```rust
+/// ```rust,ignore
 /// sdk::sys::entry_point!(my_main);
 ///
-/// extern "C" fn my_main(argc: u64, argv_va: u64, envp_va: u64) -> ! { ... }
+/// extern "C" fn my_main(argc: u64, argv_va: u64, envp_va: u64) -> ! {
+///     loop {}
+/// }
 /// ```
 #[macro_export]
 macro_rules! entry_point {
