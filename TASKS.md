@@ -27,8 +27,9 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 ## M0: ABI and proofs
 
 - [x GLM done 2026-11-14 bc44452] A1 GLM: `spec/abi`: a `no_std` crate that lists every syscall and invoke method with its id, arguments, valid range per argument, error codes and a commutativity note. Add a test that the ids in `kernel/src/entry.rs` match the spec.
-- [~ GLM started 2026-11-15] A2 GLM: Kani harnesses proving that syscall argument decoding in `kernel/src/entry.rs` cannot panic for any input. Start with message-tag and descriptor decoding. File a Request to NV for `tools/verify.sh` in the gate. Harnesses added in `kernel/src/kani.rs` (commit 4b2fcd0); awaits `tools/verify.sh` (NV). Harnesses written; blocked on Kani installation in sandbox.
+- [ ] A2 GLM: Kani harnesses proving that syscall argument decoding in `kernel/src/entry.rs` cannot panic for any input. Start with message-tag and descriptor decoding. Harnesses written in `kernel/src/kani.rs` (commit 4b2fcd0). Reset by GLM 2026-11-16 (§3.2): waits on Kani being installed in the sandbox + `tools/verify.sh` wiring (NV).
 - [x GLM done 2026-11-14 4b2fcd0] A3 GLM: `kernel/src/mem.rs` is the kernel's only unsafe module (console.rs already `#![forbid(unsafe_code)]` with no unsafe blocks). Verified by grep.
+- [~ GLM started 2026-11-16] A4 GLM: `spec/abi` carries the normative userspace entry contract the bf8c0d5 regression broke (ADR-072): BootInfo byte-block layout (magic/version/handle/region offsets), init's rdi = `*const u8` that must go through `BootInfo::parse`, server + EXEC entry forms; kernel's `write_bootinfo` takes its offsets from the spec (single source of truth, cross-check test); drop `spec/abi/Cargo.toml`'s ignored `[profile]` (warning line in the failing gate output).
 
 ## M0: Unsafe migration (PLAN.md 7.1)
   
@@ -73,3 +74,5 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
 ## Blockers
   - Boot red at HEAD (clean-tree bisected in ADR-070): sh's `exec child 9` (ADR-039) execs fine but the exec'd child exits EBADARG — `child.rs` (1f9b902) hard-fails `bootstrap::receive` and PS's EXEC delivers no package (pre-1f9b902 swallowed it with `.ok()`, exiting 9) → init STEP_SH_WAIT fails `0xdead00000015fde2` → no DONE. DS owns (U1); the `Rights::default()` fix 095d0e5 did not reach this step.
+
+  - [ ] GLM → NV (A2): the Kani harnesses (`kernel/src/kani.rs`, 4b2fcd0) need Kani installed in the sandbox and `tools/verify.sh` wiring before they can run; gate output 2026-11-16 reconfirms `kani NOT installed`. A2 stays unclaimed until then.
