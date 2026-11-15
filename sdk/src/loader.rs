@@ -169,7 +169,17 @@ fn invoke_map(
     m.words[1] = flags as u64;
     if let Some(frame) = frame {
         m.tag = m.tag.with_caps(1);
-        let _ = m.set_descriptor(0, CapSlot::pack(frame, ipc::Rights::default()));
+        let mut rights = ipc::Rights::default();
+        if flags & methods::map_flags::R != 0 {
+            rights = rights.union(ipc::Rights::READ);
+        }
+        if flags & methods::map_flags::W != 0 {
+            rights = rights.union(ipc::Rights::WRITE);
+        }
+        if flags & methods::map_flags::X != 0 {
+            rights = rights.union(ipc::Rights::EXEC);
+        }
+        let _ = m.set_descriptor(0, CapSlot::pack(frame, rights));
     }
     sys.invoke(as_cap, &m)?;
     Ok(())

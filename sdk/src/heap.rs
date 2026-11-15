@@ -137,7 +137,7 @@ impl<'a, R: RawSyscalls> RegionSource<'a, R> {
             map.tag = map.tag.with_caps(1);
             map.words[0] = self.next_va + i * 4096;
             map.words[1] = HEAP_FLAGS as u64;
-            let _ = map.set_descriptor(0, CapSlot::pack(frame, Rights::default()));
+            let _ = map.set_descriptor(0, CapSlot::pack(frame, Rights::READ.union(Rights::WRITE)));
             self.sys.invoke(self.as_cap, &map)?;
         }
 
