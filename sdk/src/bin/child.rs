@@ -36,65 +36,90 @@ sdk::sys::entry_point!(child_main);
 /// All pointer parsing is done safely via `sdk::sys::raw_cstr_from_va` and
 /// `sdk::sys::raw_ptr_array_from_va`.
 extern "C" fn child_main(argc: u64, argv_va: u64, envp_va: u64) -> ! {
-    let args = sdk::args::Args::new(argc as usize, argv_va, envp_va);
     let mut raw = X86_64Syscalls;
+
+    // 1. Receive the bootstrap package first (no allocation needed).
+    let package = {
+        let mut sys = Syscalls::new(&mut raw);
+        match sdk::bootstrap::receive(&mut sys) {
+            Ok(p) => p,
+            Err(e) => Syscalls::new(&mut raw).exit(e),
+        }
+    };
+
+    // 2. Initialize the heap from the package's region and aspace.
+    //    Carve and map heap chunks like init/ps do.
+    use sdk::heap::RegionSource;
+    use sdk::layout::{HEAP_CHUNK, HEAP_CHUNKS};
+    const CHILD_HEAP_VA_BASE: u64 = 0x4000_0000; // arbitrary, below stack
+    let span = {
+        let mut src = RegionSource::new(
+            &mut raw,
+            package.region,
+            package.aspace,
+            CHILD_HEAP_VA_BASE,
+            HEAP_CHUNK,
+        );
+        src.map_startup(HEAP_CHUNKS)
+    };
+    let (heap_start, heap_len) = match span {
+        Ok(v) => v,
+        Err(e) => Syscalls::new(&mut raw).exit(e),
+    };
+    if let Err(e) = HEAP.init(heap_start, heap_len) {
+        Syscalls::new(&mut raw).exit(e);
+    }
+
+    // 3. Now parse args (this allocates via Vec).
+    let args = sdk::args::Args::new(argc as usize, argv_va, envp_va);
+
     // S11 attack mode: `argv[0] == "attack"` runs the kernel-hardening attack
     // cases (sdk::attack) instead of the numeric-argv smoke. init spawns this
     // as a new marker step; exit 0 = every bad call was rejected.
     if matches!(args.arg(0), Some(b"attack")) {
         let status = {
             let mut sys = Syscalls::new(&mut raw);
-            match sdk::bootstrap::receive(&mut sys) {
-                Ok(package) => sdk::attack::run(&mut sys, &package),
-                Err(_) => sdk::attack::FAIL_NO_PACKAGE,
-            }
+            sdk::attack::run(&mut sys, &package)
         };
         Syscalls::new(&mut raw).exit(status)
     }
-    // Consume the bootstrap package so the spawner's `deliver` completes.
-    let package = {
-        let mut sys = Syscalls::new(&mut raw);
-        sdk::bootstrap::receive(&mut sys).ok()
-    };
     // Diagnostic: echo the crafted argv through a caller-supplied console
     // endpoint (package `optional[2]`) before exiting — makes stack-crafting
     // bugs visible on the serial line. All args, space-joined.
-    if let Some(p) = package {
-        if let Some(console) = p.optional.get(2).copied().flatten() {
-            if args.argc() != 0 {
-                let mut sys = Syscalls::new(&mut raw);
-                let mut m = ipc::Message::new(sdk::methods::console::WRITE);
-                let mut n = 0usize;
-                let mut put = |bytes: &[u8]| {
-                    for &b in bytes {
-                        if n < 32 {
-                            m.words[n / 8] |= (b as u64) << ((n % 8) * 8);
-                            n += 1;
-                        }
+    if let Some(console) = package.optional.get(2).copied().flatten() {
+        if args.argc() != 0 {
+            let mut sys = Syscalls::new(&mut raw);
+            let mut m = ipc::Message::new(sdk::methods::console::WRITE);
+            let mut n = 0usize;
+            let mut put = |bytes: &[u8]| {
+                for &b in bytes {
+                    if n < 32 {
+                        m.words[n / 8] |= (b as u64) << ((n % 8) * 8);
+                        n += 1;
                     }
-                };
-                put(b"argv=");
-                for i in 0..args.argc() {
+                }
+            };
+            put(b"argv=");
+            for i in 0..args.argc() {
+                if i != 0 {
+                    put(b" ");
+                }
+                if let Some(a) = args.arg(i) {
+                    put(a);
+                }
+            }
+            if args.envc() != 0 {
+                put(b"|env=");
+                for i in 0..args.envc() {
                     if i != 0 {
                         put(b" ");
                     }
-                    if let Some(a) = args.arg(i) {
-                        put(a);
+                    if let Some(e) = args.env(i) {
+                        put(e);
                     }
                 }
-                if args.envc() != 0 {
-                    put(b"|env=");
-                    for i in 0..args.envc() {
-                        if i != 0 {
-                            put(b" ");
-                        }
-                        if let Some(e) = args.env(i) {
-                            put(e);
-                        }
-                    }
-                }
-                let _ = sys.send(console.handle(), &m);
             }
+            let _ = sys.send(console.handle(), &m);
         }
     }
     Syscalls::new(&mut raw).exit(args.arg0_as_status())
