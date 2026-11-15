@@ -14,7 +14,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 ## M0: Security
  
  - [x GLM done 2026-11-14 35e637d] S2b GLM (do next): REGS_WRITE passes the user's entry PC (image slot 2) to `init_context` unchecked (`kernel/src/sched.rs` `regs_write`), so a non-canonical RIP faults in ring 0 at `iretq`. Reject a non-`is_user_addr` PC with EBADARG, add a host test, and file a Request for DS's attack case.
- - [x DS done 2026-11-15 <hash>] S2c DS: Add the S2b attack case to `sdk/src/attack.rs` — REGS_WRITE with a non-canonical/kernel-window/null entry PC (image slot 2) returns EBADARG; added case 2 with frame carve + REGS_WRITE(invalid PC), updated mock kernel and all tests.
+ - [x DS done 2026-11-15 5ff5f16] S2c DS: Add the S2b attack case to `sdk/src/attack.rs` — REGS_WRITE with a non-canonical/kernel-window/null entry PC (image slot 2) returns EBADARG; added case 2 with frame carve + REGS_WRITE(invalid PC), updated mock kernel and all tests.
 
 ## M0: Gates and tools
 
@@ -32,7 +32,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
 ## M0: Unsafe migration (PLAN.md 7.1)
  
- - [x DS done 2026-11-15 <hash>] U1 DS: Split raw syscall assembly into `sdk/src/sys/raw.rs`; all SDK modules + server crates now `#![forbid(unsafe_code)]`; server binaries (ps, vfs, console, auth) and child.rs use `#![forbid(unsafe_code)]`; ps.rs unsafe blocks replaced with `raw_copy_from_va_to_u64x3`; added `SysHeap` + `entry_point!` macro shared across all userspace bins; personality bins (PSX) pending per U4.
+ - [x DS done 2026-11-15 5ff5f16] U1 DS: Split raw syscall assembly into `sdk/src/sys/raw.rs`; all SDK modules + server crates now `#![forbid(unsafe_code)]`; server binaries (ps, vfs, console, auth) and child.rs use `#![forbid(unsafe_code)]`; ps.rs unsafe blocks replaced with `raw_copy_from_va_to_u64x3`; added `SysHeap` + `entry_point!` macro shared across all userspace bins; personality bins (PSX) pending per U4.
 - [x DRV done 2026-11-15 9a2db16] U2 DRV: Migrated `graphics` MMIO access to use safe `MmioWindow` wrapper (local module in virtio_gpu.rs). MMIO operations are now bounds-checked and alignment-checked. DMA page operations remain (granted via capability).
 - [x DRV done 2026-11-15 9a2db16] U3 DRV: Migrated `drivers` MMIO access to use safe `MmioWindow` wrapper (local modules in virtio_blk.rs and virtio_net.rs). MMIO operations are now bounds-checked and alignment-checked. DMA page operations remain (granted via capability).
 - [~ PSX started 2026-11-14] U4a PSX: personality bins onto sdk's safe `Args::new(argc, argv_va, envp_va)` — the 8 per-bin `unsafe` wrappers go; bins still need DS's `sdk/src/sys/raw.rs` allocator wrapper to build.
