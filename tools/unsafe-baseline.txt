@@ -23,7 +23,6 @@ personality/src/bin/ls.rs 1
 personality/src/bin/posix.rs 1
 personality/src/bin/sh.rs 1
 personality/src/bin/wc.rs 1
-personality/src/vfs.rs 10
 sdk/src/args.rs 7
 sdk/src/bin/bench.rs 6
 sdk/src/bin/child.rs 1
