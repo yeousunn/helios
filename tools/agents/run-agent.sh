@@ -318,9 +318,15 @@ run_gate() {
         rc=$?
         [ "$rc" = 124 ] && out="$out
 [gate] timed out after ${GATE_TIMEOUT}s"
+        [ "$rc" = 0 ] || out="$out
+[gate] FAILED with exit code $rc (qemu-test.sh: 1 check failed or no DONE marker, 2 kernel panic, 4 boot hung)"
         # The output is agent-controlled text that goes into prompts and the
-        # owner's terminal: printable characters only, last 60 lines.
-        out="$(printf '%s\n' "$out" | LC_ALL=C tr -cd '[:print:]\n' | tail -n 60)"
+        # owner's terminal: printable characters only. Error lines first, then
+        # the last 40 lines (a boot failure ends in a long serial log).
+        out="$(printf '%s\n' "$out" | LC_ALL=C tr -cd '[:print:]\n')"
+        out="$(printf '%s\n' "$out" | grep -E 'ERROR|FAIL|error(\[|:)|panicked|timed out|QEMU exited with status' | head -n 20
+            echo "--- last 40 lines ---"
+            printf '%s\n' "$out" | tail -n 40)"
         if [ "$rc" = 0 ]; then
             printf '%s\n' "$out" >"$GATE_CACHE/$head.ok"
             log "gate PASS on $(g rev-parse --short "$head")"
@@ -340,13 +346,13 @@ gate_note() {
     for d in $OWN_DIRS $OWN_ROOT; do re="$re|$(re_escape "$d")"; done
     mine="$(grep -E "(^|[^A-Za-z0-9_./-])(${re#|})(/|:|[[:space:]]|$)" "$GATE_RESULT" | head -n 15)"
     printf '\n\n## The gate fails at HEAD %s\n\n' "$(g rev-parse --short "$GATE_HEAD")"
-    printf 'Before this cycle the supervisor ran the full gate (AGENTS.md section 5) on a clean copy of HEAD, and it failed. The last lines of its output:\n\n```\n'
+    printf 'Before this cycle the supervisor ran the full gate (AGENTS.md section 5) on a clean copy of HEAD, and it failed. Its error lines, then the end of its output:\n\n```\n'
     cat "$GATE_RESULT"
     printf '```\n\n'
     if [ -n "$mine" ]; then
         printf 'These failing lines name files in your directories, so fixing them is your task for this cycle, before anything else. A task you marked done that caused this is not done: set it back to `[ ]` with a one-line reason. '
     else
-        printf 'No failing line names your directories. Keep working on your own tasks. '
+        printf 'No failing line names your directories. A boot failure names no files: check Requests and Blockers on the board for whose it is, and if it is yours, fix it first. Otherwise keep working on your own tasks. '
         [ "$NAME" = nv ] && printf 'As coordinator, make sure the owner of the failing files has an open board task for the failure. '
     fi
     printf 'Never hide a failure: do not add an entry to tools/unsafe-baseline.txt or raise a count in it, and do not weaken or skip a check.\n'
