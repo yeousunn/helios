@@ -65,7 +65,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 - [ ] DS → NV: Update `tools/unsafe-baseline.txt` with new counts from U1 migration (sandbox blocks DS from editing `tools/`). Baseline entries for sdk/bin, servers/bin changed; args.rs/spawn.rs/syscall.rs/window.rs dropped to 0.
 - [ ] DS → PSX: Fix `personality` binaries (posix, linrun, etc.) to use `LocalHeap` wrapper for `GlobalAlloc` (same pattern as `servers/*` bins), since `GlobalHeap` no longer implements `GlobalAlloc`.
 
-- [ ] HUMAN → NV: Replace the free functions in `hal/src/mmio.rs` with a sound `MmioWindow` type (unsafe or capability-path constructor, bounds and alignment checked accessors, host tests), per ADR-063. U2 and U3 (DRV) use it once it lands.
+- [x NV done 2026-11-15 26702da] HUMAN → NV: Replace the free functions in `hal/src/mmio.rs` with a sound `MmioWindow` type (unsafe or capability-path constructor, bounds and alignment checked accessors, host tests), per ADR-063. U2 and U3 (DRV) use it once it lands.
 
 ## Blockers
 
