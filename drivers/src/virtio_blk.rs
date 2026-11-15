@@ -10,14 +10,83 @@
 //!    used for the virtqueue (descriptors + available ring + used ring + the
 //!    request header/data area).
 //!
-//! All device register access goes through the mapped MMIO window via volatile
-//! pointer access. `Virtio::notify`/`read_isr`/`ack_used` collapse to MMIO
-//! writes/reads on the notification and ISR registers, so the driver does not
-//! depend on `hal::Virtio`. DMA allocation is the launcher's job (Frame cap +
-//! `AS::MAP`), so the driver does not depend on `hal::Dma` either. HAL traits
-//! stay kernel-internal.
+//! All device register access goes through the mapped MMIO window via the
+//! safe `MmioWindow` wrapper defined below. DMA allocation is the launcher's
+//! job (Frame cap + `AS::MAP`), so the driver does not depend on `hal::Dma`
+//! either. HAL traits stay kernel-internal.
 
 use core::ptr;
+
+mod mmio {
+    use core::ptr;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum MmioError {
+        OutOfBounds,
+        Misaligned,
+    }
+
+    pub struct MmioWindow {
+        base: usize,
+        len: usize,
+    }
+
+    impl MmioWindow {
+        pub unsafe fn new(base: usize, len: usize) -> Self {
+            Self { base, len }
+        }
+
+        pub fn read32(&self, offset: usize) -> Result<u32, MmioError> {
+            let end = offset.checked_add(4).ok_or(MmioError::OutOfBounds)?;
+            if end > self.len {
+                return Err(MmioError::OutOfBounds);
+            }
+            if !offset.is_multiple_of(4) {
+                return Err(MmioError::Misaligned);
+            }
+            Ok(unsafe { ptr::read_volatile((self.base + offset) as *const u32) })
+        }
+
+        pub fn write32(&self, offset: usize, value: u32) -> Result<(), MmioError> {
+            let end = offset.checked_add(4).ok_or(MmioError::OutOfBounds)?;
+            if end > self.len {
+                return Err(MmioError::OutOfBounds);
+            }
+            if !offset.is_multiple_of(4) {
+                return Err(MmioError::Misaligned);
+            }
+            unsafe {
+                ptr::write_volatile((self.base + offset) as *mut u32, value);
+            }
+            Ok(())
+        }
+
+        #[allow(dead_code)]
+        pub fn read64(&self, offset: usize) -> Result<u64, MmioError> {
+            let end = offset.checked_add(8).ok_or(MmioError::OutOfBounds)?;
+            if end > self.len {
+                return Err(MmioError::OutOfBounds);
+            }
+            if !offset.is_multiple_of(8) {
+                return Err(MmioError::Misaligned);
+            }
+            Ok(unsafe { ptr::read_volatile((self.base + offset) as *const u64) })
+        }
+
+        #[allow(dead_code)]
+        pub fn write64(&self, offset: usize, value: u64) -> Result<(), MmioError> {
+            let end = offset.checked_add(8).ok_or(MmioError::OutOfBounds)?;
+            if end > self.len {
+                return Err(MmioError::OutOfBounds);
+            }
+            if !offset.is_multiple_of(8) {
+                return Err(MmioError::Misaligned);
+            }
+            unsafe { ptr::write_volatile((self.base + offset) as *mut u64, value) }
+            Ok(())
+        }
+    }
+}
 
 /// Virtio PCI vendor ID (Red Hat / virtio).
 const VIRTIO_VENDOR_ID: u16 = 0x1AF4;
@@ -106,7 +175,7 @@ struct VirtQueue {
 /// A virtio-blk block device.
 pub struct VirtioBlk {
     /// Mapped MMIO window over the device BAR (from an `MmioRegion` cap).
-    mmio_base: usize,
+    mmio: mmio::MmioWindow,
     capacity_sectors: u64,
     /// Virtual address of the DMA page holding the virtqueue (from a `Frame`
     /// cap mapped via `AS::MAP`), or None until `init`.
@@ -122,9 +191,9 @@ impl VirtioBlk {
     /// `mmio_base` is the virtual address of a mapped `MmioRegion` covering the
     /// device's MMIO BAR; the caller (kernel dispatcher or init) holds the cap
     /// and has already mapped the region.
-    pub fn new(mmio_base: usize) -> Self {
+    pub fn new(mmio_base: usize, mmio_len: usize) -> Self {
         Self {
-            mmio_base,
+            mmio: unsafe { mmio::MmioWindow::new(mmio_base, mmio_len) },
             capacity_sectors: 0,
             queue_vaddr: None,
             queue_paddr: 0,
@@ -134,44 +203,46 @@ impl VirtioBlk {
     }
 
     /// Read a u32 from a virtio MMIO register.
-    ///
-    /// # Safety
-    ///
-    /// `mmio_base` must point at a mapped virtio-blk device MMIO region.
-    fn rd32(&self, offset: usize) -> u32 {
-        // SAFETY: `mmio_base` is a mapped virtio-blk MMIO window granted via
-        // an `MmioRegion` capability; the offset is within the BAR.
-        unsafe { ptr::read_volatile((self.mmio_base + offset) as *const u32) }
+    fn rd32(&self, offset: usize) -> Result<u32, &'static str> {
+        self.mmio.read32(offset).map_err(|_| "MMIO read error")
     }
 
     /// Write a u32 to a virtio MMIO register.
-    ///
-    /// # Safety
-    ///
-    /// `mmio_base` must point at a mapped virtio-blk device MMIO region.
-    fn wr32(&self, offset: usize, value: u32) {
-        // SAFETY: `mmio_base` is a mapped writable virtio-blk MMIO window
-        // granted via an `MmioRegion` capability; the offset is within the BAR.
-        unsafe {
-            ptr::write_volatile((self.mmio_base + offset) as *mut u32, value);
-        }
+    fn wr32(&self, offset: usize, value: u32) -> Result<(), &'static str> {
+        self.mmio
+            .write32(offset, value)
+            .map_err(|_| "MMIO write error")
     }
 
     /// Probe the device: verify magic/version/vendor/device IDs. Returns
     /// `true` if a virtio-blk device is present at `mmio_base`.
     pub fn probe(&self) -> bool {
-        if self.rd32(MMIO_MAGIC) != 0x7472_6976
-        /* "virt" */
-        {
+        let magic = match self.rd32(MMIO_MAGIC) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        if magic != 0x7472_6976 {
             return false;
         }
-        if self.rd32(MMIO_VERSION) != 1 {
+        let version = match self.rd32(MMIO_VERSION) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        if version != 1 {
             return false;
         }
-        if self.rd32(MMIO_DEVICE_ID) != VIRTIO_ID_BLOCK as u32 {
+        let device_id = match self.rd32(MMIO_DEVICE_ID) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        if device_id != VIRTIO_ID_BLOCK as u32 {
             return false;
         }
-        if self.rd32(MMIO_VENDOR_ID) != VIRTIO_VENDOR_ID as u32 {
+        let vendor_id = match self.rd32(MMIO_VENDOR_ID) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        if vendor_id != VIRTIO_VENDOR_ID as u32 {
             return false;
         }
         true
@@ -179,11 +250,14 @@ impl VirtioBlk {
 
     /// Read the device capacity (in 512-byte sectors) from config space.
     pub fn capacity(&self) -> u64 {
-        // SAFETY: reading config space; the device is present.
-        let lo = unsafe { ptr::read_volatile((self.mmio_base + MMIO_CONFIG_GEN + 4) as *const u32) }
-            as u64;
-        let hi = unsafe { ptr::read_volatile((self.mmio_base + MMIO_CONFIG_GEN + 8) as *const u32) }
-            as u64;
+        let lo = match self.rd32(MMIO_CONFIG_GEN + 4) {
+            Ok(v) => v as u64,
+            Err(_) => return 0,
+        };
+        let hi = match self.rd32(MMIO_CONFIG_GEN + 8) {
+            Ok(v) => v as u64,
+            Err(_) => return 0,
+        };
         lo | (hi << 32)
     }
 
@@ -197,20 +271,21 @@ impl VirtioBlk {
     /// used `AS::MAP`; the driver never allocates DMA itself).
     pub fn init(&mut self, dma_virt: usize, dma_phys: usize) -> Result<u64, &'static str> {
         // 1. Reset: write 0 to status.
-        self.wr32(MMIO_STATUS, 0);
+        self.wr32(MMIO_STATUS, 0)?;
 
         // 2. Acknowledge: we've seen the device.
-        self.wr32(MMIO_STATUS, self.rd32(MMIO_STATUS) | STATUS_ACKNOWLEDGE);
+        let status_ack = self.rd32(MMIO_STATUS)?;
+        self.wr32(MMIO_STATUS, status_ack | STATUS_ACKNOWLEDGE)?;
 
         // 3. Driver: we know how to drive it.
-        self.wr32(MMIO_STATUS, self.rd32(MMIO_STATUS) | STATUS_DRIVER);
+        self.wr32(MMIO_STATUS, status_ack | STATUS_DRIVER)?;
 
         // 4. Feature negotiation (v0: accept no extra features; device must
         //    work with the default feature set).
-        self.wr32(MMIO_STATUS, self.rd32(MMIO_STATUS) | STATUS_FEATURES_OK);
+        self.wr32(MMIO_STATUS, status_ack | STATUS_FEATURES_OK)?;
 
         // 5. Driver OK: we're ready.
-        self.wr32(MMIO_STATUS, self.rd32(MMIO_STATUS) | STATUS_DRIVER_OK);
+        self.wr32(MMIO_STATUS, status_ack | STATUS_DRIVER_OK)?;
 
         // 6. Read capacity from config space (offset 0 in config region).
         let capacity = self.capacity();
@@ -228,14 +303,14 @@ impl VirtioBlk {
     /// Program the virtqueue into the granted DMA page.
     fn setup_queue(&mut self, dma_virt: usize, dma_phys: usize) -> Result<(), &'static str> {
         // Tell the device the queue size.
-        self.wr32(MMIO_QUEUE_SEL, 0); // select queue 0
-        let max = self.rd32(MMIO_QUEUE_NUM_MAX);
+        self.wr32(MMIO_QUEUE_SEL, 0)?; // select queue 0
+        let max = self.rd32(MMIO_QUEUE_NUM_MAX)?;
         if max < QUEUE_SIZE as u32 {
             return Err("virtio-blk: queue too small");
         }
-        self.wr32(MMIO_QUEUE_NUM, QUEUE_SIZE as u32);
-        self.wr32(MMIO_QUEUE_PFN, (dma_phys / DMA_PAGE) as u32);
-        self.wr32(MMIO_QUEUE_READY, 1);
+        self.wr32(MMIO_QUEUE_NUM, QUEUE_SIZE as u32)?;
+        self.wr32(MMIO_QUEUE_PFN, (dma_phys / DMA_PAGE) as u32)?;
+        self.wr32(MMIO_QUEUE_READY, 1)?;
 
         // Zero the queue page.
         // SAFETY: `dma_virt` is the granted DMA page, exclusively ours.
@@ -300,7 +375,7 @@ impl VirtioBlk {
         self.next_desc_idx = (self.next_desc_idx + 2) % QUEUE_SIZE;
 
         // Notify the device (`Virtio::notify` -> MMIO_QUEUE_NOTIFY write).
-        self.wr32(MMIO_QUEUE_NOTIFY, 0);
+        self.wr32(MMIO_QUEUE_NOTIFY, 0)?;
 
         // Wait for the device to signal completion (spin on the used ring).
         let target_idx = self.next_avail_idx.wrapping_sub(1);
@@ -335,7 +410,7 @@ impl VirtioBlk {
         }
 
         // Acknowledge the used buffer (`Virtio::ack_used` -> MMIO_ISR read).
-        self.rd32(MMIO_ISR);
+        let _ = self.rd32(MMIO_ISR);
 
         Ok(())
     }
@@ -375,7 +450,7 @@ mod tests {
     #[test]
     fn probe_rejects_invalid_magic() {
         let mmio = MmioStub::new(4096);
-        let driver = VirtioBlk::new(mmio.base as usize);
+        let driver = VirtioBlk::new(mmio.base as usize, 4096);
         assert!(!driver.probe());
     }
 
@@ -383,7 +458,7 @@ mod tests {
     fn init_zero_capacity_is_rejected() {
         let mmio = MmioStub::new(4096);
         let dma = std::boxed::Box::leak(std::vec![0u8; DMA_PAGE].into_boxed_slice());
-        let mut driver = VirtioBlk::new(mmio.base as usize);
+        let mut driver = VirtioBlk::new(mmio.base as usize, 4096);
         // All MMIO reads return 0 → capacity 0 → rejected.
         assert_eq!(
             driver.init(dma.as_ptr() as usize, dma.as_ptr() as usize),
