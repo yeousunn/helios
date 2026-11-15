@@ -655,6 +655,7 @@ fn thread_invoke(
                 }
                 match sched::regs_write(target, &image) {
                     Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
+                    Err(sched::SchedError::BadArg) => SyscallReturn::err(ipc::status::EBADARG),
                     Err(_) => SyscallReturn::err(ipc::status::EBADSTATE),
                 }
             }

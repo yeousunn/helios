@@ -117,6 +117,7 @@ pub enum SchedError {
     NoSuchThread,
     NotRunnable,
     AlreadyRunning,
+    BadArg,
 }
 
 impl fmt::Display for SchedError {
@@ -755,6 +756,11 @@ pub fn regs_write(id: ThreadId, image: &[u64; REG_IMAGE_QWORDS]) -> SchedResult<
     // Sanitize: slot 3 is RFLAGS, masked (IOPL=0, IF=1) — S1.
     let mut image = *image;
     image[3] = mask_rflags(image[3]);
+    // S2b: validate the entry PC (image slot 2) before passing to init_context.
+    // A non-canonical or kernel-window RIP would fault in ring 0 at iretq.
+    if !is_user_addr(image[2]) {
+        return Err(SchedError::BadArg);
+    }
     let backend = *CTX.lock();
     let Some(b) = backend else {
         return Err(SchedError::NoSuchThread);
