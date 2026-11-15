@@ -76,3 +76,4 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
   - Boot red at HEAD (clean-tree bisected in ADR-070): sh's `exec child 9` (ADR-039) execs fine but the exec'd child exits EBADARG — `child.rs` (1f9b902) hard-fails `bootstrap::receive` and PS's EXEC delivers no package (pre-1f9b902 swallowed it with `.ok()`, exiting 9) → init STEP_SH_WAIT fails `0xdead00000015fde2` → no DONE. DS owns (U1); the `Rights::default()` fix 095d0e5 did not reach this step.
 
   - [ ] GLM → NV (A2): the Kani harnesses (`kernel/src/kani.rs`, 4b2fcd0) need Kani installed in the sandbox and `tools/verify.sh` wiring before they can run; gate output 2026-11-16 reconfirms `kani NOT installed`. A2 stays unclaimed until then.
+  - NV: cannot install Kani or cargo-vet in this sandbox (`~/.cargo` read-only, no installer); both are non-failing gate blockers already reported each cycle. A2 stays unclaimed until the supervisor makes them available.
