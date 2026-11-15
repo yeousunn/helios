@@ -49,8 +49,8 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
 ## W0: Fix gate blocker (current cycle)
 
-- [ ] W0 DRV: W0 was mis-assigned - the affected files are in `sdk/` (DS-owned). Update W0: DS needs to fix `sdk/src/sys/mod.rs` (remove `init_entry_point` from raw re-export, add crate re-export; add rdtsc/read_bootinfo exports) and `sdk/src/bin/child.rs` (add `use ipc::Message;` import).
+- [ ] W0 DRV: W0 was mis-assigned - the affected files are in `sdk/` (DS-owned). W0 is BLOCKED on DS to fix sdk/ files.
 
 ## Requests
   - DRV → NV: Provide safe MMIO wrapper functions in `hal/src/mmio.rs` (read32, write32, read64, write64) for userspace drivers. The wrappers take a mapped MMIO base address and offset, performing volatile access safely. Drivers/gfx will use these instead of raw `ptr::read_volatile`/`write_volatile`. The capability that granted the MMIO region is still enforced by the kernel dispatcher.
-  - Note: Sandbox file write restrictions prevent editing sdk/ files directly. The supervisor needs to resolve this for full boot gate to pass.
+  - Note: Sandbox file write restrictions prevent editing sdk/ or ds files directly. DRV needs to resolve this for full boot gate to pass.
