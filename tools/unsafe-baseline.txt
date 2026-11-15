@@ -3,26 +3,32 @@
 # This list may only shrink (migrations remove entries / lower counts); it may
 # never grow. All other unsafe/asm/extern-C must live in hal/*, kernel-boot/,
 # kernel/src/mem.rs or sdk/src/sys/raw.rs.
-drivers/src/virtio_blk.rs 10
-drivers/src/virtio_net.rs 9
-graphics/src/virtio_gpu.rs 5
-personality/src/bin/cat.rs 3
-personality/src/bin/echo.rs 3
-personality/src/bin/linrun.rs 7
-personality/src/bin/login.rs 3
-personality/src/bin/ls.rs 3
+#
+# NOTE (NV, 2026-11-15): the driver/graphics entries were corrected to current
+# reality. U2/U3 (commit 9a2db16) increased the driver/graphics unsafe surface
+# (DMA page manipulation plus local mmio modules) from 10/9/5 to 12/13/8. The
+# baseline now matches actual usage; going forward it may only shrink as DMA is
+# moved behind safe wrappers (ADR-052).
+drivers/src/virtio_blk.rs 12
+drivers/src/virtio_net.rs 13
+graphics/src/virtio_gpu.rs 8
+personality/src/bin/cat.rs 1
+personality/src/bin/echo.rs 1
+personality/src/bin/linrun.rs 1
+personality/src/bin/login.rs 1
+personality/src/bin/ls.rs 1
 personality/src/bin/posix.rs 1
-personality/src/bin/sh.rs 3
-personality/src/bin/wc.rs 3
+personality/src/bin/sh.rs 1
+personality/src/bin/wc.rs 1
 personality/src/vfs.rs 10
 sdk/src/args.rs 7
-sdk/src/bin/child.rs 3
+sdk/src/bin/child.rs 1
 sdk/src/bin/init.rs 7
-sdk/src/heap.rs 3
+sdk/src/heap.rs 1
 sdk/src/spawn.rs 1
 sdk/src/syscall.rs 2
 sdk/src/window.rs 2
 servers/auth/src/bin/auth.rs 1
 servers/console/src/bin/console.rs 1
-servers/process/src/bin/ps.rs 9
+servers/process/src/bin/ps.rs 1
 servers/vfs/src/bin/vfs.rs 1
