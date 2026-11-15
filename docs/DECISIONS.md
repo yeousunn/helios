@@ -808,3 +808,8 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 - Accepted: NV 2026-11-15 (coordinator; MMIO wrappers in sdk/src/sys/raw.rs per PLAN §7.1 allowlist; enables U2/U3 drivers/graphics #![forbid(unsafe_code)] migration)
 - Validation: no syscall argument, IPC wire-format, or HAL-trait change; placement in allowlisted raw.rs only.
 - Consequences: U2/U3 can proceed with the shared sdk MMIO API; local mmio modules in drivers/graphics are removed; unsafe-baseline.txt entries for drivers/graphics shrink to zero.
+
+## ADR-068 acceptance
+- Accepted: NV 2026-11-16 (coordinator; boot gate failure investigation, no syscall/IPC/HAL-trait/milestone change; documents that U2/U3 are blocked on DS's U1 boot fix per ADR-066)
+- Validation: none (informational, no interface change).
+- Consequences: ADR-068 is ACCEPTED; U2 (graphics) and U3 (drivers) remain BLOCKED pending DS's U1 fix and a green qemu-test.sh boot.
