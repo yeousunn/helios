@@ -18,24 +18,49 @@
 //! (PS `WAIT`) work end to end.
 #![no_std]
 #![no_main]
-#![deny(unsafe_op_in_unsafe_fn)]
+#![forbid(unsafe_code)]
 
 use core::panic::PanicInfo;
 
+#[allow(unused_imports)]
+use ipc::Message;
 use sdk::sys::SysHeap;
 use sdk::syscall::{Syscalls, X86_64Syscalls};
 
 /// The sdk rlib links `alloc`; a handler satisfies the link even though this
-/// child allocates nothing (initializing the heap is optional).
+/// child allocates nothing in the smoke path (initializing the heap is only
+/// needed for attack mode).
 #[global_allocator]
 static HEAP: SysHeap = SysHeap::new();
 
 sdk::sys::entry_point!(child_main);
 
-/// The crafted argv/envp (v0.2 entry contract) were captured by the stub.
-/// All pointer parsing is done safely via `sdk::sys::raw_cstr_from_va` and
-/// `sdk::sys::raw_ptr_array_from_va`.
-extern "C" fn child_main(argc: u64, argv_va: u64, envp_va: u64) -> ! {
+/// Parse argv[0] directly from the entry stack without allocating.
+/// Returns the exit status (argv[0] as decimal) or -1/-2 on parse failure.
+fn parse_argv0_status(argc: u64, argv_va: u64) -> i32 {
+    use sdk::sys::{raw_cstr_from_va, raw_ptr_array_from_va};
+    if argc == 0 {
+        return -1;
+    }
+    let argv_ptrs = raw_ptr_array_from_va(argv_va, argc as usize).unwrap_or(&[]);
+    if argv_ptrs.is_empty() || argv_ptrs[0] == 0 {
+        return -1;
+    }
+    let arg0 = raw_cstr_from_va(argv_ptrs[0]).unwrap_or(&[]);
+    if arg0.is_empty() || !arg0[0].is_ascii_digit() {
+        return -2;
+    }
+    let mut v: i32 = 0;
+    for &c in arg0 {
+        if !c.is_ascii_digit() {
+            break;
+        }
+        v = v.saturating_mul(10).saturating_add((c - b'0') as i32);
+    }
+    v
+}
+
+fn child_main(argc: u64, argv_va: u64, _envp_va: u64) -> ! {
     let mut raw = X86_64Syscalls;
 
     // 1. Receive the bootstrap package first (no allocation needed).
@@ -47,47 +72,59 @@ extern "C" fn child_main(argc: u64, argv_va: u64, envp_va: u64) -> ! {
         }
     };
 
-    // 2. Initialize the heap from the package's region and aspace.
-    //    Carve and map heap chunks like init/ps do.
-    use sdk::heap::RegionSource;
-    use sdk::layout::{HEAP_CHUNK, HEAP_CHUNKS};
-    const CHILD_HEAP_VA_BASE: u64 = 0x4000_0000; // arbitrary, below stack
-    let span = {
-        let mut src = RegionSource::new(
-            &mut raw,
-            package.region,
-            package.aspace,
-            CHILD_HEAP_VA_BASE,
-            HEAP_CHUNK,
-        );
-        src.map_startup(HEAP_CHUNKS)
-    };
-    let (heap_start, heap_len) = match span {
-        Ok(v) => v,
-        Err(e) => Syscalls::new(&mut raw).exit(e),
-    };
-    if let Err(e) = HEAP.init(heap_start, heap_len) {
-        Syscalls::new(&mut raw).exit(e);
-    }
+    // 2. Fast path: smoke test only needs argv[0] as decimal exit status.
+    //    Parse it directly from the entry stack without any heap allocation.
+    let smoke_status = parse_argv0_status(argc, argv_va);
 
-    // 3. Now parse args (this allocates via Vec).
-    let args = sdk::args::Args::new(argc as usize, argv_va, envp_va);
+    // 3. S11 attack mode: `argv[0] == "attack"` runs the kernel-hardening attack
+    //    cases (sdk::attack). This path needs a heap for allocations.
+    //    Check argv[0] again via the non-allocating parser to avoid heap init
+    //    unless actually needed.
+    let is_attack = {
+        use sdk::sys::{raw_cstr_from_va, raw_ptr_array_from_va};
+        if argc == 0 {
+            false
+        } else {
+            let argv_ptrs = raw_ptr_array_from_va(argv_va, argc as usize).unwrap_or(&[]);
+            !argv_ptrs.is_empty()
+                && argv_ptrs[0] != 0
+                && raw_cstr_from_va(argv_ptrs[0]) == Some(b"attack")
+        }
+    };
 
-    // S11 attack mode: `argv[0] == "attack"` runs the kernel-hardening attack
-    // cases (sdk::attack) instead of the numeric-argv smoke. init spawns this
-    // as a new marker step; exit 0 = every bad call was rejected.
-    if matches!(args.arg(0), Some(b"attack")) {
+    if is_attack {
+        // Initialize heap for attack mode (allocates via Vec in attack cases).
+        use sdk::heap::RegionSource;
+        use sdk::layout::{HEAP_CHUNK, HEAP_CHUNKS};
+        const CHILD_HEAP_VA_BASE: u64 = 0x4000_0000;
+        let span = {
+            let mut src = RegionSource::new(
+                &mut raw,
+                package.region,
+                package.aspace,
+                CHILD_HEAP_VA_BASE,
+                HEAP_CHUNK,
+            );
+            src.map_startup(HEAP_CHUNKS)
+        };
+        let (heap_start, heap_len) = match span {
+            Ok(v) => v,
+            Err(e) => Syscalls::new(&mut raw).exit(e),
+        };
+        if let Err(e) = HEAP.init(heap_start, heap_len) {
+            Syscalls::new(&mut raw).exit(e);
+        }
+
         let status = {
             let mut sys = Syscalls::new(&mut raw);
             sdk::attack::run(&mut sys, &package)
         };
         Syscalls::new(&mut raw).exit(status)
     }
-    // Diagnostic: echo the crafted argv through a caller-supplied console
-    // endpoint (package `optional[2]`) before exiting — makes stack-crafting
-    // bugs visible on the serial line. All args, space-joined.
+
+    // 4. Diagnostic: echo argv through console if provided (optional, no alloc).
     if let Some(console) = package.optional.get(2).copied().flatten() {
-        if args.argc() != 0 {
+        if argc != 0 {
             let mut sys = Syscalls::new(&mut raw);
             let mut m = ipc::Message::new(sdk::methods::console::WRITE);
             let mut n = 0usize;
@@ -99,30 +136,26 @@ extern "C" fn child_main(argc: u64, argv_va: u64, envp_va: u64) -> ! {
                     }
                 }
             };
+            use sdk::sys::{raw_cstr_from_va, raw_ptr_array_from_va};
+            let argv_ptrs = raw_ptr_array_from_va(argv_va, argc as usize).unwrap_or(&[]);
             put(b"argv=");
-            for i in 0..args.argc() {
+            for i in 0..argc as usize {
                 if i != 0 {
                     put(b" ");
                 }
-                if let Some(a) = args.arg(i) {
-                    put(a);
-                }
-            }
-            if args.envc() != 0 {
-                put(b"|env=");
-                for i in 0..args.envc() {
-                    if i != 0 {
-                        put(b" ");
-                    }
-                    if let Some(e) = args.env(i) {
-                        put(e);
+                if i < argv_ptrs.len() && argv_ptrs[i] != 0 {
+                    if let Some(a) = raw_cstr_from_va(argv_ptrs[i]) {
+                        put(a);
                     }
                 }
             }
+            // envp is optional and not parsed for the smoke path.
             let _ = sys.send(console.handle(), &m);
         }
     }
-    Syscalls::new(&mut raw).exit(args.arg0_as_status())
+
+    // 5. Exit with argv[0] as decimal status (smoke test convention).
+    Syscalls::new(&mut raw).exit(smoke_status)
 }
 
 #[panic_handler]

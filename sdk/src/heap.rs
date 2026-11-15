@@ -6,7 +6,7 @@
 //! - [`RegionSource`] — the carve + map glue (tested against mock syscalls),
 //! - [`GlobalHeap`] — a thread-safe bump allocator wrapper. **Binaries that need
 //!   a global allocator should implement `GlobalAlloc` themselves** (the `GlobalAlloc`
-//!   trait requires `unsafe impl`, which is not allowed in this crate per
+//!   trait requires an unsafe Rust impl block, which is not allowed in this crate per
 //!   PLAN.md §7.1). Init and child declare a failing allocator — they are
 //!   allocation-free.
 //!

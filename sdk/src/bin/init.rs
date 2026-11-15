@@ -15,14 +15,14 @@
 
 #![no_std]
 #![no_main]
-#![deny(unsafe_op_in_unsafe_fn)]
+#![forbid(unsafe_code)]
 
 extern crate alloc;
 
 use core::panic::PanicInfo;
 
 use ipc::{CapSlot, Message, Rights};
-use sdk::bootinfo::{BootInfo, MAX_LEN};
+use sdk::bootinfo::BootInfo;
 use sdk::bootstrap;
 use sdk::elf::ElfImage;
 use sdk::heap::RegionSource;
@@ -32,7 +32,7 @@ use sdk::layout::{
 };
 use sdk::loader;
 use sdk::methods;
-use sdk::sys::SysHeap;
+use sdk::sys::{raw_copy_from_va, raw_copy_to_va, SysHeap};
 use sdk::syscall::{Handle, Syscalls, X86_64Syscalls};
 
 include!(concat!(env!("OUT_DIR"), "/ps_image.rs")); // PS + VFS + CONSOLE images
@@ -90,18 +90,9 @@ const STACK_FLAGS: u32 = 0b011; // R | W
 
 type Result<T> = core::result::Result<T, u64>;
 
-/// # Safety
-///
-/// Called by the kernel as init's entry point. `bootinfo_ptr` must point to
-/// the BootInfo block the kernel wrote into init's first stack page (ADR-018),
-/// bounded to `MAX_LEN` bytes.
-#[no_mangle]
-pub unsafe extern "C" fn _start(bootinfo_ptr: *const u8) -> ! {
-    let info = match unsafe { read_bootinfo(bootinfo_ptr) } {
-        Ok(info) => info,
-        Err(errno) => exit_with(fail_code(STEP_BOOTINFO, errno)),
-    };
+sdk::sys::init_entry_point!(init_main);
 
+fn init_main(info: &BootInfo) -> ! {
     let mut raw = X86_64Syscalls;
     mark(&mut raw, info.debug_ep, STEP_ALIVE, 0);
     mark(
@@ -111,7 +102,7 @@ pub unsafe extern "C" fn _start(bootinfo_ptr: *const u8) -> ! {
         info.region_count as u64,
     );
 
-    match run(&mut raw, &info) {
+    match run(&mut raw, info) {
         Ok(()) => {
             mark(&mut raw, info.debug_ep, STEP_DONE, 0);
             Syscalls::new(&mut raw).exit(0)
@@ -512,9 +503,7 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
                 .ok_or(fail_code(STEP_VFS_READ, 0xE3))?
         };
         let root_handle = 1u64; // VfsServer opens the root as handle 1 (design §3.2)
-        unsafe {
-            core::ptr::copy_nonoverlapping(b"hello".as_ptr(), arg_va as *mut u8, 5);
-        }
+        raw_copy_to_va(arg_va, b"hello");
         let file_handle = {
             let mut sys = Syscalls::new(raw);
             let mut open = Message::new(methods::vfs::OPEN);
@@ -545,8 +534,9 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
             reply.words[1]
         };
         let expect = b"helios-vfs-ok";
-        let got = unsafe { core::slice::from_raw_parts(result_va as *const u8, expect.len()) };
-        if count != expect.len() as u64 || got != expect {
+        let mut got = [0u8; 13];
+        raw_copy_from_va(result_va, &mut got);
+        if count != expect.len() as u64 || got.as_slice() != expect {
             return Err(fail_code(STEP_VFS_READ, 0xE8));
         }
         mark(raw, info.debug_ep, STEP_VFS_READ, count);
@@ -559,9 +549,7 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
     // The SPAWN carries the VFS service endpoint so PS installs it as the
     // child package's `optional[0]` (design §2.3). The demo exits 77.
     {
-        unsafe {
-            core::ptr::copy_nonoverlapping(b"posix".as_ptr(), INIT_WINDOW_VA_BASE as *mut u8, 5);
-        }
+        raw_copy_to_va(INIT_WINDOW_VA_BASE, b"posix");
         let spawned = {
             write_spawn_blob(b"posix", &[]);
             let mut sys = Syscalls::new(raw);
@@ -1237,18 +1225,6 @@ fn mark(raw: &mut X86_64Syscalls, debug_ep: u32, step: u64, value: u64) {
     m.words[0] = MARK | step;
     m.words[1] = value;
     let _ = sys.send(debug_ep, &m);
-}
-
-/// SAFETY: the kernel passes a pointer to the BootInfo block it wrote into
-/// init's first stack page; the writer (ADR-018) bounds the block to
-/// `24 + region_count * 24 <= MAX_LEN` bytes inside that page, so reading
-/// `MAX_LEN` bytes stays within init's own stack mapping.
-unsafe fn read_bootinfo(ptr: *const u8) -> core::result::Result<BootInfo, u64> {
-    if ptr.is_null() {
-        return Err(0xE2);
-    }
-    let bytes = unsafe { core::slice::from_raw_parts(ptr, MAX_LEN) };
-    BootInfo::parse(bytes).map_err(|e| e as u64)
 }
 
 #[panic_handler]

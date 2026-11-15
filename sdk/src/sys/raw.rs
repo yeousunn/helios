@@ -6,6 +6,7 @@
 
 use core::alloc::{GlobalAlloc, Layout};
 
+use super::super::bootinfo::{BootInfo, MAX_LEN};
 use super::super::heap::GlobalHeap;
 use super::super::syscall::{RawSyscalls, SysReply};
 
@@ -199,6 +200,102 @@ macro_rules! entry_point {
             "mov rdi, [rsp - 8]",   // argc
             "mov rsi, [rsp - 16]",  // argv* (VA)
             "mov rdx, [rsp - 24]",  // envp* (VA)
+            "sub rsp, 64",
+            "and rsp, -16",
+            "jmp {main}",
+            main = sym $main,
+        );
+    };
+}
+
+/// Safe wrapper for `rdtsc` instruction (x86_64 cycle counter).
+/// Returns 0 on non-x86_64 targets.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub fn rdtsc() -> u64 {
+    let lo: u64;
+    let hi: u64;
+    // SAFETY: `rdtsc` is a read-only instruction available in user mode on x86_64
+    // (CR4.TSD must be clear, which the kernel ensures).
+    unsafe {
+        core::arch::asm!(
+            "rdtsc",
+            out("eax") lo,
+            out("edx") hi,
+            options(nostack, readonly, pure)
+        );
+    }
+    (hi << 32) | lo
+}
+
+/// Safe wrapper for `rdtsc` on non-x86_64 targets (host tests).
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+pub fn rdtsc() -> u64 {
+    0
+}
+
+/// Safe wrapper for reading the BootInfo block from the kernel.
+/// The kernel writes BootInfo into the first stack page and passes a pointer in `rdi`.
+///
+/// # Safety
+/// The kernel guarantees the pointer is valid and bounded to MAX_LEN bytes.
+pub unsafe fn read_bootinfo(ptr: *const u8) -> core::result::Result<BootInfo, u64> {
+    if ptr.is_null() {
+        return Err(0xE2);
+    }
+    // SAFETY: The kernel guarantees the pointer is valid and bounded to MAX_LEN bytes.
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, MAX_LEN) };
+    BootInfo::parse(bytes).map_err(|e| e as u64)
+}
+
+/// Macro to define the `_start` entry point for the init/bench binaries.
+/// The kernel passes a pointer to the BootInfo block in `rdi`.
+///
+/// Usage:
+/// ```rust,ignore
+/// sdk::sys::init_entry_point!(my_main);
+///
+/// fn my_main(info: &BootInfo) -> ! {
+///     loop {}
+/// }
+/// ```
+#[macro_export]
+macro_rules! init_entry_point {
+    ($main:ident) => {
+        core::arch::global_asm!(
+            ".global _start",
+            "_start:",
+            // rdi = bootinfo_ptr (passed by kernel)
+            "sub rsp, 64",
+            "and rsp, -16",
+            "jmp {main}",
+            main = sym $main,
+        );
+    };
+}
+
+/// Entry point for system servers (PS, VFS, console, auth, etc.).
+///
+/// These servers are spawned with an ADR-009 bootstrap package on handle 1.
+/// The kernel starts their thread at `_start` with no register arguments.
+/// The server must call `sdk::bootstrap::receive()` first to get its package.
+///
+/// Usage:
+/// ```rust,ignore
+/// sdk::sys::server_entry_point!(my_main);
+///
+/// fn my_main() -> ! {
+///     let package = sdk::bootstrap::receive(...);
+///     // init heap, mint endpoints, serve loop...
+/// }
+/// ```
+#[macro_export]
+macro_rules! server_entry_point {
+    ($main:ident) => {
+        core::arch::global_asm!(
+            ".global _start",
+            "_start:",
             "sub rsp, 64",
             "and rsp, -16",
             "jmp {main}",

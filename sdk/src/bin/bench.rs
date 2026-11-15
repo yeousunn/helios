@@ -17,45 +17,19 @@
 
 #![no_std]
 #![no_main]
-#![deny(unsafe_op_in_unsafe_fn)]
+#![forbid(unsafe_code)]
 
 extern crate alloc;
 
 use core::panic::PanicInfo;
 
 use ipc::{CapSlot, Message, Rights};
-use sdk::bootinfo::{BootInfo, MAX_LEN};
+use sdk::bootinfo::BootInfo;
 use sdk::heap::RegionSource;
 use sdk::layout::{HEAP_CHUNK, HEAP_CHUNKS, INIT_HEAP_VA_BASE};
 use sdk::methods;
-use sdk::sys::SysHeap;
+use sdk::sys::{init_entry_point, rdtsc, SysHeap};
 use sdk::syscall::{Handle, Status, Syscalls, X86_64Syscalls};
-
-/// x86_64 `rdtsc` instruction for cycle counting.
-/// SAFETY: `rdtsc` is a read-only instruction available in user mode on x86_64
-/// (CR4.TSD must be clear, which the kernel ensures).
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-fn rdtsc() -> u64 {
-    let lo: u64;
-    let hi: u64;
-    unsafe {
-        core::arch::asm!(
-            "rdtsc",
-            out("eax") lo,
-            out("edx") hi,
-            options(nostack, readonly, pure)
-        );
-    }
-    (hi << 32) | lo
-}
-
-/// Non-x86_64 fallback (host tests) — returns 0.
-#[cfg(not(target_arch = "x86_64"))]
-#[inline(always)]
-fn rdtsc() -> u64 {
-    0
-}
 
 /// Log marker prefix for debug endpoint (same as init).
 const MARK: u64 = 0x494E_4954_0000_0000;
@@ -76,16 +50,9 @@ type Result<T> = core::result::Result<T, u64>;
 const WARMUP_ITERS: u64 = 100;
 const MEASURE_ITERS: u64 = 10000;
 
-/// # Safety
-/// Called by the kernel as init's entry point. `bootinfo_ptr` must point to
-/// the BootInfo block the kernel wrote into init's first stack page.
-#[no_mangle]
-pub unsafe extern "C" fn _start(bootinfo_ptr: *const u8) -> ! {
-    let info = match unsafe { read_bootinfo(bootinfo_ptr) } {
-        Ok(info) => info,
-        Err(errno) => exit_with(fail_code(STEP_BOOTINFO, errno)),
-    };
+init_entry_point!(bench_main);
 
+fn bench_main(info: &BootInfo) -> ! {
     let mut raw = X86_64Syscalls;
     {
         let mut sys = Syscalls::new(&mut raw);
@@ -98,7 +65,7 @@ pub unsafe extern "C" fn _start(bootinfo_ptr: *const u8) -> ! {
         );
     }
 
-    match run(&mut raw, &info) {
+    match run(&mut raw, info) {
         Ok(()) => {
             let mut sys = Syscalls::new(&mut raw);
             mark(&mut sys, info.debug_ep, STEP_DONE, 0);
@@ -719,17 +686,6 @@ fn mark(sys: &mut Syscalls<X86_64Syscalls>, debug_ep: Handle, step: u64, value: 
     m.words[0] = MARK | step;
     m.words[1] = value;
     let _ = sys.send(debug_ep, &m);
-}
-
-/// Read bootinfo from the kernel.
-/// SAFETY: the kernel passes a pointer to the BootInfo block it wrote into
-/// init's first stack page; the writer bounds the block to MAX_LEN bytes.
-unsafe fn read_bootinfo(ptr: *const u8) -> core::result::Result<BootInfo, u64> {
-    if ptr.is_null() {
-        return Err(0xE2);
-    }
-    let bytes = unsafe { core::slice::from_raw_parts(ptr, MAX_LEN) };
-    BootInfo::parse(bytes).map_err(|e| e as u64)
 }
 
 #[panic_handler]
