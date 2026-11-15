@@ -33,7 +33,7 @@ use sdk::layout::{
 use sdk::loader;
 use sdk::methods;
 use sdk::sys::SysHeap;
-use sdk::sys::{raw_copy_from_va, raw_copy_to_va};
+use sdk::sys::{raw_copy_from_va, raw_copy_from_va_to_u64x3, raw_copy_to_va};
 use sdk::syscall::{Syscalls, X86_64Syscalls, REPLY_CAP};
 
 include!(concat!(env!("OUT_DIR"), "/child_image.rs"));
@@ -420,9 +420,7 @@ fn spawn_reply(
     // and the env area. Words cannot carry spans alongside 3+ descriptors
     // (descriptors overlay the trailing words). See `sdk::spawn`.
     let mut header = [0u64; 3];
-    let header_bytes =
-        unsafe { core::slice::from_raw_parts_mut(header.as_mut_ptr() as *mut u8, 24) };
-    raw_copy_from_va(win_base, header_bytes);
+    raw_copy_from_va_to_u64x3(win_base, &mut header);
     let span = |w: u64| ((w >> 32) as usize, (w & 0xFFFF_FFFF) as usize);
     let (path_off, path_len) = span(header[0]);
     let (arg_off, arg_len) = span(header[1]);
@@ -985,9 +983,7 @@ fn exec_reply(
 #[allow(clippy::type_complexity)]
 fn parse_spawn_blob(win_base: u64) -> Option<(usize, usize, usize, usize, usize, usize)> {
     let mut header = [0u64; 3];
-    let header_bytes =
-        unsafe { core::slice::from_raw_parts_mut(header.as_mut_ptr() as *mut u8, 24) };
-    raw_copy_from_va(win_base, header_bytes);
+    raw_copy_from_va_to_u64x3(win_base, &mut header);
     let span = |w: u64| ((w >> 32) as usize, (w & 0xFFFF_FFFF) as usize);
     let (path_off, path_len) = span(header[0]);
     let (arg_off, arg_len) = span(header[1]);

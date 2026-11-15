@@ -8,7 +8,7 @@
 //! prints it on the serial line. v0 has no CONNECT: the endpoint itself is
 //! the stream, and the endpoint mailbox serializes concurrent writers.
 #![no_std]
-#![deny(unsafe_op_in_unsafe_fn)]
+#![forbid(unsafe_code)]
 
 pub use sdk::methods::console;
 
