@@ -32,7 +32,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
 ## M0: Unsafe migration (PLAN.md 7.1)
 
-- [~ DS started 2026-11-14] U1 DS: Split the raw syscall assembly into `sdk/src/sys/raw.rs`. Every other `sdk` module and every server crate becomes `#![forbid(unsafe_code)]`, starting with `servers/process` (8 lines today). Library modules done; binaries need GlobalAlloc/global_asm! unsafe. Baseline update blocked (sandbox). Personality bins need PSX fix for GlobalAlloc.
+- [~ DS started 2026-11-14] U1 DS: Split the raw syscall assembly into `sdk/src/sys/raw.rs`. Every other `sdk` module and every server crate becomes `#![forbid(unsafe_code)]`, starting with `servers/process` (8 lines today). Library modules done; binaries need GlobalAlloc/global_asm! unsafe. Baseline update blocked (sandbox). **SDK binaries (init, child) and server binaries (ps, vfs, console, auth) migrated to shared SysHeap/entry_point macro in sdk/sys/raw.rs (commit 4f0780d). Personality bins (PSX) pending.**
 - [x DRV done 2026-11-15 9a2db16] U2 DRV: Migrated `graphics` MMIO access to use safe `MmioWindow` wrapper (local module in virtio_gpu.rs). MMIO operations are now bounds-checked and alignment-checked. DMA page operations remain (granted via capability).
 - [x DRV done 2026-11-15 9a2db16] U3 DRV: Migrated `drivers` MMIO access to use safe `MmioWindow` wrapper (local modules in virtio_blk.rs and virtio_net.rs). MMIO operations are now bounds-checked and alignment-checked. DMA page operations remain (granted via capability).
 - [~ PSX started 2026-11-14] U4a PSX: personality bins onto sdk's safe `Args::new(argc, argv_va, envp_va)` — the 8 per-bin `unsafe` wrappers go; bins still need DS's `sdk/src/sys/raw.rs` allocator wrapper to build.
