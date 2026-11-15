@@ -18,6 +18,11 @@ name = "child"
 path = "src/bin/child.rs"
 required-features = ["user"]
 
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+required-features = ["user"]
+
 [dependencies]
 ipc = { path = "../ipc" }
 spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
