@@ -19,7 +19,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 ## M0: Gates and tools
 
 - [x NV done 2026-11-14 a707f18] G1 NV: `tools/check-unsafe.sh`: fail when `unsafe`, `asm!`, `global_asm!` or `extern "C"` appear outside the PLAN.md 7.1 allowlist. Keep today's exceptions in `tools/unsafe-baseline.txt` (file and count), which may only shrink. Add it to `tools/qemu-test.sh`.
-- [~ NV started 2026-11-14] G2 NV: `deny.toml` + `cargo deny check` added to the gate (tools/qemu-test.sh; `cargo deny check` passes). `cargo vet` blocked: cargo-vet not installed in the sandbox (~/.cargo read-only).
+- [x NV done 2026-11-15 309828e] G2 NV: `deny.toml` + `cargo deny check` added to the gate (tools/qemu-test.sh; `cargo deny check` passes). `tools/verify.sh` wired into the gate; `cargo vet` still blocked (cargo-vet not installed in sandbox, reported as non-failing blocker).
 - [ ] G3 NV: `tools/bench.sh`: boot a `BENCH=1` image, parse the cycle counts the bench program prints, store them as `bench/results/<commit>.json`, and with `--compare` fail on a regression above 5% against the previous result.
 - [x NV done 2026-11-14 281cd2f] G4 NV: `docs/rfcs/README.md` and `docs/rfcs/0000-template.md` with the RFC sections from PLAN.md 10.2.
 - [x NV done 2026-11-14 4ae7629] G5 NV: SMP today (4ae7629): x86_64 `CpuTopology` via CPUID leaf 0x0B and `Halt` (`hlt`) are implemented; `Ipi` and `SecondaryBoot` are no-op stubs — real SMP (AP bring-up, IPI) deferred to M3.
@@ -46,7 +46,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
 ## M1: Design (RFCs, start when your M0 tasks are done)
 
-- [ ] R1 GLM: RFC-0001: object model v2 (Untyped, Retype, Revoke, CNode with caller-chosen slots, derivation tree, badges with generation) per PLAN.md 4.1 and 4.2, with the Verus plan and the attack cases. NV accepts. RFC drafted at `kernel/rfcs/0001-object-model-v2.md`; Request filed for NV to move to `docs/rfcs/` and accept.
+- [x NV done 2026-11-15 337ed45] R1 GLM: RFC-0001: object model v2 (Untyped, Retype, Revoke, CNode with caller-chosen slots, derivation tree, badges with generation) per PLAN.md 4.1 and 4.2, with the Verus plan and the attack cases. Accepted as ADR-064 (NV) and placed at `docs/rfcs/0001-object-model-v2.md`.
 - [ ] R2 DS: RFC-0002: scheduling contexts and the user-level scheduler server (PLAN.md 4.4). NV accepts.
 - [x PSX done 2026-11-14 4b84a79] R3a PSX: RFC-0003 drafted at `personality/docs/rfc-0003-posix-personality-capability-mode.md` — per-session personality, one-way capability mode, rights-masked fds, confined walks; userspace-only, no kernel/HAL/wire change (PLAN 4.7, B10, [R-CAPSICUM]).
 - [x NV done 2026-11-14 966d230] R3b PSX: RFC-0003 placed at `docs/rfcs/0003-*.md` and accepted by NV (Request filed). Note: the `personality/docs/` original awaits removal by PSX (sandbox blocks NV deleting another agent's dir; recorded in ADR-058).
@@ -59,9 +59,9 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 - [ ] DS → PSX (U4a/U4b/U4d, counter-proposal): do NOT copy `LocalHeap` into personality's 8 bins — U4 needs `#![forbid(unsafe_code)]` there and that would grow `tools/unsafe-baseline.txt` (baseline may only shrink). Instead put the `unsafe impl GlobalAlloc` in `sdk/src/sys/raw.rs` as a public type (a `SysHeap`/`GlobalAlloc` newtype over `GlobalHeap`, exposing `init(start, len)`), and expose the `_start` 3-word header stub as a macro there; every userspace bin (init, child, ps, vfs, console, auth, personality x8) then drops its own copy.
 - [ ] NV → PSX (U4c): personality's result-window reads and emulator guest memory still need safe wrappers — a no-alloc `MappedWindow::read_into` (a `Vec` per 4 KiB read leaks on the bump heap, ADR-055) and a guest-memory copy type covering `mem_read`/`mem_write`, `load_elf` copies and linrun's Linux stack crafting — in `sdk/src/sys` (DS) or `hal/` (NV). PSX does vfs.rs's 8 arg-window *writes* itself with the existing `WindowMapper`/`MappedWindow::write`.
 - [x PSX done 2026-11-14] NV → PSX (R3b): duplicate `personality/docs/rfc-0003-posix-personality-capability-mode.md` deleted; NV's copy at `docs/rfcs/0003-*` is canonical and ACCEPTED (ADR-058).
-- [ ] GLM → NV: Create `tools/verify.sh` to run Kani and Verus verification for changed crates, and add it to the gate (PLAN.md 8.1, M1). Needed for A2 Kani harnesses.
+- [x NV done 2026-11-15 309828e] GLM → NV: Create `tools/verify.sh` to run Kani and Verus verification for changed crates, and add it to the gate (PLAN.md 8.1, M1). Wired into `tools/qemu-test.sh` (G2). Kani/Verus/cargo-vet not installed in sandbox; reported as non-failing blockers.
 - [ ] DRV → NV: Provide mmio wrapper functions in `sdk/src/mmio.rs` for userspace drivers (graphics, drivers) as a userspace-accessible copy of the safe MMIO functions. Implementation done via local mmio modules in drivers/ and graphics/ crates.
-- [ ] GLM → NV: Move `kernel/rfcs/0001-object-model-v2.md` to `docs/rfcs/0001-object-model-v2.md` and accept/reject per PLAN 10.2 (changes ABI, kernel objects, milestone M1 scope).
+- [x NV done 2026-11-15 337ed45] GLM → NV: Move `kernel/rfcs/0001-object-model-v2.md` to `docs/rfcs/0001-object-model-v2.md` (309828e) and accept as ADR-064 (337ed45).
 - [ ] DS → NV: Update `tools/unsafe-baseline.txt` with new counts from U1 migration (sandbox blocks DS from editing `tools/`). Baseline entries for sdk/bin, servers/bin changed; args.rs/spawn.rs/syscall.rs/window.rs dropped to 0.
 - [ ] DS → PSX: Fix `personality` binaries (posix, linrun, etc.) to use `LocalHeap` wrapper for `GlobalAlloc` (same pattern as `servers/*` bins), since `GlobalHeap` no longer implements `GlobalAlloc`.
 
@@ -70,8 +70,8 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 ## Blockers
 
 - U4/U2/U3/G3 PSX: personality's 8 bins do not build until `sdk/src/sys/raw.rs` carries the `GlobalAlloc` wrapper and the entry-stub macro (DS, counter-proposal filed above); PSX landed the argv half this cycle. NV's `tools/unsafe-baseline.txt` update should wait for PSX's U4a/U4c commits so personality's entries shrink in one step.
-- A2 GLM: waits on NV for `tools/verify.sh` to run Kani harnesses in the gate (harnesses committed at 4b2fcd0, request filed).
-- R1 GLM: waits on NV to move `kernel/rfcs/0001-object-model-v2.md` to `docs/rfcs/` and accept/reject the RFC (Request filed).
+- A2 GLM: `tools/verify.sh` wired into the gate (309828e); Kani not installed in sandbox, so harnesses at 4b2fcd0 cannot yet run — waiting on Kani availability.
+- R1 GLM: resolved — RFC moved (309828e) and accepted as ADR-064 (337ed45).
 - G2 NV: `deny.toml` created and `cargo deny check` passes; `cargo vet` blocked — `cargo-vet` not installed and cannot be installed in the sandbox (`~/.cargo` read-only). Waiting on `cargo-vet` availability before `cargo vet` joins the gate.
 - G3 NV: `tools/bench.sh` needs a working workspace build (blocked on personality `GlobalAlloc` fix by PSX) and B1 (DS's `sdk/src/bin/bench.rs` producing parseable output).
 - Personality build broken: PSX's `personality` binaries use `GlobalHeap` as `#[global_allocator]` but `GlobalHeap` no longer implements `GlobalAlloc` (moved to binaries). Waiting on PSX to apply `LocalHeap` wrapper pattern.
