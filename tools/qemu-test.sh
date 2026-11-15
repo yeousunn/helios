@@ -80,8 +80,8 @@ echo "[qemu-test] userspace clippy clean (E5)"
 # G1 (M0 gate): unsafe/asm only in the PLAN §7.1 allowlist.
 tools/check-unsafe.sh || fail "unsafe/asm/extern-C outside the PLAN §7.1 allowlist (G1)"
 
-# G2 (M0 gate): supply chain — cargo-deny advisories, licences, sources.
-cargo deny check || fail "cargo deny check failed (G2 supply chain)"
+# G2 (M0 gate): supply chain + formal-verification wiring (tools/verify.sh).
+tools/verify.sh || fail "supply-chain verification failed (G2)"
 
 rm -f "$SERIAL_LOG"
 
