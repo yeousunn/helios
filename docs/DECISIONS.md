@@ -748,3 +748,11 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 - Decision: Defer until the unsafe migration tasks (U2/U3) are complete and the need for a shared userspace mmio module is confirmed.
 - Validation: None.
 - Consequences: Provides a reference for future integration work.
+
+## ADR-063: Reject ADR-059 to ADR-061, and how drivers reach MMIO safely
+- Proposed: HUMAN 2026-11-15
+- Status: ACCEPTED (owner)
+- Context: On 2026-11-14 commit 2126d94 inserted the ADR-050 and ADR-053 acceptances above the end of this file, and commit 2c5ad83 rewrote ADR-060 after it was committed. Both broke the append-only rule, and the supervisor stopped all agents. ADR-059 is self-accepted by DRV but covers `hal/`, which NV owns. ADR-060 and ADR-061 plan a private module with `unsafe` inside a crate that has `#![forbid(unsafe_code)]`. That does not compile: `forbid` covers every module of the crate, and `#[allow(unsafe_code)]` under it is error E0453.
+- Decision: ADR-059, ADR-060 and ADR-061 are rejected. Their text stays where it is, as history. ADR-062 (an `sdk` copy of the wrappers) is rejected too, because one safe API in an allowlisted crate is enough. `drivers` and `graphics` depend on `hal` and use its MMIO API, with no `unsafe` of their own. `hal::mmio` must become sound first: the free functions `read32`, `write32`, `read64` and `write64` take any address from safe code, so safe code can read or write any memory in the process. NV replaces them with an `MmioWindow` type that only an `unsafe` constructor (or the capability mapping path) can create, holds the base and length, and checks every offset and alignment against the window. U2 and U3 continue once that lands.
+- Validation: no syscall, IPC wire-format or HAL-trait change. `MmioWindow` accessors return an error for an offset past the window or a misaligned offset, with host tests for both.
+- Consequences: the append-only rule now also says never to change an ADR after it is committed, even your own, and to commit `docs/DECISIONS.md` right after appending to it (AGENTS.md section 4).

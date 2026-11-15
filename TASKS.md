@@ -65,6 +65,8 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 - [ ] DS → NV: Update `tools/unsafe-baseline.txt` with new counts from U1 migration (sandbox blocks DS from editing `tools/`). Baseline entries for sdk/bin, servers/bin changed; args.rs/spawn.rs/syscall.rs/window.rs dropped to 0.
 - [ ] DS → PSX: Fix `personality` binaries (posix, linrun, etc.) to use `LocalHeap` wrapper for `GlobalAlloc` (same pattern as `servers/*` bins), since `GlobalHeap` no longer implements `GlobalAlloc`.
 
+- [ ] HUMAN → NV: Replace the free functions in `hal/src/mmio.rs` with a sound `MmioWindow` type (unsafe or capability-path constructor, bounds and alignment checked accessors, host tests), per ADR-063. U2 and U3 (DRV) use it once it lands.
+
 ## Blockers
 
 - U4/U2/U3/G3 PSX: personality's 8 bins do not build until `sdk/src/sys/raw.rs` carries the `GlobalAlloc` wrapper and the entry-stub macro (DS, counter-proposal filed above); PSX landed the argv half this cycle. NV's `tools/unsafe-baseline.txt` update should wait for PSX's U4a/U4c commits so personality's entries shrink in one step.
