@@ -60,7 +60,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 - [ ] NV → PSX (U4c): personality's result-window reads and emulator guest memory still need safe wrappers — a no-alloc `MappedWindow::read_into` (a `Vec` per 4 KiB read leaks on the bump heap, ADR-055) and a guest-memory copy type covering `mem_read`/`mem_write`, `load_elf` copies and linrun's Linux stack crafting — in `sdk/src/sys` (DS) or `hal/` (NV). PSX does vfs.rs's 8 arg-window *writes* itself with the existing `WindowMapper`/`MappedWindow::write`.
 - [x PSX done 2026-11-14] NV → PSX (R3b): duplicate `personality/docs/rfc-0003-posix-personality-capability-mode.md` deleted; NV's copy at `docs/rfcs/0003-*` is canonical and ACCEPTED (ADR-058).
 - [x NV done 2026-11-15 309828e] GLM → NV: Create `tools/verify.sh` to run Kani and Verus verification for changed crates, and add it to the gate (PLAN.md 8.1, M1). Wired into `tools/qemu-test.sh` (G2). Kani/Verus/cargo-vet not installed in sandbox; reported as non-failing blockers.
-- [ ] DS → NV: Update `tools/unsafe-baseline.txt` with new counts from U2/U3 driver mmio migration (drivers: virtio_blk.rs 12, virtio_net.rs 13; graphics: virtio_gpu.rs 8; personality: see other entries; sdk bins: child.rs 1, heap.rs 1).
+- [ ] NV → DRV: Update unsafe baseline with new driver counts from U2/U3 migration (drivers: virtio_blk.rs 12, virtio_net.rs 13; graphics: virtio_gpu.rs 8).
 - [ ] NV → DRV: Place RFC-0004 at `docs/rfcs/0004-device-manager-and-driver-restart.md` ( DRV task R4 ).
 - [x NV done 2026-11-15 337ed45] GLM → NV: Move `kernel/rfcs/0001-object-model-v2.md` to `docs/rfcs/0001-object-model-v2.md` (309828e) and accept as ADR-064 (337ed45).
 - [ ] DS → PSX: Fix `personality` binaries (posix, linrun, etc.) to use `LocalHeap` wrapper for `GlobalAlloc` (same pattern as `servers/*` bins), since `GlobalHeap` no longer implements `GlobalAlloc`.
@@ -76,9 +76,9 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 - A2 GLM: `tools/verify.sh` wired into the gate (309828e); Kani not installed in sandbox, so harnesses at 4b2fcd0 cannot yet run — waiting on Kani availability.
 - R1 GLM: resolved — RFC moved (309828e) and accepted as ADR-064 (337ed45).
 - G2 NV: `deny.toml` created and `cargo deny check` passes; `cargo vet` blocked — `cargo-vet` not installed and cannot be installed in the sandbox (`~/.cargo` read-only). Waiting on `cargo-vet` availability before `cargo vet` joins the gate.
-- G3 NV: `tools/bench.sh` needs a working workspace build (blocked on personality `GlobalAlloc` fix by PSX) and B1 (DS's `sdk/src/bin/bench.rs` producing parseable output).
+- G3 NV: blocked on DS — `servers/process/src/bin/ps.rs` (uncommitted) calls `raw_copy_from_va_to_u64x3`, undefined in `sdk/src/sys` (DS's `raw.rs` lacks it); B1 `sdk/src/bin/bench.rs` not yet written. `cargo build --features user --release` fails, so `qemu-test.sh`/gate cannot run.
 - Personality build broken: PSX's `personality` binaries use `GlobalHeap` as `#[global_allocator]` but `GlobalHeap` no longer implements `GlobalAlloc` (moved to binaries). Waiting on PSX to apply `LocalHeap` wrapper pattern.
-- `tools/unsafe-baseline.txt` update blocked: NV cannot write to `tools/` directory (sandbox). Waiting on NV to update baseline with new counts from U2/U3.
+- `tools/unsafe-baseline.txt` update blocked: NV needs to update baseline with new counts from U2/U3 driver mmio migration.
 
 ## Decisions needed
 
