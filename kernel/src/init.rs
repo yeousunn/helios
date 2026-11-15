@@ -12,11 +12,12 @@ use spin::Mutex;
 /// Reserved kernel object id for the debug (serial console) endpoint.
 pub const DEBUG_EP_ID: u64 = 0xD1;
 
-/// BootInfo magic: "HELI" little-endian.
-pub const BOOTINFO_MAGIC: u32 = 0x4845_4C49;
+/// BootInfo magic: "HELI" little-endian (normative: `spec/abi::entry`,
+/// ADR-073).
+pub const BOOTINFO_MAGIC: u32 = helios_abi::entry::BOOTINFO_MAGIC;
 /// v1 (ADR-043): console_in u32 added at offset 24 (header 24 → 28 bytes);
-/// regions shift to offset 28. v0 readers reject via the version check.
-pub const BOOTINFO_VERSION: u32 = 1;
+/// regions shift to offset 32. v0 readers reject via the version check.
+pub const BOOTINFO_VERSION: u32 = helios_abi::entry::BOOTINFO_VERSION_V1;
 
 /// One usable physical memory region handed to init.
 #[derive(Clone, Copy, Debug)]
@@ -42,9 +43,11 @@ pub struct BootInfoV0 {
     pub region_count: u32,
 }
 
-pub const MAX_BOOT_REGIONS: usize = 8;
+pub const MAX_BOOT_REGIONS: usize = helios_abi::entry::MAX_REGIONS;
 
-/// Serialize BootInfo into `buf` (little-endian, repr(C) layout):
+/// Serialize BootInfo into `buf` (little-endian). The byte layout is
+/// normative in `spec/abi::entry` (ADR-073); every offset here is taken
+/// from that module so the writer cannot drift from the spec:
 /// ```text
 /// u32 magic; u32 version(1); u32 debug_ep; u32 factory;
 /// u32 region_count; u32 self_as;
@@ -54,8 +57,9 @@ pub const MAX_BOOT_REGIONS: usize = 8;
 /// Returns the number of bytes written. Regions beyond `MAX_BOOT_REGIONS`
 /// are dropped (truncated to region_count).
 pub fn write_bootinfo(buf: &mut [u8], info: &BootInfoV0) -> usize {
+    use helios_abi::entry as spec;
     let count = (info.region_count as usize).min(MAX_BOOT_REGIONS);
-    let need = 32 + count * 24;
+    let need = spec::HEADER_LEN_V1 + count * spec::REGION_LEN;
     if buf.len() < need {
         return 0;
     }
@@ -64,16 +68,16 @@ pub fn write_bootinfo(buf: &mut [u8], info: &BootInfoV0) -> usize {
             buf[off + i] = ((v >> (i * 8)) & 0xFF) as u8;
         }
     };
-    w(0, BOOTINFO_MAGIC as u64, 4);
-    w(4, BOOTINFO_VERSION as u64, 4);
-    w(8, info.debug_ep as u64, 4);
-    w(12, info.factory as u64, 4);
-    w(16, count as u64, 4);
-    w(20, info.self_as as u64, 4);
-    w(24, info.console_in as u64, 4);
-    w(28, 0, 4);
+    w(spec::OFF_MAGIC, BOOTINFO_MAGIC as u64, 4);
+    w(spec::OFF_VERSION, BOOTINFO_VERSION as u64, 4);
+    w(spec::OFF_DEBUG_EP, info.debug_ep as u64, 4);
+    w(spec::OFF_FACTORY, info.factory as u64, 4);
+    w(spec::OFF_REGION_COUNT, count as u64, 4);
+    w(spec::OFF_SELF_AS, info.self_as as u64, 4);
+    w(spec::OFF_CONSOLE_IN, info.console_in as u64, 4);
+    w(spec::OFF_RESERVED, 0, 4);
     for (i, &(handle, base, len)) in info.regions[..count].iter().enumerate() {
-        let off = 32 + i * 24;
+        let off = spec::HEADER_LEN_V1 + i * spec::REGION_LEN;
         w(off, handle as u64, 4);
         w(off + 4, 0, 4);
         w(off + 8, base, 8);
@@ -385,6 +389,10 @@ mod tests {
 
     #[test]
     fn bootinfo_writer_layout() {
+        // Every offset in this test comes from `spec/abi::entry` (ADR-073),
+        // the same module `write_bootinfo` reads its constants from: if the
+        // spec or the writer moves, this test stops compiling/pinning.
+        use helios_abi::entry as spec;
         let mut buf = [0u8; 256];
         let mut regions = [(0u32, 0u64, 0u64); MAX_BOOT_REGIONS];
         regions[0] = (4, 0x100000, 0x40000);
@@ -398,27 +406,62 @@ mod tests {
             region_count: 2,
         };
         let n = write_bootinfo(&mut buf, &info);
-        assert_eq!(n, 32 + 2 * 24);
-        let rd = |o: usize| -> u64 {
-            u64::from_le_bytes(buf[o..o + 8].try_into().unwrap())
-                & ((1u128 << (8 * 4)) as u64 - 1)
-                & 0xFFFF_FFFF
-        };
+        assert_eq!(n, spec::HEADER_LEN_V1 + 2 * spec::REGION_LEN);
         let rd32 = |o: usize| -> u32 { u32::from_le_bytes(buf[o..o + 4].try_into().unwrap()) };
-        assert_eq!(rd32(0), BOOTINFO_MAGIC);
-        assert_eq!(rd32(4), 1);
-        assert_eq!(rd32(8), 2);
-        assert_eq!(rd32(12), 3);
-        assert_eq!(rd32(16), 2);
-        assert_eq!(rd32(20), 9, "self_as at offset 20 (ADR-023)");
-        assert_eq!(rd32(24), 7, "console_in at offset 24 (ADR-043)");
-        assert_eq!(rd32(28), 0, "reserved");
-        // base/len are u64 fields.
-        let base0 = u64::from_le_bytes(buf[40..48].try_into().unwrap());
-        let len0 = u64::from_le_bytes(buf[48..56].try_into().unwrap());
+        assert_eq!(rd32(spec::OFF_MAGIC), BOOTINFO_MAGIC);
+        assert_eq!(rd32(spec::OFF_MAGIC), spec::BOOTINFO_MAGIC);
+        assert_eq!(rd32(spec::OFF_VERSION), BOOTINFO_VERSION);
+        assert_eq!(rd32(spec::OFF_VERSION), spec::BOOTINFO_VERSION_V1);
+        assert_eq!(rd32(spec::OFF_DEBUG_EP), 2);
+        assert_eq!(rd32(spec::OFF_FACTORY), 3);
+        assert_eq!(rd32(spec::OFF_REGION_COUNT), 2);
+        assert_eq!(rd32(spec::OFF_SELF_AS), 9, "self_as at offset 20 (ADR-023)");
+        assert_eq!(
+            rd32(spec::OFF_CONSOLE_IN),
+            7,
+            "console_in at offset 24 (ADR-043)"
+        );
+        assert_eq!(rd32(spec::OFF_RESERVED), 0, "reserved");
+        // Region records start at the v1 header length; base/len are u64
+        // fields at +8/+16 inside the record.
+        let rec0 = spec::HEADER_LEN_V1;
+        assert_eq!(rd32(rec0), 4);
+        let base0 = u64::from_le_bytes(buf[rec0 + 8..rec0 + 16].try_into().unwrap());
+        let len0 = u64::from_le_bytes(buf[rec0 + 16..rec0 + 24].try_into().unwrap());
         assert_eq!(base0, 0x100000);
         assert_eq!(len0, 0x40000);
-        let _ = rd(0);
+        let rec1 = spec::HEADER_LEN_V1 + spec::REGION_LEN;
+        assert_eq!(rd32(rec1), 5);
+        let base1 = u64::from_le_bytes(buf[rec1 + 8..rec1 + 16].try_into().unwrap());
+        assert_eq!(base1, 0x200000);
+    }
+
+    /// ADR-073 regression pin: the bytes the kernel hands init must decode
+    /// through the normative v1 layout — magic/version identify the block
+    /// and the declared region count bounds what a parser may read.
+    #[test]
+    fn bootinfo_block_matches_entry_spec() {
+        use helios_abi::entry as spec;
+        let mut buf = [0u8; helios_abi::entry::BOOTINFO_MAX_LEN];
+        let info = BootInfoV0 {
+            debug_ep: 2,
+            factory: 3,
+            self_as: 9,
+            console_in: 7,
+            regions: [(4, 0x100000, 0x40000); MAX_BOOT_REGIONS],
+            region_count: MAX_BOOT_REGIONS as u32,
+        };
+        let n = write_bootinfo(&mut buf, &info);
+        assert_eq!(n, spec::BOOTINFO_MAX_LEN);
+        let rd32 = |o: usize| -> u32 { u32::from_le_bytes(buf[o..o + 4].try_into().unwrap()) };
+        assert_eq!(rd32(spec::OFF_MAGIC), spec::BOOTINFO_MAGIC);
+        assert_eq!(rd32(spec::OFF_VERSION), spec::BOOTINFO_VERSION_V1);
+        assert_eq!(rd32(spec::OFF_REGION_COUNT) as usize, spec::MAX_REGIONS);
+        // The last region record ends exactly at the parser bound.
+        assert_eq!(
+            spec::HEADER_LEN_V1 + rd32(spec::OFF_REGION_COUNT) as usize * spec::REGION_LEN,
+            spec::BOOTINFO_MAX_LEN
+        );
     }
 
     #[test]

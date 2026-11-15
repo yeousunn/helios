@@ -15,12 +15,16 @@
 
 pub mod capability;
 pub mod commutativity;
+pub mod entry;
 pub mod error;
 pub mod invoke;
 pub mod syscall;
 
 pub use capability::{ObjType, Rights};
 pub use commutativity::{Commutativity, CommutativitySpec, ResourceExtractor, ResourceKey};
+pub use entry::{
+    BOOTINFO_MAGIC, BOOTINFO_MAX_LEN, BOOTINFO_VERSION_V0, BOOTINFO_VERSION_V1, MAX_REGIONS,
+};
 pub use error::{ErrorCode, ErrorSpec};
 pub use invoke::InvokeSpec;
 /// Re-export commonly used types

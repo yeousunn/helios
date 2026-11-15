@@ -8,10 +8,12 @@ license.workspace = true
 spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
 ipc = { path = "../ipc" }
 caps = { path = "../caps" }
+# The kernel implements the ABI spec; entry-path constants come from it
+# (ADR-073).
+helios-abi = { path = "../spec/abi" }
 
 [dev-dependencies]
 criterion = "0.5"
-helios-abi = { path = "../spec/abi" }
 
 [[bench]]
 name = "ipc_bench"
