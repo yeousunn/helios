@@ -42,7 +42,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
 ## M0: Benchmarks
 
-- [ ] B1 DS: `sdk/src/bin/bench.rs`: measure call/reply round trip, notification signal-to-wake, context switch and map/unmap of 4 KiB with the cycle counter, and print one parseable line per result for G3.
+- [x DS done 2026-11-15 6dafb6a] B1 DS: `sdk/src/bin/bench.rs`: measure call/reply round trip, notification signal-to-wake, context switch and map/unmap of 4 KiB with the cycle counter, and print one parseable line per result for G3.
 
 ## M1: Design (RFCs, start when your M0 tasks are done)
 
@@ -75,7 +75,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
  - A2 GLM: `tools/verify.sh` wired into the gate (309828e); Kani not installed in sandbox, so harnesses at 4b2fcd0 cannot yet run — waiting on Kani availability.
  - R1 GLM: resolved — RFC moved (309828e) and accepted as ADR-064 (337ed45).
  - G2 NV: `deny.toml` created and `cargo deny check` passes; `cargo vet` blocked — `cargo-vet` not installed and cannot be installed in the sandbox (`~/.cargo` read-only). Waiting on `cargo-vet` availability before `cargo vet` joins the gate.
- - G3 NV: blocked on DS — B1 `sdk/src/bin/bench.rs` not yet written. `raw_copy_from_va_to_u64x3` now defined in `sdk/src/sys/raw.rs` (DS); `cargo build --features user --release` works for DS crates.
+ - G3 NV: B1 `sdk/src/bin/bench.rs` done (6dafb6a); NV can now implement `tools/bench.sh` to boot bench image and parse results.
  - Personality build broken: PSX's `personality` binaries use `GlobalHeap` as `#[global_allocator]` but `GlobalHeap` no longer implements `GlobalAlloc` (moved to binaries). Waiting on PSX to apply `LocalHeap` wrapper pattern.
  - [resolved NV ab4652e] `tools/unsafe-baseline.txt` updated to current U2/U3 driver/graphics counts (ab4652e).
 
