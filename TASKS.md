@@ -38,7 +38,8 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 - [x PSX done 2026-11-15 6bb21d2] U4a PSX: personality bins onto sdk's safe `Args::new(argc, argv_va, envp_va)` + `sdk::sys::SysHeap` — the 8 per-bin unsafe wrappers are gone and the bins build again; argv parses below `HEAP.init` (allocating Args) except linrun's pre-heap non-allocating copy.
 - [x PSX done 2026-11-15 6bb21d2] U4b PSX: the 8 per-bin `global_asm!` `_start` stubs are gone — each bin calls `sdk::sys::entry_point!`; posix.rs's hand-written `_start` too. Each bin now holds 1 baseline line (`extern "C"` main).
 - [x PSX done 2026-11-15 6bb21d2] U4c1 PSX: `vfs.rs`'s 8 arg-window writes now route through `WindowMapper`/`MappedWindow::write` (both windows mapped by one mapper at ARG/RESULT_WINDOW_VA; same wire messages, rights and VAs).
-- [ ] U4c2 PSX/DS: `vfs.rs`'s 2 result-window reads off `raw_copy_from_va` onto a no-alloc `MappedWindow::read_into` (a Vec per 4 KiB read leaks on the bump heap, ADR-055) — sdk (DS).
+- [x PSX done 2026-11-15 012160a] U4e PSX: host test for `VfsClient::connect`'s carve→map-at-layout-VA→CONNECT sequence (U4c1 regression cover, boot-independent).
+- [~ PSX started 2026-11-15] U4c2 PSX/DS: `vfs.rs`'s 2 result-window reads off `raw_copy_from_va` onto a no-alloc `MappedWindow::read_into` (a Vec per 4 KiB read leaks on the bump heap, ADR-055) — sdk (DS).
 - [ ] U4c3 PSX/DS: `linrun.rs`'s guest-memory copies (`mem_read`/`mem_write`, `load_elf` copies, the Linux stack/auxv layout) behind a safe guest-memory copy type — sdk (DS) or hal (NV).
 - [x PSX done 2026-11-15 6bb21d2] U4d1 PSX: `#![forbid(unsafe_code)]` on personality (lib + 8 bins) — zero unsafe blocks, vfs.rs at 0 and each bin at 1 baseline line.
 
