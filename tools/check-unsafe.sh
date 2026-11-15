@@ -36,7 +36,7 @@ while IFS= read -r -d '' f; do
     printf '%s\n' "$rel" | grep -Eq "$ALLOW" && continue
     count=$(grep -cE "$PAT" "$f" 2>/dev/null || true)
     [[ "$count" -gt 0 ]] && printf '%s %s\n' "$rel" "$count" >> "$tmp"
-done < <(find . -name '*.rs' -not -path './target/*' -not -path './.git/*' -print0)
+done < <(find . -name '*.rs' -not -path './target/*' -not -path './.git/*' -not -path './.agents/*' -print0)
 
 [[ -f "$BASELINE" ]] || { echo "[check-unsafe] ERROR: $BASELINE not found" >&2; exit 1; }
 
