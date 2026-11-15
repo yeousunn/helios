@@ -237,10 +237,9 @@ pub fn rdtsc() -> u64 {
 
 /// Safe wrapper for reading the BootInfo block from the kernel.
 /// The kernel writes BootInfo into the first stack page and passes a pointer in `rdi`.
-///
-/// # Safety
 /// The kernel guarantees the pointer is valid and bounded to MAX_LEN bytes.
-pub unsafe fn read_bootinfo(ptr: *const u8) -> core::result::Result<BootInfo, u64> {
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn read_bootinfo(ptr: *const u8) -> core::result::Result<BootInfo, u64> {
     if ptr.is_null() {
         return Err(0xE2);
     }
@@ -256,7 +255,8 @@ pub unsafe fn read_bootinfo(ptr: *const u8) -> core::result::Result<BootInfo, u6
 /// ```rust,ignore
 /// sdk::sys::init_entry_point!(my_main);
 ///
-/// fn my_main(info: &BootInfo) -> ! {
+/// fn my_main(bootinfo_ptr: *const u8) -> ! {
+///     let info = sdk::bootinfo::BootInfo::parse(unsafe { core::slice::from_raw_parts(bootinfo_ptr, sdk::bootinfo::MAX_LEN) }).unwrap();
 ///     loop {}
 /// }
 /// ```
@@ -269,6 +269,7 @@ macro_rules! init_entry_point {
             // rdi = bootinfo_ptr (passed by kernel)
             "sub rsp, 64",
             "and rsp, -16",
+            "mov rdi, rdi",
             "jmp {main}",
             main = sym $main,
         );

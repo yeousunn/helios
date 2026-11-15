@@ -92,7 +92,11 @@ type Result<T> = core::result::Result<T, u64>;
 
 sdk::sys::init_entry_point!(init_main);
 
-fn init_main(info: &BootInfo) -> ! {
+fn init_main(bootinfo_ptr: *const u8) -> ! {
+    let info = match sdk::sys::read_bootinfo(bootinfo_ptr) {
+        Ok(info) => info,
+        Err(e) => exit_with(fail_code(STEP_BOOTINFO, e)),
+    };
     let mut raw = X86_64Syscalls;
     mark(&mut raw, info.debug_ep, STEP_ALIVE, 0);
     mark(
@@ -102,7 +106,7 @@ fn init_main(info: &BootInfo) -> ! {
         info.region_count as u64,
     );
 
-    match run(&mut raw, info) {
+    match run(&mut raw, &info) {
         Ok(()) => {
             mark(&mut raw, info.debug_ep, STEP_DONE, 0);
             Syscalls::new(&mut raw).exit(0)

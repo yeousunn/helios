@@ -52,7 +52,11 @@ const MEASURE_ITERS: u64 = 10000;
 
 init_entry_point!(bench_main);
 
-fn bench_main(info: &BootInfo) -> ! {
+fn bench_main(bootinfo_ptr: *const u8) -> ! {
+    let info = match sdk::sys::read_bootinfo(bootinfo_ptr) {
+        Ok(info) => info,
+        Err(e) => exit_with(fail_code(STEP_BOOTINFO, e)),
+    };
     let mut raw = X86_64Syscalls;
     {
         let mut sys = Syscalls::new(&mut raw);
@@ -65,7 +69,7 @@ fn bench_main(info: &BootInfo) -> ! {
         );
     }
 
-    match run(&mut raw, info) {
+    match run(&mut raw, &info) {
         Ok(()) => {
             let mut sys = Syscalls::new(&mut raw);
             mark(&mut sys, info.debug_ep, STEP_DONE, 0);

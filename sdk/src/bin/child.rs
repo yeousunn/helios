@@ -64,10 +64,15 @@ fn child_main(argc: u64, argv_va: u64, _envp_va: u64) -> ! {
     let mut raw = X86_64Syscalls;
 
     // 1. Receive the bootstrap package first (no allocation needed).
+    //    For exec'd processes, the bootstrap endpoint was already consumed by
+    //    the parent (shell), so handle 1 is invalid (EBADCAP) or points to a
+    //    different capability (EBADARG). In that case we proceed without a
+    //    package — the smoke path only needs argv[0].
     let package = {
         let mut sys = Syscalls::new(&mut raw);
         match sdk::bootstrap::receive(&mut sys) {
-            Ok(p) => p,
+            Ok(p) => Some(p),
+            Err(ipc::status::EBADCAP) | Err(ipc::status::EBADARG) => None,
             Err(e) => Syscalls::new(&mut raw).exit(e),
         }
     };
@@ -77,7 +82,8 @@ fn child_main(argc: u64, argv_va: u64, _envp_va: u64) -> ! {
     let smoke_status = parse_argv0_status(argc, argv_va);
 
     // 3. S11 attack mode: `argv[0] == "attack"` runs the kernel-hardening attack
-    //    cases (sdk::attack). This path needs a heap for allocations.
+    //    cases (sdk::attack). This path needs a heap for allocations and the
+    //    bootstrap package (region, aspace). Only reachable via fresh SPAWN.
     //    Check argv[0] again via the non-allocating parser to avoid heap init
     //    unless actually needed.
     let is_attack = {
@@ -93,6 +99,7 @@ fn child_main(argc: u64, argv_va: u64, _envp_va: u64) -> ! {
     };
 
     if is_attack {
+        let package = package.expect("attack mode requires bootstrap package");
         // Initialize heap for attack mode (allocates via Vec in attack cases).
         use sdk::heap::RegionSource;
         use sdk::layout::{HEAP_CHUNK, HEAP_CHUNKS};
@@ -123,34 +130,36 @@ fn child_main(argc: u64, argv_va: u64, _envp_va: u64) -> ! {
     }
 
     // 4. Diagnostic: echo argv through console if provided (optional, no alloc).
-    if let Some(console) = package.optional.get(2).copied().flatten() {
-        if argc != 0 {
-            let mut sys = Syscalls::new(&mut raw);
-            let mut m = ipc::Message::new(sdk::methods::console::WRITE);
-            let mut n = 0usize;
-            let mut put = |bytes: &[u8]| {
-                for &b in bytes {
-                    if n < 32 {
-                        m.words[n / 8] |= (b as u64) << ((n % 8) * 8);
-                        n += 1;
+    if let Some(pkg) = &package {
+        if let Some(console) = pkg.optional.get(2).copied().flatten() {
+            if argc != 0 {
+                let mut sys = Syscalls::new(&mut raw);
+                let mut m = ipc::Message::new(sdk::methods::console::WRITE);
+                let mut n = 0usize;
+                let mut put = |bytes: &[u8]| {
+                    for &b in bytes {
+                        if n < 32 {
+                            m.words[n / 8] |= (b as u64) << ((n % 8) * 8);
+                            n += 1;
+                        }
+                    }
+                };
+                use sdk::sys::{raw_cstr_from_va, raw_ptr_array_from_va};
+                let argv_ptrs = raw_ptr_array_from_va(argv_va, argc as usize).unwrap_or(&[]);
+                put(b"argv=");
+                for i in 0..argc as usize {
+                    if i != 0 {
+                        put(b" ");
+                    }
+                    if i < argv_ptrs.len() && argv_ptrs[i] != 0 {
+                        if let Some(a) = raw_cstr_from_va(argv_ptrs[i]) {
+                            put(a);
+                        }
                     }
                 }
-            };
-            use sdk::sys::{raw_cstr_from_va, raw_ptr_array_from_va};
-            let argv_ptrs = raw_ptr_array_from_va(argv_va, argc as usize).unwrap_or(&[]);
-            put(b"argv=");
-            for i in 0..argc as usize {
-                if i != 0 {
-                    put(b" ");
-                }
-                if i < argv_ptrs.len() && argv_ptrs[i] != 0 {
-                    if let Some(a) = raw_cstr_from_va(argv_ptrs[i]) {
-                        put(a);
-                    }
-                }
+                // envp is optional and not parsed for the smoke path.
+                let _ = sys.send(console.handle(), &m);
             }
-            // envp is optional and not parsed for the smoke path.
-            let _ = sys.send(console.handle(), &m);
         }
     }
 
