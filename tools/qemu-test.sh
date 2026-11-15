@@ -146,6 +146,10 @@ fi
 
 [[ "$serial_ok" == "1" ]] || exit 1
 
+# G3 (M0 gate): boot the bench image, measure cycle counts, store results,
+# fail on >5% regression against the previous result.
+tools/bench.sh --compare || fail "benchmark measurement or regression check failed (G3)"
+
 echo "[qemu-test] QEMU exited cleanly (status $qemu_status)"
 echo "[qemu-test] ===== done (full-system boot smoke-test complete) ====="
 exit 0
