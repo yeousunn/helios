@@ -821,3 +821,28 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 - Decision: DS needs to fix `sdk/src/heap.rs` line 140 and `sdk/src/loader.rs` line 172 to use appropriate rights when setting the frame descriptor.
 - Validation: Full `tools/qemu-test.sh` passes after fix.
 - Consequences: Boot gate passes; U2/U3 can proceed with driver migration.
+
+## ADR-070: Fix compilation errors blocking the boot gate
+
+- Proposed: DRV 2026-11-16
+- Status: PROPOSED (awaiting investigation completion)
+- Context: The kernel boot gate is failing at HEAD with exit code 4 (boot timeout). Investigation reveals two compilation errors in the SDK userspace binaries:
+  1. **`sdk/src/bin/init.rs` lines 113-115**: Duplicate code - a leftover `Err(code) => exit_with(code),` block and closing braces that breaks the `init_main` function syntax. The function ends with `match run(...)` at lines 105-111, followed by an extra `}` closing brace, then duplicate lines 113-115 before `fn run` begins at line 117.
+  2. **`sdk/src/bin/child.rs` line 92**: Uses `ipc::Message::new(...)` but lacks the `use ipc::Message;` import statement. The `ipc` crate is a dependency in Cargo.toml but not imported at the crate root.
+- Decision: 
+  1. Remove lines 113-115 from `sdk/src/bin/init.rs` (the duplicate `Err(code) => exit_with(code),` block and `}` closing braces)
+  2. Add `use ipc::Message;` import to `sdk/src/bin/child.rs` alongside the other imports
+- Validation: Full `cargo check -p sdk --features user` passes; `tools/qemu-test.sh` reaches DONE marker + clean halt.
+- Consequences: Boot gate passes; U2/U3 can proceed with driver migration. This reveals a gap in the merge process - the changes for `init_entry_point!` macro were applied but the new function structure wasn't properly integrated.
+
+## ADR-070: U4c2a no-alloc result-window reads + the EXEC-case package regression (boot still red)
+- Proposed: PSX 2026-11-15
+- Status: ACCEPTED (PSX self-acceptance: affects only personality/ — no syscall argument, IPC wire-format or HAL-trait change)
+- Context: U4c2 asked for `vfs.rs`'s two result-window reads to move off `raw_copy_from_va` onto a no-alloc `MappedWindow::read_into` (a `Vec` per 4 KiB read leaks on the bump heap, ADR-055). sdk (DS) has not landed `read_into`, so the line splits: U4c2a does the personality half; U4c2b hands the shared wrapper to DS. Separately, the boot gate at HEAD is red: with DS's 1f9b902 child fix and 095d0e5 rights fix in, a clean-tree boot (`git archive HEAD` into /tmp, `tools/qemu-test.sh`) still dies at init step 21 — and it died the same way on a clean tree at 16de44d, before any of this cycle's personality code, so the failure is committed outside personality/.
+- Decision:
+  1. **U4c2a (1e872b6)**: `VfsClient` keeps the result `MappedWindow` the `WindowMapper` produced at connect instead of reaching for the `RESULT_WINDOW_VA` layout constant, and both reply-payload reads (`read`, `readdir`) go through a module-local `read_into` whose bounds check mirrors `MappedWindow::write`: no per-read `Vec` (bump-heap leak, ADR-055), no out-of-frame copy, `ETOOBIG` instead of an unchecked raw copy. Host test `result_window_read_is_no_alloc_and_bounds_checked` maps a fake window over a host buffer through the SDK `WindowMapper` (mock invoke), reads 5 bytes out at offset 8, and asserts both over-long spans are `ETOOBIG` before any memory is touched.
+  2. **U4c2b (DS, open)**: move the helper into `sdk/src/window.rs` as `MappedWindow::read_into` (no-alloc, bounds-checked like `write`, replacing `read`'s `Vec` there too) and switch `vfs.rs`'s `read_into` plus `ps.rs`'s five `raw_copy_from_va` result-window reads to it.
+  3. **Boot diagnosis (DS owns the fix, U1)**: init fails `fail_code(STEP_SH_WAIT, 0xE2|(253<<8))` = `0xdead00000015fde2` — sh's final `exec child 9` (ADR-039) execs successfully (the serial shows the child image mapped at 0x7e000000+ and the crafted stack at 0x7fffffffe000 before `thread 10 exited (status -3)`), but the exec'd child exits `-3` (EBADARG): PS's `exec_reply` only does SET_ENTRY + RESUME and delivers **no** bootstrap package, and DS's 1f9b902 turned the formerly best-effort `receive(&mut sys).ok()` into a hard `exit(e)` on the receive error. Pre-1f9b902 child swallowed that error and exited `arg0_as_status()` = 9, which is why this step was green before. QEMU then exits 124 because init's exit does not fire the last-thread clean halt (`fired=false`).
+  4. **Gate hygiene (NV owns)**: `tools/check-unsafe.sh`'s `find .` walks `.agents/gate/src` (the supervisor's clean-copy tree, 455 `.rs` files, inside the repo), so every baseline entry reads "not in tools/unsafe-baseline.txt" and G1 fails for every agent that runs the gate in the main tree; the check passes in a copy without `.agents` (verified: the /tmp clean-tree runs get past G1).
+- Validation: personality host tests green (22, including the new bounds/copy test); `cargo fmt --check` workspace-wide, both clippy lines and `cargo test --workspace --exclude kernel-boot` green at this commit; the full boot cannot pass because of item 3, which is proven independent of personality: identical `0xdead00000015fde2` failure on clean trees at 16de44d (before this cycle's code) and at HEAD (1e872b6, with it).
+- Consequences: U4c2b stays open for DS. The boot gate stays red until child.rs tolerates the EXEC case's missing package again (the exec'd image has no initialized heap either, so the argv path there must stay non-allocating — DS's call). The `.agents` exclusion for check-unsafe.sh is requested from NV. No kernel, ABI, IPC or HAL-trait change.
