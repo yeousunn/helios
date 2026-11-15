@@ -668,3 +668,120 @@ impl VfsClient {
         self.readdir(sys, entry.handle, cookie, name_out)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::{ARG_WINDOW_VA, RESULT_WINDOW_VA};
+    use ipc::{status, Tag};
+    use sdk::syscall::{number, SysReply};
+
+    /// A recording `RawSyscalls`: every raw call is kept for inspection.
+    /// `CARVE` replies hand out a fresh frame handle; the `CONNECT` call is
+    /// answered the way the server answers it (`words[0] = 0`, the connection
+    /// cap in the trailing descriptor word, the root in `words[2]`).
+    struct Mock {
+        calls: [(u32, [u64; 6]); 16],
+        n: usize,
+        next_frame: u32,
+    }
+
+    impl Mock {
+        fn new() -> Self {
+            Self {
+                calls: [(0, [0; 6]); 16],
+                n: 0,
+                next_frame: 100,
+            }
+        }
+
+        /// The message label of recorded call `i`.
+        fn label(&self, i: usize) -> u16 {
+            self.calls[i].1[1] as u16
+        }
+    }
+
+    impl RawSyscalls for Mock {
+        fn raw(&mut self, number: u32, args: [u64; 6]) -> SysReply {
+            self.calls[self.n] = (number, args);
+            self.n += 1;
+            if number == number::CALL && args[1] as u16 == methods::vfs::CONNECT {
+                return SysReply {
+                    status: status::OK,
+                    tag: Tag::new(methods::vfs::CONNECT).with_caps(1).0,
+                    // words[0] = 0 (ok), words[2] = root handle, and the
+                    // trailing word carries the connection cap descriptor.
+                    words: [
+                        0,
+                        0,
+                        7,
+                        CapSlot::pack(42, Rights::READ.union(Rights::WRITE)).0,
+                    ],
+                };
+            }
+            self.next_frame += 1;
+            SysReply {
+                status: status::OK,
+                tag: 0,
+                words: [self.next_frame as u64, 0, 0, 0],
+            }
+        }
+    }
+
+    /// The arg/result windows are carved from the package region and mapped
+    /// through the SDK `WindowMapper` at the two layout VAs, R|W, before the
+    /// `CONNECT` message hands the two frame caps to the server.
+    #[test]
+    fn connect_carves_both_frames_then_maps_them_at_the_layout_window_vas() {
+        let mut raw = Mock::new();
+        let client = {
+            let mut sys = Syscalls::new(&mut raw);
+            VfsClient::connect(&mut sys, 6, 5, 9, 8).expect("connect")
+        };
+
+        // Both frames are carved from the package region (one per window).
+        for i in 0..2 {
+            assert_eq!(raw.calls[i].0, number::INVOKE, "carve {i}");
+            assert_eq!(raw.label(i), methods::region::CARVE, "carve {i}");
+            assert_eq!(raw.calls[i].1[0], 5, "carve {i} goes to the region cap");
+            assert_eq!(raw.calls[i].1[2], WINDOW as u64, "carve {i}: one window");
+            assert_eq!(raw.calls[i].1[3], WINDOW as u64, "carve {i}: aligned");
+        }
+        // The mapper then maps both frames into our AS at the layout VAs.
+        for (i, va) in [ARG_WINDOW_VA, RESULT_WINDOW_VA].into_iter().enumerate() {
+            let idx = 2 + i;
+            assert_eq!(raw.calls[idx].0, number::INVOKE, "map {i}");
+            assert_eq!(raw.label(idx), methods::aspace::MAP, "map {i}");
+            assert_eq!(raw.calls[idx].1[0], 6, "map {i} goes to the AS cap");
+            assert_eq!(raw.calls[idx].1[2], va, "map {i} vaddr");
+            assert_eq!(raw.calls[idx].1[3], 0b011, "map {i} flags = R | W");
+            // caps[0] is the carved frame (packed in the trailing word).
+            let frame = CapSlot(raw.calls[idx].1[5]).handle();
+            assert_eq!(frame, 101 + i as u32, "map {i} carries the carved frame");
+        }
+
+        // CONNECT finally hands the session and both frames to the server.
+        let idx = 4;
+        assert_eq!(raw.calls[idx].0, number::CALL, "connect");
+        assert_eq!(raw.label(idx), methods::vfs::CONNECT);
+        assert_eq!(raw.calls[idx].1[0], 9, "connect goes to the VFS endpoint");
+        assert_eq!(
+            CapSlot(raw.calls[idx].1[3]).handle(),
+            8,
+            "caps[0] = the session notification"
+        );
+        assert_eq!(
+            CapSlot(raw.calls[idx].1[4]).handle(),
+            101,
+            "caps[1] = the arg window frame"
+        );
+        assert_eq!(
+            CapSlot(raw.calls[idx].1[5]).handle(),
+            102,
+            "caps[2] = the result window frame"
+        );
+
+        assert_eq!(client.root(), 7, "root handle from the reply");
+        assert_eq!(raw.n, 5, "carve x2, map x2, connect x1");
+    }
+}
