@@ -9,7 +9,7 @@
 
 #![no_std]
 #![no_main]
-#![deny(unsafe_op_in_unsafe_fn)]
+#![forbid(unsafe_code)]
 
 use core::panic::PanicInfo;
 
@@ -24,8 +24,9 @@ use sdk::syscall::{Syscalls, X86_64Syscalls, REPLY_CAP};
 #[global_allocator]
 static HEAP: SysHeap = SysHeap::new();
 
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
+sdk::sys::server_entry_point!(console_main);
+
+fn console_main() -> ! {
     let mut raw = X86_64Syscalls;
 
     let package = {

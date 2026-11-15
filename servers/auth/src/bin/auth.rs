@@ -7,7 +7,7 @@
 
 #![no_std]
 #![no_main]
-#![deny(unsafe_op_in_unsafe_fn)]
+#![forbid(unsafe_code)]
 
 use core::panic::PanicInfo;
 
@@ -20,13 +20,14 @@ use sdk::syscall::{Syscalls, X86_64Syscalls, REPLY_CAP};
 #[global_allocator]
 static HEAP: SysHeap = SysHeap::new();
 
+sdk::sys::server_entry_point!(auth_main);
+
 /// v0 built-in user table: `(name, password, uid, gid)`. Plaintext v0
 /// (ADR-048); `/etc/passwd` + hashing are the follow-up slice.
 const USERS: &[(&[u8], &[u8], u32, u32)] =
     &[(b"root", b"root", 0, 0), (b"user", b"user", 1000, 1000)];
 
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
+fn auth_main() -> ! {
     let mut raw = X86_64Syscalls;
 
     let package = {

@@ -20,7 +20,7 @@
 
 #![no_std]
 #![no_main]
-#![deny(unsafe_op_in_unsafe_fn)]
+#![forbid(unsafe_code)]
 
 extern crate alloc;
 
@@ -41,6 +41,8 @@ use vfs::server::VfsServer;
 
 #[global_allocator]
 static HEAP: SysHeap = SysHeap::new();
+
+sdk::sys::server_entry_point!(vfs_main);
 
 /// Upper bound on lazily-mapped caller windows. Each client connection maps
 /// its arg + result frames once and never releases them (v0 has no
@@ -136,8 +138,7 @@ impl Windows for BinWindows {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
+fn vfs_main() -> ! {
     let mut raw = X86_64Syscalls;
 
     // 1. Bootstrap package (handle 1, ADR-009): [aspace, thread, region, 4

@@ -13,7 +13,7 @@
 
 #![no_std]
 #![no_main]
-#![deny(unsafe_op_in_unsafe_fn)]
+#![forbid(unsafe_code)]
 
 extern crate alloc;
 
@@ -40,6 +40,8 @@ include!(concat!(env!("OUT_DIR"), "/child_image.rs"));
 
 #[global_allocator]
 static HEAP: SysHeap = SysHeap::new();
+
+sdk::sys::server_entry_point!(ps_main);
 
 /// Connection endpoints currently served (each `CONNECT` mints one and the
 /// serve loop polls them round-robin). Must exceed the number of LIVE
@@ -113,8 +115,7 @@ fn register_conn(ep: u32, pid: u64) {
     CONN_PIDS[i].store(pid, Ordering::Relaxed);
 }
 
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
+fn ps_main() -> ! {
     let mut raw = X86_64Syscalls;
 
     // 1. Bootstrap package (handle 1, ADR-009): [aspace, thread, region, 4
