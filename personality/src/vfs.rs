@@ -13,7 +13,7 @@ use sdk::sys::raw_copy_from_va;
 use sdk::syscall::{Handle, RawSyscalls, Status, Syscalls};
 use sdk::window::{MappedWindow, WindowMapper, FLAG_READ, FLAG_WRITE};
 
-use crate::layout::{ARG_WINDOW_VA, RESULT_WINDOW_VA};
+use crate::layout::ARG_WINDOW_VA;
 use crate::posix::{EBADF, EINVAL, O_CREAT};
 
 /// Local fd table size (v0).
@@ -40,10 +40,29 @@ pub struct VfsClient {
     /// request payload travels through [`MappedWindow::write`], which bounds
     /// the copy against the frame.
     arg: MappedWindow,
+    /// The connection's result window, mapped R|W by the same mapper at
+    /// `RESULT_WINDOW_VA` (one frame above the arg window): every reply
+    /// payload is read through [`read_into`], the no-alloc counterpart of
+    /// [`MappedWindow::write`].
+    result: MappedWindow,
 }
 
 /// Maximum `cd` nesting the client tracks for `cd ..`.
 pub const MAX_CWD_DEPTH: usize = 8;
+
+/// Read `dst.len()` bytes at `offset` out of a mapped window without touching
+/// the heap: the bounds check mirrors [`MappedWindow::write`] and the copy is
+/// the SDK's raw window copy, so no `Vec` per 4 KiB read (which leaks on the
+/// bump heap, ADR-055) is ever allocated. This is the no-alloc counterpart of
+/// `MappedWindow::read`; it stands in for `MappedWindow::read_into` (U4c2b,
+/// DS), which will also cover ps.rs's five result-window reads.
+fn read_into(window: MappedWindow, offset: u32, dst: &mut [u8]) -> Result<(), Status> {
+    if offset + dst.len() as u32 > WINDOW as u32 {
+        return Err(status::ETOOBIG);
+    }
+    raw_copy_from_va(window.va() + offset as u64, dst);
+    Ok(())
+}
 
 impl VfsClient {
     /// Connect to the VFS service endpoint: carve + map the two windows into
@@ -78,7 +97,7 @@ impl VfsClient {
         // the result window at `RESULT_WINDOW_VA` as before.
         let mut windows = WindowMapper::new(aspace, ARG_WINDOW_VA, frames.len());
         let arg = windows.window_of(sys, frames[0], FLAG_READ | FLAG_WRITE)?;
-        let _result = windows.window_of(sys, frames[1], FLAG_READ | FLAG_WRITE)?;
+        let result = windows.window_of(sys, frames[1], FLAG_READ | FLAG_WRITE)?;
 
         let mut connect = Message::new(methods::vfs::CONNECT);
         connect.tag = connect.tag.with_caps(3);
@@ -116,6 +135,7 @@ impl VfsClient {
             cwd_depth: 0,
             fds: [None; MAX_FDS],
             arg,
+            result,
         })
     }
 
@@ -340,8 +360,8 @@ impl VfsClient {
                 break;
             }
             // Result window mapped R|W by `connect`; `count <= WINDOW` was
-            // clamped above, so the destination slice is fully written.
-            raw_copy_from_va(RESULT_WINDOW_VA, &mut buf[got..got + count]);
+            // clamped above, so the read stays inside the frame.
+            read_into(self.result, 0, &mut buf[got..got + count])?;
             got += count;
             entry.offset += count as u64;
             if count < want {
@@ -636,7 +656,7 @@ impl VfsClient {
         }
         // Result window mapped R|W by `connect`; `len <= WINDOW` and
         // `len <= name_out.len()` were checked above.
-        raw_copy_from_va(RESULT_WINDOW_VA, &mut name_out[..len]);
+        read_into(self.result, 0, &mut name_out[..len])?;
         Ok(Some((next, reply.words[3] as u8, len)))
     }
     /// Open a **directory** by path into an fd slot (the emulator's
@@ -783,5 +803,33 @@ mod tests {
 
         assert_eq!(client.root(), 7, "root handle from the reply");
         assert_eq!(raw.n, 5, "carve x2, map x2, connect x1");
+    }
+
+    /// The result-window read allocates nothing and rejects an over-long span
+    /// before touching memory: a fake window is mapped over a host buffer via
+    /// the SDK `WindowMapper` (mock invoke), then read out with `read_into`.
+    #[test]
+    fn result_window_read_is_no_alloc_and_bounds_checked() {
+        let mut backing = [0u8; WINDOW];
+        backing[8..13].copy_from_slice(b"hello");
+        let window = {
+            let mut raw = Mock::new();
+            let mut sys = Syscalls::new(&mut raw);
+            let mut mapper = WindowMapper::new(6, backing.as_mut_ptr() as u64, 1);
+            mapper
+                .window_of(&mut sys, 21, FLAG_READ | FLAG_WRITE)
+                .expect("map the fake window")
+        };
+        let mut dst = [0u8; 5];
+        read_into(window, 8, &mut dst).expect("read inside the window");
+        assert_eq!(&dst, b"hello");
+        assert_eq!(
+            read_into(window, WINDOW as u32, &mut dst).err(),
+            Some(status::ETOOBIG)
+        );
+        assert_eq!(
+            read_into(window, WINDOW as u32 - 1, &mut [0u8; 2]).err(),
+            Some(status::ETOOBIG)
+        );
     }
 }
