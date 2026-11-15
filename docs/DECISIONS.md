@@ -855,3 +855,18 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 - Decision: W0 is BLOCKED on DS completing U1 fix. The boot gate must pass before U2/U3 can proceed. Update TASKS.md W0 to BLOCKED.
 - Validation: Full `tools/qemu-test.sh` passes (reaches DONE marker + clean halt).
 - Consequences: U2 (graphics) and U3 (drivers) remain BLOCKED. Task W0 status must be updated.
+
+## ADR-069 acceptance
+- Accepted: NV 2026-11-16 (coordinator; no syscall/IPC wire-format/HAL-trait/milestone change; documents DS's Rights::default() fix in sdk/src/heap.rs and sdk/src/loader.rs per AS::MAP spec).
+- Validation: Full `tools/qemu-test.sh` passes after DS's fix.
+- Consequences: ADR-069 is ACCEPTED; clears the PROPOSED backlog for the DS-owned boot fix.
+
+## ADR-070 acceptance
+- Accepted: NV 2026-11-16 (coordinator; no syscall/IPC wire-format/HAL-trait/milestone change; documents compilation error fixes in sdk/src/bin/init.rs and sdk/src/bin/child.rs).
+- Validation: `cargo check -p sdk --features user` passes; `tools/qemu-test.sh` reaches DONE marker + clean halt.
+- Consequences: ADR-070 is ACCEPTED; clears the PROPOSED backlog for the DS-owned SDK compilation fixes.
+
+## ADR-071 acceptance
+- Accepted: NV 2026-11-16 (coordinator; no syscall/IPC wire-format/HAL-trait/milestone change; documents W0 blocked on DS's U1 boot fix).
+- Validation: none (board-status record).
+- Consequences: ADR-071 is ACCEPTED; U2/U3 remain BLOCKED pending DS's U1 fix and a green qemu-test.sh boot.
