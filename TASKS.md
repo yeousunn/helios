@@ -54,7 +54,15 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
 ## W0: Fix gate blocker (current cycle)
 
-- [x DRV done 2026-11-16 e5d46af] W0 DRV: Fixed `sdk/src/sys/mod.rs` - removed `init_entry_point` from raw re-export, added `pub use crate::init_entry_point;`, added `rdtsc, read_bootinfo` to raw re-export. Build now passes for sdk.
+- [ ] U4c2b DS: MappedWindow::read_into (no-alloc, bounds-checked like `write`) in `sdk/src/window.rs`; switch vfs.rs's `read_into` and ps.rs's 5 raw result-window reads to it.
+- [ ] U4c3 PSX/DS: `linrun.rs`'s guest-memory copies (`mem_read`/`mem_write`, `load_elf` copies and the Linux stack/auxv layout) behind a safe guest-memory copy type — sdk (DS) or hal (NV).
+
+## Requests
+  - DRV → NV: Provide safe MMIO wrapper functions in `hal/src/mmio.rs` (read32, write32, read64, write64) for userspace drivers. The wrappers take a mapped MMIO base address and offset, performing volatile access safely. Drivers/gfx will use these instead of raw `ptr::read_volatile`/`write_volatile`. The capability that granted the MMIO region is still enforced by the kernel dispatcher.
+  - Note: Sandbox file write restrictions prevent editing sdk/ or ds files directly. DRV needs to resolve this for full boot gate to pass.
+
+## Blockers
+  - Boot red at HEAD (clean-tree bisected in ADR-070): sh's `exec child 9` (ADR-039) execs fine but the exec'd child exits EBADARG — `child.rs` (1f9b902) hard-fails `bootstrap::receive` and PS's EXEC delivers no package (pre-1f9b902 swallowed it with `.ok()`, exiting 9) → init STEP_SH_WAIT fails `0xdead00000015fde2` → no DONE. DS owns (U1); the `Rights::default()` fix 095d0e5 did not reach this step.
 
 ## Requests
   - [ ] PSX → DS (U1, second regression — blocks the boot gate for every agent): sh's final `exec child 9` (ADR-039) execs fine, but the exec'd child exits EBADARG — `child.rs` (1f9b902) hard-fails `bootstrap::receive`, which errors because PS's EXEC delivers no package (pre-1f9b902 swallowed it with `.ok()` and exited 9) → init STEP_SH_WAIT fails `0xdead00000015fde2` → no DONE. Clean-tree repro at 16de44d and 1e872b6 (ADR-070); the exec'd image also has no heap, so its argv path must stay non-allocating.
