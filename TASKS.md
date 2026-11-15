@@ -41,7 +41,8 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 - [x PSX done 2026-11-15 012160a] U4e PSX: host test for `VfsClient::connect`'s carve→map-at-layout-VA→CONNECT sequence (U4c1 regression cover, boot-independent).
 - [x PSX done 2026-11-15 1e872b6] U4c2a PSX: `vfs.rs`'s 2 result-window reads now go through the mapper's result `MappedWindow` + a module-local no-alloc bounds-checked `read_into` (host test; sdk's `read_into` lands in U4c2b). Boot stays red from DS's 1f9b902 EXEC regression (ADR-070), proven independent of this change.
 - [ ] U4c2b DS: `MappedWindow::read_into` (no-alloc, bounds-checked like `write`) in `sdk/src/window.rs`; switch vfs.rs's `read_into` and ps.rs's 5 raw result-window reads to it.
-- [ ] U4c3 PSX/DS: `linrun.rs`'s guest-memory copies (`mem_read`/`mem_write`, `load_elf` copies and the Linux stack/auxv layout) behind a safe guest-memory copy type — sdk (DS) or hal (NV).
+- [~ PSX started 2026-11-16] U4c3a PSX: personality-local `GuestMemory` (bounds-checked guest-memory copy type: span table, merge, `EFAULT` before any copy, host test) — linrun's `mem_read`/`mem_write`, `load_elf` copies and the Linux stack/auxv/stub layout route through it; boot red independently of it (ADR-072/ADR-073).
+- [ ] U4c3b DS/NV: the shared `GuestMemory` type in `sdk` (DS) or `hal` (NV) per ADR-073 — personality drops its local copy for it; sdk's raw VA wrappers stay allowlisted.
 - [x PSX done 2026-11-15 6bb21d2] U4d1 PSX: `#![forbid(unsafe_code)]` on personality (lib + 8 bins) — zero unsafe blocks, vfs.rs at 0 and each bin at 1 baseline line.
 
 ## M1: Design (RFCs, start when your M0 tasks are done)
@@ -55,7 +56,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 ## W0: Fix gate blocker (BLOCKED)
 
 - [ ] U4c2b DS: MappedWindow::read_into (no-alloc, bounds-checked like `write`) in `sdk/src/window.rs`; switch vfs.rs's `read_into` and ps.rs's 5 raw result-window reads to it.
-- [ ] U4c3 PSX/DS: `linrun.rs`'s guest-memory copies (`mem_read`/`mem_write`, `load_elf` copies and the Linux stack/auxv layout) behind a safe guest-memory copy type — sdk (DS) or hal (NV).
+- [ ] U4c3b DS/NV: (was U4c3, split) the shared safe guest-memory copy type in sdk/hal per ADR-073; personality's local GuestMemory (U4c3a) is the interim until it lands.
 
 ## Requests
   - [x NV done 2026-11-16 48ec9b3] DRV → NV: MMIO wrappers in `hal/src/mmio.rs` — `MmioWindow` with `unsafe fn new` constructor + bounds/alignment-checked `read32`/`write32`/`read64`/`write64` accessors already present (ADR-063/ADR-067 accepted).
