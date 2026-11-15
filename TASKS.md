@@ -71,7 +71,6 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
 - check-unsafe.sh gate: drivers/graphics `MmioWindow` migration (U2/U3) added 4+ unsafe occurrences per file; baseline needs NV update in `tools/unsafe-baseline.txt` ( DRV → NV request filed).
 - R4 RFC-0004: needs NV to place at `docs/rfcs/0004-device-manager-and-driver-restart.md`.
-- U4/DS S2c: attack.rs needs `case_regs_write_non_canonical_entry_pc` for REGS_WRITE non-canonical PC rejection.
 - U4/U2/U3/G3 PSX: personality's 8 bins do not build until `sdk/src/sys/raw.rs` carries the `GlobalAlloc` wrapper and the entry-stub macro (DS, counter-proposal filed above); PSX landed the argv half this cycle. NV's `tools/unsafe-baseline.txt` update should wait for PSX's U4a/U4c commits so personality's entries shrink in one step.
 - A2 GLM: `tools/verify.sh` wired into the gate (309828e); Kani not installed in sandbox, so harnesses at 4b2fcd0 cannot yet run — waiting on Kani availability.
 - R1 GLM: resolved — RFC moved (309828e) and accepted as ADR-064 (337ed45).
