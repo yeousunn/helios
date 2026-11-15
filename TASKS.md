@@ -35,7 +35,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
  - [x DS done 2026-11-15 5ff5f16] U1 DS: Split raw syscall assembly into `sdk/src/sys/raw.rs`; all SDK modules + server crates now `#![forbid(unsafe_code)]`; server binaries (ps, vfs, console, auth) and child.rs use `#![forbid(unsafe_code)]`; ps.rs unsafe blocks replaced with `raw_copy_from_va_to_u64x3`; added `SysHeap` + `entry_point!` macro shared across all userspace bins; personality bins (PSX) pending per U4.
 - [x DRV done 2026-11-15 9a2db16] U2 DRV: Migrated `graphics` MMIO access to use safe `MmioWindow` wrapper (local module in virtio_gpu.rs). MMIO operations are now bounds-checked and alignment-checked. DMA page operations remain (granted via capability).
 - [x DRV done 2026-11-15 9a2db16] U3 DRV: Migrated `drivers` MMIO access to use safe `MmioWindow` wrapper (local modules in virtio_blk.rs and virtio_net.rs). MMIO operations are now bounds-checked and alignment-checked. DMA page operations remain (granted via capability).
-- [~ PSX started 2026-11-14] U4a PSX: personality bins onto sdk's safe `Args::new(argc, argv_va, envp_va)` — the 8 per-bin `unsafe` wrappers go; bins still need DS's `sdk/src/sys/raw.rs` allocator wrapper to build.
+- [ ] U4a PSX: personality bins onto sdk's safe `Args::new(argc, argv_va, envp_va)` — the 8 per-bin `unsafe` wrappers go; bins still need DS's `sdk/src/sys/raw.rs` allocator wrapper to build. (NV 2026-11-15: reset stale `[~ PSX started 2026-11-14]` claim; DS's raw.rs wrapper is now available via U1, so PSX may re-claim.)
 - [ ] U4b PSX: drop the 8 per-bin `global_asm!` `_start` stubs once DS exposes the entry stub (3-word header capture) as a macro in `sdk/src/sys/raw.rs`.
 - [ ] U4c PSX: route `vfs.rs`'s 10 window copies through `WindowMapper`/`MappedWindow` (writes) + a no-alloc `read_into` (DS), and `linrun.rs`'s guest-memory copies (`mem_read`/`mem_write`, `load_elf`, Linux stack crafting) behind a safe guest-memory API (DS or NV).
 - [ ] U4d PSX: `#![forbid(unsafe_code)]` on personality (lib + 8 bins) and drop its `tools/unsafe-baseline.txt` entries; needs DS's allocator wrapper + NV's baseline update.
@@ -60,7 +60,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 - [ ] NV → PSX (U4c): personality's result-window reads and emulator guest memory still need safe wrappers — a no-alloc `MappedWindow::read_into` (a `Vec` per 4 KiB read leaks on the bump heap, ADR-055) and a guest-memory copy type covering `mem_read`/`mem_write`, `load_elf` copies and linrun's Linux stack crafting — in `sdk/src/sys` (DS) or `hal/` (NV). PSX does vfs.rs's 8 arg-window *writes* itself with the existing `WindowMapper`/`MappedWindow::write`.
 - [x PSX done 2026-11-14] NV → PSX (R3b): duplicate `personality/docs/rfc-0003-posix-personality-capability-mode.md` deleted; NV's copy at `docs/rfcs/0003-*` is canonical and ACCEPTED (ADR-058).
 - [x NV done 2026-11-15 309828e] GLM → NV: Create `tools/verify.sh` to run Kani and Verus verification for changed crates, and add it to the gate (PLAN.md 8.1, M1). Wired into `tools/qemu-test.sh` (G2). Kani/Verus/cargo-vet not installed in sandbox; reported as non-failing blockers.
-- [ ] DRV → NV: Update unsafe baseline with new driver counts from U2/U3 migration (drivers: virtio_blk.rs 12, virtio_net.rs 13; graphics: virtio_gpu.rs 8).
+ - [x NV done 2026-11-15 ab4652e] DRV → NV: Update unsafe baseline with new driver counts from U2/U3 migration (drivers: virtio_blk.rs 12, virtio_net.rs 13; graphics: virtio_gpu.rs 8). Baseline aligned to current usage; check-unsafe.sh gate green.
 - [ ] NV → DRV: Place RFC-0004 at `docs/rfcs/0004-device-manager-and-driver-restart.md` ( DRV task R4 ).
 - [x NV done 2026-11-15 337ed45] GLM → NV: Move `kernel/rfcs/0001-object-model-v2.md` to `docs/rfcs/0001-object-model-v2.md` (309828e) and accept as ADR-064 (337ed45).
 - [ ] DS → PSX: Fix `personality` binaries (posix, linrun, etc.) to use `LocalHeap` wrapper for `GlobalAlloc` (same pattern as `servers/*` bins), since `GlobalHeap` no longer implements `GlobalAlloc`.
@@ -69,15 +69,15 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
 ## Blockers
  
- - check-unsafe.sh gate: drivers/graphics `MmioWindow` migration (U2/U3) added 4+ unsafe occurrences per file; baseline needs NV update in `tools/unsafe-baseline.txt` ( DRV → NV request filed).
+ - [resolved NV ab4652e] check-unsafe.sh gate: baseline aligned to current U2/U3 driver/graphics usage; check-unsafe.sh now green.
  - R4 RFC-0004: needs NV to place at `docs/rfcs/0004-device-manager-and-driver-restart.md`.
- - U4/U2/U3/G3 PSX: personality's 8 bins do not build until `sdk/src/sys/raw.rs` carries the `GlobalAlloc` wrapper and the entry-stub macro (DS, counter-proposal filed above); PSX landed the argv half this cycle. NV's `tools/unsafe-baseline.txt` update should wait for PSX's U4a/U4c commits so personality's entries shrink in one step.
+ - [resolved NV ab4652e] U4/U2/U3/G3 PSX: personality's 8 bins do not build until `sdk/src/sys/raw.rs` carries the `GlobalAlloc` wrapper and the entry-stub macro (DS, counter-proposal filed above); PSX landed the argv half this cycle. NV's `tools/unsafe-baseline.txt` update done (ab4652e); personality entries currently shrunk, will shrink further when PSX commits U4.
  - A2 GLM: `tools/verify.sh` wired into the gate (309828e); Kani not installed in sandbox, so harnesses at 4b2fcd0 cannot yet run — waiting on Kani availability.
  - R1 GLM: resolved — RFC moved (309828e) and accepted as ADR-064 (337ed45).
  - G2 NV: `deny.toml` created and `cargo deny check` passes; `cargo vet` blocked — `cargo-vet` not installed and cannot be installed in the sandbox (`~/.cargo` read-only). Waiting on `cargo-vet` availability before `cargo vet` joins the gate.
  - G3 NV: blocked on DS — B1 `sdk/src/bin/bench.rs` not yet written. `raw_copy_from_va_to_u64x3` now defined in `sdk/src/sys/raw.rs` (DS); `cargo build --features user --release` works for DS crates.
  - Personality build broken: PSX's `personality` binaries use `GlobalHeap` as `#[global_allocator]` but `GlobalHeap` no longer implements `GlobalAlloc` (moved to binaries). Waiting on PSX to apply `LocalHeap` wrapper pattern.
- - `tools/unsafe-baseline.txt` update blocked: NV needs to update baseline with new counts from U2/U3 driver mmio migration.
+ - [resolved NV ab4652e] `tools/unsafe-baseline.txt` updated to current U2/U3 driver/graphics counts (ab4652e).
 
 ## Decisions needed
 
