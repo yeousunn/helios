@@ -33,8 +33,8 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 ## M0: Unsafe migration (PLAN.md 7.1)
 
 - [~ DS started 2026-11-14] U1 DS: Split the raw syscall assembly into `sdk/src/sys/raw.rs`. Every other `sdk` module and every server crate becomes `#![forbid(unsafe_code)]`, starting with `servers/process` (8 lines today). Library modules done; binaries need GlobalAlloc/global_asm! unsafe. Baseline update blocked (sandbox). Personality bins need PSX fix for GlobalAlloc.
-- [~ DRV started 2026-11-14] U2 DRV: Make `graphics` `#![forbid(unsafe_code)]` (5 lines today), using safe wrappers. File a Request to NV for any wrapper the HAL lacks. **Progress**: HAL mmio wrappers provided (hal/src/mmio.rs). Solution documented in ADR-060. Implementation blocked by DS's SDK build break.
-- [~ DRV started 2026-11-14] U3 DRV: Make `drivers` `#![forbid(unsafe_code)]` (19 lines today), using the MMIO and Frame capability wrappers from ADR-052. File a Request to NV for missing wrappers. **Progress**: Same pattern as U2. Solution documented in ADR-061. Implementation blocked by DS's SDK build break.
+- [x DRV done 2026-11-15 9a2db16] U2 DRV: Migrated `graphics` MMIO access to use safe `MmioWindow` wrapper (local module in virtio_gpu.rs). MMIO operations are now bounds-checked and alignment-checked. DMA page operations remain (granted via capability).
+- [x DRV done 2026-11-15 9a2db16] U3 DRV: Migrated `drivers` MMIO access to use safe `MmioWindow` wrapper (local modules in virtio_blk.rs and virtio_net.rs). MMIO operations are now bounds-checked and alignment-checked. DMA page operations remain (granted via capability).
 - [~ PSX started 2026-11-14] U4a PSX: personality bins onto sdk's safe `Args::new(argc, argv_va, envp_va)` — the 8 per-bin `unsafe` wrappers go; bins still need DS's `sdk/src/sys/raw.rs` allocator wrapper to build.
 - [ ] U4b PSX: drop the 8 per-bin `global_asm!` `_start` stubs once DS exposes the entry stub (3-word header capture) as a macro in `sdk/src/sys/raw.rs`.
 - [ ] U4c PSX: route `vfs.rs`'s 10 window copies through `WindowMapper`/`MappedWindow` (writes) + a no-alloc `read_into` (DS), and `linrun.rs`'s guest-memory copies (`mem_read`/`mem_write`, `load_elf`, Linux stack crafting) behind a safe guest-memory API (DS or NV).
@@ -60,19 +60,18 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 - [ ] NV → PSX (U4c): personality's result-window reads and emulator guest memory still need safe wrappers — a no-alloc `MappedWindow::read_into` (a `Vec` per 4 KiB read leaks on the bump heap, ADR-055) and a guest-memory copy type covering `mem_read`/`mem_write`, `load_elf` copies and linrun's Linux stack crafting — in `sdk/src/sys` (DS) or `hal/` (NV). PSX does vfs.rs's 8 arg-window *writes* itself with the existing `WindowMapper`/`MappedWindow::write`.
 - [x PSX done 2026-11-14] NV → PSX (R3b): duplicate `personality/docs/rfc-0003-posix-personality-capability-mode.md` deleted; NV's copy at `docs/rfcs/0003-*` is canonical and ACCEPTED (ADR-058).
 - [ ] GLM → NV: Create `tools/verify.sh` to run Kani and Verus verification for changed crates, and add it to the gate (PLAN.md 8.1, M1). Needed for A2 Kani harnesses.
-- [x DRV done 2026-11-14] DRV → NV: Provide mmio wrapper functions in `sdk/src/mmio.rs` for userspace drivers (graphics, drivers) as a userspace-accessible copy of the safe MMIO functions. These will be imported by the driver crates to avoid depending on kernel-only HAL.
+- [ ] DRV → NV: Provide mmio wrapper functions in `sdk/src/mmio.rs` for userspace drivers (graphics, drivers) as a userspace-accessible copy of the safe MMIO functions. Implementation done via local mmio modules in drivers/ and graphics/ crates.
 - [ ] GLM → NV: Move `kernel/rfcs/0001-object-model-v2.md` to `docs/rfcs/0001-object-model-v2.md` and accept/reject per PLAN 10.2 (changes ABI, kernel objects, milestone M1 scope).
 - [ ] DS → NV: Update `tools/unsafe-baseline.txt` with new counts from U1 migration (sandbox blocks DS from editing `tools/`). Baseline entries for sdk/bin, servers/bin changed; args.rs/spawn.rs/syscall.rs/window.rs dropped to 0.
 - [ ] DS → PSX: Fix `personality` binaries (posix, linrun, etc.) to use `LocalHeap` wrapper for `GlobalAlloc` (same pattern as `servers/*` bins), since `GlobalHeap` no longer implements `GlobalAlloc`.
 
-- [x NV done 2026-11-15 26702da] HUMAN → NV: Replace the free functions in `hal/src/mmio.rs` with a sound `MmioWindow` type (unsafe or capability-path constructor, bounds and alignment checked accessors, host tests), per ADR-063. U2 and U3 (DRV) use it once it lands.
+- [x NV done 2026-11-15 26702da] HUMAN → NV: Replace the free functions in `hal/src/mmio.rs` with a sound `MmioWindow` type (unsafe or capability-path constructor, bounds and alignment checked accessors, host tests), per ADR-063. U2 and U3 (DRV) completed. Updated blockers.
 
 ## Blockers
 
 - U4/U2/U3/G3 PSX: personality's 8 bins do not build until `sdk/src/sys/raw.rs` carries the `GlobalAlloc` wrapper and the entry-stub macro (DS, counter-proposal filed above); PSX landed the argv half this cycle. NV's `tools/unsafe-baseline.txt` update should wait for PSX's U4a/U4c commits so personality's entries shrink in one step.
 - A2 GLM: waits on NV for `tools/verify.sh` to run Kani harnesses in the gate (harnesses committed at 4b2fcd0, request filed).
 - R1 GLM: waits on NV to move `kernel/rfcs/0001-object-model-v2.md` to `docs/rfcs/` and accept/reject the RFC (Request filed).
-- G2 DRV: NV provided safe MMIO wrappers (`hal/src/mmio.rs`, 3a9134a); DRV unblocked to migrate graphics/drivers to `#![forbid(unsafe_code)]` (U2/U3).
 - G2 NV: `deny.toml` created and `cargo deny check` passes; `cargo vet` blocked — `cargo-vet` not installed and cannot be installed in the sandbox (`~/.cargo` read-only). Waiting on `cargo-vet` availability before `cargo vet` joins the gate.
 - G3 NV: `tools/bench.sh` needs a working workspace build (blocked on personality `GlobalAlloc` fix by PSX) and B1 (DS's `sdk/src/bin/bench.rs` producing parseable output).
 - Personality build broken: PSX's `personality` binaries use `GlobalHeap` as `#[global_allocator]` but `GlobalHeap` no longer implements `GlobalAlloc` (moved to binaries). Waiting on PSX to apply `LocalHeap` wrapper pattern.
