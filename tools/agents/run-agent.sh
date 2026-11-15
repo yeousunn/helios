@@ -237,8 +237,129 @@ worktree_check() { # start-commit
     done < <(g -c core.quotePath=false diff -z --name-only --no-renames "$1" HEAD)
 }
 
+# ---- The gate on HEAD, run by the supervisor ----
+# Agents have marked tasks done without running the full gate. Before every
+# cycle the supervisor runs it on a clean copy of HEAD and tells the agent
+# what fails. The gate scripts and build scripts are agent-written code, so
+# they only ever run inside a sandbox that can write .agents/gate and temp,
+# and cannot read the control directory or opencode's data. The supervisor
+# itself only pipes `git archive` in and reads the output back. One gate runs
+# at a time across all agents, and results are cached per commit.
+GATE_DIR="$WORK/gate"
+GATE_CACHE="$CTRL/gate"
+GATE_TIMEOUT="${GATE_TIMEOUT:-2400}"
+GATE_SCRIPT='set -euo pipefail
+mkdir -p "$GATE/src"
+rm -rf "$GATE/new"
+mkdir "$GATE/new"
+tar -x -C "$GATE/new" -f -
+# Copy only changed files, so cargo rebuilds only what changed.
+rsync -r --checksum --delete "$GATE/new/" "$GATE/src/"
+rm -rf "$GATE/new"
+cd "$GATE/src"
+export CARGO_TARGET_DIR="$GATE/target" SERIAL_LOG="$GATE/serial.log"
+rel="$CARGO_TARGET_DIR/x86_64-unknown-none/release"
+for img in INIT PS CHILD VFS POSIX CONSOLE AUTH SH CAT LS ECHO WC LINRUN LOGIN; do
+    export "${img}_IMAGE=$rel/$(echo "$img" | tr "[:upper:]" "[:lower:]")"
+done
+export KERNEL_ELF="$rel/kernel-boot"
+echo "[gate] cargo fmt --check"
+cargo fmt --check
+echo "[gate] host clippy"
+cargo clippy --workspace --exclude kernel-boot -- -D warnings
+echo "[gate] kernel-boot clippy"
+cargo clippy -p kernel-boot --target x86_64-unknown-none -- -D warnings
+echo "[gate] host tests"
+cargo test --workspace --exclude kernel-boot 2>&1 | grep -vE "^test .* ok$|^running [0-9]+ tests?$|^$"
+echo "[gate] tools/qemu-test.sh"
+bash tools/qemu-test.sh'
+
+gate_profile() {
+    local p="$CTRL/sandbox-gate-$NAME.sb"
+    {
+        cat "$CTRL/sandbox.sb"
+        echo "(allow file-write* (subpath \"$GATE_DIR\"))"
+        echo "(deny file-read* file-write* (subpath \"$CTRL\")"
+        echo "    (subpath \"$HOME/.local/share/opencode\") (subpath \"$HOME/.local/state/opencode\")"
+        echo "    (subpath \"$HOME/.config/opencode\") (subpath \"$HOME/.cache/opencode\"))"
+    } >"$p"
+    echo "$p"
+}
+
+# Sets GATE_HEAD and GATE_RESULT (the cache file, ending in .ok or .fail).
+run_gate() {
+    local head gp out rc lockpid have_lock=0
+    head="$(g rev-parse HEAD)"
+    GATE_HEAD="$head"
+    mkdir -p "$GATE_CACHE"
+    until [ -f "$GATE_CACHE/$head.ok" ] || [ -f "$GATE_CACHE/$head.fail" ]; do
+        if mkdir "$CTRL/gate.lock" 2>/dev/null; then
+            echo $$ >"$CTRL/gate.lock/pid"
+            have_lock=1
+            break
+        fi
+        # A lock left by a supervisor that died is removed. A lock whose pid
+        # is not written yet belongs to one that is starting, so wait.
+        lockpid="$(cat "$CTRL/gate.lock/pid" 2>/dev/null)"
+        if [ -n "$lockpid" ] && ! kill -0 "$lockpid" 2>/dev/null; then
+            rm -rf "$CTRL/gate.lock"
+            continue
+        fi
+        sleep 20
+    done
+    if [ "$have_lock" = 1 ] && [ ! -f "$GATE_CACHE/$head.ok" ] && [ ! -f "$GATE_CACHE/$head.fail" ]; then
+        log "gate start on $(g rev-parse --short "$head")"
+        gp="$(gate_profile)"
+        out="$(g archive --format=tar "$head" |
+            sandbox-exec -f "$gp" -D HOME="$HOME" -D CTRL="$CTRL" -D TMP="$TMP_REAL" \
+                "$GTIMEOUT_BIN" --kill-after=60 "$GATE_TIMEOUT" \
+                /usr/bin/env -i HOME="$HOME" PATH="$AGENT_PATH" TMPDIR="$TMP_REAL" GATE="$GATE_DIR" \
+                /bin/bash -c "$GATE_SCRIPT" 2>&1)"
+        rc=$?
+        [ "$rc" = 124 ] && out="$out
+[gate] timed out after ${GATE_TIMEOUT}s"
+        # The output is agent-controlled text that goes into prompts and the
+        # owner's terminal: printable characters only, last 60 lines.
+        out="$(printf '%s\n' "$out" | LC_ALL=C tr -cd '[:print:]\n' | tail -n 60)"
+        if [ "$rc" = 0 ]; then
+            printf '%s\n' "$out" >"$GATE_CACHE/$head.ok"
+            log "gate PASS on $(g rev-parse --short "$head")"
+        else
+            printf '%s\n' "$out" >"$GATE_CACHE/$head.fail"
+            log "gate FAIL rc=$rc on $(g rev-parse --short "$head")"
+        fi
+    fi
+    [ "$have_lock" = 1 ] && rm -rf "$CTRL/gate.lock"
+    if [ -f "$GATE_CACHE/$head.ok" ]; then GATE_RESULT="$GATE_CACHE/$head.ok"; else GATE_RESULT="$GATE_CACHE/$head.fail"; fi
+}
+
+# Text appended to the prompt when the gate fails at HEAD.
+gate_note() {
+    [ -f "$GATE_RESULT" ] && [ "${GATE_RESULT%.fail}" != "$GATE_RESULT" ] || return 0
+    local re="" d mine
+    for d in $OWN_DIRS $OWN_ROOT; do re="$re|$(re_escape "$d")"; done
+    mine="$(grep -E "(^|[^A-Za-z0-9_./-])(${re#|})(/|:|[[:space:]]|$)" "$GATE_RESULT" | head -n 15)"
+    printf '\n\n## The gate fails at HEAD %s\n\n' "$(g rev-parse --short "$GATE_HEAD")"
+    printf 'Before this cycle the supervisor ran the full gate (AGENTS.md section 5) on a clean copy of HEAD, and it failed. The last lines of its output:\n\n```\n'
+    cat "$GATE_RESULT"
+    printf '```\n\n'
+    if [ -n "$mine" ]; then
+        printf 'These failing lines name files in your directories, so fixing them is your task for this cycle, before anything else. A task you marked done that caused this is not done: set it back to `[ ]` with a one-line reason. '
+    else
+        printf 'No failing line names your directories. Keep working on your own tasks. '
+        [ "$NAME" = nv ] && printf 'As coordinator, make sure the owner of the failing files has an open board task for the failure. '
+    fi
+    printf 'Never hide a failure: do not add an entry to tools/unsafe-baseline.txt or raise a count in it, and do not weaken or skip a check.\n'
+}
+
 if [ "${2:-}" = "--print-profile" ]; then # for testing: write and print the profile, then exit
     cat "$(make_profile)"
+    exit 0
+fi
+if [ "${2:-}" = "--gate" ]; then # for testing: run the gate on HEAD and print the prompt note
+    run_gate
+    echo "result: $GATE_RESULT"
+    gate_note
     exit 0
 fi
 
@@ -281,6 +402,8 @@ while true; do
     prompt="$(sed -e "s|{{NAME}}|$LABEL|g" -e "s|{{TAG}}|$TAG|g" -e "s|{{ROLE}}|$ROLE|g" \
         -e "s|{{ROLE_NOTE}}|$ROLE_NOTE|g" -e "s|{{TARGET}}|$CARGO_TARGET_DIR|g" \
         -e "s|{{SERIAL}}|$SERIAL_LOG|g" "$CTRL/prompt.md")"
+    run_gate
+    prompt="$prompt$(gate_note)"
 
     log "cycle $cycle start ($MODEL) -> $(basename "$out")"
     sandbox-exec -f "$profile" -D HOME="$HOME" -D CTRL="$CTRL" -D TMP="$TMP_REAL" \

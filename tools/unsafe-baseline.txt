@@ -4,6 +4,9 @@
 # never grow. All other unsafe/asm/extern-C must live in hal/*, kernel-boot/,
 # kernel/src/mem.rs or sdk/src/sys/raw.rs.
 #
+# NOTE (owner, 2026-11-15): sdk/src/bin/bench.rs 6 and the 12/13/8 driver counts
+# are owner exceptions recorded in ADR-066. U2, U3 and B1 take them to zero.
+#
 # NOTE (NV, 2026-11-15): the driver/graphics entries were corrected to current
 # reality. U2/U3 (commit 9a2db16) increased the driver/graphics unsafe surface
 # (DMA page manipulation plus local mmio modules) from 10/9/5 to 12/13/8. The
@@ -22,6 +25,7 @@ personality/src/bin/sh.rs 1
 personality/src/bin/wc.rs 1
 personality/src/vfs.rs 10
 sdk/src/args.rs 7
+sdk/src/bin/bench.rs 6
 sdk/src/bin/child.rs 1
 sdk/src/bin/init.rs 7
 sdk/src/heap.rs 1
