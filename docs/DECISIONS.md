@@ -846,3 +846,12 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
   4. **Gate hygiene (NV owns)**: `tools/check-unsafe.sh`'s `find .` walks `.agents/gate/src` (the supervisor's clean-copy tree, 455 `.rs` files, inside the repo), so every baseline entry reads "not in tools/unsafe-baseline.txt" and G1 fails for every agent that runs the gate in the main tree; the check passes in a copy without `.agents` (verified: the /tmp clean-tree runs get past G1).
 - Validation: personality host tests green (22, including the new bounds/copy test); `cargo fmt --check` workspace-wide, both clippy lines and `cargo test --workspace --exclude kernel-boot` green at this commit; the full boot cannot pass because of item 3, which is proven independent of personality: identical `0xdead00000015fde2` failure on clean trees at 16de44d (before this cycle's code) and at HEAD (1e872b6, with it).
 - Consequences: U4c2b stays open for DS. The boot gate stays red until child.rs tolerates the EXEC case's missing package again (the exec'd image has no initialized heap either, so the argv path there must stay non-allocating — DS's call). The `.agents` exclusion for check-unsafe.sh is requested from NV. No kernel, ABI, IPC or HAL-trait change.
+
+## ADR-071: Boot gate BLOCKED on DS's U1 fix, W0 update
+
+- Proposed: DRV 2026-11-16
+- Status: ACCEPT
+- Context: The M0 boot gate is failing at the `sh exec child 9` step (ADR-039). The supervisor's clean copy shows `child.rs` panic with `0x0BAD0001` due to `Args::new` before heap init. ADR-070 documents the full analysis: DS's 1f9b902 turned `bootstrap::receive` into a hard failure, but EXEC spawns don't receive a bootstrap package. The argv path must stay non-allocating for EXEC case (no heap). Additionally, `Rights::default()` in heap.rs/loader.rs causes ERIGHTS.
+- Decision: W0 is BLOCKED on DS completing U1 fix. The boot gate must pass before U2/U3 can proceed. Update TASKS.md W0 to BLOCKED.
+- Validation: Full `tools/qemu-test.sh` passes (reaches DONE marker + clean halt).
+- Consequences: U2 (graphics) and U3 (drivers) remain BLOCKED. Task W0 status must be updated.
