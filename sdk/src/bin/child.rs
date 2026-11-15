@@ -9,48 +9,34 @@
 //! ```text
 //! entry rsp = sdk::layout::USER_STACK_TOP
 //! [rsp - 8]  = argc (u64)
-//! [rsp - 16] = argv[0] pointer (u64, VA)
-//! [rsp - 32 ..] = NUL-terminated argv strings (written downward)
+//! [rsp - 16] = argv* (u64, VA of pointer array)
+//! [rsp - 24] = envp* (u64, VA of pointer array)
 //! ```
 //!
 //! The smoke behavior: exit with argv[0] parsed as a decimal number — proof
 //! that arg-window → PS → child-stack data flow and exit-status propagation
 //! (PS `WAIT`) work end to end.
-
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use core::arch::global_asm;
 use core::panic::PanicInfo;
 
-use sdk::heap::GlobalHeap;
+use sdk::sys::SysHeap;
 use sdk::syscall::{Syscalls, X86_64Syscalls};
 
 /// The sdk rlib links `alloc`; a handler satisfies the link even though this
 /// child allocates nothing (initializing the heap is optional).
 #[global_allocator]
-static HEAP: GlobalHeap = GlobalHeap::new();
+static HEAP: SysHeap = SysHeap::new();
 
-// Capture the crafted header in registers BEFORE any Rust code runs: the
-// first prologue push would overwrite [sp-8..sp-24]. Then move sp safely
-// below the header so the rest of the program cannot clobber it either
-// (v0.2 entry contract, `sdk::args`).
-global_asm!(
-    ".global _start",
-    "_start:",
-    "mov rdi, [rsp - 8]",  // argc
-    "mov rsi, [rsp - 16]", // argv*
-    "mov rdx, [rsp - 24]", // envp*
-    "sub rsp, 64",
-    "and rsp, -16",
-    "jmp {main}",
-    main = sym child_main,
-);
+sdk::sys::entry_point!(child_main);
 
 /// The crafted argv/envp (v0.2 entry contract) were captured by the stub.
-extern "C" fn child_main(argc: u64, argv: *const *const u8, envp: *const *const u8) -> ! {
-    let args = unsafe { sdk::args::Args::new(argc, argv, envp) };
+/// All pointer parsing is done safely via `sdk::sys::raw_cstr_from_va` and
+/// `sdk::sys::raw_ptr_array_from_va`.
+extern "C" fn child_main(argc: u64, argv_va: u64, envp_va: u64) -> ! {
+    let args = sdk::args::Args::new(argc as usize, argv_va, envp_va);
     let mut raw = X86_64Syscalls;
     // S11 attack mode: `argv[0] == "attack"` runs the kernel-hardening attack
     // cases (sdk::attack) instead of the numeric-argv smoke. init spawns this

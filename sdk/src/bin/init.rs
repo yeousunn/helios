@@ -25,19 +25,20 @@ use ipc::{CapSlot, Message, Rights};
 use sdk::bootinfo::{BootInfo, MAX_LEN};
 use sdk::bootstrap;
 use sdk::elf::ElfImage;
-use sdk::heap::{GlobalHeap, RegionSource};
+use sdk::heap::RegionSource;
 use sdk::layout::{
     CHILD_STACK_PAGES, HEAP_CHUNK, HEAP_CHUNKS, INIT_HEAP_VA_BASE, INIT_SCRATCH_VA_BASE,
     INIT_WINDOW_VA_BASE, USER_STACK_TOP,
 };
 use sdk::loader;
 use sdk::methods;
+use sdk::sys::SysHeap;
 use sdk::syscall::{Handle, Syscalls, X86_64Syscalls};
 
 include!(concat!(env!("OUT_DIR"), "/ps_image.rs")); // PS + VFS + CONSOLE images
 
 #[global_allocator]
-static HEAP: GlobalHeap = GlobalHeap::new();
+static HEAP: SysHeap = SysHeap::new();
 
 /// Log marker: "INIT" in the high bytes, step number in the low byte.
 const MARK: u64 = 0x494E_4954_0000_0000;

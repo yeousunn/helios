@@ -15,14 +15,14 @@ use core::panic::PanicInfo;
 
 use ipc::{CapSlot, Message, Rights};
 use sdk::bootstrap::{self, receive};
-use sdk::heap::GlobalHeap;
 use sdk::methods;
+use sdk::sys::SysHeap;
 use sdk::syscall::{Syscalls, X86_64Syscalls, REPLY_CAP};
 
 /// The sdk rlib links `alloc`; a handler satisfies the link even though this
 /// server allocates nothing (initializing the heap is optional).
 #[global_allocator]
-static HEAP: GlobalHeap = GlobalHeap::new();
+static HEAP: SysHeap = SysHeap::new();
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {

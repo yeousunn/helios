@@ -28,9 +28,10 @@ use alloc::vec::Vec;
 use core::panic::PanicInfo;
 
 use ipc::{CapSlot, Message, Rights};
-use sdk::heap::{GlobalHeap, RegionSource};
+use sdk::heap::RegionSource;
 use sdk::layout::{HEAP_CHUNK, HEAP_CHUNKS, VFS_HEAP_VA_BASE, VFS_WINDOW_VA_BASE};
 use sdk::methods;
+use sdk::sys::SysHeap;
 use sdk::syscall::{Syscalls, X86_64Syscalls, REPLY_CAP};
 use sdk::window::{WindowMapper, FLAG_READ, FLAG_WRITE};
 
@@ -39,7 +40,7 @@ use vfs::runtime::{Handle as KernelHandle, Transport, VfsKernel, Windows};
 use vfs::server::VfsServer;
 
 #[global_allocator]
-static HEAP: GlobalHeap = GlobalHeap::new();
+static HEAP: SysHeap = SysHeap::new();
 
 /// Upper bound on lazily-mapped caller windows. Each client connection maps
 /// its arg + result frames once and never releases them (v0 has no

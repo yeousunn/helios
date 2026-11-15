@@ -17,6 +17,7 @@
 
 extern crate alloc;
 
+use alloc::vec;
 use alloc::vec::Vec;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -24,19 +25,21 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use ipc::{CapSlot, Message, Rights};
 use sdk::bootstrap::{self, receive, BootstrapPackage};
 use sdk::elf::ElfImage;
-use sdk::heap::{GlobalHeap, RegionSource};
+use sdk::heap::RegionSource;
 use sdk::layout::{
     CHILD_STACK_PAGES, HEAP_CHUNK, HEAP_CHUNKS, PS_HEAP_VA_BASE, PS_SCRATCH_VA_BASE,
     PS_WINDOW_VA_BASE, USER_STACK_TOP,
 };
 use sdk::loader;
 use sdk::methods;
+use sdk::sys::SysHeap;
+use sdk::sys::{raw_copy_from_va, raw_copy_to_va};
 use sdk::syscall::{Syscalls, X86_64Syscalls, REPLY_CAP};
 
 include!(concat!(env!("OUT_DIR"), "/child_image.rs"));
 
 #[global_allocator]
-static HEAP: GlobalHeap = GlobalHeap::new();
+static HEAP: SysHeap = SysHeap::new();
 
 /// Connection endpoints currently served (each `CONNECT` mints one and the
 /// serve loop polls them round-robin). Must exceed the number of LIVE
@@ -416,18 +419,14 @@ fn spawn_reply(
     // [u64 env_span]` then path bytes, the argv area (NUL-separated strings)
     // and the env area. Words cannot carry spans alongside 3+ descriptors
     // (descriptors overlay the trailing words). See `sdk::spawn`.
-    let (path_off, path_len, arg_off, arg_len, env_off, env_len) = {
-        let f = win_base as *const u8;
-        // SAFETY: our CONNECT arg window is mapped R in this AS.
-        unsafe {
-            let rd = |o: usize| core::ptr::read_unaligned(f.add(o) as *const u64);
-            let span = |w: u64| ((w >> 32) as usize, (w & 0xFFFF_FFFF) as usize);
-            let (po, pl) = span(rd(0));
-            let (ao, al) = span(rd(8));
-            let (eo, el) = span(rd(16));
-            (po, pl, ao, al, eo, el)
-        }
-    };
+    let mut header = [0u64; 3];
+    let header_bytes =
+        unsafe { core::slice::from_raw_parts_mut(header.as_mut_ptr() as *mut u8, 24) };
+    raw_copy_from_va(win_base, header_bytes);
+    let span = |w: u64| ((w >> 32) as usize, (w & 0xFFFF_FFFF) as usize);
+    let (path_off, path_len) = span(header[0]);
+    let (arg_off, arg_len) = span(header[1]);
+    let (env_off, env_len) = span(header[2]);
     let span_ok = |off: usize, len: usize| off.checked_add(len).is_some_and(|e| e <= 4096);
     if path_len == 0
         || !span_ok(path_off, path_len)
@@ -680,11 +679,10 @@ fn load_via_vfs(
         LOAD_ROOT.store(root, Ordering::Relaxed);
     }
     // Copy the path into the VFS arg window (its first bytes) and OPEN it.
-    let path =
-        unsafe { core::slice::from_raw_parts((params.win_base + path_off as u64) as *const u8, path_len) };
-    unsafe {
-        core::ptr::copy_nonoverlapping(path.as_ptr(), arg_va as *mut u8, path_len);
-    }
+    // Read path from caller's window and copy to VFS arg window.
+    let mut path = vec![0u8; path_len];
+    raw_copy_from_va(params.win_base + path_off as u64, &mut path);
+    raw_copy_to_va(arg_va, &path);
     let mut open = Message::new(methods::vfs::OPEN);
     open.words[0] = root;
     open.words[1] = path_len as u64; // Span { off 0, len path_len }
@@ -724,8 +722,9 @@ fn load_via_vfs(
         if count == 0 {
             break;
         }
-        let chunk = unsafe { core::slice::from_raw_parts(result_va as *const u8, count) };
-        buf.extend_from_slice(chunk);
+        let mut chunk = vec![0u8; count];
+        raw_copy_from_va(result_va, &mut chunk);
+        buf.extend_from_slice(&chunk);
         offset += count as u64;
         if count < 4096 {
             break;
@@ -774,12 +773,27 @@ fn craft_stack(
     let mut envp_ptrs = [0u64; MAX_ARGS];
     let mut argc = 0usize;
     let mut envc = 0usize;
-    let mut fill = |area: (usize, usize),
+
+    // Read the argv and env areas from the window into local buffers for safe parsing.
+    let argv_buf = {
+        let len = argv_span.1;
+        let mut buf = vec![0u8; len];
+        raw_copy_from_va(win_base + argv_span.0 as u64, &mut buf);
+        buf
+    };
+    let env_buf = {
+        let len = env_span.1;
+        let mut buf = vec![0u8; len];
+        raw_copy_from_va(win_base + env_span.0 as u64, &mut buf);
+        buf
+    };
+
+    let mut fill = |buf: &[u8],
                     ptrs: &mut [u64; MAX_ARGS],
                     count: &mut usize,
                     str_cursor: &mut usize|
      -> Result<(), i32> {
-        let (off, len) = area;
+        let len = buf.len();
         let mut i = 0usize;
         while i < len {
             if *count == MAX_ARGS {
@@ -787,7 +801,7 @@ fn craft_stack(
             }
             // One NUL-terminated string; zero-padded tail = empty, skip.
             let start = i;
-            while i < len && unsafe { *((win_base as *const u8).add(off + i)) } != 0 {
+            while i < len && buf[i] != 0 {
                 i += 1;
             }
             let slen = i - start;
@@ -798,17 +812,15 @@ fn craft_stack(
             if *str_cursor + slen + 1 > 4096 - 32 {
                 return Err(-103);
             }
-            for k in 0..slen {
-                page[*str_cursor + k] = unsafe { *((win_base as *const u8).add(off + start + k)) };
-            }
+            page[*str_cursor..*str_cursor + slen].copy_from_slice(&buf[start..start + slen]);
             ptrs[*count] = page_va + *str_cursor as u64;
             *count += 1;
             *str_cursor += slen + 1;
         }
         Ok(())
     };
-    fill(argv_span, &mut argv_ptrs, &mut argc, &mut str_cursor)?;
-    fill(env_span, &mut envp_ptrs, &mut envc, &mut str_cursor)?;
+    fill(&argv_buf, &mut argv_ptrs, &mut argc, &mut str_cursor)?;
+    fill(&env_buf, &mut envp_ptrs, &mut envc, &mut str_cursor)?;
 
     // Pointer arrays at 0x400: argv ptrs, NULL, envp ptrs, NULL.
     let argv_arr = 0x400usize;
@@ -831,9 +843,8 @@ fn craft_stack(
     page[4096 - 16..4096 - 8].copy_from_slice(&(page_va + argv_arr as u64).to_le_bytes());
     page[4096 - 24..4096 - 16].copy_from_slice(&(page_va + envp_arr as u64).to_le_bytes());
 
-    unsafe {
-        core::ptr::copy_nonoverlapping(page.as_ptr(), PS_SCRATCH_VA_BASE as *mut u8, 4096);
-    }
+    // Copy the crafted stack page to the scratch VA (mapped in this AS).
+    raw_copy_to_va(PS_SCRATCH_VA_BASE, &page);
     invoke_map(sys, child_as, USER_STACK_TOP - 4096, 0b011, frame)?;
     let mut m = Message::new(methods::aspace::UNMAP);
     m.words[0] = PS_SCRATCH_VA_BASE;
@@ -973,16 +984,14 @@ fn exec_reply(
 /// (`[path_span][argv_span][env_span]` + areas). `None` = malformed.
 #[allow(clippy::type_complexity)]
 fn parse_spawn_blob(win_base: u64) -> Option<(usize, usize, usize, usize, usize, usize)> {
-    let f = win_base as *const u8;
-    // SAFETY: the caller's CONNECT arg window is mapped R in this AS.
-    let (path_off, path_len, arg_off, arg_len, env_off, env_len) = unsafe {
-        let rd = |o: usize| core::ptr::read_unaligned(f.add(o) as *const u64);
-        let span = |w: u64| ((w >> 32) as usize, (w & 0xFFFF_FFFF) as usize);
-        let (po, pl) = span(rd(0));
-        let (ao, al) = span(rd(8));
-        let (eo, el) = span(rd(16));
-        (po, pl, ao, al, eo, el)
-    };
+    let mut header = [0u64; 3];
+    let header_bytes =
+        unsafe { core::slice::from_raw_parts_mut(header.as_mut_ptr() as *mut u8, 24) };
+    raw_copy_from_va(win_base, header_bytes);
+    let span = |w: u64| ((w >> 32) as usize, (w & 0xFFFF_FFFF) as usize);
+    let (path_off, path_len) = span(header[0]);
+    let (arg_off, arg_len) = span(header[1]);
+    let (env_off, env_len) = span(header[2]);
     let ok = |off: usize, len: usize| off.checked_add(len).is_some_and(|e| e <= 4096);
     if path_len == 0 || !ok(path_off, path_len) || !ok(arg_off, arg_len) || !ok(env_off, env_len) {
         return None;

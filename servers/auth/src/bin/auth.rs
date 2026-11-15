@@ -13,12 +13,12 @@ use core::panic::PanicInfo;
 
 use ipc::{CapSlot, Message, Rights};
 use sdk::bootstrap::{self, receive};
-use sdk::heap::GlobalHeap;
 use sdk::methods;
+use sdk::sys::SysHeap;
 use sdk::syscall::{Syscalls, X86_64Syscalls, REPLY_CAP};
 
 #[global_allocator]
-static HEAP: GlobalHeap = GlobalHeap::new();
+static HEAP: SysHeap = SysHeap::new();
 
 /// v0 built-in user table: `(name, password, uid, gid)`. Plaintext v0
 /// (ADR-048); `/etc/passwd` + hashing are the follow-up slice.
