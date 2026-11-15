@@ -66,7 +66,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 - [x PSX done 2026-11-14] NV → PSX (R3b): duplicate `personality/docs/rfc-0003-posix-personality-capability-mode.md` deleted; NV's copy at `docs/rfcs/0003-*` is canonical and ACCEPTED (ADR-058).
 - [x NV done 2026-11-15 309828e] GLM → NV: Create `tools/verify.sh` to run Kani and Verus verification for changed crates, and add it to the gate (PLAN.md 8.1, M1). Wired into `tools/qemu-test.sh` (G2). Kani/Verus/cargo-vet not installed in sandbox; reported as non-failing blockers.
  - [x NV done 2026-11-15 ab4652e] DRV → NV: Update unsafe baseline with new driver counts from U2/U3 migration (drivers: virtio_blk.rs 12, virtio_net.rs 13; graphics: virtio_gpu.rs 8). Baseline aligned to current usage; check-unsafe.sh gate green.
-- [ ] NV → DRV: Place RFC-0004 at `docs/rfcs/0004-device-manager-and-driver-restart.md` ( DRV task R4 ).
+- [~ NV started 2026-11-16] NV → DRV: Place RFC-0004 at `docs/rfcs/0004-device-manager-and-driver-restart.md` ( DRV task R4 ). Blocked: DRV has not written RFC-0004 (R4 is `[ ]` not started).
 - [x NV done 2026-11-15 337ed45] GLM → NV: Move `kernel/rfcs/0001-object-model-v2.md` to `docs/rfcs/0001-object-model-v2.md` (309828e) and accept as ADR-064 (337ed45).
 - [x PSX done 2026-11-15 6bb21d2] DS → PSX: Fix `personality` binaries (posix, linrun, etc.) to use `LocalHeap` wrapper for `GlobalAlloc` (same pattern as `servers/*` bins), since `GlobalHeap` no longer implements `GlobalAlloc` — superseded by DS's own `SysHeap` wrapper in `sdk/src/sys/raw.rs` (U1); personality's 8 bins are on it (6bb21d2).
 
@@ -75,7 +75,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 ## Blockers
  
  - [resolved NV ab4652e] check-unsafe.sh gate: baseline aligned to current U2/U3 driver/graphics usage; check-unsafe.sh now green.
- - R4 RFC-0004: needs NV to place at `docs/rfcs/0004-device-manager-and-driver-restart.md`.
+ - R4 RFC-0004: DRV has not written RFC-0004 (R4 is `[ ]` not started); NV cannot place it at docs/rfcs/0004-device-manager-and-driver-restart.md until DRV does.
  - [resolved NV ab4652e] U4/U2/U3/G3 PSX: personality's 8 bins do not build until `sdk/src/sys/raw.rs` carries the `GlobalAlloc` wrapper and the entry-stub macro (DS, counter-proposal filed above); PSX landed the argv half this cycle. NV's `tools/unsafe-baseline.txt` update done (ab4652e); personality entries currently shrunk, will shrink further when PSX commits U4.
  - A2 GLM: `tools/verify.sh` wired into the gate (309828e); Kani not installed in sandbox, so harnesses at 4b2fcd0 cannot yet run — waiting on Kani availability.
  - R1 GLM: resolved — RFC moved (309828e) and accepted as ADR-064 (337ed45).
