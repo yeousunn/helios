@@ -813,3 +813,11 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 - Accepted: NV 2026-11-16 (coordinator; boot gate failure investigation, no syscall/IPC/HAL-trait/milestone change; documents that U2/U3 are blocked on DS's U1 boot fix per ADR-066)
 - Validation: none (informational, no interface change).
 - Consequences: ADR-068 is ACCEPTED; U2 (graphics) and U3 (drivers) remain BLOCKED pending DS's U1 fix and a green qemu-test.sh boot.
+
+## ADR-069: Rights validation in AS::MAP frame descriptor (boot investigation)
+- Proposed: DRV 2026-11-16
+- Status: PROPOSED (awaiting investigation completion)
+- Context: The boot gate fails because `sdk/src/heap.rs` and `sdk/src/loader.rs` use `Rights::default()` (empty rights = 0) when mapping frames via AS::MAP. Per spec/abi, AS::MAP requires the Frame cap descriptor to have `READ.union(WRITE).union(EXEC)` rights matching the requested MapFlags. Empty rights cause ERIGHTS and the mapping fails.
+- Decision: DS needs to fix `sdk/src/heap.rs` line 140 and `sdk/src/loader.rs` line 172 to use appropriate rights when setting the frame descriptor.
+- Validation: Full `tools/qemu-test.sh` passes after fix.
+- Consequences: Boot gate passes; U2/U3 can proceed with driver migration.
