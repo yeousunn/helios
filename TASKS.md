@@ -32,7 +32,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
 ## M0: Unsafe migration (PLAN.md 7.1)
   
-- [ ] U1 DS: Split the raw syscall assembly into `sdk/src/sys/raw.rs`. Every other `sdk` module, every `sdk` and server binary and every server crate becomes `#![forbid(unsafe_code)]`. (Reopened by HUMAN 2026-11-15: 5ff5f16 broke the boot, `child.rs` calls the allocating `Args::new` before its heap is up and exits `0x0BAD0001`. The server bins and `child.rs` have no `forbid`, and `init.rs` keeps 7 `unsafe`.)
+- [~ DS started 2026-11-15] U1 DS: Split the raw syscall assembly into `sdk/src/sys/raw.rs`. Every other `sdk` module, every `sdk` and server binary and every server crate becomes `#![forbid(unsafe_code)]`. (Reopened by HUMAN 2026-11-15: 5ff5f16 broke the boot, `child.rs` calls the allocating `Args::new` before its heap is up and exits `0x0BAD0001`. The server bins and `child.rs` have no `forbid`, and `init.rs` keeps 7 `unsafe`.)
 - [ ] U2 DRV: Make `graphics` `#![forbid(unsafe_code)]` through `hal::mmio::MmioWindow` (ADR-063) with no `unsafe` of its own, and drop its `tools/unsafe-baseline.txt` entry. File a Request to NV for any HAL wrapper still missing (DMA frames). (Reopened by HUMAN 2026-11-15: 9a2db16 added a local unsafe MMIO module instead, `unsafe` went from 5 to 8, no `forbid`.)
 - [ ] U3 DRV: Make `drivers` `#![forbid(unsafe_code)]` through `hal::mmio::MmioWindow` (ADR-063) with no `unsafe` of its own, and drop its `tools/unsafe-baseline.txt` entries. File a Request to NV for any HAL wrapper still missing (DMA frames). (Reopened by HUMAN 2026-11-15: 9a2db16 added local unsafe MMIO modules instead, `unsafe` went from 10/9 to 12/13, no `forbid`.)
 - [x PSX done 2026-11-15 6bb21d2] U4a PSX: personality bins onto sdk's safe `Args::new(argc, argv_va, envp_va)` + `sdk::sys::SysHeap` — the 8 per-bin unsafe wrappers are gone and the bins build again; argv parses below `HEAP.init` (allocating Args) except linrun's pre-heap non-allocating copy.
@@ -50,7 +50,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
 ## M0: Benchmarks
 
-- [ ] B1 DS: `sdk/src/bin/bench.rs`: measure call/reply round trip, notification signal-to-wake, context switch and map/unmap of 4 KiB with the cycle counter, and print one parseable line per result for G3. The bin is `#![forbid(unsafe_code)]` and has no baseline entry. (Reopened by HUMAN 2026-11-15: 6dafb6a adds 6 `unsafe` outside the allowlist, which fails `tools/check-unsafe.sh`.)
+- [~ DS started 2026-11-15] B1 DS: `sdk/src/bin/bench.rs`: measure call/reply round trip, notification signal-to-wake, context switch and map/unmap of 4 KiB with the cycle counter, and print one parseable line per result for G3. The bin is `#![forbid(unsafe_code)]` and has no baseline entry. (Reopened by HUMAN 2026-11-15: 6dafb6a adds 6 `unsafe` outside the allowlist, which fails `tools/check-unsafe.sh`.)
 
 ## W0: Fix gate blocker (current cycle)
 
