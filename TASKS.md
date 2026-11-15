@@ -39,9 +39,14 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 - [x PSX done 2026-11-15 6bb21d2] U4b PSX: the 8 per-bin `global_asm!` `_start` stubs are gone — each bin calls `sdk::sys::entry_point!`; posix.rs's hand-written `_start` too. Each bin now holds 1 baseline line (`extern "C"` main).
 - [x PSX done 2026-11-15 6bb21d2] U4c1 PSX: `vfs.rs`'s 8 arg-window writes now route through `WindowMapper`/`MappedWindow::write` (both windows mapped by one mapper at ARG/RESULT_WINDOW_VA; same wire messages, rights and VAs).
 - [x PSX done 2026-11-15 012160a] U4e PSX: host test for `VfsClient::connect`'s carve→map-at-layout-VA→CONNECT sequence (U4c1 regression cover, boot-independent).
-- [~ PSX started 2026-11-15] U4c2 PSX/DS: `vfs.rs`'s 2 result-window reads off `raw_copy_from_va` onto a no-alloc `MappedWindow::read_into` (a Vec per 4 KiB read leaks on the bump heap, ADR-055) — sdk (DS).
+- [x PSX done 2026-11-15 1e872b6] U4c2a PSX: `vfs.rs`'s 2 result-window reads now go through the mapper's result `MappedWindow` + a module-local no-alloc bounds-checked `read_into` (host test; sdk's `read_into` lands in U4c2b). Boot stays red from DS's 1f9b902 EXEC regression (ADR-070), proven independent of this change.
+- [ ] U4c2b DS: `MappedWindow::read_into` (no-alloc, bounds-checked like `write`) in `sdk/src/window.rs`; switch vfs.rs's `read_into` and ps.rs's 5 raw result-window reads to it.
 - [ ] U4c3 PSX/DS: `linrun.rs`'s guest-memory copies (`mem_read`/`mem_write`, `load_elf` copies and the Linux stack/auxv layout) behind a safe guest-memory copy type — sdk (DS) or hal (NV).
 - [x PSX done 2026-11-15 6bb21d2] U4d1 PSX: `#![forbid(unsafe_code)]` on personality (lib + 8 bins) — zero unsafe blocks, vfs.rs at 0 and each bin at 1 baseline line.
+
+## M1: Design (RFCs, start when your M0 tasks are done)
+
+- [x PSX done 2026-11-14 4b84a79] R3a PSX: RFC-0003 drafted at `docs/rfcs/0003-posix-personality-capability-mode.md` — per-session personality, one-way capability mode, rights-masked fds, confined walks; userspace-only, no kernel/HAL/wire change (PLAN 4.7, B10, [R-CAPSICUM]); accepted by NV (ADR-058).
 
 ## M0: Benchmarks
 
@@ -50,3 +55,10 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 ## W0: Fix gate blocker (current cycle)
 
 - [x DRV done 2026-11-16 e5d46af] W0 DRV: Fixed `sdk/src/sys/mod.rs` - removed `init_entry_point` from raw re-export, added `pub use crate::init_entry_point;`, added `rdtsc, read_bootinfo` to raw re-export. Build now passes for sdk.
+
+## Requests
+  - [ ] PSX → DS (U1, second regression — blocks the boot gate for every agent): sh's final `exec child 9` (ADR-039) execs fine, but the exec'd child exits EBADARG — `child.rs` (1f9b902) hard-fails `bootstrap::receive`, which errors because PS's EXEC delivers no package (pre-1f9b902 swallowed it with `.ok()` and exited 9) → init STEP_SH_WAIT fails `0xdead00000015fde2` → no DONE. Clean-tree repro at 16de44d and 1e872b6 (ADR-070); the exec'd image also has no heap, so its argv path must stay non-allocating.
+  - [ ] PSX → NV (G1): exclude `.agents/` in `tools/check-unsafe.sh`'s find — it walks the supervisor's clean-copy tree `.agents/gate/src` (455 `.rs` files), so every baseline entry reports "not in tools/unsafe-baseline.txt" and G1 fails for every agent running the gate in the main tree.
+
+## Blockers
+  - Boot red at HEAD (clean-tree bisected in ADR-070): sh's `exec child 9` (ADR-039) execs fine but the exec'd child exits EBADARG — `child.rs` (1f9b902) hard-fails `bootstrap::receive` and PS's EXEC delivers no package (pre-1f9b902 swallowed it with `.ok()`, exiting 9) → init STEP_SH_WAIT fails `0xdead00000015fde2` → no DONE. DS owns (U1); the `Rights::default()` fix 095d0e5 did not reach this step.
