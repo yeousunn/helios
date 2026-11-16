@@ -101,6 +101,24 @@ pub fn write_reg_image_user(kstack_top: u64, image: &[u64; 10]) {
     }
 }
 
+/// Write ONE user-owned slot of a freshly built initial-context frame
+/// (RFC-0004/ADR-085: the spawn-time stack-top overlay — the same
+/// discipline as `write_reg_image_user`, which `regs_write` runs after
+/// every rebuild). `i` is the init-context image index (0 = [top-1] arg,
+/// 1 = user RSP, 3 = RFLAGS visible image slot, 4..10 = callee-saved);
+/// the real frame slot 3 is the kernel-owned ring-0 trampoline return and
+/// is never a valid target here.
+pub(crate) fn write_reg_slot(kstack_top: u64, i: usize, val: u64) {
+    debug_assert!(i < 10, "reg image slot {i} out of range");
+    debug_assert!(i != 3, "frame slot 3 is kernel-owned (trampoline return)");
+    // SAFETY: as write_reg_image_user — the frame is kernel-owned RAM of a
+    // quiescent thread whose context was just rebuilt (not yet resumed).
+    unsafe {
+        let top = phys_to_virt(kstack_top) as *mut u64;
+        *top.sub(i + 1) = val;
+    }
+}
+
 /// ADR-045 slice 2: the shared higher-half window maps every physical page
 /// below 1 GiB at `0xFFFFFFFF80000000 + PA` in every address space (boot.S
 /// alias for the boot CR3, the shared PML4[511] window for user ASes) — the

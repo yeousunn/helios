@@ -247,6 +247,18 @@ fn queue_pop(s: &mut Sched, prio: u8) -> Option<SlotIdx> {
 /// the init thread is spawned by `init::start` before its image is mapped)
 /// and build its initial kernel context when a backend is registered.
 pub fn set_initial_pc(id: ThreadId, pc: u64) -> SchedResult<()> {
+    set_initial_pc_with_stack(id, pc, 0)
+}
+
+/// `set_initial_pc` with a caller-supplied initial user stack top
+/// (RFC-0004/ADR-085). `user_rsp == 0` keeps the arch default the backend's
+/// `init_context` builds; a nonzero top is overlaid into the fresh frame
+/// (slot 1 = user RSP) before the first resume — the same rebuild+overlay
+/// discipline `regs_write` uses (S1/ADR-050), so no HAL trait changes.
+/// Validation of the value (canonical user, 16-byte aligned) is the
+/// caller's (entry.rs `valid_stack_top`), done before any child state
+/// exists.
+pub fn set_initial_pc_with_stack(id: ThreadId, pc: u64, user_rsp: u64) -> SchedResult<()> {
     let mut top = kstack_top_of(id);
     if top == 0 {
         // First time this thread acquires a userspace entry: give it a
@@ -275,6 +287,14 @@ pub fn set_initial_pc(id: ThreadId, pc: u64) -> SchedResult<()> {
             .as_ref()
             .map(|b| b.init_context(top, pc))
             .unwrap_or(0);
+        // RFC-0004/ADR-085: a caller-supplied stack top (w1 of
+        // NEW_THREAD/THREAD_CREATE) is overlaid into the fresh frame's
+        // slot 1 (user RSP) before the first resume; the S1/ADR-050 snapshot
+        // below then mirrors it into the register image, so REGS_READ/WRITE
+        // and the actual iretq frame agree. 0 keeps the arch default.
+        if ksp != 0 && user_rsp != 0 {
+            crate::mem::write_reg_slot(top, 1, user_rsp);
+        }
         // ADR-037 depth accounting: paint the unused tail below the built
         // context (debug builds only; the context occupies the top).
         #[cfg(debug_assertions)]
@@ -345,12 +365,25 @@ pub fn kstack_high_water(base: u64, used_bottom: u64) -> u64 {
     crate::mem::high_water(base, used_bottom - base, crate::sched::KSTACK_PAINT)
 }
 
-/// Register a new thread with a userspace entry PC (ADR-019 §4); builds its
+/// Register a new thread with a userspace entry PC and initial user stack
+/// top (RFC-0004/ADR-085); builds its initial kernel context (M3) when a
+/// context backend is registered.
+pub fn spawn_with_stack(
+    process: ObjRef,
+    priority: u8,
+    initial_pc: u64,
+    user_rsp: u64,
+) -> SchedResult<ThreadId> {
+    let id = spawn(process, priority)?;
+    set_initial_pc_with_stack(id, initial_pc, user_rsp)?;
+    Ok(id)
+}
+
+/// Register a new thread with a userspace entry PC (ADR-019 §4) and the
+/// arch-default initial stack (RFC-0004/ADR-085: w1 = 0); builds its
 /// initial kernel context (M3) when a context backend is registered.
 pub fn spawn_with(process: ObjRef, priority: u8, initial_pc: u64) -> SchedResult<ThreadId> {
-    let id = spawn(process, priority)?;
-    set_initial_pc(id, initial_pc)?;
-    Ok(id)
+    spawn_with_stack(process, priority, initial_pc, 0)
 }
 
 /// Read a thread's saved kernel stack pointer (arch switch).
@@ -1539,6 +1572,98 @@ mod tests {
         let t2 = get(t).unwrap();
         assert_eq!(t2.user_regs[3], 0x202, "RFLAGS masked");
         assert_eq!(t2.initial_pc, 0x405000);
+    }
+
+    /// RFC-0004/ADR-085: a backend whose init_context emulates the real
+    /// frame build and returns a nonzero ksp, so the spawn-time stack-top
+    /// overlay actually fires. Host-test hermeticity: the frame "build"
+    /// only succeeds for the kstack top the test registered (a real static
+    /// buffer) — the host frame allocator hands out fake physical
+    /// addresses with no backing RAM when parallel frame tests leak their
+    /// init, and those must yield ksp 0 (no frame, no snapshot, no
+    /// overlay), exactly like the un-registered case on hardware.
+    struct FrameCtx;
+    impl ContextBackend for FrameCtx {
+        fn switch(&self, _f: ThreadId, _t: ThreadId) {}
+        fn start_first(&self, _t: ThreadId) {}
+        fn init_context(&self, kstack_top: u64, _entry_pc: u64) -> u64 {
+            let (base, top) = *FRAME_RANGE.lock();
+            if base != 0 && kstack_top == top {
+                kstack_top - 80
+            } else {
+                0
+            }
+        }
+        fn activate_aspace(&self, _as_id: u64) {}
+    }
+
+    /// The FAKE frame buffer's [base, top) that FrameCtx accepts (host-test
+    /// registration, see FrameCtx).
+    static FRAME_RANGE: Mutex<(u64, u64)> = Mutex::new((0, 0));
+
+    /// RFC-0004/ADR-085: a caller-supplied stack top is overlaid into the
+    /// fresh frame's slot 1 (user RSP) at spawn, and the per-thread image
+    /// mirrors it (REGS_READ agreement). Every other slot keeps the
+    /// backend's value — the write is surgical.
+    #[test]
+    fn spawn_with_stack_overlays_caller_stack_top_into_frame() {
+        setup();
+        set_context_backend(&FrameCtx);
+        let p = ObjRef(1);
+        let top_rsp = 0x5000_0000u64; // 16-byte aligned canonical user VA
+        let t = spawn_with_stack(p, 100, 0x401000, top_rsp).unwrap();
+        // Deterministic fake kstack (host tests have no real frame
+        // allocator): 16 frames so the debug kstack paint below the built
+        // context stays inside the buffer.
+        static FAKE: Mutex<[u64; 16384]> = Mutex::new([0; 16384]);
+        let fake = FAKE.lock();
+        let base = fake.as_ptr() as u64;
+        set_kstack(t, base, 16).unwrap();
+        let top = base + 16 * crate::frame::FRAME_SIZE as u64;
+        *FRAME_RANGE.lock() = (base, top);
+        // Seed the frame the backend "built": canary in every slot.
+        crate::mem::seed_reg_image(top, &[0x1111; REG_IMAGE_QWORDS]);
+        // Re-run the entry staging now that the kstack exists: the backend
+        // rebuilds (ksp != 0) and the overlay replaces slot 1 with the
+        // caller's top before the first resume.
+        set_initial_pc_with_stack(t, 0x401000, top_rsp).unwrap();
+        let mut frame = [0u64; REG_IMAGE_QWORDS];
+        crate::mem::read_reg_image(top, &mut frame);
+        drop(fake);
+        assert_eq!(frame[1], top_rsp, "frame slot 1 = caller stack top");
+        assert_eq!(frame[2], 0x1111, "entry PC slot untouched by the overlay");
+        // The register image agrees (snapshot ran after the overlay).
+        let _ = pick_next(); // t Running
+        suspend(t).unwrap();
+        let mut image = [0u64; REG_IMAGE_QWORDS];
+        regs_read(t, &mut image).unwrap();
+        assert_eq!(image[1], top_rsp, "REGS_READ slot 1 = caller stack top");
+    }
+
+    /// RFC-0004/ADR-085: w1 = 0 keeps the arch default — the overlay must
+    /// not fire, so the frame's slot 1 stays exactly what the backend built.
+    #[test]
+    fn spawn_with_stack_zero_keeps_arch_default_stack() {
+        setup();
+        set_context_backend(&FrameCtx);
+        let p = ObjRef(1);
+        let t = spawn_with_stack(p, 100, 0x401000, 0).unwrap();
+        static FAKE: Mutex<[u64; 16384]> = Mutex::new([0; 16384]);
+        let fake = FAKE.lock();
+        let base = fake.as_ptr() as u64;
+        set_kstack(t, base, 16).unwrap();
+        let top = base + 16 * crate::frame::FRAME_SIZE as u64;
+        *FRAME_RANGE.lock() = (base, top);
+        // The backend-built image: arch default user RSP in slot 1.
+        crate::mem::seed_reg_image(top, &[0, 0x7FFF_FFFF_F000, 0x401000, 0, 0, 0, 0, 0, 0, 0]);
+        set_initial_pc_with_stack(t, 0x401000, 0).unwrap();
+        let mut frame = [0u64; REG_IMAGE_QWORDS];
+        crate::mem::read_reg_image(top, &mut frame);
+        drop(fake);
+        assert_eq!(
+            frame[1], 0x7FFF_FFFF_F000,
+            "no overlay: arch default RSP from the backend"
+        );
     }
 
     /// S1/ADR-050: REGS_WRITE on a BLOCKED thread must not edit its live

@@ -3,7 +3,8 @@
 //! The arch trap handler (hal-*, NV) decodes registers into
 //! [`SyscallArgs`], then calls [`dispatch`] — the kernel never touches
 //! registers. Factory::NEW_THREAD follows ADR-017 (w0 = entry PC;
-//! caps[0..=2] positional).
+//! caps[0..=2] positional). Thread::THREAD_CREATE takes RFC-0004/ADR-085's
+//! w1 = initial user stack top (0 = arch default).
 #![forbid(unsafe_code)]
 
 use crate::proc::{self, ProcError, ProcessId};
@@ -686,13 +687,28 @@ fn thread_invoke(
         THREAD_CREATE => {
             // ADR-033 §1: new thread in the TARGET's process (shares AS +
             // cap table). w0 = entry PC. CONTROL right already enforced.
+            // RFC-0004/ADR-085: the method takes no descriptors — with any
+            // attached cap, trailing-descriptor overlay would put descriptor
+            // bytes in words[1] where w1 = stack top is read, so reject.
+            if msg.tag.cap_count() != 0 {
+                return SyscallReturn::err(ipc::status::EBADARG);
+            }
             // S2: the entry PC must be a canonical user address.
             if !sched::is_user_addr(msg.words[0]) {
                 return SyscallReturn::err(ipc::status::EBADARG);
             }
+            // RFC-0004/ADR-085: w1 = initial user stack top (0 = arch
+            // default), rejected before any child state exists.
+            if !valid_stack_top(msg.words[1]) {
+                return SyscallReturn::err(ipc::status::EBADARG);
+            }
             let proc_ref = sched::get(target).map(|t| t.process).unwrap_or(ObjRef(0));
-            let child_tid = match sched::spawn_with(proc_ref, sched::DEFAULT_PRIORITY, msg.words[0])
-            {
+            let child_tid = match sched::spawn_with_stack(
+                proc_ref,
+                sched::DEFAULT_PRIORITY,
+                msg.words[0],
+                msg.words[1],
+            ) {
                 Ok(t) => t,
                 Err(_) => return SyscallReturn::err(ipc::status::ENOMEM),
             };
@@ -870,13 +886,30 @@ fn resolve_thread_ep(pid: ProcessId, msg: &Message, idx: usize) -> Result<Option
     }))
 }
 
-/// Factory::NEW_THREAD (ADR-017 packing): creates the child process + thread,
-/// applies caps[1] (fault EP) atomically, installs caps[2] (bootstrap EP) at
-/// child handle 1 (slot 0) per ADR-009, and returns the child's thread cap.
-/// S8: caps[1]/caps[2] transfer under the same rules as in-message caps
-/// (`syscall::resolve_transfers`, ADR-026): live Endpoint + GRANT on the
-/// caller's cap, child receives rights ∩ requested — no full-rights copy,
-/// no added SEND.
+/// RFC-0004/ADR-085: validate the initial user stack top (w1 of
+/// THREAD_CREATE). `0` = arch default (`USER_STACK_TOP`, the value every
+/// thread enters with today); nonzero must be a canonical user address
+/// (the S2 rule, same as the entry PC) and 16-byte aligned (the x86-64
+/// SysV stack discipline — the arch default satisfies it too). Form only,
+/// like the entry PC: the kernel never checks the mapping; an unmapped
+/// top faults in the child at its first push and routes to the child's
+/// fault endpoint (ADR-007).
+///
+/// NEW_THREAD does NOT take a stack top: at the cap_count 3 layout every
+/// production sender uses, trailing-descriptor overlay puts descriptor 0
+/// (the AS cap) in words[1], so w1 carries descriptor bytes. The kernel
+/// ignores w1 there (deferred to the ADR-086 proposal).
+fn valid_stack_top(w: u64) -> bool {
+    w == 0 || (sched::is_user_addr(w) && w & 0xF == 0)
+}
+
+/// Factory::NEW_THREAD (ADR-017 packing): creates the child process +
+/// thread, applies caps[1] (fault EP) atomically, installs caps[2]
+/// (bootstrap EP) at child handle 1 (slot 0) per ADR-009, and returns the
+/// child's thread cap. S8: caps[1]/caps[2] transfer under the same rules
+/// as in-message caps (`syscall::resolve_transfers`, ADR-026): live
+/// Endpoint + GRANT on the caller's cap, child receives rights ∩
+/// requested — no full-rights copy, no added SEND.
 fn new_thread(pid: ProcessId, cap: &Capability, msg: &Message) -> SyscallReturn {
     if !cap.rights.contains(Rights::GRANT) {
         return SyscallReturn::err(ipc::status::ERIGHTS);
@@ -933,7 +966,8 @@ fn new_thread(pid: ProcessId, cap: &Capability, msg: &Message) -> SyscallReturn 
     }
 
     // Spawn at scheduler default priority (ADR-017 §3); SET_PRIORITY refines.
-    // Entry PC from w0 (ADR-019 §4); SP is arch-owned.
+    // Entry PC from w0 (ADR-019 §4); SP is arch-owned (NEW_THREAD w1 is
+    // descriptor-overlay territory — ADR-086 proposal).
     let child_tid = match sched::spawn_with(ObjRef(child_pid.0), sched::DEFAULT_PRIORITY, entry_pc)
     {
         Ok(t) => t,
@@ -1596,6 +1630,119 @@ mod tests {
         ));
         assert_eq!(r.status, ipc::status::OK as i64, "valid SET_ENTRY pc");
         assert_eq!(sched::get(child_tid).unwrap().initial_pc, 0x500000);
+    }
+
+    /// RFC-0004/ADR-085: THREAD_CREATE w1 (initial user stack top) must be
+    /// 0 (arch default) or a canonical, 16-byte-aligned user address —
+    /// rejected with EBADARG before any child state exists. The w1 word
+    /// was ignored before this change (every thread entered at the aliased
+    /// arch default), so a kernel-window or misaligned top was silently
+    /// accepted: the fail-before state. NEW_THREAD is excluded: at the
+    /// cap_count 3 layout every production sender uses, words[1] carries
+    /// the packed AS descriptor (trailing-descriptor overlay), so the
+    /// kernel must not read a stack top there (ADR-086 proposal).
+    #[test]
+    fn a9_thread_stacks_reject_invalid_top_before_any_child_state() {
+        let (pid, server, _factory) = setup();
+        let tc = proc::install_cap(
+            pid,
+            Capability {
+                obj: ObjId(server.0),
+                typ: ObjType::Thread,
+                rights: Rights::CONTROL.union(Rights::GRANT),
+            },
+        )
+        .unwrap();
+
+        for bad in [
+            0xFFFF_8000_0100_0000, // kernel window (ADR-045)
+            0xFFFF_FFFF_FFFF_F000, // non-canonical
+            0x0000_8000_0000_0000, // the user/kernel split
+            0x5000_0008,           // misaligned user VA
+            0x7FFF_FFFF_F008,      // misaligned near the arch default
+        ] {
+            let mut m = Message::new(13);
+            m.words[0] = 0x402000; // valid entry PC
+            m.words[1] = bad;
+            let r = thread_invoke_for_test(pid, tc, m);
+            assert_eq!(
+                r.status,
+                ipc::status::EBADARG as i64,
+                "THREAD_CREATE stack top {bad:#x}"
+            );
+        }
+
+        // Attached descriptors would overlay words[1] (the stack-top
+        // read) — rejected regardless of the values (spec: no descriptors).
+        let mut m = Message::new(13);
+        m.words[0] = 0x402000;
+        m.tag = m.tag.with_caps(1);
+        m.set_descriptor(0, CapSlot::pack(1, Rights::SEND)).unwrap();
+        let r = thread_invoke_for_test(pid, tc, m);
+        assert_eq!(
+            r.status,
+            ipc::status::EBADARG as i64,
+            "THREAD_CREATE with descriptors"
+        );
+
+        // No child state was burned by the rejections: valid tops still
+        // spawn siblings in the target's process.
+        for top in [0x5000_0000u64, 0x5001_0000] {
+            let mut m = Message::new(13);
+            m.words[0] = 0x402000;
+            m.words[1] = top;
+            let r = thread_invoke_for_test(pid, tc, m);
+            assert_eq!(r.status, ipc::status::OK as i64, "valid top {top:#x}");
+            let new_tid = ThreadId(r.w[1]);
+            assert_eq!(sched::get(new_tid).unwrap().initial_pc, 0x402000);
+        }
+    }
+
+    /// A1 cross-check discipline: the kernel's stack-top validation agrees
+    /// with the spec/abi InvokeSpec entry (RFC-0004/ADR-085) for
+    /// THREAD_CREATE — the stack_top argument exists, EBADARG out of
+    /// range, and the kernel's rule accepts/rejects the spec's boundary
+    /// values. NEW_THREAD's w1 is descriptor-overlay territory at
+    /// cap_count 3 (ADR-086 proposal): its spec entry says so, and the
+    /// kernel does not validate it as a stack.
+    #[test]
+    fn a9_stack_top_spec_matches_kernel_validation() {
+        let arg = helios_abi::invoke::THREAD_CREATE
+            .args
+            .iter()
+            .find(|a| a.name == "stack_top")
+            .expect("THREAD_CREATE: spec/abi lacks the stack_top argument");
+        assert_eq!(
+            arg.range_error,
+            helios_abi::ErrorCode::EBADARG,
+            "stack_top range error"
+        );
+        assert_eq!(arg.range.0, 0, "stack_top min (0 = arch default)");
+        assert_eq!(
+            arg.range.1,
+            0x0000_8000_0000_0000 - 1,
+            "stack_top max (canonical user limit)"
+        );
+        // The kernel's rule agrees with the spec for boundary values.
+        for (w, ok) in [
+            (0u64, true),                       // arch default
+            (0x1000, true),                     // aligned user
+            (0x7FFF_FFFF_F000, true),           // the arch default itself
+            (0x0000_8000_0000_0000 - 1, false), // top of range, misaligned
+            (0x5000_0008, false),               // misaligned user
+            (0x0000_8000_0000_0000, false),     // the split (out of range)
+            (0xFFFF_8000_0100_0000, false),     // kernel window
+        ] {
+            assert_eq!(valid_stack_top(w), ok, "stack top {w:#x}");
+        }
+        // NEW_THREAD: the spec marks w1 reserved-ignored (kernel reads no
+        // stack there until the wire format grows — ADR-086 proposal).
+        let nt_w1 = helios_abi::invoke::FACTORY_NEW_THREAD
+            .args
+            .iter()
+            .find(|a| a.name == "w1_reserved")
+            .expect("NEW_THREAD: spec/abi lacks the w1_reserved marker");
+        assert_eq!(nt_w1.range_error, helios_abi::ErrorCode::OK);
     }
 
     /// S4: AS::MAP/UNMAP/PROTECT must reject kernel-window, split and null

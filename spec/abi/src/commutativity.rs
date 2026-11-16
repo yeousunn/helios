@@ -258,7 +258,7 @@ pub mod invoke_commutativity {
     pub const FACTORY_NEW_THREAD: CommutativitySpec = CommutativitySpec {
         class: Commutativity::Commutes,
         resource_extractor: ResourceExtractor::CapSlot, // destination cap slot for thread cap
-        notes: "Creates independent thread/process. The AddressSpace cap (caps[0]) is read-only for this operation.",
+        notes: "Creates independent thread/process. The AddressSpace cap (caps[0]) is read-only for this operation. w1 is descriptor-overlay territory at cap_count 3 and is ignored by the kernel (ADR-086 proposal; RFC-0004's stack top ships on THREAD_CREATE w1 only).",
     };
 
     // Thread methods
@@ -315,7 +315,7 @@ pub mod invoke_commutativity {
     pub const THREAD_CREATE: CommutativitySpec = CommutativitySpec {
         class: Commutativity::Commutes,
         resource_extractor: ResourceExtractor::CapSlot, // destination cap slot
-        notes: "Creates a new thread in the same process. Only the target process's thread table is modified.",
+        notes: "Creates a new thread in the same process. Only the target process's thread table is modified. w1 (initial stack top, RFC-0004/ADR-085) is a value copied into the child frame; callers choose disjoint tops — two threads with the same top alias one stack (caller bug).",
     };
 
     /// THREAD_SET_ENTRY invoke commutativity

@@ -96,6 +96,12 @@ pub const FACTORY_NEW_THREAD: InvokeSpec = InvokeSpec {
             range_error: ErrorCode::EBADARG,
             description: "Entry point PC (must be canonical user address, validated by is_user_addr)",
         },
+        InvokeArg {
+            name: "w1_reserved",
+            range: (0, u64::MAX),
+            range_error: ErrorCode::OK,
+            description: "RESERVED (ignored by the kernel). RFC-0004/ADR-085 assigned w1 = initial stack top, but at cap_count 3 — the layout every production sender uses — trailing-descriptor overlay puts descriptor 0 (the AS cap) in words[1], so w1 carries descriptor bytes, not a stack value. The kernel therefore reads no stack from NEW_THREAD until the wire format grows (ADR-086 proposal); custom stacks go through THREAD_CREATE w1.",
+        },
     ],
     descriptors: &[
         ("caps[0]", ObjType::AddressSpace, Rights::MAP), // required
@@ -111,7 +117,7 @@ pub const FACTORY_NEW_THREAD: InvokeSpec = InvokeSpec {
         ErrorCode::EREVOKED,
     ],
     commutativity: Commutativity::Commutes,
-    description: "Create a new thread in a new process. w0 = entry PC. caps[0] = AddressSpace (required, MAP right). caps[1] = fault endpoint (optional, GRANT). caps[2] = bootstrap endpoint (optional, GRANT, installed at child handle 1). Returns thread cap with CONTROL|GRANT.",
+    description: "Create a new thread in a new process. w0 = entry PC; w1 is descriptor-overlay territory at cap_count 3 (the kernel ignores it — ADR-086). caps[0] = AddressSpace (required, MAP right). caps[1] = fault endpoint (optional, GRANT). caps[2] = bootstrap endpoint (optional, GRANT, installed at child handle 1). Returns thread cap with CONTROL|GRANT.",
 };
 
 // ============================================================================
@@ -271,11 +277,17 @@ pub const THREAD_CREATE: InvokeSpec = InvokeSpec {
             range_error: ErrorCode::EBADARG,
             description: "Entry point PC (must be canonical user address)",
         },
+        InvokeArg {
+            name: "stack_top",
+            range: (0, 0x0000_8000_0000_0000 - 1),
+            range_error: ErrorCode::EBADARG,
+            description: "Initial user stack top (RFC-0004/ADR-085). 0 = arch default USER_STACK_TOP (0x0000_7FFF_FFFF_F000). Nonzero: canonical user address (nonzero, < 0x8000_0000_0000_0000) AND 16-byte aligned; the caller maps [top - size, top) in the target process's AS. Form only — an unmapped top faults in the child at first push (fault EP, ADR-007).",
+        },
     ],
     descriptors: &[],
     errors: &[ErrorCode::OK, ErrorCode::EBADCAP, ErrorCode::ERIGHTS, ErrorCode::EBADARG, ErrorCode::ENOMEM, ErrorCode::EBADSTATE],
     commutativity: Commutativity::Commutes,
-    description: "Create a new thread in the same process as the target (shares AS and cap table). Returns thread cap with CONTROL|GRANT.",
+    description: "Create a new thread in the same process as the target (shares AS and cap table). w0 = entry PC, w1 = initial user stack top (0 = arch default, RFC-0004/ADR-085). Returns thread cap with CONTROL|GRANT.",
 };
 
 /// THREAD_SET_ENTRY invoke specification
