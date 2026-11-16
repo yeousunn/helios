@@ -41,15 +41,25 @@ impl MappedWindow {
         self.va
     }
 
-    /// Read `len` bytes at `offset` inside the window.
-    pub fn read(&self, offset: u32, len: u32) -> Result<Vec<u8>, Status> {
+    /// Read `len` bytes at `offset` inside the window into a pre-allocated buffer.
+    /// No allocation; returns `ETOOBIG` if the span exceeds the window or `buf.len() != len`.
+    pub fn read_into(&self, offset: u32, len: u32, buf: &mut [u8]) -> Result<(), Status> {
         if offset + len > WINDOW_SIZE {
             return Err(status::ETOOBIG);
         }
-        let mut buf = vec![0u8; len as usize];
+        if buf.len() != len as usize {
+            return Err(status::ETOOBIG);
+        }
         // SAFETY: The window VA is valid and mapped (guaranteed by WindowMapper).
         // The bounds check keeps the access inside the frame.
-        raw_copy_from_va(self.va + offset as u64, &mut buf);
+        raw_copy_from_va(self.va + offset as u64, buf);
+        Ok(())
+    }
+
+    /// Read `len` bytes at `offset` inside the window (allocating a new buffer).
+    pub fn read(&self, offset: u32, len: u32) -> Result<Vec<u8>, Status> {
+        let mut buf = vec![0u8; len as usize];
+        self.read_into(offset, len, &mut buf)?;
         Ok(buf)
     }
 
@@ -215,6 +225,20 @@ mod tests {
             w.write(WINDOW_SIZE - 1, &[0u8; 2]).err(),
             Some(status::ETOOBIG)
         );
+        let mut buf = [0u8; 4];
+        assert_eq!(
+            w.read_into(WINDOW_SIZE, 1, &mut buf).err(),
+            Some(status::ETOOBIG)
+        );
+        assert_eq!(
+            w.read_into(WINDOW_SIZE - 1, 2, &mut buf).err(),
+            Some(status::ETOOBIG)
+        );
+        assert_eq!(
+            w.read_into(0, 5, &mut buf).err(),
+            Some(status::ETOOBIG),
+            "buf.len() != len"
+        );
     }
 
     #[test]
@@ -227,5 +251,20 @@ mod tests {
         assert_eq!(w.read(8, 5).unwrap().as_slice(), b"hello");
         assert_eq!(w.read(0, 8).unwrap(), vec![0u8; 8]);
         assert_eq!(&buf[8..13], b"hello");
+    }
+
+    #[test]
+    fn read_into_roundtrip_no_alloc() {
+        let mut buf = vec![0u8; WINDOW_SIZE as usize];
+        let w = MappedWindow {
+            va: buf.as_mut_ptr() as u64,
+        };
+        w.write(8, b"hello").unwrap();
+        let mut out = [0u8; 5];
+        w.read_into(8, 5, &mut out).unwrap();
+        assert_eq!(&out, b"hello");
+        let mut out2 = [0u8; 8];
+        w.read_into(0, 8, &mut out2).unwrap();
+        assert_eq!(out2, [0u8; 8]);
     }
 }

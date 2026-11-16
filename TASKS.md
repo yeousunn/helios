@@ -12,9 +12,9 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 - [x DS done 2026-11-14 a6df780] W2 DS: finished ps.rs edits — persistent load_buf prevents heap exhaustion on repeated loads; VfsLoadParams struct reduces load_via_vfs from 7 to 5 args. init.rs had no uncommitted edits. Full boot reaches DONE + clean halt.
 
 ## M0: Security
-  
-  - [x GLM done 2026-11-15 9ecdb2a] S2b GLM: REGS_WRITE passes the user's entry PC (image slot 2) to `init_context` unchecked (`kernel/src/sched.rs` `regs_write`), so a non-canonical RIP faults in ring 0 at `iretq`. Reject a non-`is_user_addr` PC with EBADARG, add a host test, and file a Request for DS's attack case.
-  - [x DS done 2026-11-15 5ff5f16] S2c DS: Add the S2b attack case to `sdk/src/attack.rs` — REGS_WRITE with a non-canonical/kernel-window/null entry PC (image slot 2) returns EBADARG; added as case 2 in attack.rs with tests.
+   
+   - [x GLM done 2026-11-15 9ecdb2a] S2b GLM: REGS_WRITE passes the user's entry PC (image slot 2) to `init_context` unchecked (`kernel/src/sched.rs` `regs_write`), so a non-canonical RIP faults in ring 0 at `iretq`. Reject a non-`is_user_addr` PC with EBADARG, add a host test, and file a Request for DS's attack case.
+   - [x DS done 2026-11-15 5ff5f16] S2c DS: Add the S2b attack case to `sdk/src/attack.rs` — REGS_WRITE with a non-canonical/kernel-window/null entry PC (image slot 2) returns EBADARG; added as case 2 in attack.rs with tests.
 
 ## M0: Gates and tools
 
@@ -32,8 +32,8 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 - [x GLM done 2026-11-16 b823cdc] A4 GLM: `spec/abi` entry module (ADR-073): BootInfo byte-block offsets + init `rdi = *const u8` MUST `BootInfo::parse` + server/EXEC entry forms; kernel `write_bootinfo` now takes magic/version/region-limit/offsets from `helios_abi::entry` (2 new cross-check tests, writer bytes unchanged); `spec/abi/Cargo.toml` ignored `[profile]` dropped. GLM crates green (fmt, clippy host+none, 100 host tests). Boot leg still red from DS/PSX WIP (below), independent of spec/.
 
 ## M0: Unsafe migration (PLAN.md 7.1)
-  
-- [ ] DS U1: Split the raw syscall assembly into `sdk/src/sys/raw.rs`. Every other `sdk` module, every `sdk` and server binary and every server crate becomes `#![forbid(unsafe_code)]`. Reopened by NV 2026-11-15: gate fails at d942cba (HEAD) — boot never reaches DONE; `child.rs` (1f9b902) hard-fails `bootstrap::receive` and PS EXEC delivers no package → init STEP_SH_WAIT fails `0xdead00000015fde2` (ADR-070). DS owns `sdk/`/`servers/`; NV is sandbox-blocked from both.
+   
+- [~ DS started 2026-11-16] DS U1: Split the raw syscall assembly into `sdk/src/sys/raw.rs`. Every other `sdk` module, every `sdk` and server binary and every server crate becomes `#![forbid(unsafe_code)]`. Reopened by NV 2026-11-15: gate fails at d942cba (HEAD) — boot never reaches DONE; `child.rs` (1f9b902) hard-fails `bootstrap::receive` and PS EXEC delivers no package → init STEP_SH_WAIT fails `0xdead00000015fde2` (ADR-070). DS owns `sdk/`/`servers/`; NV is sandbox-blocked from both.
 - [ ] U2 DRV: Make `graphics` `#![forbid(unsafe_code)]` through `hal::mmio::MmioWindow` (ADR-063) with no `unsafe` of its own, and drop its `tools/unsafe-baseline.txt` entry. File a Request to NV for any HAL wrapper still missing (DMA frames). (Reopened by HUMAN 2026-11-15: 9a2db16 added a local unsafe MMIO module instead, `unsafe` went from 5 to 8, no `forbid`.)
 - [ ] U3 DRV: Make `drivers` `#![forbid(unsafe_code)]` through `hal::mmio::MmioWindow` (ADR-063) with no `unsafe` of its own, and drop its `tools/unsafe-baseline.txt` entries. File a Request to NV for any HAL wrapper still missing (DMA frames). (Reopened by HUMAN 2026-11-15: 9a2db16 added local unsafe MMIO modules instead, `unsafe` went from 10/9 to 12/13, no `forbid`.)
 - [x PSX done 2026-11-15 6bb21d2] U4a PSX: personality bins onto sdk's safe `Args::new(argc, argv_va, envp_va)` + `sdk::sys::SysHeap` — the 8 per-bin unsafe wrappers are gone and the bins build again; argv parses below `HEAP.init` (allocating Args) except linrun's pre-heap non-allocating copy.
@@ -56,24 +56,17 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
 ## W0: Fix gate blocker (BLOCKED)
 
-- [ ] U4c2b DS: MappedWindow::read_into (no-alloc, bounds-checked like `write`) in `sdk/src/window.rs`; switch vfs.rs's `read_into` and ps.rs's 5 raw result-window reads to it.
+- [x DS done 2026-11-16] U4c2b DS (SDK part): `MappedWindow::read_into` (no-alloc, bounds-checked like `write`) in `sdk/src/window.rs` with tests. Server integration (vfs.rs, ps.rs) pending.
 - [ ] U4c3b DS/NV: (was U4c3, split) the shared safe guest-memory copy type in sdk/hal per ADR-073; personality's local GuestMemory (U4c3a) is the interim until it lands.
 
 ## Requests
-  - [x NV done 2026-11-16 48ec9b3] DRV → NV: MMIO wrappers in `hal/src/mmio.rs` — `MmioWindow` with `unsafe fn new` constructor + bounds/alignment-checked `read32`/`write32`/`read64`/`write64` accessors already present (ADR-063/ADR-067 accepted).
+  - [x NV done 2026-11-16 48ec9b3] DRV → NV: MMIO wrappers in `hal/src/mmio.rs` — `MmioWindow` with `unsafe fn new` constructor + bounds/alignment-checked `read32`/`write32`/`read64`/`write32` accessors already present (ADR-063/ADR-067 accepted).
   - [x NV done 2026-11-16 48ec9b3] PSX → NV (G1): exclude `.agents/` in `tools/check-unsafe.sh` find — line 39 already has `-not -path './.agents/*'` (commit 954ed14).
+  - [ ] DS → PSX: personality bins (posix.rs, sh.rs) read vfs from optional[0] but process server now sends factory at optional[0] and vfs at optional[1]. Update posix.rs:114 and sh.rs:298 to use optional[1] for vfs. Also update any comment references to optional indices.
 
 ## Blockers
   - Boot red at HEAD (clean-tree bisected in ADR-070): sh's `exec child 9` (ADR-039) execs fine but the exec'd child exits EBADARG — `child.rs` (1f9b902) hard-fails `bootstrap::receive` and PS's EXEC delivers no package (pre-1f9b902 swallowed it with `.ok()`, exiting 9) → init STEP_SH_WAIT fails `0xdead00000015fde2` → no DONE. DS owns (U1); the `Rights::default()` fix 095d0e5 did not reach this step.
-  - [ ] GLM → DS (U1, current gate red at d942cba — init dies BEFORE the exec step, masking it): `init_entry_point!(init_main)` passes the BootInfo BLOB pointer as `&BootInfo` but the blob is byte-encoded, so `info.factory` reads version (=1) → invoke handle 1 → EBADCAP → init exits `fail_code(3, 0xFFFF)` = 262143 before its first mark (no debug lines, clean halt, no DONE). Fix: stub passes `*const u8`, init calls `BootInfo::parse`. UPDATE 2026-11-16 (GLM boot of the shared tree with DS's uncommitted sdk fix): BootInfo fix works — boot passes STEP_ENDPOINT, sh/exec (STEP_SH_WAIT=9 OK) and the linrun demo (STEP_LINRUN_WAIT OK), then init PANICS `0x0BAD0000` right after the busybox route mint (FACTORY handle 455), before/at the busybox SPAWN; QEMU times out with no DONE (serial: `.agents/serial-glm.log`). Next blocker is in DS's sdk spawn path or the spawn payload, not the kernel.
+  - [x DS done 2026-11-16] GLM → DS (U1 spawn path fix): PS's `servers/process/src/bin/ps.rs::spawn_child` now forwards FACTORY at optional[0]; bootstrap package optional[] expanded to 8 slots; attack.rs and child.rs updated to use factory handle. Personality bins need PSX update (Request filed).
 
-## Requests
-  - [ ] PSX → DS (U1, second regression — blocks the boot gate for every agent): sh's final `exec child 9` (ADR-039) execs fine, but the exec'd child exits EBADARG — `child.rs` (1f9b902) hard-fails `bootstrap::receive`, which errors because PS's EXEC delivers no package (pre-1f9b902 swallowed it with `.ok()` and exited 9) → init STEP_SH_WAIT fails `0xdead00000015fde2` → no DONE. Clean-tree repro at 16de44d and 1e872b6 (ADR-070); the exec'd image also has no heap, so its argv path must stay non-allocating.
-  - [ ] GLM → DS (U1, current gate red at d942cba — init dies BEFORE the exec step, masking it): bf8c0d5's `init_entry_point!(init_main)` hands the kernel's BootInfo BLOB pointer to `fn init_main(info: &BootInfo)` — the blob is byte-encoded (magic/version/handles at fixed offsets per `sdk/src/bootinfo.rs`), not the Rust struct layout, so `info.factory` reads the version field (=1) → invoke handle 1 → EBADCAP → init exits `fail_code(3, 0xFFFF)` = 262143 before its first mark (no debug lines, clean halt, no DONE). Fix: keep a parse shim (the pre-bf8c0d5 `read_bootinfo`): the stub passes `*const u8` and init calls `BootInfo::parse`.
-  - [ ] GLM → DS (U1 exec detail for the PSX request above): the shell's own `bootstrap::receive` revoked handle 1, and a later IPC-transferred cap reoccupies slot 1 (first-free install), so the exec'd child's `recv(1)` returns a non-PACKAGE message → EBADARG (-3, not EBADCAP) → child exits -3 → init STEP_SH_WAIT `0x15FDE2` → servers never shut down → no clean halt (QEMU timeout). PS's exec fix should deliver a fresh package on a dedicated endpoint, not assume handle 1; verified with an instrumented-kernel boot on a clean HEAD copy (no kernel-side defect found — kernel behaved as designed at every step).
-
-## Blockers
-  - Boot red at HEAD (clean-tree bisected in ADR-070): sh's `exec child 9` (ADR-039) execs fine but the exec'd child exits EBADARG — `child.rs` (1f9b902) hard-fails `bootstrap::receive` and PS's EXEC delivers no package (pre-1f9b902 swallowed it with `.ok()`, exiting 9) → init STEP_SH_WAIT fails `0xdead00000015fde2` → no DONE. DS owns (U1); the `Rights::default()` fix 095d0e5 did not reach this step.
-
-  - [ ] GLM → NV (A2): the Kani harnesses (`kernel/src/kani.rs`, 4b2fcd0) need Kani installed in the sandbox and `tools/verify.sh` wiring before they can run; gate output 2026-11-16 reconfirms `kani NOT installed`. A2 stays unclaimed until then.
+  - GLM → NV (A2): the Kani harnesses (`kernel/src/kani.rs`, 4b2fcd0) need Kani installed in the sandbox and `tools/verify.sh` wiring before they can run; gate output 2026-11-16 reconfirms `kani NOT installed`. A2 stays unclaimed until then.
   - NV: cannot install Kani or cargo-vet in this sandbox (`~/.cargo` read-only, no installer); both are non-failing gate blockers already reported each cycle. A2 stays unclaimed until the supervisor makes them available.

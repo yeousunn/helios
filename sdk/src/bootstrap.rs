@@ -40,6 +40,9 @@ pub const FIXED_CAPS: usize = 3 + SESSION_POOL + 1;
 /// Ceiling on package size (fixed array on the child side, no allocator).
 pub const MAX_PACKAGE_CAPS: usize = 16;
 
+/// Number of optional capability slots (factory + vfs + stdin + stdout + stderr).
+pub const OPTIONAL_CAPS: usize = 8;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct BootstrapPackage {
     pub aspace: Handle,
@@ -50,9 +53,9 @@ pub struct BootstrapPackage {
     /// The process's pid (package header `w1`) — how a process learns its own
     /// identity (POSIX `getpid`; PS's EXEC resolves the caller by pid).
     pub pid: u64,
-    /// Optional trailing caps in caller order (vfs, stdin, stdout, stderr);
+    /// Optional trailing caps in caller order (factory, vfs, stdin, stdout, stderr);
     /// `None` = trimmed tail or a failed (partial) grant.
-    pub optional: [Option<CapSlot>; 4],
+    pub optional: [Option<CapSlot>; OPTIONAL_CAPS],
 }
 
 /// Send a bootstrap package (header + chunks of <= 4 caps) to the child's
@@ -129,8 +132,11 @@ pub fn receive<R: RawSyscalls>(sys: &mut Syscalls<R>) -> Result<BootstrapPackage
         }
     }
 
-    let mut optional = [None; 4];
+    let mut optional = [None; OPTIONAL_CAPS];
     for (i, slot) in caps[FIXED_CAPS..total].iter().enumerate() {
+        if i >= OPTIONAL_CAPS {
+            break;
+        }
         if slot.handle() != ipc::NULL_HANDLE {
             optional[i] = Some(*slot);
         }
@@ -209,8 +215,9 @@ mod tests {
             caps.push(CapSlot::pack(h, ipc::Rights::SIGNAL)); // sessions
         }
         caps.push(CapSlot::pack(17, ipc::Rights::SEND)); // ps_ep
-        caps.push(CapSlot::pack(18, ipc::Rights::SEND)); // vfs
-        caps.push(CapSlot::pack(19, ipc::Rights::RECV)); // stdin
+        caps.push(CapSlot::pack(18, ipc::Rights::ALL)); // factory
+        caps.push(CapSlot::pack(19, ipc::Rights::SEND)); // vfs
+        caps.push(CapSlot::pack(20, ipc::Rights::RECV)); // stdin
         caps
     }
 
@@ -231,7 +238,7 @@ mod tests {
             header(caps.len()),
             chunk(&caps[0..4]),
             chunk(&caps[4..8]),
-            chunk(&caps[8..10]),
+            chunk(&caps[8..11]),
         ]);
         let package = result.unwrap();
         assert_eq!(package.aspace, 10);
@@ -239,10 +246,14 @@ mod tests {
         assert_eq!(package.region, 12);
         assert_eq!(package.session_notifications, [13, 14, 15, 16]);
         assert_eq!(package.process_server_ep, 17);
-        assert_eq!(package.optional[0].unwrap().handle(), 18);
-        assert_eq!(package.optional[1].unwrap().handle(), 19);
-        assert_eq!(package.optional[2], None);
+        assert_eq!(package.optional[0].unwrap().handle(), 18); // factory
+        assert_eq!(package.optional[1].unwrap().handle(), 19); // vfs
+        assert_eq!(package.optional[2].unwrap().handle(), 20); // stdin
         assert_eq!(package.optional[3], None);
+        assert_eq!(package.optional[4], None);
+        assert_eq!(package.optional[5], None);
+        assert_eq!(package.optional[6], None);
+        assert_eq!(package.optional[7], None);
 
         let (number, args) = raw.calls.last().unwrap();
         assert_eq!(*number, crate::syscall::number::CAP_REVOKE);
@@ -299,7 +310,7 @@ mod tests {
             header(caps.len()),
             chunk(&caps[0..4]),
             chunk(&caps[4..8]),
-            chunk(&caps[8..10]),
+            chunk(&caps[8..11]),
         ]);
         assert_eq!(result, Err(status::EBADCAP));
     }
@@ -307,16 +318,17 @@ mod tests {
     #[test]
     fn null_optional_cap_is_absent() {
         let mut caps = full_package_caps();
-        caps[8] = CapSlot::NULL; // vfs was a partial grant
+        caps[9] = CapSlot::NULL; // vfs was a partial grant (factory at 8, vfs at 9)
         let (result, _) = receive_with(vec![
             header(caps.len()),
             chunk(&caps[0..4]),
             chunk(&caps[4..8]),
-            chunk(&caps[8..10]),
+            chunk(&caps[8..11]),
         ]);
         let package = result.unwrap();
-        assert_eq!(package.optional[0], None);
-        assert_eq!(package.optional[1].unwrap().handle(), 19);
+        assert_eq!(package.optional[0].unwrap().handle(), 18); // factory
+        assert_eq!(package.optional[1], None); // vfs
+        assert_eq!(package.optional[2].unwrap().handle(), 20); // stdin
     }
 
     #[test]
@@ -369,7 +381,9 @@ mod tests {
             ));
         }
         caps.push(CapSlot::pack(17, ipc::Rights::SEND));
-        caps.push(CapSlot::pack(18, ipc::Rights::ALL)); // tail[0] = Factory
+        caps.push(CapSlot::pack(18, ipc::Rights::ALL)); // factory
+        caps.push(CapSlot::pack(19, ipc::Rights::SEND)); // vfs
+        caps.push(CapSlot::pack(20, ipc::Rights::RECV)); // stdin
 
         let mut raw = LoopbackRaw::default();
         let package;
@@ -378,14 +392,16 @@ mod tests {
             deliver(&mut sys, BOOTSTRAP_HANDLE, &caps, 7).unwrap();
             package = receive(&mut sys).unwrap();
         }
-        assert_eq!(raw.sends, 4, "header + 3 chunks for 10 caps");
+        assert_eq!(raw.sends, 4, "header + 3 chunks for 11 caps");
         assert_eq!(package.aspace, 10);
         assert_eq!(package.thread, 11);
         assert_eq!(package.region, 12);
         assert_eq!(package.session_notifications, [13, 14, 15, 16]);
         assert_eq!(package.process_server_ep, 17);
-        assert_eq!(package.optional[0].unwrap().handle(), 18);
+        assert_eq!(package.optional[0].unwrap().handle(), 18); // factory
         assert_eq!(package.optional[0].unwrap().rights(), ipc::Rights::ALL);
+        assert_eq!(package.optional[1].unwrap().handle(), 19); // vfs
+        assert_eq!(package.optional[2].unwrap().handle(), 20); // stdin
     }
 
     #[test]
@@ -419,6 +435,6 @@ mod tests {
         ]);
         let package = result.unwrap();
         assert_eq!(package.process_server_ep, 17);
-        assert_eq!(package.optional, [None; 4]);
+        assert_eq!(package.optional, [None; OPTIONAL_CAPS]);
     }
 }

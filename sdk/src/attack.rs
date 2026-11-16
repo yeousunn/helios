@@ -47,7 +47,9 @@ pub const FAIL_NO_PACKAGE: i32 = FAIL_BASE | 0x100;
 
 /// Run every case against the live kernel; return `0` if all bad calls were
 /// rejected, else `FAIL_BASE | (index + 1)` for the first one that was not.
-pub fn run<R: RawSyscalls>(sys: &mut Syscalls<R>, pkg: &BootstrapPackage) -> i32 {
+/// `factory` is the Factory capability handle (from optional[0]) needed for
+/// cases that spawn threads (S2).
+pub fn run<R: RawSyscalls>(sys: &mut Syscalls<R>, pkg: &BootstrapPackage, factory: u32) -> i32 {
     // Append one entry per S-task as it lands. Keep the order stable: the
     // index is part of the failure status.
     //
@@ -63,8 +65,8 @@ pub fn run<R: RawSyscalls>(sys: &mut Syscalls<R>, pkg: &BootstrapPackage) -> i32
         case_orphan_handle(sys),
         case_regs_write_non_frame_cap(sys, pkg),
         case_regs_write_invalid_entry_pc(sys, pkg), // S2b
-        case_thread_create_kernel_pc(sys, pkg),     // S2
-        case_set_entry_kernel_pc(sys, pkg),         // S2
+        case_thread_create_kernel_pc(sys, factory), // S2
+        case_set_entry_kernel_pc(sys, factory),     // S2
         case_set_tls_non_canonical(sys, pkg),       // S3
         case_map_kernel_window(sys, pkg),           // S4/S5
         case_unmap_kernel_window(sys, pkg),         // S4
@@ -136,13 +138,10 @@ fn case_regs_write_invalid_entry_pc<R: RawSyscalls>(
 /// `THREAD_CREATE` with a kernel-window entry PC must be rejected before any
 /// thread is created (S2). Pre-fix the call returned OK and the new thread
 /// entered ring 3 at a kernel address. Case 3.
-fn case_thread_create_kernel_pc<R: RawSyscalls>(
-    sys: &mut Syscalls<R>,
-    pkg: &BootstrapPackage,
-) -> bool {
+fn case_thread_create_kernel_pc<R: RawSyscalls>(sys: &mut Syscalls<R>, factory: u32) -> bool {
     let mut m = Message::new(crate::methods::thread::THREAD_CREATE);
     m.words[0] = KERNEL_PC;
-    sys.invoke(pkg.thread, &m).is_err()
+    sys.invoke(factory, &m).is_err()
 }
 
 /// `SET_ENTRY` with a kernel-window PC must be rejected (S2). Case 3.
@@ -153,10 +152,10 @@ fn case_thread_create_kernel_pc<R: RawSyscalls>(
 /// once suspended). Overwriting its entry with a kernel-window PC pre-fix
 /// returned OK and pointed a user thread at the shared kernel window;
 /// post-fix it is EBADARG. The scratch thread's cap is revoked afterwards.
-fn case_set_entry_kernel_pc<R: RawSyscalls>(sys: &mut Syscalls<R>, pkg: &BootstrapPackage) -> bool {
+fn case_set_entry_kernel_pc<R: RawSyscalls>(sys: &mut Syscalls<R>, factory: u32) -> bool {
     let mut create = Message::new(crate::methods::thread::THREAD_CREATE);
     create.words[0] = SCRATCH_PC;
-    let Ok(reply) = sys.invoke(pkg.thread, &create) else {
+    let Ok(reply) = sys.invoke(factory, &create) else {
         return false;
     };
     let scratch = reply.words[0] as u32;
@@ -333,7 +332,7 @@ mod tests {
             session_notifications: [13, 14, 15, 16],
             process_server_ep: 17,
             pid: 5,
-            optional: [None; 4],
+            optional: [None; crate::bootstrap::OPTIONAL_CAPS],
         }
     }
 
@@ -341,14 +340,14 @@ mod tests {
     fn all_rejected_passes() {
         let mut k = MockKernel::rejects();
         let mut sys = Syscalls::new(&mut k);
-        assert_eq!(run(&mut sys, &pkg()), 0);
+        assert_eq!(run(&mut sys, &pkg(), 99), 0);
     }
 
     #[test]
     fn accepted_bad_call_is_a_failure() {
         let mut k = MockKernel::accepts();
         let mut sys = Syscalls::new(&mut k);
-        assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 1);
+        assert_eq!(run(&mut sys, &pkg(), 99), FAIL_BASE | 1);
     }
 
     #[test]
@@ -359,7 +358,7 @@ mod tests {
         let mut k = MockKernel::rejects();
         k.statuses[3] = ipc::status::OK;
         let mut sys = Syscalls::new(&mut k);
-        assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 3);
+        assert_eq!(run(&mut sys, &pkg(), 99), FAIL_BASE | 3);
     }
 
     #[test]
@@ -370,7 +369,7 @@ mod tests {
         let mut k = MockKernel::rejects();
         k.statuses[4] = ipc::status::OK;
         let mut sys = Syscalls::new(&mut k);
-        assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 4);
+        assert_eq!(run(&mut sys, &pkg(), 99), FAIL_BASE | 4);
     }
 
     #[test]
@@ -381,7 +380,7 @@ mod tests {
         let mut k = MockKernel::rejects();
         k.statuses[7] = ipc::status::OK;
         let mut sys = Syscalls::new(&mut k);
-        assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 5);
+        assert_eq!(run(&mut sys, &pkg(), 99), FAIL_BASE | 5);
     }
 
     #[test]
@@ -391,7 +390,7 @@ mod tests {
         let mut k = MockKernel::rejects();
         k.statuses[10] = ipc::status::OK;
         let mut sys = Syscalls::new(&mut k);
-        assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 6);
+        assert_eq!(run(&mut sys, &pkg(), 99), FAIL_BASE | 6);
     }
 
     #[test]
@@ -401,7 +400,7 @@ mod tests {
         let mut k = MockKernel::rejects();
         k.statuses[11] = ipc::status::OK;
         let mut sys = Syscalls::new(&mut k);
-        assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 7);
+        assert_eq!(run(&mut sys, &pkg(), 99), FAIL_BASE | 7);
     }
 
     #[test]
@@ -411,7 +410,7 @@ mod tests {
         let mut k = MockKernel::rejects();
         k.statuses[12] = ipc::status::OK;
         let mut sys = Syscalls::new(&mut k);
-        assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 8);
+        assert_eq!(run(&mut sys, &pkg(), 99), FAIL_BASE | 8);
     }
 
     #[test]
@@ -421,7 +420,7 @@ mod tests {
         let mut k = MockKernel::rejects();
         k.statuses[13] = ipc::status::OK;
         let mut sys = Syscalls::new(&mut k);
-        assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 9);
+        assert_eq!(run(&mut sys, &pkg(), 99), FAIL_BASE | 9);
     }
 
     #[test]
@@ -431,7 +430,7 @@ mod tests {
         let mut k = MockKernel::rejects();
         k.statuses[14] = ipc::status::OK;
         let mut sys = Syscalls::new(&mut k);
-        assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 10);
+        assert_eq!(run(&mut sys, &pkg(), 99), FAIL_BASE | 10);
     }
 
     #[test]
@@ -441,7 +440,7 @@ mod tests {
         let mut k = MockKernel::rejects();
         k.statuses[15] = ipc::status::OK;
         let mut sys = Syscalls::new(&mut k);
-        assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 11);
+        assert_eq!(run(&mut sys, &pkg(), 99), FAIL_BASE | 11);
     }
 
     #[test]

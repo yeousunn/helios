@@ -557,10 +557,11 @@ fn spawn_child(
         return Err(ipc::status::ENOMEM);
     }
     // 7. ADR-009 package: fixed prefix + the optional tail (design §2.3
-    //    order: vfs, stdin, stdout, stderr), holes preserved positionally.
-    //    Regular processes get no Factory.
+    //    order: factory, vfs, stdin, stdout, stderr), holes preserved
+    //    positionally. The factory cap (tail[0]) lets children spawn further
+    //    processes (required for attack mode).
     let session_rights = Rights::SIGNAL.union(Rights::RECV).union(Rights::GRANT);
-    let mut caps = [CapSlot::NULL; bootstrap::FIXED_CAPS + 4];
+    let mut caps = [CapSlot::NULL; bootstrap::FIXED_CAPS + 5];
     caps[0] = CapSlot::pack(child_as, Rights::MAP.union(Rights::GRANT));
     caps[1] = CapSlot::pack(thread_cap, Rights::CONTROL);
     caps[2] = CapSlot::pack(package.region, Rights::GRANT);
@@ -569,14 +570,12 @@ fn spawn_child(
     caps[5] = CapSlot::pack(s2, session_rights);
     caps[6] = CapSlot::pack(s3, session_rights);
     caps[7] = CapSlot::pack(service_ep, Rights::SEND.union(Rights::GRANT));
-    let mut total = bootstrap::FIXED_CAPS;
+    caps[bootstrap::FIXED_CAPS] = CapSlot::pack(factory, Rights::ALL);
+    let mut total = bootstrap::FIXED_CAPS + 1;
     for (i, extra) in extras.iter().enumerate() {
         if let Some((handle, rights)) = extra {
-            // Forward the rights the client requested for this slot (the
-            // kernel intersects with PS's own held rights at delivery). The
-            // previous hardcoded SEND|GRANT stripped RECV from pipe inputs.
-            caps[bootstrap::FIXED_CAPS + i] = CapSlot::pack(*handle, *rights);
-            total = bootstrap::FIXED_CAPS + 1 + i;
+            caps[bootstrap::FIXED_CAPS + 1 + i] = CapSlot::pack(*handle, *rights);
+            total = bootstrap::FIXED_CAPS + 2 + i;
         }
     }
     // 6. PS's death binding on the child thread.
