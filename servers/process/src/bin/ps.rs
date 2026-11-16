@@ -726,9 +726,9 @@ fn load_via_vfs(
         if count == 0 {
             break;
         }
-        let mut chunk = vec![0u8; count];
-        raw_copy_from_va(result_va, &mut chunk);
-        buf.extend_from_slice(&chunk);
+        let start = buf.len();
+        buf.resize(start + count, 0);
+        raw_copy_from_va(result_va, &mut buf[start..]);
         offset += count as u64;
         if count < 4096 {
             break;
