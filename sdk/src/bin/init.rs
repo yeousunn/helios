@@ -1117,16 +1117,15 @@ fn spawn_server(
         )?;
     }
 
-    // Child thread (ADR-017 packing): w0 = entry; caps[0] = AS (input),
-    // caps[1] = fault EP (none v0), caps[2] = bootstrap EP.
+    // Child thread (ADR-088 uniform packing): w0 = entry; caps[0] = AS (input),
+    // caps[1] = bootstrap EP (fault EP moved to BIND_FAULT_EP post-creation).
     let (thread_cap, pid) = {
         let mut sys = Syscalls::new(raw);
         let mut m = Message::new(methods::factory::NEW_THREAD);
-        m.tag = m.tag.with_caps(3);
+        m.tag = m.tag.with_caps(2);
         m.words[0] = elf.entry;
         let _ = m.set_descriptor(0, CapSlot::pack(child_as, Rights::MAP.union(Rights::GRANT)));
-        let _ = m.set_descriptor(1, CapSlot::NULL);
-        let _ = m.set_descriptor(2, CapSlot::pack(bootstrap_ep, Rights::RECV));
+        let _ = m.set_descriptor(1, CapSlot::pack(bootstrap_ep, Rights::RECV));
         let reply = sys
             .invoke(info.factory, &m)
             .map_err(|e| fail_code(step, 0xE6_00 | (e as u64 & 0xFF)))?;

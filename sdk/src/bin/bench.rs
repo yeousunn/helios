@@ -670,11 +670,10 @@ fn spawn_thread(
     entry_pc: u64,
 ) -> Result<(Handle, u64)> {
     let mut m = Message::new(methods::factory::NEW_THREAD);
-    m.tag = m.tag.with_caps(3);
+    m.tag = m.tag.with_caps(2);
     m.words[0] = entry_pc;
     let _ = m.set_descriptor(0, CapSlot::pack(aspace, Rights::MAP.union(Rights::GRANT)));
-    let _ = m.set_descriptor(1, CapSlot::NULL);
-    let _ = m.set_descriptor(2, CapSlot::pack(ep, Rights::RECV));
+    let _ = m.set_descriptor(1, CapSlot::pack(ep, Rights::RECV));
 
     let reply = sys
         .invoke(factory, &m)

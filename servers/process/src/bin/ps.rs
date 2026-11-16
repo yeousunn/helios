@@ -550,13 +550,13 @@ fn spawn_child(
     let s2 = invoke_w0(sys, factory, methods::factory::NEW_NOTIFICATION, [0; 4])? as u32;
     let s3 = invoke_w0(sys, factory, methods::factory::NEW_NOTIFICATION, [0; 4])? as u32;
     let exit_notif = invoke_w0(sys, factory, methods::factory::NEW_NOTIFICATION, [0; 4])? as u32;
-    // 5. Child thread (ADR-017 packing; ADR-009 bootstrap at child handle 1).
+    // 5. Child thread (ADR-088 uniform packing): w0 = entry; caps[0] = AS (input),
+    // caps[1] = bootstrap EP (fault EP moved to BIND_FAULT_EP post-creation).
     let mut m = Message::new(methods::factory::NEW_THREAD);
-    m.tag = m.tag.with_caps(3);
+    m.tag = m.tag.with_caps(2);
     m.words[0] = image.entry;
     let _ = m.set_descriptor(0, CapSlot::pack(child_as, Rights::MAP.union(Rights::GRANT)));
-    let _ = m.set_descriptor(1, CapSlot::NULL);
-    let _ = m.set_descriptor(2, CapSlot::pack(bootstrap_ep, Rights::RECV));
+    let _ = m.set_descriptor(1, CapSlot::pack(bootstrap_ep, Rights::RECV));
     let thread_reply = sys.invoke(factory, &m)?;
     let thread_cap = thread_reply.words[0] as u32;
     let pid = thread_reply.words[2];
