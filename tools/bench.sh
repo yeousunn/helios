@@ -32,7 +32,7 @@ RESULTS_DIR="$ROOT/bench/results"
 QEMU="${QEMU:-qemu-system-x86_64}"
 QEMU_TIMEOUT="${QEMU_TIMEOUT:-90}"
 SERIAL_LOG="${SERIAL_LOG:-$TD/serial.log}"
-BENCH_RUNS="${BENCH_RUNS:-3}"
+BENCH_RUNS="${BENCH_RUNS:-5}"
 
 compare=0
 [[ "${1:-}" == "--compare" ]] && compare=1
