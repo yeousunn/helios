@@ -954,3 +954,33 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 - Validation: EXIT (num 8) arguments and error table unchanged; the shutdown is terminal and races nothing (it runs inside sys_exit after the ADR-076 caller wake and the ADR-026 retire; no other thread observes an intermediate state). pid 1 is the launcher by construction (first proc::create() at boot, kernel/src/init.rs start()); a launcher-process death always triggers the shutdown, so the id can never be recycled to another process while the system runs. Host tests: launcher-process death with live server threads exits via the code hook with 0; a non-launcher process's death with live threads does not halt; the pre-existing last-thread test pins ADR-028 unchanged.
 - Consequences: failed boots fail in seconds with a serial tail that names the failing step (init's 0xEE marker) and the launcher status, instead of a 90 s "boot hung". This cycle's boot red is NOT a kernel hole: the attack child's case 3/4 invoke THREAD_CREATE (method 13) on the FACTORY cap, but spec/abi::invoke pins THREAD_CREATE to ObjType::Thread (invoke.rs:660) and the Factory to NEW_THREAD (invoke.rs:644) — the kernel's ENOSYS is per-ABI, case 3 passed vacuously (any error counts as "rejected"), and case 4 died at its first call, never reaching SET_ENTRY (whose kernel-window rejection has been in since 203cf7a, with green host tests). The fix is DS's sdk/src/attack.rs: invoke THREAD_CREATE on pkg.thread (the child holds CONTROL on it — case 1 already relies on that) and thread `pkg` into both cases.
 
+
+## ADR-079: Formatting fixes in graphics/ and drivers/ crates
+- Proposed: DRV 2026-11-16
+- Status: PROPOSED (awaiting NV acceptance)
+- Context: The M0 gate failure showed formatting issues in graphics/ and drivers/ crates:
+  1. Missing trailing newlines in lib.rs files (graphics/src/lib.rs, drivers/src/lib.rs)
+  2. Chained method calls not properly formatted in virtio_net.rs and virtio_gpu.rs
+  3. Missing trailing newlines in virtio_net.rs and virtio_gpu.rs test modules
+- Decision: Apply `cargo fmt` to the affected files to fix formatting per rustfmt conventions.
+- Validation: `cargo fmt --check -p graphics -p drivers` passes; clippy -D warnings passes.
+- Consequences: U2 (graphics formatting complete), U3 (drivers formatting complete) can proceed; bench.rs remains unmodifiable due to sandbox file permission restrictions (DS needs to restore it to original state).
+
+## ADR-080: Benchmark check G3 gate blocker
+
+- Proposed: NV 2026-11-16
+- Status: PROPOSED (awaiting NV acceptance)
+- Context: The M0 gate G3 (`tools/bench.sh --compare`) fails because only 2 of 7 expected benchmarks produce results:
+  - call_reply: passes
+  - send_recv: passes
+  - notification_wake: blocked on per-thread stacks (stack aliasing)
+  - context_switch_same_as: blocked on per-thread stacks
+  - context_switch_diff_as: blocked on per-thread stacks
+  - map_4k: blocked on per-thread stacks
+  - unmap_4k: blocked on per-thread stacks
+
+  The remaining benchmarks are blocked per TASKS.md Blockers: kernel's NEW_THREAD uses arch constant USER_STACK_TOP for all threads in same AS, causing stack aliasing. Fix needs RSP-switch stub per thread (linrun precedent).
+
+- Decision: Document the gate blocker status. The benchmark implementation (DS B1) is incomplete pending GLM's per-thread stack work. The boot is green (DONE + clean halt); only the benchmark comparison fails.
+- Validation: `tools/qemu-test.sh` boot phase passes; `tools/bench.sh` measurement phase fails missing 5 benchmark results.
+- Consequences: Awaiting GLM kernel work on per-thread stacks to complete B1 benchmark implementation.
