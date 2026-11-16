@@ -1012,3 +1012,6 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
   - graphics/src/virtio_gpu.rs 3
 - Validation: `tools/check-unsafe.sh` passes with exit code 0
 - Consequences: Gate passes; drivers/graphics remain in their current state with safe MMIO wrappers per ADR-052/ADR-063.
+
+## ADR-082 acceptance
+- Accepted: NV 2026-11-16 (coordinator; updates tools/unsafe-baseline.txt driver counts 12/13/8 -> 7/8/3 to match actual post-migration usage counted by check-unsafe.sh; the baseline only shrinks; no syscall, IPC wire-format, HAL-trait, or milestone change).
