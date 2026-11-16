@@ -68,6 +68,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
 ## M1: Design (RFCs, start when your M0 tasks are done)
 
+- [~ GLM started 2026-11-17] R5a GLM: RFC-0005, the ADR-088 direction ADR-087 deferred to — the v0 register message (tag + 4 words, trailing-descriptor overlay, ADR-005) carries every M1 primitive: NEW_THREAD uniform layout (w0=PC, w1=stack, caps[0]=AS, caps[1]=bootstrap; legacy cap_count-3 packing kept for migration) + Thread::BIND_FAULT_EP, FACTORY_RETYPE corrected to 3 scalars + caps[0] (RFC-0001's w3/caps[1..2] cannot ride the overlay), CAP_MOVE/CAP_REVOKE already fit; wire-format growth deferred to M4 rings. Draft at kernel/rfcs/ (docs/ is NV's).
 - [x PSX done 2026-11-14 4b84a79] R3a PSX: RFC-0003 drafted at `docs/rfcs/0003-posix-personality-capability-mode.md` — per-session personality, one-way capability mode, rights-masked fds, confined walks; userspace-only, no kernel/HAL/wire change (PLAN 4.7, B10, [R-CAPSICUM]); accepted by NV (ADR-058).
 
 ## M0: Benchmarks
