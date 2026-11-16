@@ -24,7 +24,7 @@ personality/src/bin/posix.rs 1
 personality/src/bin/sh.rs 1
 personality/src/bin/wc.rs 1
 sdk/src/args.rs 7
-sdk/src/bin/bench.rs 6
+sdk/src/bin/bench.rs 2
 sdk/src/bin/child.rs 1
 sdk/src/bin/init.rs 7
 sdk/src/heap.rs 1
