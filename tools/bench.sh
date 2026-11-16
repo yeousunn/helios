@@ -216,17 +216,22 @@ if [[ "$compare" -eq 1 ]]; then
     if [[ "$prev_commit" != "unknown" && -f "$RESULTS_DIR/$prev_commit.json" ]]; then
         prev="$RESULTS_DIR/$prev_commit.json"
     else
+        prev=""
+        prev_time=0
         shopt -s nullglob
         set -- "$RESULTS_DIR"/*.json
         shopt -u nullglob
-        latest=""
         for f in "$@"; do
-            [[ "$(basename "$f")" == "$COMMIT.json" ]] && continue
-            if [[ -z "$latest" || "$f" -nt "$latest" ]]; then
-                latest="$f"
+            name="$(basename "$f" .json)"
+            [[ "$name" == "$COMMIT" ]] && continue
+            fruns="$(python3 -c "import json;print(json.load(open('$f'))['runs'])" 2>/dev/null || echo 0)"
+            [[ "$fruns" != "$BENCH_RUNS" ]] && continue  # minima only comparable across equal run counts
+            ctime="$(git log -1 --format=%ct "$name" 2>/dev/null || echo 0)"
+            if [[ -z "$prev" || "$ctime" -gt "$prev_time" ]]; then
+                prev_time="$ctime"
+                prev="$f"
             fi
         done
-        prev="$latest"
     fi
 
     if [[ -z "$prev" ]]; then
