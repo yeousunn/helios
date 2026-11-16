@@ -5,12 +5,17 @@
 //! performs native Helios operations through a [`Host`], then replies with
 //! the Linux result (negative errno on failure, as Linux does).
 //!
-//! This module is pure logic — no kernel or IPC types — so it is unit-tested
-//! on the host with a mock [`Host`]. The production `Host` is implemented over
-//! [`crate::runtime::Runtime`] (stdio over the console endpoint, fds over the
-//! VFS client, the heap over the region). Memory args (pointers) are read and
-//! written through `Host::mem_*`: the emulator and the emulated image share an
-//! address space in the v0 model, so a pointer is just an address.
+//! This module is pure logic — no kernel or service objects, no IPC messages —
+//! so it is unit-tested on the host with a mock [`Host`]. It names the
+//! protocol status table (`ipc::status`, a plain constant list) only to
+//! translate it into Linux errnos at the [`Host`] boundary. The production
+//! `Host` is implemented over [`crate::runtime::Runtime`] (stdio over the
+//! console endpoint, fds over the VFS client, the heap over the region).
+//! Memory args (pointers) are read and written through `Host::mem_*`: the
+//! emulator and the emulated image share an address space in the v0 model, so
+//! a pointer is just an address.
+
+use ipc::status;
 
 /// Linux x86_64 syscall numbers (a starter subset; `linux/syscall_64.tbl`).
 pub mod linux {
@@ -75,6 +80,81 @@ pub const EINVAL: i64 = -22;
 pub const EBADF: i64 = -9;
 pub const ENOSYS: i64 = -38;
 pub const EPERM: i64 = -1;
+/// Not a pipe, a tty or any other seekable object.
+pub const ESPIPE: i64 = -29;
+/// No such file or directory.
+pub const ENOENT: i64 = -2;
+/// Out of memory.
+pub const ENOMEM: i64 = -12;
+/// A path that does not fit in the emulator's string buffer.
+pub const ENAMETOOLONG: i64 = -36;
+/// Resource temporarily unavailable (`EWOULDBLOCK`).
+pub const EAGAIN: i64 = -11;
+/// Permission denied (a rights failure, not a bad handle).
+pub const EACCES: i64 = -13;
+/// No such process (`EDEAD` on a call target).
+pub const ESRCH: i64 = -3;
+/// Argument list too long (a payload that does not fit a window).
+pub const E2BIG: i64 = -7;
+/// File exists.
+pub const EEXIST: i64 = -17;
+/// Is a directory.
+pub const EISDIR: i64 = -21;
+/// Not a directory.
+pub const ENOTDIR: i64 = -20;
+/// Directory not empty.
+pub const ENOTEMPTY: i64 = -39;
+/// Too many open files.
+pub const EMFILE: i64 = -24;
+/// Connection timed out.
+pub const ETIMEDOUT: i64 = -110;
+/// Operation canceled.
+pub const ECANCELED: i64 = -125;
+/// Value too large for the destination.
+pub const EOVERFLOW: i64 = -75;
+/// I/O error — the emulator's fallback for a protocol code with no close
+/// Linux equivalent, or a window that cannot carry the reply.
+pub const EIO: i64 = -5;
+
+/// Translate a Helios protocol status (`ipc::status`, negative) into the Linux
+/// errno the emulated program must see. Servers report the protocol table
+/// (`ENOENT` = -15, `EBADCAP` = -1); Linux numbers differ (`-2`, `-9`), and
+/// handing a protocol code straight to the guest made `open("/missing")`
+/// return -15 (EMLINK) instead of ENOENT, so every guest-side errno check
+/// missed. `OK` maps to 0, which the callers treat as success.
+pub fn linux_errno(code: i32) -> i64 {
+    let l: i64 = match code {
+        status::OK => 0,
+        status::EBADCAP => EBADF,
+        status::ERIGHTS => EACCES,
+        status::EBADARG => EINVAL,
+        status::EWOULDBLOCK => EAGAIN,
+        status::ECANCELED => ECANCELED,
+        status::EREVOKED => EBADF,
+        status::EFAULT => EFAULT,
+        status::ENOMEM => ENOMEM,
+        status::ETIMEDOUT => ETIMEDOUT,
+        status::EBUSY => -16,
+        status::EDEAD => ESRCH,
+        status::EBADSTATE => EIO,
+        status::ETOOBIG => E2BIG,
+        status::ENOSYS => ENOSYS,
+        status::ENOENT => ENOENT,
+        status::EEXIST => EEXIST,
+        status::EISDIR => EISDIR,
+        status::ENOTDIR => ENOTDIR,
+        status::ENOTEMPTY => ENOTEMPTY,
+        status::EMFILE => EMFILE,
+        status::EACCES => EACCES,
+        _ => EIO,
+    };
+    l
+}
+
+/// Linux `lseek` `whence` values.
+pub const SEEK_SET: u32 = 0;
+pub const SEEK_CUR: u32 = 1;
+pub const SEEK_END: u32 = 2;
 
 /// A host file's metadata (neutral; hosts map their own stat-bearing types).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -143,6 +223,10 @@ pub trait Host {
     fn gettid(&mut self) -> i64;
     /// Adjust the program break; returns the (possibly unchanged) break.
     fn brk(&mut self, requested: u64) -> i64;
+    /// `lseek(fd, offset, whence)` — reposition the fd's cursor; returns the
+    /// resulting absolute offset or a negative Linux errno (`ESPIPE` for a
+    /// non-seekable fd, `EBADF`, `EINVAL`).
+    fn lseek(&mut self, fd: i32, offset: i64, whence: u32) -> i64;
     /// Map `len` anonymous zeroed bytes; returns the base address or a
     /// negative errno (libc uses this for the heap/TLS/thread stacks).
     fn mmap_anon(&mut self, len: usize) -> i64;
@@ -161,15 +245,27 @@ pub trait Host {
 /// `mmap` `flags` bit: anonymous (not file-backed).
 pub const MAP_ANONYMOUS: u64 = 0x20;
 
+/// Largest anonymous mapping the emulator will attempt (16 MiB). The package
+/// region holds a few MiB of frames, so a larger request can only fail; the
+/// bound keeps a wild guest length from driving the host's carve loop.
+pub const MAX_ANON_MMAP: usize = 16 << 20;
+
 /// Read a NUL-terminated guest string at `addr` into `out` (bounded); returns
-/// the length (without the NUL).
-fn read_cstr<H: Host>(host: &mut H, addr: u64, out: &mut [u8]) -> usize {
+/// the length (without the NUL). A pointer the guest cannot read is `EFAULT`
+/// and a string that fills `out` without a NUL is `ENAMETOOLONG`, the two
+/// errnos Linux itself returns here — quietly truncating to the buffer edge
+/// instead made a bad pointer look like a short or empty path.
+fn read_cstr<H: Host>(host: &mut H, addr: u64, out: &mut [u8]) -> Result<usize, i64> {
     let n = host.mem_read(addr, out);
     if n < 0 {
-        return 0;
+        return Err(EFAULT);
     }
     let n = n as usize;
-    out[..n].iter().position(|&b| b == 0).unwrap_or(n)
+    match out[..n].iter().position(|&b| b == 0) {
+        Some(pos) => Ok(pos),
+        None if n == out.len() => Err(ENAMETOOLONG),
+        None => Ok(n),
+    }
 }
 
 /// Signals v0: does this signal number's default action terminate the process?
@@ -231,9 +327,11 @@ pub fn dispatch<H: Host>(num: u64, args: [u64; 6], host: &mut H) -> Action {
         linux::BRK => Action::Return(host.brk(args[0])),
         linux::EXIT | linux::EXIT_GROUP => Action::Exit(args[0] as i32),
         // Signals v0 (single process): a self-directed *terminating* signal
-        // ends the process (128+sig, the shell convention); signals whose
-        // default action is ignore/stop/continue are no-ops. Real POSIX
-        // handler delivery is the deferred ADR (GLM's checklist).
+        // ends the process (128+sig, the shell convention); signal 0 is the
+        // existence probe (never delivered), signals outside 1..=64 are
+        // EINVAL, and signals whose default action is ignore/stop/continue
+        // are no-ops. Real POSIX handler delivery is the deferred ADR (GLM's
+        // checklist).
         linux::KILL | linux::TKILL | linux::TGKILL => {
             // kill(pid,sig) / tkill(tid,sig): sig is arg1; tgkill(g,t,sig): arg2.
             let sig = if num == linux::TGKILL {
@@ -241,6 +339,12 @@ pub fn dispatch<H: Host>(num: u64, args: [u64; 6], host: &mut H) -> Action {
             } else {
                 args[1]
             };
+            if sig > 64 {
+                return Action::Return(EINVAL);
+            }
+            if sig == 0 {
+                return Action::Return(0); // probe: no signal is delivered
+            }
             if default_terminates(sig as u32) {
                 Action::Exit(0x80 | (sig as i32 & 0x7f))
             } else {
@@ -303,13 +407,19 @@ pub fn dispatch<H: Host>(num: u64, args: [u64; 6], host: &mut H) -> Action {
         }
         linux::CHDIR => {
             let mut p = [0u8; 256];
-            let n = read_cstr(host, args[0], &mut p);
+            let n = match read_cstr(host, args[0], &mut p) {
+                Ok(n) => n,
+                Err(e) => return Action::Return(e),
+            };
             Action::Return(host.chdir(&p[..n]))
         }
         // readlink(2): path in rdi, buf rsi, size rdx (no dirfd).
         linux::READLINK => {
             let mut p = [0u8; 256];
-            let n = read_cstr(host, args[0], &mut p);
+            let n = match read_cstr(host, args[0], &mut p) {
+                Ok(n) => n,
+                Err(e) => return Action::Return(e),
+            };
             let mut out = [0u8; 256];
             let want = (args[2] as usize).min(out.len());
             let r = host.readlink(&p[..n], &mut out[..want]);
@@ -335,7 +445,10 @@ pub fn dispatch<H: Host>(num: u64, args: [u64; 6], host: &mut H) -> Action {
                 (args[0], args[1])
             };
             let mut p = [0u8; 256];
-            let n = read_cstr(host, parg, &mut p);
+            let n = match read_cstr(host, parg, &mut p) {
+                Ok(n) => n,
+                Err(e) => return Action::Return(e),
+            };
             match host.stat_path(&p[..n]) {
                 Ok(st) => {
                     let mut b = [0u8; 144];
@@ -350,17 +463,26 @@ pub fn dispatch<H: Host>(num: u64, args: [u64; 6], host: &mut H) -> Action {
         // (no dirfd), flags arg1, mode arg2 — dirfd is implicitly AT_FDCWD.
         linux::OPEN => {
             let mut p = [0u8; 256];
-            let n = read_cstr(host, args[0], &mut p);
+            let n = match read_cstr(host, args[0], &mut p) {
+                Ok(n) => n,
+                Err(e) => return Action::Return(e),
+            };
             Action::Return(host.openat(-100, &p[..n], args[1] as u32))
         }
         linux::OPENAT => {
             let mut p = [0u8; 256];
-            let n = read_cstr(host, args[1], &mut p);
+            let n = match read_cstr(host, args[1], &mut p) {
+                Ok(n) => n,
+                Err(e) => return Action::Return(e),
+            };
             Action::Return(host.openat(args[0] as i32, &p[..n], args[2] as u32))
         }
         linux::READLINKAT => {
             let mut p = [0u8; 256];
-            let n = read_cstr(host, args[1], &mut p);
+            let n = match read_cstr(host, args[1], &mut p) {
+                Ok(n) => n,
+                Err(e) => return Action::Return(e),
+            };
             let mut out = [0u8; 256];
             let want = (args[3] as usize).min(out.len());
             let r = host.readlink(&p[..n], &mut out[..want]);
@@ -410,7 +532,6 @@ pub fn dispatch<H: Host>(num: u64, args: [u64; 6], host: &mut H) -> Action {
                 Action::Return(0)
             }
         }
-        linux::LSEEK => Action::Return(0), // offset 0 (v0 fds are stream-like)
         linux::UNAME => {
             // struct utsname: six 65-byte NUL-terminated fields.
             let mut u = [0u8; 65 * 6];
@@ -433,11 +554,37 @@ pub fn dispatch<H: Host>(num: u64, args: [u64; 6], host: &mut H) -> Action {
             // Anonymous mappings (libc heap/TLS/stacks) are backed by the
             // Host allocator; file/device mappings are not supported yet.
             let flags = args[3];
-            if flags & MAP_ANONYMOUS != 0 {
-                Action::Return(host.mmap_anon(args[1] as usize))
-            } else {
-                Action::Return(ENOSYS)
+            if flags & MAP_ANONYMOUS == 0 {
+                return Action::Return(ENOSYS);
             }
+            // A zero length is EINVAL in Linux, and one page is the minimum
+            // the host can carve. Beyond MAX_ANON_MMAP the request cannot be
+            // satisfied (the region is a few MiB), so refuse it as ENOMEM
+            // rather than letting a wild guest length drive the carve loop.
+            let len = args[1] as usize;
+            if len == 0 {
+                return Action::Return(EINVAL);
+            }
+            if len > MAX_ANON_MMAP {
+                return Action::Return(linux_errno(status::ENOMEM));
+            }
+            Action::Return(host.mmap_anon(len))
+        }
+        // Offset position inside an fd (the VFS client tracks it per fd).
+        // Linux returns the resulting absolute offset, EINVAL for a bad
+        // whence or a negative result, ESPIPE for the console stdio (not a
+        // seekable object) and EBADF for an unknown fd.
+        linux::LSEEK => {
+            let fd = args[0] as i32;
+            if fd < 3 {
+                // stdio is the console endpoint: not seekable.
+                return Action::Return(ESPIPE);
+            }
+            let off = args[1] as i64;
+            if !matches!(args[2] as u32, SEEK_SET | SEEK_CUR | SEEK_END) {
+                return Action::Return(EINVAL);
+            }
+            Action::Return(host.lseek(fd, off, args[2] as u32))
         }
         // Deliberately unimplemented: device fds need a device layer — refuse
         // cleanly so the emulated program sees a normal error, not garbage.
@@ -459,6 +606,8 @@ mod tests {
         break_: u64,
         mmap_bump: u64,
         tls: u64,
+        /// Cursor of the one seekable mock fd (Linux fd 4, size 11).
+        fd_off: u64,
     }
     impl Mock {
         fn new() -> Self {
@@ -470,6 +619,7 @@ mod tests {
                 break_: 0x1000,
                 mmap_bump: 0x1000_0000,
                 tls: 0,
+                fd_off: 2,
             }
         }
     }
@@ -553,6 +703,24 @@ mod tests {
                 self.break_ = requested;
             }
             self.break_ as i64
+        }
+        fn lseek(&mut self, fd: i32, offset: i64, whence: u32) -> i64 {
+            // One seekable mock fd: Linux fd 4, 11 bytes long, cursor at 2.
+            if fd != 4 {
+                return EBADF;
+            }
+            let base = match whence {
+                SEEK_SET => 0,
+                SEEK_CUR => self.fd_off,
+                SEEK_END => 11,
+                _ => return EINVAL,
+            };
+            let next = base as i64 + offset;
+            if next < 0 {
+                return EINVAL;
+            }
+            self.fd_off = next as u64;
+            next
         }
         fn mmap_anon(&mut self, len: usize) -> i64 {
             let base = self.mmap_bump;
@@ -859,5 +1027,153 @@ mod tests {
             dispatch(linux::ARCH_PRCTL, [0x1002, 0, 0, 0, 0, 0], &mut m),
             Action::Return(0)
         );
+    }
+
+    /// A string argument the guest cannot read must reach it as EFAULT, the
+    /// errno Linux returns for a bad path pointer. Before the fix the
+    /// truncated-to-zero-length string fell through to the Host, so a wild
+    /// pointer looked like a short path and the host answered ENOENT.
+    #[test]
+    fn unreadable_string_pointer_is_efault() {
+        let mut m = Mock::new();
+        let a = dispatch(
+            linux::OPENAT,
+            [(-100i64) as u64, 100_000, 0, 0, 0, 0],
+            &mut m,
+        );
+        assert_eq!(a, Action::Return(EFAULT));
+        let c = dispatch(linux::CHDIR, [100_000, 0, 0, 0, 0, 0], &mut m);
+        assert_eq!(c, Action::Return(EFAULT));
+    }
+
+    /// A path that fills the whole string buffer without a NUL is
+    /// ENAMETOOLONG, as Linux reports a path longer than the kernel's limit.
+    #[test]
+    fn unterminated_string_is_enametoolong() {
+        let mut m = Mock::new();
+        m.mem[..256].fill(b'/');
+        let a = dispatch(linux::CHDIR, [0, 0, 0, 0, 0, 0], &mut m);
+        assert_eq!(a, Action::Return(ENAMETOOLONG));
+    }
+
+    /// `kill(pid, 0)` is the existence probe: no signal is delivered, so it
+    /// must not terminate the process. Signal numbers outside 1..=64 are
+    /// EINVAL; a terminating one still ends it with 128+sig.
+    #[test]
+    fn signal_zero_is_a_probe_and_out_of_range_is_einval() {
+        let mut m = Mock::new();
+        assert_eq!(
+            dispatch(linux::KILL, [1, 0, 0, 0, 0, 0], &mut m),
+            Action::Return(0)
+        );
+        assert_eq!(
+            dispatch(linux::TKILL, [1, 65, 0, 0, 0, 0], &mut m),
+            Action::Return(EINVAL)
+        );
+        assert_eq!(
+            dispatch(linux::TGKILL, [1, 1, u64::MAX, 0, 0, 0], &mut m),
+            Action::Return(EINVAL)
+        );
+        // A real terminating signal is unchanged.
+        assert_eq!(
+            dispatch(linux::KILL, [1, 15, 0, 0, 0, 0], &mut m),
+            Action::Exit(0x8f)
+        );
+    }
+
+    /// `mmap` argument bounds: a zero length is EINVAL and a length beyond
+    /// the emulator's bound is ENOMEM instead of driving the carve loop.
+    #[test]
+    fn mmap_length_bounds() {
+        let mut m = Mock::new();
+        let flags = MAP_ANONYMOUS | 0x02;
+        assert_eq!(
+            dispatch(linux::MMAP, [0, 0, 3, flags, u64::MAX, 0], &mut m),
+            Action::Return(EINVAL)
+        );
+        assert_eq!(
+            dispatch(
+                linux::MMAP,
+                [0, (MAX_ANON_MMAP + 1) as u64, 3, flags, u64::MAX, 0],
+                &mut m
+            ),
+            Action::Return(ENOMEM)
+        );
+        // In-bounds anonymous mappings still return an address.
+        assert_eq!(
+            dispatch(linux::MMAP, [0, 4096, 3, flags, u64::MAX, 0], &mut m),
+            Action::Return(0x1000_0000)
+        );
+    }
+
+    /// `lseek` reports the resulting absolute offset from the fd's cursor,
+    /// rejects a negative result or an unknown whence with EINVAL, answers
+    /// ESPIPE for the console stdio (not seekable) and EBADF for an unknown
+    /// fd.
+    #[test]
+    fn lseek_repositions_the_fd_cursor() {
+        let mut m = Mock::new();
+        assert_eq!(
+            dispatch(linux::LSEEK, [4u64, 5, SEEK_CUR as u64, 0, 0, 0], &mut m),
+            Action::Return(7)
+        );
+        assert_eq!(
+            dispatch(linux::LSEEK, [4u64, 0, SEEK_END as u64, 0, 0, 0], &mut m),
+            Action::Return(11)
+        );
+        assert_eq!(
+            dispatch(linux::LSEEK, [4u64, 5, SEEK_SET as u64, 0, 0, 0], &mut m),
+            Action::Return(5)
+        );
+        assert_eq!(
+            dispatch(
+                linux::LSEEK,
+                [4u64, (-100i64) as u64, SEEK_CUR as u64, 0, 0, 0],
+                &mut m
+            ),
+            Action::Return(EINVAL)
+        );
+        assert_eq!(
+            dispatch(linux::LSEEK, [4u64, 5, 9, 0, 0, 0], &mut m),
+            Action::Return(EINVAL)
+        );
+        assert_eq!(
+            dispatch(linux::LSEEK, [1u64, 5, SEEK_SET as u64, 0, 0, 0], &mut m),
+            Action::Return(ESPIPE)
+        );
+        assert_eq!(
+            dispatch(linux::LSEEK, [7u64, 5, SEEK_SET as u64, 0, 0, 0], &mut m),
+            Action::Return(EBADF)
+        );
+    }
+
+    /// Servers report Helios protocol statuses, whose numbers are not Linux
+    /// errnos: the emulated program has to see Linux numbers, so
+    /// `linux_errno` is the single translation at the `Host` boundary.
+    #[test]
+    fn protocol_statuses_become_linux_errnos() {
+        assert_eq!(linux_errno(status::OK), 0);
+        assert_eq!(linux_errno(status::ENOENT), ENOENT); // protocol -15
+        assert_eq!(linux_errno(status::EEXIST), EEXIST); // protocol -16
+        assert_eq!(linux_errno(status::EBADCAP), EBADF); // protocol -1
+        assert_eq!(linux_errno(status::ERIGHTS), EACCES); // protocol -2
+        assert_eq!(linux_errno(status::EBADARG), EINVAL); // protocol -3
+        assert_eq!(linux_errno(status::EFAULT), EFAULT); // protocol -7
+        assert_eq!(linux_errno(status::ENOMEM), -12); // protocol -8
+        assert_eq!(linux_errno(status::EISDIR), EISDIR); // protocol -17
+        assert_eq!(linux_errno(status::ENOTDIR), ENOTDIR); // protocol -18
+        assert_eq!(linux_errno(status::EMFILE), EMFILE); // protocol -20
+        assert_eq!(linux_errno(status::EACCES), EACCES); // protocol -21
+        assert_eq!(linux_errno(status::EWOULDBLOCK), EAGAIN);
+        assert_eq!(linux_errno(status::EDEAD), ESRCH);
+        assert_eq!(linux_errno(status::ETOOBIG), E2BIG);
+        // An unknown or positive code is an I/O error, never a protocol
+        // number handed to the guest unchanged.
+        assert_eq!(linux_errno(-1234), EIO);
+        assert_eq!(linux_errno(42), EIO);
+        // ERIGHTS and EACCES both land on EACCES, but they are distinct
+        // protocol codes — the map never collapses two different codes onto
+        // two different answers by accident.
+        assert_ne!(status::ERIGHTS, status::EACCES);
     }
 }

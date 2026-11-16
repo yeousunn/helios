@@ -13,6 +13,7 @@ use sdk::sys::raw_copy_from_va;
 use sdk::syscall::{Handle, RawSyscalls, Status, Syscalls};
 use sdk::window::{MappedWindow, WindowMapper, FLAG_READ, FLAG_WRITE};
 
+use crate::foreign::{SEEK_CUR, SEEK_END, SEEK_SET};
 use crate::layout::ARG_WINDOW_VA;
 use crate::posix::{EBADF, EINVAL, O_CREAT};
 
@@ -687,6 +688,35 @@ impl VfsClient {
         let entry = self.fds.get(fd as usize).copied().flatten().ok_or(EBADF)?;
         self.readdir(sys, entry.handle, cookie, name_out)
     }
+
+    /// Reposition the cursor of fd `fd` by `offset` bytes and return the new
+    /// absolute offset. `whence` is the Linux value
+    /// ([`crate::foreign::SEEK_SET`] and friends): `SEEK_END` stats the fd to
+    /// learn its size, one extra request only on that path. A resulting
+    /// negative offset or an unknown whence is `EBADARG`, an unknown fd is
+    /// `EBADF` — the two errnos Linux reports for the same cases.
+    pub fn seek<R: RawSyscalls>(
+        &mut self,
+        sys: &mut Syscalls<R>,
+        fd: u32,
+        offset: i64,
+        whence: u32,
+    ) -> Result<u64, Status> {
+        let mut entry = self.fds.get(fd as usize).copied().flatten().ok_or(EBADF)?;
+        let base: u64 = match whence {
+            SEEK_SET => 0,
+            SEEK_CUR => entry.offset,
+            SEEK_END => self.stat_fd(sys, fd)?.size,
+            _ => return Err(ipc::status::EBADARG),
+        };
+        let next = base as i64 + offset;
+        if next < 0 {
+            return Err(ipc::status::EBADARG);
+        }
+        entry.offset = next as u64;
+        self.fds[fd as usize] = Some(entry);
+        Ok(entry.offset)
+    }
 }
 
 #[cfg(test)]
@@ -737,6 +767,23 @@ mod tests {
                         7,
                         CapSlot::pack(42, Rights::READ.union(Rights::WRITE)).0,
                     ],
+                };
+            }
+            // `OPEN` answers with the server's file handle in words[1].
+            if number == number::CALL && args[1] as u16 == methods::vfs::OPEN {
+                return SysReply {
+                    status: status::OK,
+                    tag: 0,
+                    words: [0, 55, 0, 0],
+                };
+            }
+            // `STAT` answers `kind | mode << 8` in words[1] and the size in
+            // words[2] (the fd is a 99-byte regular file).
+            if number == number::CALL && args[1] as u16 == methods::vfs::STAT {
+                return SysReply {
+                    status: status::OK,
+                    tag: 0,
+                    words: [0, 0o1_000644, 99, 0],
                 };
             }
             self.next_frame += 1;
@@ -831,5 +878,36 @@ mod tests {
             read_into(window, WINDOW as u32 - 1, &mut [0u8; 2]).err(),
             Some(status::ETOOBIG)
         );
+    }
+
+    /// `seek` moves the fd cursor and reports the new absolute offset.
+    /// `SEEK_END` asks the server for the size (one `STAT`), a negative
+    /// result or an unknown whence is `EBADARG`, and an unknown fd `EBADF` —
+    /// the errnos Linux reports for the same cases. The fd is seeded
+    /// directly, so no path resolution (and no arg-window write) runs: this
+    /// test covers the cursor arithmetic, not `open`.
+    #[test]
+    fn seek_repositions_the_cursor_and_seek_end_uses_the_stat_size() {
+        let mut raw = Mock::new();
+        let mut client = {
+            let mut sys = Syscalls::new(&mut raw);
+            VfsClient::connect(&mut sys, 6, 5, 9, 8).expect("connect")
+        };
+        let mut sys = Syscalls::new(&mut raw);
+        client.fds[3] = Some(Fd {
+            handle: 77,
+            offset: 0,
+        });
+
+        assert_eq!(client.seek(&mut sys, 3, 5, SEEK_SET), Ok(5));
+        assert_eq!(client.seek(&mut sys, 3, 3, SEEK_CUR), Ok(8));
+        // The mock fd is 99 bytes long, so -4 from the end is 95.
+        assert_eq!(client.seek(&mut sys, 3, -4, SEEK_END), Ok(95));
+        assert_eq!(
+            client.seek(&mut sys, 3, -100, SEEK_CUR),
+            Err(status::EBADARG)
+        );
+        assert_eq!(client.seek(&mut sys, 3, 0, 9), Err(status::EBADARG));
+        assert_eq!(client.seek(&mut sys, 9, 0, SEEK_SET), Err(EBADF));
     }
 }

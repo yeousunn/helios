@@ -21,6 +21,7 @@ extern crate alloc;
 use core::panic::PanicInfo;
 
 use ipc::Message;
+use personality::foreign::{linux_errno, EBADF, EINVAL, ENOENT, ENOMEM};
 use personality::layout::HEAP_VA_BASE;
 use sdk::guest::GuestMemory;
 use sdk::heap::RegionSource;
@@ -180,7 +181,7 @@ impl personality::foreign::Host for Emu<'_> {
     }
     fn write_fd(&mut self, fd: i32, data: &[u8]) -> i64 {
         if fd != 1 && fd != 2 {
-            return -9; // EBADF
+            return EBADF;
         }
         // Buffer: the console send must happen AFTER this syscall's reply —
         // a nested blocking send while the foreign reply is pending corrupted
@@ -192,15 +193,17 @@ impl personality::foreign::Host for Emu<'_> {
         // stdio (0/1/2) has no VFS backing here; VFS slot fds are remapped to
         // Linux fd = slot + 3 (see `openat`).
         if fd < 3 {
-            return -9; // EBADF
+            return EBADF;
         }
         let Some(vfs) = self.vfs.as_deref_mut() else {
-            return -9;
+            return EBADF;
         };
         let mut sys = Syscalls::new(self.raw);
         match vfs.read(&mut sys, (fd as u32) - 3, out) {
             Ok(n) => n as i64,
-            Err(e) => e as i64,
+            // The VFS answers in protocol codes, the guest expects Linux
+            // errnos (see `linux_errno`).
+            Err(e) => linux_errno(e),
         }
     }
     fn close_fd(&mut self, fd: i32) -> i64 {
@@ -213,7 +216,17 @@ impl personality::foreign::Host for Emu<'_> {
         let mut sys = Syscalls::new(self.raw);
         match vfs.close(&mut sys, (fd as u32) - 3) {
             Ok(()) => 0,
-            Err(e) => e as i64,
+            Err(e) => linux_errno(e),
+        }
+    }
+    fn lseek(&mut self, fd: i32, offset: i64, whence: u32) -> i64 {
+        let Some(vfs) = self.vfs.as_deref_mut() else {
+            return EBADF;
+        };
+        let mut sys = Syscalls::new(self.raw);
+        match vfs.seek(&mut sys, (fd as u32) - 3, offset, whence) {
+            Ok(off) => off as i64,
+            Err(e) => linux_errno(e),
         }
     }
     fn getpid(&mut self) -> i64 {
@@ -239,12 +252,12 @@ impl personality::foreign::Host for Emu<'_> {
     }
     fn mmap_anon(&mut self, len: usize) -> i64 {
         if len == 0 {
-            return -22; // EINVAL
+            return EINVAL;
         }
         let pages = (len as u64).div_ceil(4096);
         let base = *self.mmap_bump;
         if !self.map_pages(base, len) {
-            return -12; // ENOMEM
+            return ENOMEM;
         }
         *self.mmap_bump += pages * 4096;
         base as i64
@@ -256,12 +269,12 @@ impl personality::foreign::Host for Emu<'_> {
         m.words[0] = base;
         match sys.invoke(self.child, &m) {
             Ok(_) => 0,
-            Err(e) => e as i64,
+            Err(e) => linux_errno(e),
         }
     }
     fn openat(&mut self, _dirfd: i32, path: &[u8], flags: u32) -> i64 {
         let Some(vfs) = self.vfs.as_deref_mut() else {
-            return -2; // ENOENT (no VFS client wired)
+            return ENOENT; // no VFS client wired
         };
         let name = match path.iter().position(|&b| b == 0) {
             Some(n) => &path[..n],
@@ -289,23 +302,23 @@ impl personality::foreign::Host for Emu<'_> {
         };
         match r {
             Ok(slot) => slot as i64 + 3,
-            Err(e) => e as i64,
+            Err(e) => linux_errno(e),
         }
     }
     fn getdents(&mut self, fd: i32, out: &mut [u8]) -> i64 {
         if fd < 3 {
-            return -9; // EBADF
+            return EBADF;
         }
         let slot = (fd as u32) - 3;
         if slot as usize >= self.dents_cookie.len() {
-            return -9;
+            return EBADF;
         }
         let slot = slot as usize;
         if self.dents_cookie[slot] == u64::MAX {
             return 0; // end-of-directory already reached
         }
         let Some(vfs) = self.vfs.as_deref_mut() else {
-            return -9;
+            return EBADF;
         };
         let mut off = 0usize;
         while out.len() - off >= 24 {
@@ -342,17 +355,17 @@ impl personality::foreign::Host for Emu<'_> {
                     self.dents_cookie[slot] = next;
                 }
                 Ok(None) => break,
-                Err(e) => return if off > 0 { off as i64 } else { e as i64 },
+                Err(e) => return if off > 0 { off as i64 } else { linux_errno(e) },
             }
         }
         off as i64
     }
     fn fstat(&mut self, fd: i32) -> Result<personality::foreign::FileStat, i64> {
         if fd < 3 {
-            return Err(-9); // EBADF
+            return Err(EBADF);
         }
         let Some(vfs) = self.vfs.as_deref_mut() else {
-            return Err(-9);
+            return Err(EBADF);
         };
         let mut sys = Syscalls::new(self.raw);
         vfs.stat_fd(&mut sys, (fd as u32) - 3)
@@ -361,11 +374,11 @@ impl personality::foreign::Host for Emu<'_> {
                 mode: s.mode,
                 size: s.size,
             })
-            .map_err(|e| e as i64)
+            .map_err(linux_errno)
     }
     fn stat_path(&mut self, path: &[u8]) -> Result<personality::foreign::FileStat, i64> {
         let Some(vfs) = self.vfs.as_deref_mut() else {
-            return Err(-2); // ENOENT
+            return Err(ENOENT);
         };
         let name = match path.iter().position(|&b| b == 0) {
             Some(n) => &path[..n],
@@ -378,12 +391,12 @@ impl personality::foreign::Host for Emu<'_> {
                 mode: s.mode,
                 size: s.size,
             }),
-            Err(e) => Err(e as i64),
+            Err(e) => Err(linux_errno(e)),
         }
     }
     fn chdir(&mut self, path: &[u8]) -> i64 {
         let Some(vfs) = self.vfs.as_deref_mut() else {
-            return -2;
+            return ENOENT;
         };
         let name = match path.iter().position(|&b| b == 0) {
             Some(n) => &path[..n],
@@ -392,7 +405,7 @@ impl personality::foreign::Host for Emu<'_> {
         let mut sys = Syscalls::new(self.raw);
         vfs.chdir(&mut sys, name)
             .map(|_| 0)
-            .unwrap_or_else(|e| e as i64)
+            .unwrap_or_else(linux_errno)
     }
     fn getcwd(&mut self, out: &mut [u8]) -> i64 {
         // v0: the emulated program's cwd is always the VFS root.
