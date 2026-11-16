@@ -155,7 +155,9 @@ boot_and_parse() {
 
 # 4. Run the bench image BENCH_RUNS times, collecting every reported marker.
 TMP_RESULTS="$(mktemp)"
-trap 'rm -f "$TMP_RESULTS"' EXIT
+TMP_PREV="$(mktemp)"
+TMP_CUR="$(mktemp)"
+trap 'rm -f "$TMP_RESULTS" "$TMP_PREV" "$TMP_CUR"' EXIT
 : > "$TMP_RESULTS"
 
 for (( run = 1; run <= BENCH_RUNS; run++ )); do
@@ -214,65 +216,82 @@ for name in "${present[@]}"; do
     echo "[bench]   $name: $cyc cycles (min over $BENCH_RUNS runs)"
 done
 
-# 7. --compare: fail on any regression above 5% versus the previous result.
+# 7. --compare: fail on any regression above 15% versus a rolling median of the
+#    most recent up-to-3 previous results with the same BENCH_RUNS. A single
+#    lucky-low previous read (TCG noise) no longer triggers a false regression:
+#    the median discounts it. See ADR-092 (residual risk, lever is NV's) and
+#    ADR-094. The 15% threshold, min-over-BENCH_RUNS, per-metric skip, and the
+#    result JSON schema are unchanged.
 if [[ "$compare" -eq 1 ]]; then
-    prev=""
-    prev_commit="$(git rev-parse --verify --quiet "HEAD~1" 2>/dev/null || echo unknown)"
-    if [[ "$prev_commit" != "unknown" && -f "$RESULTS_DIR/$prev_commit.json" ]]; then
-        prev="$RESULTS_DIR/$prev_commit.json"
-    else
-        prev=""
-        prev_time=0
-        shopt -s nullglob
-        set -- "$RESULTS_DIR"/*.json
-        shopt -u nullglob
-        for f in "$@"; do
-            name="$(basename "$f" .json)"
-            [[ "$name" == "$COMMIT" ]] && continue
-            fruns="$(python3 -c "import json;print(json.load(open('$f'))['runs'])" 2>/dev/null || echo 0)"
-            [[ "$fruns" != "$BENCH_RUNS" ]] && continue  # minima only comparable across equal run counts
-            ctime="$(git log -1 --format=%ct "$name" 2>/dev/null || echo 0)"
-            if [[ -z "$prev" || "$ctime" -gt "$prev_time" ]]; then
-                prev_time="$ctime"
-                prev="$f"
-            fi
-        done
-    fi
+    shopt -s nullglob
+    set -- "$RESULTS_DIR"/*.json
+    shopt -u nullglob
+    : > "$TMP_PREV"
+    for f in "$@"; do
+        name="$(basename "$f" .json)"
+        [[ "$name" == "$COMMIT" ]] && continue
+        fruns="$(python3 -c "import json;print(json.load(open('$f'))['runs'])" 2>/dev/null || echo 0)"
+        [[ "$fruns" == "$BENCH_RUNS" ]] || continue  # minima comparable across equal run counts
+        ctime="$(git log -1 --format=%ct "$name" 2>/dev/null || echo 0)"
+        printf '%s %s\n' "$ctime" "$f" >> "$TMP_PREV"
+    done
+    # Newest up-to-3 previous results form the rolling baseline.
+    prev_files=()
+    while IFS= read -r f; do
+        [[ -n "$f" ]] && prev_files+=("$f")
+    done < <(sort -rn "$TMP_PREV" | head -n 3 | cut -d' ' -f2-)
 
-    if [[ -z "$prev" ]]; then
+    if [[ "${#prev_files[@]}" -eq 0 ]]; then
         echo "[bench] --compare: no previous result to compare against (skipping)"
         exit 0
     fi
 
-    echo "[bench] --compare: comparing against $prev"
-    fail_compare=0
+    echo "[bench] --compare: rolling-median baseline over ${#prev_files[@]} previous result(s)"
+
+    # Current minima for the reported metrics.
+    : > "$TMP_CUR"
     for name in "${present[@]}"; do
-        eval "cur=\$CYCLES_$name"
-        prev_val="$(python3 - "$prev" "$name" 2>/dev/null <<'EOF'
-import json, sys
-try:
-    with open(sys.argv[1]) as f:
-        data = json.load(f)
-    print(data["cycles"][sys.argv[2]])
-except Exception:
-    pass
-EOF
-        )"
-        if [[ -z "$prev_val" ]]; then
-            echo "[bench]   $name: previous value unavailable"
-            continue
-        fi
-        # regression threshold: current > previous * 1.15 (integer math); 15%
-        # sits above the ~11% same-code TCG noise floor so G3 stops flaking.
-        limit=$(( prev_val * 115 / 100 ))
-        if [[ "$cur" -gt "$limit" ]]; then
-            echo "[bench]   $name: REGRESSION $prev_val -> $cur cycles (>15%)" >&2
-            fail_compare=1
-        else
-            echo "[bench]   $name: $prev_val -> $cur cycles OK"
-        fi
+        eval "cyc=\$CYCLES_$name"
+        echo "$name $cyc" >> "$TMP_CUR"
     done
-    [[ "$fail_compare" -eq 0 ]] || fail "benchmark regression above 5% vs $prev"
+
+    fail_compare=0
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        echo "$line"
+        [[ "$line" == *REGRESSION* ]] && fail_compare=1
+    done < <(python3 - "$TMP_CUR" "${prev_files[@]}" <<'EOF'
+import json, statistics, sys
+cur_file = sys.argv[1]
+prev_files = sys.argv[2:]
+cur = {}
+with open(cur_file) as fh:
+    for raw in fh:
+        raw = raw.strip()
+        if not raw:
+            continue
+        n, c = raw.split()
+        cur[n] = int(c)
+for name, c in cur.items():
+    vals = []
+    for pf in prev_files:
+        try:
+            with open(pf) as fh:
+                vals.append(json.load(fh)["cycles"][name])
+        except Exception:
+            pass
+    if not vals:
+        print(f"[bench]   {name}: no previous value, skipping")
+        continue
+    med = int(statistics.median(vals))
+    limit = med * 115 // 100
+    if c > limit:
+        print(f"[bench]   {name}: REGRESSION median {med} -> {c} cycles (>15% vs limit {limit})")
+    else:
+        print(f"[bench]   {name}: median {med} -> {c} cycles OK (limit {limit})")
+EOF
+    )
+    [[ "$fail_compare" -eq 0 ]] || fail "benchmark regression above 15% vs rolling-median baseline"
     echo "[bench] --compare: no regression above 15%"
 fi
 
