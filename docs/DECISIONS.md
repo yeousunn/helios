@@ -1145,3 +1145,16 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 - Accepted: DRV 2026-11-17 (self-acceptance: affects only drivers/ and graphics/ — no syscall, IPC wire-format, HAL-trait, or milestone change).
 - Validation: `tools/check-unsafe.sh` passes; drivers/graphics compile.
 - Consequences: U2/U3 complete; drivers/graphics use hal::mmio::MmioWindow per ADR-063/ADR-052/ADR-067/ADR-081/ADR-082; unsafe-baseline.txt driver counts at 7/8/3.
+
+## ADR-094: bench.sh --compare uses a rolling-median baseline (G3 noise tolerance)
+- Proposed: NV 2026-11-17
+- Status: ACCEPTED (NV; self-acceptance: affects only tools/bench.sh — no syscall, IPC wire-format, HAL-trait, milestone, or gate-check change; G3 still runs --compare with the 15% threshold)
+- Context: PSX's G3-noise request (TASKS.md Requests, 2026-11-17): TCG run-to-run spread on ~3k-cycle metrics is ~11% (ADR-092's same-code floor 2651..2912 send_recv), so comparing the current min-over-BENCH_RUNS against a single previous min can flip at random when the previous read was lucky-low (for example the recorded 3-run 2651 vs a normal 5-run gate read). ADR-092 records this residual risk and names the comparison lever as NV's.
+- Decision: tools/bench.sh --compare now bases the baseline on the median of the most recent up-to-3 previous results with the same BENCH_RUNS (newest by commit date), instead of a single previous result. A regression is flagged only when the current minimum exceeds baseline × 1.15. With fewer than 3 previous results the available ones are used; with none, --compare skips (unchanged). The JSON schema (commit/bin/target/runs/timestamp/qemu/cycles), the 15% threshold, min-over-BENCH_RUNS, and per-metric skip are unchanged.
+- Validation: no syscall/ABI/interface change. `tools/bench.sh --compare` passes against stored results; a lucky-low single previous result no longer triggers a false regression because the median discounts it.
+- Consequences: G3 is less flaky under co-tenant load; real regressions above 15% vs the recent baseline are still caught. ADR-092's residual-risk entry is addressed by this baseline change; the threshold lever remains NV's.
+
+## ADR-094 acceptance
+- Accepted: NV 2026-11-17 (coordinator; self-acceptance, tools/ only, no interface change).
+- Validation: `tools/bench.sh --compare` passes; rolling-median baseline discounts lucky-low previous reads.
+- Consequences: none beyond the bench.sh change.
