@@ -271,8 +271,11 @@ impl VirtioGpu {
 
     /// Program the virtqueue into the granted DMA page.
     fn setup_queue(&mut self, dma_virt: usize, dma_phys: usize) -> Result<(), &'static str> {
-        self.wr32(MMIO_QUEUE_SEL, 0).map_err(|_| "MMIO write error")?; // select queue 0
-        let max = self.rd32(MMIO_QUEUE_NUM_MAX).map_err(|_| "MMIO read error")?;
+        self.wr32(MMIO_QUEUE_SEL, 0)
+            .map_err(|_| "MMIO write error")?; // select queue 0
+        let max = self
+            .rd32(MMIO_QUEUE_NUM_MAX)
+            .map_err(|_| "MMIO read error")?;
         if max < QUEUE_SIZE as u32 {
             return Err("virtio-gpu: queue too small");
         }
@@ -280,7 +283,8 @@ impl VirtioGpu {
             .map_err(|_| "MMIO write error")?;
         self.wr32(MMIO_QUEUE_PFN, (dma_phys / DMA_PAGE) as u32)
             .map_err(|_| "MMIO write error")?;
-        self.wr32(MMIO_QUEUE_READY, 1).map_err(|_| "MMIO write error")?;
+        self.wr32(MMIO_QUEUE_READY, 1)
+            .map_err(|_| "MMIO write error")?;
 
         // Zero and type-pun the granted DMA page as a VirtQueue, touching
         // every queue struct type so the layout is exercised.

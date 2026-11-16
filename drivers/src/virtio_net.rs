@@ -307,8 +307,11 @@ impl VirtioNet {
 
     /// Program the virtqueue into the granted DMA page.
     fn setup_queue(&mut self, dma_virt: usize, dma_phys: usize) -> Result<(), &'static str> {
-        self.wr32(MMIO_QUEUE_SEL, 0).map_err(|_| "MMIO write error")?; // select queue 0
-        let max = self.rd32(MMIO_QUEUE_NUM_MAX).map_err(|_| "MMIO read error")?;
+        self.wr32(MMIO_QUEUE_SEL, 0)
+            .map_err(|_| "MMIO write error")?; // select queue 0
+        let max = self
+            .rd32(MMIO_QUEUE_NUM_MAX)
+            .map_err(|_| "MMIO read error")?;
         if max < QUEUE_SIZE as u32 {
             return Err("virtio-net: queue too small");
         }
@@ -316,7 +319,8 @@ impl VirtioNet {
             .map_err(|_| "MMIO write error")?;
         self.wr32(MMIO_QUEUE_PFN, (dma_phys / DMA_PAGE) as u32)
             .map_err(|_| "MMIO write error")?;
-        self.wr32(MMIO_QUEUE_READY, 1).map_err(|_| "MMIO write error")?;
+        self.wr32(MMIO_QUEUE_READY, 1)
+            .map_err(|_| "MMIO write error")?;
 
         // Zero the queue page.
         unsafe {
@@ -395,7 +399,8 @@ impl VirtioNet {
         self.next_desc_idx = (self.next_desc_idx + 2) % QUEUE_SIZE;
 
         // Notify the device.
-        self.wr32(MMIO_QUEUE_NOTIFY, 0).map_err(|_| "MMIO write error")?;
+        self.wr32(MMIO_QUEUE_NOTIFY, 0)
+            .map_err(|_| "MMIO write error")?;
 
         // Wait for the device to signal completion (spin on the used ring).
         let target_idx = head.wrapping_sub(1);
