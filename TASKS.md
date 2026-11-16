@@ -24,7 +24,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 - [x NV done 2026-11-16 662de4d] G3 NV: `tools/bench.sh`: boot a `BENCH=1` image, parse the cycle counts the bench program prints, store them as `bench/results/<commit>.json`, and with `--compare` fail on a regression above 5% against the previous result. `--compare` now stores decimal (valid JSON) and skips metrics with no previous value instead of crashing on a corrupt previous result.
 - [x NV done 2026-11-14 281cd2f] G4 NV: `docs/rfcs/README.md` and `docs/rfcs/0000-template.md` with the RFC sections from PLAN.md 10.2.
 - [x NV done 2026-11-14 4ae7629] G5 NV: SMP today (4ae7629): x86_64 `CpuTopology` via CPUID leaf 0x0B and `Halt` (`hlt`) are implemented; `Ipi` and `SecondaryBoot` are no-op stubs — real SMP (AP bring-up, IPI) deferred to M3.
-- [~ NV started 2026-11-17] G6 NV: tools/bench.sh --compare noise tolerance — raise the regression threshold from 5% (prev ×1.05) to 15% (prev ×1.15) because the same-code TCG send_recv spread (~11%) sits under the 5% gate, making G3 flake at random on ~3k-cycle metrics; keep min-over-BENCH_RUNS reduction and stored runs/qemu/timestamp for noise interpretation.
+- [x NV done 2026-11-17 a4630b4] G6 NV: tools/bench.sh --compare noise tolerance — raise the regression threshold from 5% (prev ×1.05) to 15% (prev ×1.15) because the same-code TCG send_recv spread (~11%) sits under the 5% gate, making G3 flake at random on ~3k-cycle metrics; keep min-over-BENCH_RUNS reduction and stored runs/qemu/timestamp for noise interpretation.
 
 ## M0: ABI and proofs
 
