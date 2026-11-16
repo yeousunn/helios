@@ -84,6 +84,12 @@ pub const FACTORY_NEW_ADDRESS_SPACE: InvokeSpec = InvokeSpec {
 };
 
 /// FACTORY_NEW_THREAD invoke specification
+///
+/// ADR-088 (RFC-0005): the packing is discriminated by cap_count, so the
+/// (label, cap_count) dispatch stays total. cap_count 2 = uniform layout
+/// (w1 = initial user stack top, caps[1] = bootstrap EP, no fault EP);
+/// cap_count 3 = legacy ADR-017 (w1..w3 are descriptor bytes, never
+/// stack-validated). Any other cap_count → EBADARG.
 pub const FACTORY_NEW_THREAD: InvokeSpec = InvokeSpec {
     obj_type: ObjType::Factory,
     label: 4,
@@ -97,16 +103,22 @@ pub const FACTORY_NEW_THREAD: InvokeSpec = InvokeSpec {
             description: "Entry point PC (must be canonical user address, validated by is_user_addr)",
         },
         InvokeArg {
+            name: "stack_top",
+            range: (0, 0x0000_8000_0000_0000 - 1),
+            range_error: ErrorCode::EBADARG,
+            description: "Initial user stack top at cap_count 2 (ADR-088 uniform packing). 0 = arch default USER_STACK_TOP (0x0000_7FFF_FFFF_F000). Nonzero: canonical user address (nonzero, < 0x8000_0000_0000_0000) AND 16-byte aligned — the same rule THREAD_CREATE w1 runs, so the two cannot drift. Validated before any child state exists.",
+        },
+        InvokeArg {
             name: "w1_reserved",
             range: (0, u64::MAX),
             range_error: ErrorCode::OK,
-            description: "RESERVED (ignored by the kernel). RFC-0004/ADR-085 assigned w1 = initial stack top, but at cap_count 3 — the layout every production sender uses — trailing-descriptor overlay puts descriptor 0 (the AS cap) in words[1], so w1 carries descriptor bytes, not a stack value. The kernel therefore reads no stack from NEW_THREAD until the wire format grows (ADR-086 proposal); custom stacks go through THREAD_CREATE w1.",
+            description: "RESERVED at cap_count 3 (legacy ADR-017 packing, kept until the M2 housekeeping ADR deletes it): trailing-descriptor overlay puts descriptor 0 (the AS cap) in words[1], so w1 carries descriptor bytes, not a stack value — the kernel ignores it there and must not stack-validate descriptor bytes (ADR-087 rule). Custom stacks for legacy senders go through THREAD_CREATE w1.",
         },
     ],
     descriptors: &[
-        ("caps[0]", ObjType::AddressSpace, Rights::MAP), // required
-        ("caps[1]", ObjType::Endpoint, Rights::GRANT),    // optional fault endpoint
-        ("caps[2]", ObjType::Endpoint, Rights::GRANT),    // optional bootstrap endpoint
+        ("caps[0]", ObjType::AddressSpace, Rights::MAP), // required (both packings)
+        ("caps[1]", ObjType::Endpoint, Rights::GRANT), // cap_count 2: bootstrap EP; cap_count 3: fault EP
+        ("caps[2]", ObjType::Endpoint, Rights::GRANT), // cap_count 3 only: bootstrap endpoint
     ],
     errors: &[
         ErrorCode::OK,
@@ -117,7 +129,7 @@ pub const FACTORY_NEW_THREAD: InvokeSpec = InvokeSpec {
         ErrorCode::EREVOKED,
     ],
     commutativity: Commutativity::Commutes,
-    description: "Create a new thread in a new process. w0 = entry PC; w1 is descriptor-overlay territory at cap_count 3 (the kernel ignores it — ADR-086). caps[0] = AddressSpace (required, MAP right). caps[1] = fault endpoint (optional, GRANT). caps[2] = bootstrap endpoint (optional, GRANT, installed at child handle 1). Returns thread cap with CONTROL|GRANT.",
+    description: "Create a new thread in a new process. w0 = entry PC (both packings). cap_count 2 (ADR-088 uniform): w1 = initial user stack top (0 = arch default, ADR-085 validation), caps[0] = AddressSpace, caps[1] = bootstrap endpoint (installed at child handle 1), no fault EP (bind one later with Thread::BIND_FAULT_EP before the first yield — the child cannot run before the parent yields). cap_count 3 (legacy ADR-017): w1..w3 are descriptor bytes (ignored, no validation), caps[0] = AddressSpace, caps[1] = fault endpoint (optional), caps[2] = bootstrap endpoint (optional, installed at child handle 1). Any other cap_count: EBADARG. caps transfer under S8 (rights ∩ requested). Returns thread cap with CONTROL|GRANT.",
 };
 
 // ============================================================================
@@ -369,6 +381,29 @@ pub const THREAD_DEFER: InvokeSpec = InvokeSpec {
     errors: &[ErrorCode::OK, ErrorCode::EBADCAP, ErrorCode::ERIGHTS, ErrorCode::EBADARG, ErrorCode::EBADSTATE],
     commutativity: Commutativity::Commutes,
     description: "Mint a one-shot Reply cap from the thread's implicit reply slot (self only). Returns handle.",
+};
+
+/// THREAD_BIND_FAULT_EP invoke specification
+///
+/// ADR-088 (RFC-0005 §2): the fault endpoint leaves NEW_THREAD's uniform
+/// cap_count-2 packing (it was NULL in every production sender) and comes
+/// back as this post-creation bind. Label 18: TRAP_READ owns 16, DEFER
+/// owns 17. ADR-017's fault-race objection is answered structurally: a
+/// NEW_THREAD child is created Ready and the cooperative scheduler cannot
+/// run it while the parent is Running, so a launcher that wants fault
+/// routing MUST invoke BIND_FAULT_EP before its first yield or block.
+pub const THREAD_BIND_FAULT_EP: InvokeSpec = InvokeSpec {
+    obj_type: ObjType::Thread,
+    label: 18,
+    name: "BIND_FAULT_EP",
+    required_rights: Rights::CONTROL,
+    args: &[],
+    descriptors: &[
+        ("caps[0]", ObjType::Endpoint, Rights::GRANT), // optional, NULL to clear
+    ],
+    errors: &[ErrorCode::OK, ErrorCode::EBADCAP, ErrorCode::ERIGHTS, ErrorCode::EBADARG],
+    commutativity: Commutativity::Conflicts,
+    description: "Bind or clear the target thread's fault endpoint (ADR-088). caps[0] = Endpoint or NULL to clear. CONTROL required (else ERIGHTS); target must be live (else EBADCAP); the caller's cap must be a live Endpoint carrying GRANT (else EBADARG/ERIGHTS); the target's process receives rights ∩ requested (S8 — never a full-rights copy, never an added right). Errors: EBADCAP, ERIGHTS, EBADARG.",
 };
 
 /// THREAD_REGS_READ invoke specification
@@ -627,6 +662,7 @@ pub const ALL_SPECS: &[InvokeSpec] = &[
     THREAD_SET_FOREIGN,
     THREAD_TRAP_READ,
     THREAD_DEFER,
+    THREAD_BIND_FAULT_EP,
     THREAD_REGS_READ,
     THREAD_REGS_WRITE,
     AS_MAP,
@@ -677,6 +713,10 @@ pub const SPEC_BY_TYPE_AND_LABEL: &[((ObjType, u16), &InvokeSpec)] = &[
     ),
     ((ObjType::Thread, THREAD_TRAP_READ.label), &THREAD_TRAP_READ),
     ((ObjType::Thread, THREAD_DEFER.label), &THREAD_DEFER),
+    (
+        (ObjType::Thread, THREAD_BIND_FAULT_EP.label),
+        &THREAD_BIND_FAULT_EP,
+    ),
     ((ObjType::Thread, THREAD_REGS_READ.label), &THREAD_REGS_READ),
     (
         (ObjType::Thread, THREAD_REGS_WRITE.label),

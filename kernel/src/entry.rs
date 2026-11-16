@@ -2,9 +2,13 @@
 //!
 //! The arch trap handler (hal-*, NV) decodes registers into
 //! [`SyscallArgs`], then calls [`dispatch`] — the kernel never touches
-//! registers. Factory::NEW_THREAD follows ADR-017 (w0 = entry PC;
-//! caps[0..=2] positional). Thread::THREAD_CREATE takes RFC-0004/ADR-085's
-//! w1 = initial user stack top (0 = arch default).
+//! registers. Factory::NEW_THREAD carries ADR-088's dual packing,
+//! discriminated by cap_count: 2 = uniform (w0 = entry PC, w1 = initial
+//! user stack top, caps[0] = AS, caps[1] = bootstrap EP), 3 = legacy
+//! ADR-017 (w0 = entry PC; caps[0..=2] positional, w1 ignored). Anything
+//! else is EBADARG. Thread::THREAD_CREATE takes RFC-0004/ADR-085's
+//! w1 = initial user stack top (0 = arch default); Thread::BIND_FAULT_EP
+//! (label 18, ADR-088) binds a fault endpoint after creation.
 #![forbid(unsafe_code)]
 
 use crate::proc::{self, ProcError, ProcessId};
@@ -515,6 +519,7 @@ fn thread_invoke(
     const SET_FOREIGN: u16 = 15;
     const TRAP_READ: u16 = 16;
     const DEFER: u16 = 17;
+    const BIND_FAULT_EP: u16 = 18;
     const REGS_READ: u16 = 9;
     const REGS_WRITE: u16 = 10;
 
@@ -602,6 +607,7 @@ fn thread_invoke(
                 Err(e) => SyscallReturn::err(e),
             }
         }
+        BIND_FAULT_EP => bind_fault_ep(pid, target, &msg),
         SET_FOREIGN => {
             // ADR-044 (amended): flag the thread so its syscall traps route
             // raw to the emulator's endpoint. w0 = the CALLER's cap HANDLE
@@ -764,9 +770,72 @@ fn set_bound_notification(target: ThreadId, n: Option<crate::sched::ObjRef>) -> 
     sched::set_bound_notification(target, n).map_err(|_| ipc::status::EBADCAP)
 }
 
-/// Factory methods (syscall-abi §7). NEW_THREAD per ADR-017:
-/// w0 = entry PC; caps[0] = AddressSpace (required), caps[1] = fault EP
-/// (optional), caps[2] = bootstrap EP (optional → child handle 1).
+/// Thread::BIND_FAULT_EP (label 18, ADR-088): bind or clear the target's
+/// fault endpoint — the uniform NEW_THREAD packing (cap_count 2) carries
+/// no fault EP, so a launcher binds one after creation. ADR-017's
+/// fault-race objection is answered structurally: the child is created
+/// Ready and the cooperative scheduler cannot run it while the parent is
+/// Running, so a bind between NEW_THREAD and the parent's first yield or
+/// block races nothing (a Ready child executes no instruction).
+///
+/// caps[0] = Endpoint or NULL (or absent) to clear. Fail-before-any-state
+/// discipline: the caller's cap is resolved and validated first; then the
+/// bound cap is installed into the TARGET's process table (fault routing
+/// scans the faulting process's table — `fault::find_ep_cap`) under the
+/// S8 rules (rights ∩ requested — never a full-rights copy, never an
+/// added right), and only then is the binding recorded (ADR-007: a fault
+/// consults `Thread::fault_ep`). Clearing only drops the binding; any cap
+/// previously installed stays until its owner revokes it.
+fn bind_fault_ep(pid: ProcessId, target: ThreadId, msg: &Message) -> SyscallReturn {
+    let Some(cs) = msg.descriptor(0).filter(|cs| cs.handle() != 0) else {
+        return match sched::set_fault_ep(target, None) {
+            Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
+            Err(_) => SyscallReturn::err(ipc::status::EBADCAP),
+        };
+    };
+    // Resolve + validate the caller's cap before touching any state.
+    let ep = match proc::get_cap(pid, cs.handle()) {
+        Ok(c) => c,
+        Err(e) => return SyscallReturn::err(map_proc(e)),
+    };
+    if ep.typ != ObjType::Endpoint {
+        return SyscallReturn::err(ipc::status::EBADARG);
+    }
+    if !crate::objreg::is_alive(ep.obj) {
+        return SyscallReturn::err(ipc::status::EBADARG);
+    }
+    if !ep.rights.contains(Rights::GRANT) {
+        return SyscallReturn::err(ipc::status::ERIGHTS);
+    }
+    // The target must still be live (CONTROL + sched::get already checked
+    // it in thread_invoke; an Exited slot still resolves, so the state is
+    // checked explicitly). Re-fetch for the target's process id.
+    let target_process = match sched::get(target) {
+        Ok(t) if !matches!(t.state, crate::sched::State::Exited(_)) => t.process,
+        _ => return SyscallReturn::err(ipc::status::EBADCAP),
+    };
+    let granted = ep.rights.intersect(cs.rights());
+    if let Err(e) = proc::install_cap(
+        proc::from_ref(target_process),
+        Capability {
+            obj: ep.obj,
+            typ: ObjType::Endpoint,
+            rights: granted,
+        },
+    ) {
+        return SyscallReturn::err(map_proc(e));
+    }
+    match sched::set_fault_ep(target, Some(crate::sched::ObjRef(ep.obj.0))) {
+        Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
+        Err(_) => SyscallReturn::err(ipc::status::EBADCAP),
+    }
+}
+
+/// Factory methods (syscall-abi §7). NEW_THREAD carries ADR-088's dual
+/// packing (see `new_thread`): cap_count 2 = uniform (w0 = entry PC,
+/// w1 = stack top, caps[0] = AS, caps[1] = bootstrap EP), cap_count 3 =
+/// legacy ADR-017 (caps[0] = AS, caps[1] = fault EP, caps[2] = bootstrap
+/// EP → child handle 1).
 fn factory_invoke(
     pid: ProcessId,
     _tid: ThreadId,
@@ -887,29 +956,44 @@ fn resolve_thread_ep(pid: ProcessId, msg: &Message, idx: usize) -> Result<Option
 }
 
 /// RFC-0004/ADR-085: validate the initial user stack top (w1 of
-/// THREAD_CREATE). `0` = arch default (`USER_STACK_TOP`, the value every
-/// thread enters with today); nonzero must be a canonical user address
-/// (the S2 rule, same as the entry PC) and 16-byte aligned (the x86-64
-/// SysV stack discipline — the arch default satisfies it too). Form only,
-/// like the entry PC: the kernel never checks the mapping; an unmapped
-/// top faults in the child at its first push and routes to the child's
-/// fault endpoint (ADR-007).
+/// THREAD_CREATE, and of NEW_THREAD's ADR-088 uniform cap_count-2
+/// packing — the same code path, so the two stack rules cannot drift).
+/// `0` = arch default (`USER_STACK_TOP`, the value every thread enters
+/// with today); nonzero must be a canonical user address (the S2 rule,
+/// same as the entry PC) and 16-byte aligned (the x86-64 SysV stack
+/// discipline — the arch default satisfies it too). Form only, like the
+/// entry PC: the kernel never checks the mapping; an unmapped top faults
+/// in the child at its first push and routes to the child's fault
+/// endpoint (ADR-007).
 ///
-/// NEW_THREAD does NOT take a stack top: at the cap_count 3 layout every
-/// production sender uses, trailing-descriptor overlay puts descriptor 0
-/// (the AS cap) in words[1], so w1 carries descriptor bytes. The kernel
-/// ignores w1 there (deferred to the ADR-086 proposal).
+/// At NEW_THREAD's legacy cap_count 3 packing, w1 is descriptor-overlay
+/// territory (trailing-descriptor overlay puts descriptor 0 — the AS
+/// cap — in words[1]); the caller must not pass it through here
+/// (ADR-087 rule: descriptor bytes must not be stack-validated).
 fn valid_stack_top(w: u64) -> bool {
     w == 0 || (sched::is_user_addr(w) && w & 0xF == 0)
 }
 
-/// Factory::NEW_THREAD (ADR-017 packing): creates the child process +
-/// thread, applies caps[1] (fault EP) atomically, installs caps[2]
-/// (bootstrap EP) at child handle 1 (slot 0) per ADR-009, and returns the
-/// child's thread cap. S8: caps[1]/caps[2] transfer under the same rules
-/// as in-message caps (`syscall::resolve_transfers`, ADR-026): live
-/// Endpoint + GRANT on the caller's cap, child receives rights ∩
-/// requested — no full-rights copy, no added SEND.
+/// Factory::NEW_THREAD (ADR-088 dual packing, discriminated by cap_count
+/// — the field the kernel already dispatches on, so the (label,
+/// cap_count) dispatch stays total):
+///
+/// - **cap_count 2 (uniform, ADR-088):** w0 = entry PC, w1 = initial user
+///   stack top (0 = arch default; otherwise `valid_stack_top` — EBADARG
+///   before any child state), caps[0] = AddressSpace (required), caps[1]
+///   = bootstrap endpoint (optional, installed at child handle 1). No
+///   fault EP: bind one with Thread::BIND_FAULT_EP (label 18) before the
+///   first yield or block.
+/// - **cap_count 3 (legacy, ADR-017):** w0 = entry PC; w1..w3 are
+///   descriptor bytes and are ignored (never stack-validated — ADR-087
+///   rule); caps[0] = AddressSpace (required), caps[1] = fault EP
+///   (optional), caps[2] = bootstrap EP (optional → child handle 1).
+/// - **any other cap_count:** EBADARG (v0 happened to accept 0/1 by
+///   accident; tightening costs nothing and every sender sends 2 or 3).
+///
+/// Endpoint transfer rules (S8, `syscall::resolve_transfers`, ADR-026):
+/// the caller's cap must be a live Endpoint carrying GRANT, and the child
+/// receives rights ∩ requested — no full-rights copy, no added SEND.
 fn new_thread(pid: ProcessId, cap: &Capability, msg: &Message) -> SyscallReturn {
     if !cap.rights.contains(Rights::GRANT) {
         return SyscallReturn::err(ipc::status::ERIGHTS);
@@ -921,15 +1005,33 @@ fn new_thread(pid: ProcessId, cap: &Capability, msg: &Message) -> SyscallReturn 
         return SyscallReturn::err(ipc::status::EBADARG);
     }
 
-    // S8: resolve both endpoint descriptors BEFORE the child exists, so a
-    // bad call costs no process slot.
-    let fault_ep = match resolve_thread_ep(pid, msg, 1) {
-        Ok(c) => c,
-        Err(status) => return SyscallReturn::err(status),
-    };
-    let boot_ep = match resolve_thread_ep(pid, msg, 2) {
-        Ok(c) => c,
-        Err(status) => return SyscallReturn::err(status),
+    // ADR-088 packing dispatch. All validation and descriptor resolution
+    // happens BEFORE the child exists, so a rejected call burns no
+    // process/thread/capability state (S2b/S2d discipline).
+    let (stack_top, fault_ep, boot_ep) = match msg.tag.cap_count() {
+        2 => {
+            // ADR-085 validation, shared with THREAD_CREATE.
+            if !valid_stack_top(msg.words[1]) {
+                return SyscallReturn::err(ipc::status::EBADARG);
+            }
+            let boot_ep = match resolve_thread_ep(pid, msg, 1) {
+                Ok(c) => c,
+                Err(status) => return SyscallReturn::err(status),
+            };
+            (msg.words[1], None, boot_ep)
+        }
+        3 => {
+            let fault_ep = match resolve_thread_ep(pid, msg, 1) {
+                Ok(c) => c,
+                Err(status) => return SyscallReturn::err(status),
+            };
+            let boot_ep = match resolve_thread_ep(pid, msg, 2) {
+                Ok(c) => c,
+                Err(status) => return SyscallReturn::err(status),
+            };
+            (0, fault_ep, boot_ep)
+        }
+        _ => return SyscallReturn::err(ipc::status::EBADARG),
     };
 
     let child_pid = match proc::create() {
@@ -949,16 +1051,18 @@ fn new_thread(pid: ProcessId, cap: &Capability, msg: &Message) -> SyscallReturn 
         }
     }
 
-    // caps[1] = fault endpoint (optional; S8-validated above).
+    // Legacy packing only: caps[1] = fault endpoint (optional;
+    // S8-validated above). The uniform packing has no fault EP.
     if let Some(fep) = fault_ep {
         if proc::install_cap(child_pid, fep).is_err() {
             return SyscallReturn::err(ipc::status::ENOMEM);
         }
     }
 
-    // caps[2] = bootstrap endpoint → child handle 1 (slot 0), ADR-009
-    // (S8: rights ∩ requested only — the v0 forced SEND is gone; no current
-    // flow sends on the bootstrap EP, the child only receives + revokes it).
+    // Bootstrap endpoint → child handle 1 (slot 0), ADR-009 — caps[1] at
+    // cap_count 2, caps[2] at cap_count 3 (S8: rights ∩ requested only —
+    // the v0 forced SEND is gone; no current flow sends on the bootstrap
+    // EP, the child only receives + revokes it).
     if let Some(bep) = boot_ep {
         if proc::install_cap_at(child_pid, 0, bep).is_err() {
             return SyscallReturn::err(ipc::status::ENOMEM);
@@ -966,10 +1070,15 @@ fn new_thread(pid: ProcessId, cap: &Capability, msg: &Message) -> SyscallReturn 
     }
 
     // Spawn at scheduler default priority (ADR-017 §3); SET_PRIORITY refines.
-    // Entry PC from w0 (ADR-019 §4); SP is arch-owned (NEW_THREAD w1 is
-    // descriptor-overlay territory — ADR-086 proposal).
-    let child_tid = match sched::spawn_with(ObjRef(child_pid.0), sched::DEFAULT_PRIORITY, entry_pc)
-    {
+    // Entry PC from w0 (ADR-019 §4); stack top from w1 at cap_count 2
+    // (overlay per RFC-0004/ADR-085 — `sched::spawn_with_stack`), arch
+    // default (0) for the legacy packing.
+    let child_tid = match sched::spawn_with_stack(
+        ObjRef(child_pid.0),
+        sched::DEFAULT_PRIORITY,
+        entry_pc,
+        stack_top,
+    ) {
         Ok(t) => t,
         Err(_) => return SyscallReturn::err(ipc::status::ENOMEM),
     };
@@ -1498,10 +1607,11 @@ mod tests {
         let r_as = dispatch(args(num::INVOKE, factory, Tag::new(3), [0; 4]));
         let as_h = r_as.w[0] as u32;
 
-        // NEW_THREAD (creates the child suspended-entry thread).
+        // NEW_THREAD (creates the child suspended-entry thread) — ADR-088
+        // uniform packing (cap_count 2; 0/1 are EBADARG now).
         let mut m = Message::new(4);
         m.words[0] = 0x401000;
-        m.tag = m.tag.with_caps(1);
+        m.tag = m.tag.with_caps(2);
         m.set_descriptor(0, CapSlot::pack(as_h, Rights::MAP))
             .unwrap();
         let r = dispatch(args(num::INVOKE, factory, m.tag, m.words));
@@ -1561,6 +1671,8 @@ mod tests {
 
         // NEW_THREAD: kernel-window PC (higher half), the canonical split
         // value itself, and null are all EBADARG; no child is spawned.
+        // (ADR-088: these messages use the uniform cap_count-2 packing —
+        // cap_count 0/1 are EBADARG regardless of the PC.)
         for bad in [
             0xFFFF_8000_0100_0000, // kernel window (ADR-045)
             0xFFFF_FFFF_FFFF_F000, // non-canonical
@@ -1569,7 +1681,7 @@ mod tests {
         ] {
             let mut m = Message::new(4);
             m.words[0] = bad;
-            m.tag = m.tag.with_caps(1);
+            m.tag = m.tag.with_caps(2);
             m.set_descriptor(0, CapSlot::pack(as_h, Rights::MAP))
                 .unwrap();
             let r = dispatch(args(num::INVOKE, factory, m.tag, m.words));
@@ -1582,7 +1694,7 @@ mod tests {
         // A valid PC still works after the rejections (no state corrupted).
         let mut m = Message::new(4);
         m.words[0] = 0x401000;
-        m.tag = m.tag.with_caps(1);
+        m.tag = m.tag.with_caps(2);
         m.set_descriptor(0, CapSlot::pack(as_h, Rights::MAP))
             .unwrap();
         let r = dispatch(args(num::INVOKE, factory, m.tag, m.words));
@@ -1735,14 +1847,313 @@ mod tests {
         ] {
             assert_eq!(valid_stack_top(w), ok, "stack top {w:#x}");
         }
-        // NEW_THREAD: the spec marks w1 reserved-ignored (kernel reads no
-        // stack there until the wire format grows — ADR-086 proposal).
+        // NEW_THREAD: the spec marks w1 reserved-ignored at the legacy
+        // cap_count-3 packing (kernel reads no stack there), and carries
+        // the ADR-088 uniform stack_top at cap_count 2 with the same
+        // range/error as THREAD_CREATE's.
         let nt_w1 = helios_abi::invoke::FACTORY_NEW_THREAD
             .args
             .iter()
             .find(|a| a.name == "w1_reserved")
             .expect("NEW_THREAD: spec/abi lacks the w1_reserved marker");
         assert_eq!(nt_w1.range_error, helios_abi::ErrorCode::OK);
+        let nt_stack = helios_abi::invoke::FACTORY_NEW_THREAD
+            .args
+            .iter()
+            .find(|a| a.name == "stack_top")
+            .expect("NEW_THREAD: spec/abi lacks the ADR-088 stack_top argument");
+        assert_eq!(nt_stack.range_error, helios_abi::ErrorCode::EBADARG);
+        assert_eq!(nt_stack.range, arg.range, "same rule as THREAD_CREATE");
+
+        // ADR-088: BIND_FAULT_EP is Thread label 18, CONTROL-required,
+        // Conflicts (the target's fault-routing state).
+        let bfe = helios_abi::invoke_spec(helios_abi::ObjType::Thread, 18)
+            .expect("spec/abi lacks Thread::BIND_FAULT_EP (label 18)");
+        assert_eq!(bfe.name, "BIND_FAULT_EP");
+        assert_eq!(bfe.required_rights, helios_abi::Rights::CONTROL);
+        assert_eq!(
+            bfe.commutativity,
+            helios_abi::Commutativity::Conflicts,
+            "RFC-0005 §ABI row 2: conflicts on the target's fault-routing state"
+        );
+    }
+
+    /// ADR-088 uniform packing (cap_count 2): w0 = entry PC, w1 = stack
+    /// top (0 = arch default, else `valid_stack_top`), caps[0] = AS,
+    /// caps[1] = bootstrap EP (installed at child handle 1, rights ∩
+    /// requested), no fault EP read (caps[1]'s predecessor slot at the
+    /// legacy packing).
+    #[test]
+    fn a9b_new_thread_cap_count_2_uniform_packing() {
+        let (pid, _tid, factory) = setup();
+
+        let r_as = dispatch(args(num::INVOKE, factory, Tag::new(3), [0; 4]));
+        let as_h = r_as.w[0] as u32;
+        let r_ep = dispatch(args(num::INVOKE, factory, Tag::new(1), [0; 4]));
+        let boot_ep_h = r_ep.w[0] as u32;
+
+        // w1 = 0 (arch default): the packing DS's migrated senders use.
+        let mut m = Message::new(4);
+        m.words[0] = 0x401000;
+        m.tag = m.tag.with_caps(2);
+        m.set_descriptor(0, CapSlot::pack(as_h, Rights::MAP.union(Rights::GRANT)))
+            .unwrap();
+        m.set_descriptor(1, CapSlot::pack(boot_ep_h, Rights::RECV))
+            .unwrap();
+        let r = dispatch(args(num::INVOKE, factory, m.tag, m.words));
+        assert_eq!(r.status, ipc::status::OK as i64, "w1 = 0 must be accepted");
+        let child_pid = ObjId(r.w[2]);
+        let boot = proc::get_cap(child_pid, 1).unwrap();
+        assert_eq!(boot.typ, ObjType::Endpoint);
+        assert_eq!(boot.obj, proc::get_cap(pid, boot_ep_h).unwrap().obj);
+        assert_eq!(boot.rights, Rights::RECV, "bootstrap = rights ∩ requested");
+        let child_tid = ThreadId(r.w[3]);
+        proc::destroy(child_pid).unwrap();
+
+        // w1 = a valid carved stack top: accepted, entry PC echoed.
+        let mut m = Message::new(4);
+        m.words[0] = 0x402000;
+        m.words[1] = 0x5000_0000;
+        m.tag = m.tag.with_caps(2);
+        m.set_descriptor(0, CapSlot::pack(as_h, Rights::MAP))
+            .unwrap();
+        let r = dispatch(args(num::INVOKE, factory, m.tag, m.words));
+        assert_eq!(r.status, ipc::status::OK as i64, "aligned user w1");
+        assert_eq!(r.w[1], 0x402000);
+        // No bootstrap descriptor → child handle 1 stays empty.
+        let child_pid2 = ObjId(r.w[2]);
+        assert!(proc::get_cap(child_pid2, 1).is_err());
+        let _ = child_tid;
+    }
+
+    /// ADR-088 fail-before: at the pre-ADR-088 kernel a cap_count-2
+    /// NEW_THREAD was accepted with ANY w1 (the legacy reader ignored it),
+    /// so a kernel-window or misaligned stack top silently spawned a
+    /// child on the aliased arch default. The uniform packing validates
+    /// w1 with the THREAD_CREATE rule and rejects with EBADARG BEFORE any
+    /// child state exists — pinned by process/thread id continuity: a
+    /// burned child process or thread would push the next successful
+    /// spawn's ids past the consecutive pair below (proc::create and
+    /// sched::spawn both allocate the lowest free slot).
+    #[test]
+    fn a9b_new_thread_cap_count_2_rejects_bad_stack_top_before_child_state() {
+        let (_pid, _tid, factory) = setup();
+
+        let r_as = dispatch(args(num::INVOKE, factory, Tag::new(3), [0; 4]));
+        let as_h = r_as.w[0] as u32;
+
+        let msg2 = |w1: u64| {
+            let mut m = Message::new(4);
+            m.words[0] = 0x401000;
+            m.words[1] = w1;
+            m.tag = m.tag.with_caps(2);
+            m.set_descriptor(0, CapSlot::pack(as_h, Rights::MAP))
+                .unwrap();
+            m
+        };
+
+        for bad in [
+            0xFFFF_8000_0100_0000, // kernel window (ADR-045)
+            0xFFFF_FFFF_FFFF_F000, // non-canonical
+            0x0000_8000_0000_0000, // the user/kernel split
+            0x5000_0008,           // misaligned user VA
+        ] {
+            let r = dispatch(args(num::INVOKE, factory, msg2(bad).tag, msg2(bad).words));
+            assert_eq!(
+                r.status,
+                ipc::status::EBADARG as i64,
+                "cap_count-2 w1 {bad:#x} must be EBADARG (fail-before: accepted at the legacy reader)"
+            );
+        }
+
+        // No child state was burned by the rejections: the next successful
+        // spawns take consecutive process and thread slots.
+        let r1 = dispatch(args(num::INVOKE, factory, msg2(0).tag, msg2(0).words));
+        assert_eq!(r1.status, ipc::status::OK as i64);
+        let r2 = dispatch(args(
+            num::INVOKE,
+            factory,
+            msg2(0x5000_0000).tag,
+            msg2(0x5000_0000).words,
+        ));
+        assert_eq!(r2.status, ipc::status::OK as i64);
+        assert_eq!(
+            r2.w[2],
+            r1.w[2] + 1,
+            "no process slot burned by the rejected calls"
+        );
+        assert_eq!(
+            r2.w[3],
+            r1.w[3] + 1,
+            "no thread slot burned by the rejected calls"
+        );
+    }
+
+    /// ADR-088: the (label, cap_count) dispatch stays total — any
+    /// cap_count outside {2, 3} is EBADARG before any child state (v0
+    /// happened to accept 0/1 by accident).
+    #[test]
+    fn a9b_new_thread_rejects_cap_count_outside_2_and_3() {
+        let (_pid, _tid, factory) = setup();
+        let r_as = dispatch(args(num::INVOKE, factory, Tag::new(3), [0; 4]));
+        let as_h = r_as.w[0] as u32;
+
+        for caps in [0u8, 1, 4] {
+            let mut m = Message::new(4);
+            m.words[0] = 0x401000;
+            m.tag = m.tag.with_caps(caps);
+            if caps >= 1 {
+                m.set_descriptor(0, CapSlot::pack(as_h, Rights::MAP))
+                    .unwrap();
+            }
+            let r = dispatch(args(num::INVOKE, factory, m.tag, m.words));
+            assert_eq!(
+                r.status,
+                ipc::status::EBADARG as i64,
+                "cap_count {caps} must be EBADARG"
+            );
+        }
+    }
+
+    /// ADR-088: Thread::BIND_FAULT_EP (label 18) — bind a live Endpoint on
+    /// a NEW_THREAD child created through the uniform packing (which
+    /// carries no fault EP), verify the target's `fault_ep` binding and
+    /// the S8-installed cap (rights ∩ requested, found by fault routing's
+    /// table scan), then clear with NULL.
+    #[test]
+    fn a9b_bind_fault_ep_binds_installs_and_clears() {
+        let (pid, _tid, factory) = setup();
+
+        let r_as = dispatch(args(num::INVOKE, factory, Tag::new(3), [0; 4]));
+        let as_h = r_as.w[0] as u32;
+        let r_ep = dispatch(args(num::INVOKE, factory, Tag::new(1), [0; 4]));
+        let ep_h = r_ep.w[0] as u32;
+        let ep_obj = proc::get_cap(pid, ep_h).unwrap().obj;
+
+        // Uniform-packing child: no fault EP.
+        let mut m = Message::new(4);
+        m.words[0] = 0x401000;
+        m.tag = m.tag.with_caps(2);
+        m.set_descriptor(0, CapSlot::pack(as_h, Rights::MAP))
+            .unwrap();
+        let r = dispatch(args(num::INVOKE, factory, m.tag, m.words));
+        assert_eq!(r.status, ipc::status::OK as i64);
+        let child_pid = ObjId(r.w[2]);
+        let child_tid = ThreadId(r.w[3]);
+        let child_thread_cap = r.w[0] as u32;
+        assert!(
+            sched::get(child_tid).unwrap().fault_ep.is_none(),
+            "uniform packing binds no fault EP"
+        );
+        // The child is Ready and executes nothing before the parent
+        // yields: the bind races nothing (ADR-017 objection, answered
+        // structurally).
+        assert!(matches!(
+            sched::get(child_tid).unwrap().state,
+            sched::State::Ready
+        ));
+
+        // BIND_FAULT_EP: caps[0] = the endpoint, requesting SEND only.
+        let mut b = Message::new(18);
+        b.tag = b.tag.with_caps(1);
+        b.set_descriptor(0, CapSlot::pack(ep_h, Rights::SEND))
+            .unwrap();
+        let r = thread_invoke_for_test(pid, child_thread_cap, b);
+        assert_eq!(r.status, ipc::status::OK as i64, "bind a live endpoint");
+        let bound = sched::get(child_tid).unwrap().fault_ep;
+        assert_eq!(bound, Some(crate::sched::ObjRef(ep_obj.0)));
+        // The target's process carries the S8 cap (rights ∩ requested =
+        // SEND), which is what fault::find_ep_cap scans for.
+        let installed = proc::get_cap(child_pid, 1).unwrap();
+        assert_eq!(installed.typ, ObjType::Endpoint);
+        assert_eq!(installed.obj, ep_obj);
+        assert_eq!(installed.rights, Rights::SEND);
+
+        // NULL clears the binding (any installed cap stays until revoked).
+        let c = Message::new(18);
+        let r = thread_invoke_for_test(pid, child_thread_cap, c);
+        assert_eq!(r.status, ipc::status::OK as i64, "NULL clears");
+        assert_eq!(sched::get(child_tid).unwrap().fault_ep, None);
+
+        proc::destroy(child_pid).unwrap();
+        crate::proc::reset_for_test();
+    }
+
+    /// ADR-088 BIND_FAULT_EP validation: non-Endpoint caps[0] → EBADARG,
+    /// GRANT-less caller cap → ERIGHTS, dead handle → EBADCAP, no
+    /// CONTROL on the target cap → ERIGHTS — each before any state
+    /// change (the binding and the target's table stay untouched).
+    #[test]
+    fn a9b_bind_fault_ep_rejects_bad_arguments_before_state() {
+        let (pid, _tid, factory) = setup();
+
+        let r_ep = dispatch(args(num::INVOKE, factory, Tag::new(1), [0; 4]));
+        let ep_h = r_ep.w[0] as u32;
+        let r_notif = dispatch(args(num::INVOKE, factory, Tag::new(2), [0; 4]));
+        let notif_h = r_notif.w[0] as u32;
+        // GRANT-less cap on the same live endpoint.
+        let ep_no_grant = proc::install_cap(
+            pid,
+            Capability {
+                obj: proc::get_cap(pid, ep_h).unwrap().obj,
+                typ: ObjType::Endpoint,
+                rights: Rights::SEND,
+            },
+        )
+        .unwrap();
+
+        // A target thread cap WITH CONTROL and one without.
+        let target = sched::spawn(ObjRef(1), 100).unwrap();
+        let tc = proc::install_cap(
+            pid,
+            Capability {
+                obj: ObjId(target.0),
+                typ: ObjType::Thread,
+                rights: Rights::CONTROL.union(Rights::GRANT),
+            },
+        )
+        .unwrap();
+        let weak = proc::install_cap(
+            pid,
+            Capability {
+                obj: ObjId(target.0),
+                typ: ObjType::Thread,
+                rights: Rights::GRANT,
+            },
+        )
+        .unwrap();
+
+        let bind_msg = |cap_h: u32, rights: ipc::Rights| {
+            let mut b = Message::new(18);
+            b.tag = b.tag.with_caps(1);
+            b.set_descriptor(0, CapSlot::pack(cap_h, rights)).unwrap();
+            b
+        };
+
+        // Non-Endpoint caps[0] → EBADARG; nothing bound.
+        let r = thread_invoke_for_test(pid, tc, bind_msg(notif_h, Rights::SIGNAL));
+        assert_eq!(r.status, ipc::status::EBADARG as i64, "non-Endpoint");
+        assert!(sched::get(target).unwrap().fault_ep.is_none());
+
+        // Caller cap without GRANT → ERIGHTS.
+        let r = thread_invoke_for_test(pid, tc, bind_msg(ep_no_grant, Rights::SEND));
+        assert_eq!(r.status, ipc::status::ERIGHTS as i64, "no GRANT");
+        assert!(sched::get(target).unwrap().fault_ep.is_none());
+
+        // Dead handle → EBADCAP.
+        let r = thread_invoke_for_test(pid, tc, bind_msg(0xDEAD, Rights::SEND));
+        assert_eq!(r.status, ipc::status::EBADCAP as i64, "unknown handle");
+
+        // No CONTROL on the target cap → ERIGHTS (thread_invoke gate).
+        let r = thread_invoke_for_test(pid, weak, bind_msg(ep_h, Rights::SEND));
+        assert_eq!(r.status, ipc::status::ERIGHTS as i64, "no CONTROL");
+
+        // Dead target → EBADCAP.
+        syscall::sys_exit(target, 0).unwrap();
+        let r = thread_invoke_for_test(pid, tc, bind_msg(ep_h, Rights::SEND));
+        assert_eq!(r.status, ipc::status::EBADCAP as i64, "dead target");
+
+        crate::proc::reset_for_test();
     }
 
     /// S4: AS::MAP/UNMAP/PROTECT must reject kernel-window, split and null

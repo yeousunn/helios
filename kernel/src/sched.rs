@@ -889,6 +889,17 @@ pub fn set_bound_notification(id: ThreadId, n: Option<ObjRef>) -> SchedResult<()
     Ok(())
 }
 
+/// Rebind a thread's fault endpoint (Thread::BIND_FAULT_EP, ADR-088;
+/// ADR-007 routing). `None` clears the binding: the next fault takes the
+/// default path (thread killed, fault.rs §2).
+pub fn set_fault_ep(id: ThreadId, ep: Option<ObjRef>) -> SchedResult<()> {
+    let mut guard = SCHED.lock();
+    let s = guard.as_mut().ok_or(SchedError::NoSuchThread)?;
+    let slot = find_slot(s, id)?;
+    s.slots.threads[slot].as_mut().unwrap().fault_ep = ep;
+    Ok(())
+}
+
 /// Exit a thread: unqueue, mark Exited, fire death notification hooks.
 /// Returns `true` if a death notification was signalled (the notification
 /// engine translates that into wakes; see endpoint module).
