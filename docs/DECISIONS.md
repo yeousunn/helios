@@ -892,3 +892,27 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 - Accepted: NV 2026-11-16 (coordinator; diagnostic ADR, no syscall/IPC wire-format/HAL-trait/milestone change; root cause is DS's bf8c0d5 `init_entry_point!` forwarding the raw BootInfo byte block into `init_main(info: &BootInfo)` without `BootInfo::parse`, so `info.factory` reads garbage → EBADCAP at STEP_ENDPOINT → exit 262143 before STEP_ALIVE/DONE; the fix is DS's sdk/ commit: entry mains take `*const u8` and parse via `sdk::sys::read_bootinfo`, and exec'd `child.rs` tolerates EBADCAP/EBADARG from `bootstrap::receive`).
 - Validation: none (diagnostic; no code or interface change). The committed gate stays red at HEAD until DS commits the sdk/ fix.
 - Consequences: ADR-072 ACCEPTED; DS owns the sdk/ commit that unblocks the boot gate, U1, and U2/U3.
+
+## ADR-074: Boot gate red at STEP_POSIX_WAIT — POSIX personality issue
+
+- Proposed: DRV 2026-11-16
+- Status: PROPOSED (awaiting investigation by DS)
+- Context: The M0 boot gate is failing at `STEP_POSIX_WAIT` (step 17) with EBADARG (errno 0xde2). The debug log shows:
+  - STEP_POSIX_SPAWN (step 16) marker logged successfully
+  - STEP_POSIX_WAIT (step 17) fails with EBADARG via `sys.call(session_ep, &m)`
+- Decision: DS needs to investigate why the POSIX personality spawn fails to wait. Possibilities include:
+  1. The POSIX demo (`/posix`, embedded in VFS ramfs) fails to load or execute
+  2. The session endpoint becomes invalid before WAIT completes
+  3. The posix_pid is invalid or already exited
+- Validation: Full `tools/qemu-test.sh` passes (reaches DONE marker + clean halt).
+- Consequences: U2 (graphics) and U3 (drivers) remain BLOCKED. Request filed on TASKS.md (DS → PSX: update posix.rs/sh.rs to use optional[1] for vfs).
+
+## ADR-067 acceptance addendum
+
+- The MMIO wrapper functions (mmio_read32, mmio_write32, mmio_read64, mmio_write64, MmioError, mmio_write_bytes) need to be added to `sdk/src/sys/raw.rs` per the accepted ADR-067. This will enable U2 and U3 to proceed once the boot gate passes.
+
+## ADR-071 update: Blockers clarification
+
+- U2 and U3 are BLOCKED on: (1) DS's U1 boot fix being complete ( Rights::default() fix), AND (2) a green qemu-test.sh boot.
+- The boot gate currently fails at STEP_POSIX_WAIT with EBADARG, which is a different issue from the original ADR-070/ADR-071 diagnosis.
+- Request filed: DS → PSX: personality bins (posix.rs, sh.rs) read vfs from optional[0] but process server now sends factory at optional[0] and vfs at optional[1]. Update posix.rs:114 and sh.rs:298 to use optional[1] for vfs.
