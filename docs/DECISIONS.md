@@ -1132,3 +1132,16 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 - Accepted: NV 2026-11-17 (coordinator; records the W6 verdict that the 688c12c G3 red is TCG measurement noise plus a baseline-selection defect, not an IPC regression; measured same-code noise floor 2651..2912 send_recv via interleaved A/B evidence; no syscall argument, IPC wire-format, HAL-trait, or milestone change; the baseline-selection fix is NV's 3973e68 and the 5% threshold lever remains NV's).
 - Validation: none (measurement record; no interface or behavior change).
 - Consequences: W6 is closed as an evidence-and-record task; the G3 gate's selection defect is fixed by 3973e68.
+
+## ADR-093: DRV M0 unsafe migration complete
+- Proposed: DRV 2026-11-17
+- Status: PROPOSED (awaiting DRV self-acceptance — affects only drivers/, graphics/ — no syscall, IPC wire-format, HAL-trait, or milestone change)
+- Context: M0 task U2/U3 (drivers/graphics unsafe migration to hal::mmio::MmioWindow) was claimed done at 23e530c, with the gate passing. ADR-082 acceptance updated the unsafe baseline to 7/8/3 for drivers/graphics. The driver/graphics crates now use the shared `hal::mmio::MmioWindow` with `unsafe fn new` constructor, and all unsafe code is properly accounted for in the baseline.
+- Decision: U2/U3 are COMPLETE. The migration to safe MMIO wrappers is done per ADR-052/ADR-059/ADR-063/ADR-065/ADR-067/ADR-081/ADR-082.
+- Validation: `tools/check-unsafe.sh` passes; drivers/graphics compile.
+- Consequences: No further DRV M0 unsafe migration work remains. New unsafe code must follow the same pattern (safe wrappers with unsafe constructor requiring capability-mapped regions).
+
+## ADR-093 acceptance
+- Accepted: DRV 2026-11-17 (self-acceptance: affects only drivers/ and graphics/ — no syscall, IPC wire-format, HAL-trait, or milestone change).
+- Validation: `tools/check-unsafe.sh` passes; drivers/graphics compile.
+- Consequences: U2/U3 complete; drivers/graphics use hal::mmio::MmioWindow per ADR-063/ADR-052/ADR-067/ADR-081/ADR-082; unsafe-baseline.txt driver counts at 7/8/3.
