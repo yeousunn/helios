@@ -7,12 +7,20 @@
 # stores them as `bench/results/<commit>.json`, and with `--compare` fails
 # when any metric regressed by more than 5% against the previous result.
 #
+# To tame run-to-run cycle-count noise (TCG/jitter makes the same HEAD swing
+# tens of percent), the image is booted `BENCH_RUNS` times (default 3) and the
+# minimum cycle count per metric is used — noise only adds cycles, so the
+# minimum is the best estimate of the true cost. Each result record stores the
+# QEMU options and a UTC timestamp so regressions can be interpreted against
+# the harness conditions that produced them.
+#
 # Usage:
-#   tools/bench.sh               # build, boot, measure, store results
+#   tools/bench.sh               # build, boot (BENCH_RUNS times), measure, store
 #   tools/bench.sh --compare     # same, plus fail on >5% regression
 #
-# Environment: CARGO_TARGET_DIR, TARGET, QEMU, QEMU_TIMEOUT, SERIAL_LOG
-# (same defaults as tools/qemu-test.sh).
+# Environment: CARGO_TARGET_DIR, TARGET, QEMU, QEMU_TIMEOUT, SERIAL_LOG,
+#              BENCH_RUNS   (boots per run, default 3)
+#              (same defaults as tools/qemu-test.sh).
 #
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -24,6 +32,7 @@ RESULTS_DIR="$ROOT/bench/results"
 QEMU="${QEMU:-qemu-system-x86_64}"
 QEMU_TIMEOUT="${QEMU_TIMEOUT:-90}"
 SERIAL_LOG="${SERIAL_LOG:-$TD/serial.log}"
+BENCH_RUNS="${BENCH_RUNS:-3}"
 
 compare=0
 [[ "${1:-}" == "--compare" ]] && compare=1
@@ -50,6 +59,7 @@ ALL_NAMES="call_reply send_recv notification_wake context_switch_same_as context
 
 echo "[bench] ===== Helios microbenchmark run (G3) ====="
 echo "[bench] target dir: $TD"
+echo "[bench] runs per commit: $BENCH_RUNS"
 
 # 1. Build the bench image.
 echo "[bench] building sdk --bin bench"
@@ -78,88 +88,99 @@ if command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN=gtimeout;
 elif command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN=timeout;
 else fail "neither 'timeout' nor 'gtimeout' found on PATH"; fi
 
-rm -f "$SERIAL_LOG"
+# Harness conditions recorded with every result (noise interpretation).
+QEMU_SUMMARY="accel=$QEMU_ACCEL cpu=max m=256M"
+TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-echo "[bench] --- QEMU boot: $QEMU (accel=$QEMU_ACCEL, init=$BENCH_BIN) ---"
-set +e
-"$TIMEOUT_BIN" "${QEMU_TIMEOUT}" "$QEMU" \
-    -machine accel="$QEMU_ACCEL" \
-    -cpu max \
-    -m 256M \
-    -kernel "$KERNEL_ELF" \
-    -serial file:"$SERIAL_LOG" \
-    -display none \
-    -no-reboot \
-    -device isa-debug-exit,iobase=0x501,iosize=0x02 \
-    -nographic \
-    </dev/null >/tmp/helios-bench-stdout.log 2>/tmp/helios-bench-stderr.log
-qemu_status=$?
-set -e
+prefix='w=[0x494e49540000fe'
 
-case "$qemu_status" in
-    1) ci_code=0 ;;   # clean halt
-    3) ci_code=2 ;;   # kernel panic
-    5) ci_code=3 ;;   # unhandled fault / shutdown
-    7) ci_code=4 ;;   # boot timeout
-    124) ci_code=4 ;; # harness timeout
-    255) ci_code=255 ;;
-    *) ci_code=1 ;;
-esac
+# Boot once, require DONE + clean halt, append "name cycles" lines to stdout.
+boot_and_parse() {
+    rm -f "$SERIAL_LOG"
+    set +e
+    "$TIMEOUT_BIN" "${QEMU_TIMEOUT}" "$QEMU" \
+        -machine accel="$QEMU_ACCEL" \
+        -cpu max \
+        -m 256M \
+        -kernel "$KERNEL_ELF" \
+        -serial file:"$SERIAL_LOG" \
+        -display none \
+        -no-reboot \
+        -device isa-debug-exit,iobase=0x501,iosize=0x02 \
+        -nographic \
+        </dev/null >/tmp/helios-bench-stdout.log 2>/tmp/helios-bench-stderr.log
+    qemu_status=$?
+    set -e
 
-if [[ "$ci_code" != "0" ]]; then
-    echo "[bench] QEMU exited with status $qemu_status (CI code $ci_code)"
-    cat /tmp/helios-bench-stderr.log 2>/dev/null || true
-    echo "--- Serial log ---"
-    cat "$SERIAL_LOG" 2>/dev/null || true
-    exit "$ci_code"
-fi
+    case "$qemu_status" in
+        1) ci_code=0 ;;   # clean halt
+        3) ci_code=2 ;;   # kernel panic
+        5) ci_code=3 ;;   # unhandled fault / shutdown
+        7) ci_code=4 ;;   # boot timeout
+        124) ci_code=4 ;; # harness timeout
+        255) ci_code=255 ;;
+        *) ci_code=1 ;;
+    esac
 
-[[ -f "$SERIAL_LOG" ]] || fail "serial log not written: $SERIAL_LOG"
-grep -aq 'clean halt' "$SERIAL_LOG" || fail "clean halt not found in serial log"
-grep -aq '494e49540000000f' "$SERIAL_LOG" || fail "DONE marker not found in serial log"
-echo "[bench] clean halt + DONE marker confirmed"
+    if [[ "$ci_code" != "0" ]]; then
+        echo "[bench] QEMU exited with status $qemu_status (CI code $ci_code)"
+        cat /tmp/helios-bench-stderr.log 2>/dev/null || true
+        echo "--- Serial log ---"
+        cat "$SERIAL_LOG" 2>/dev/null || true
+        exit "$ci_code"
+    fi
 
-# 4. Parse the bench markers: w=[0x494e495400fe<lo> <cycles> ...]
+    [[ -f "$SERIAL_LOG" ]] || fail "serial log not written: $SERIAL_LOG"
+    grep -aq 'clean halt' "$SERIAL_LOG" || fail "clean halt not found in serial log"
+    grep -aq '494e49540000000f' "$SERIAL_LOG" || fail "DONE marker not found in serial log"
+
+    grep -a 'userspace\[debug\]:' "$SERIAL_LOG" | grep -F "$prefix" | while IFS= read -r line; do
+        rest="${line#*$prefix}"           # <lo> <cycles> 0x0 0x0]
+        lo="${rest%% *}"                  # lo byte (e.g. c0)
+        rest2="${rest#* }"                # <cycles> 0x0 0x0]
+        cyc="${rest2%% *}"                # cycles
+        name="$(name_for_lo "$lo")"
+        if [[ -z "$name" ]]; then
+            echo "[bench] WARN: unknown bench lo byte $lo (cycles $cyc)" >&2
+            continue
+        fi
+        echo "$name $cyc"
+    done
+}
+
+# 4. Run the bench image BENCH_RUNS times, collecting every reported marker.
 TMP_RESULTS="$(mktemp)"
 trap 'rm -f "$TMP_RESULTS"' EXIT
 : > "$TMP_RESULTS"
 
-prefix='w=[0x494e49540000fe'
-grep -a 'userspace\[debug\]:' "$SERIAL_LOG" | grep -F "$prefix" | while IFS= read -r line; do
-    rest="${line#*$prefix}"           # <lo> <cycles> 0x0 0x0]
-    lo="${rest%% *}"                  # lo byte (e.g. c0)
-    rest2="${rest#* }"                # <cycles> 0x0 0x0]
-    cyc="${rest2%% *}"                # cycles
-    name="$(name_for_lo "$lo")"
-    if [[ -z "$name" ]]; then
-        echo "[bench] WARN: unknown bench lo byte $lo (cycles $cyc)" >&2
-        continue
-    fi
-    echo "$name $cyc"
-done > "$TMP_RESULTS"
+for (( run = 1; run <= BENCH_RUNS; run++ )); do
+    echo "[bench] --- QEMU boot run $run/$BENCH_RUNS (accel=$QEMU_ACCEL, init=$BENCH_BIN) ---"
+    boot_and_parse >> "$TMP_RESULTS"
+done
+echo "[bench] clean halt + DONE marker confirmed on all $BENCH_RUNS runs"
 
-# Collect into name -> cycles variables. A benchmark that does not report a
-# result (not yet implemented, or blocked on per-thread stacks) is skipped
-# with a warning rather than failing the run; only reported metrics are
-# stored and compared.
-get_cycles() {
-    grep -E "^$1 " "$TMP_RESULTS" | head -1 | awk '{print $2}' || true
-}
-
-present=()
+# 5. Reduce to the minimum cycle count per metric across runs. A benchmark
+#    that does not report a result (not yet implemented, or blocked on
+#    per-thread stacks) is skipped with a warning; only reported metrics are
+#    stored and compared.
+declare -a present=()
 for name in $ALL_NAMES; do
-    cyc="$(get_cycles "$name")"
-    if [[ -z "$cyc" ]]; then
+    best=""
+    while IFS=' ' read -r n c; do
+        [[ "$n" == "$name" ]] || continue
+        c=$(( c ))  # hex "0x.." -> decimal
+        if [[ -z "$best" || "$c" -lt "$best" ]]; then best="$c"; fi
+    done < "$TMP_RESULTS"
+    if [[ -z "$best" ]]; then
         echo "[bench] WARN: no result reported for $name (skipping)" >&2
         continue
     fi
-    cyc=$(( cyc ))  # hex "0x.." -> decimal, so display + compare are decimal
-    eval "CYCLES_$name='$cyc'"
+    eval "CYCLES_$name='$best'"
     present+=("$name")
 done
 [[ "${#present[@]}" -gt 0 ]] || fail "no bench results were reported at all"
 
-# 5. Store results (only metrics that were actually reported).
+# 6. Store results (only metrics that were actually reported).
 COMMIT="$(git rev-parse --verify --quiet HEAD 2>/dev/null || echo unknown)"
 mkdir -p "$RESULTS_DIR"
 {
@@ -167,13 +188,13 @@ mkdir -p "$RESULTS_DIR"
     echo "  \"commit\": \"$COMMIT\","
     echo "  \"bin\": \"sdk --bin bench\","
     echo "  \"target\": \"$TARGET\","
+    echo "  \"runs\": $BENCH_RUNS,"
+    echo "  \"timestamp\": \"$TIMESTAMP\","
+    echo "  \"qemu\": \"$QEMU_SUMMARY\","
     echo "  \"cycles\": {"
     first=1
     for name in "${present[@]}"; do
         eval "cyc=\$CYCLES_$name"
-        # The bench program prints cycle counts as hex ("0x78b4"); JSON does not
-        # accept 0x literals, so normalize to a plain decimal integer before
-        # storing so the result file round-trips through json.load.
         cyc=$(( cyc ))
         if [[ $first -eq 1 ]]; then first=0; else echo ","; fi
         printf '    "%s": %s' "$name" "$cyc"
@@ -185,10 +206,10 @@ mkdir -p "$RESULTS_DIR"
 echo "[bench] results stored: $RESULTS_DIR/$COMMIT.json"
 for name in "${present[@]}"; do
     eval "cyc=\$CYCLES_$name"
-    echo "[bench]   $name: $cyc cycles"
+    echo "[bench]   $name: $cyc cycles (min over $BENCH_RUNS runs)"
 done
 
-# 6. --compare: fail on any regression above 5% versus the previous result.
+# 7. --compare: fail on any regression above 5% versus the previous result.
 if [[ "$compare" -eq 1 ]]; then
     prev=""
     prev_commit="$(git rev-parse --verify --quiet "HEAD~1" 2>/dev/null || echo unknown)"
