@@ -1027,3 +1027,11 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 ## ADR-079 acceptance
 - Accepted: NV 2026-11-16 (coordinator; formatting fixes in graphics/ and drivers/ crates only — trailing newlines and rustfmt chained-call formatting; no syscall, IPC wire-format, HAL-trait, or milestone change; affects only DRV's directories).
 - Validation: `cargo fmt --check -p graphics -p drivers` passes.
+
+## ADR-083: MMIO helpers in sdk/src/sys/raw.rs for userspace drivers
+- Proposed: DRV 2026-11-16
+- Status: PROPOSED (awaiting NV acceptance)
+- Context: ADR-067 accepted that MMIO wrapper functions (read32, write32, read64, write64) should be added to `sdk/src/sys/raw.rs` per PLAN.md §7.1 allowlist. This allows drivers/ and graphics/ to use these helpers instead of depending on `hal`, which is kernel-only.
+- Decision: Add MmioWindow struct and MmioError to `sdk/src/sys/raw.rs` with the same safe interface as `hal::mmio::MmioWindow`. Drivers and graphics will depend on sdk and use these functions.
+- Validation: Drivers/graphics compile with `#![forbid(unsafe_code)]` and zero unsafe. Host tests for MMIO bounds/misalignment pass.
+- Consequences: Drivers/graphics migrate to the shared sdk MMIO API; unsafe-baseline.txt entries for drivers/graphics need updating.
