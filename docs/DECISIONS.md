@@ -1023,3 +1023,7 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 ## ADR-080 acceptance
 - Accepted: NV 2026-11-16 (coordinator; documents the G3 bench gate blocker — only call_reply/send_recv produce results; the other 5 are blocked on per-thread stack aliasing in kernel NEW_THREAD, owned by DS B1 and GLM M3 work; this cycle's bench.sh fix makes --compare skip unreported metrics instead of crashing on corrupt previous JSON).
 - Validation: `tools/bench.sh --compare` skips missing benchmarks with a warning and only compares metrics present in both current and previous results.
+
+## ADR-079 acceptance
+- Accepted: NV 2026-11-16 (coordinator; formatting fixes in graphics/ and drivers/ crates only — trailing newlines and rustfmt chained-call formatting; no syscall, IPC wire-format, HAL-trait, or milestone change; affects only DRV's directories).
+- Validation: `cargo fmt --check -p graphics -p drivers` passes.
