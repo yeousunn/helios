@@ -158,8 +158,8 @@ fn ps_main() -> ! {
         core::hint::black_box(&v);
     }
 
-    // 4. Mint our service endpoint through the Factory (tail[0]).
-    let factory = match package.optional[0] {
+    // 4. Mint our service endpoint through the Factory (optional[4]).
+    let factory = match package.optional[4] {
         Some(cap) => cap.handle(),
         None => Syscalls::new(&mut raw).exit(0xE1),
     };
@@ -557,9 +557,10 @@ fn spawn_child(
         return Err(ipc::status::ENOMEM);
     }
     // 7. ADR-009 package: fixed prefix + the optional tail (design §2.3
-    //    order: factory, vfs, stdin, stdout, stderr), holes preserved
-    //    positionally. The factory cap (tail[0]) lets children spawn further
-    //    processes (required for attack mode).
+    //    order: vfs, stdin, stdout, stderr, factory), holes preserved
+    //    positionally. The factory cap (tail[4]) lets children spawn further
+    //    processes (required for attack mode). Personality bins expect vfs at
+    //    optional[0], so factory is placed after the four stdio caps.
     let session_rights = Rights::SIGNAL.union(Rights::RECV).union(Rights::GRANT);
     let mut caps = [CapSlot::NULL; bootstrap::FIXED_CAPS + 5];
     caps[0] = CapSlot::pack(child_as, Rights::MAP.union(Rights::GRANT));
@@ -570,13 +571,15 @@ fn spawn_child(
     caps[5] = CapSlot::pack(s2, session_rights);
     caps[6] = CapSlot::pack(s3, session_rights);
     caps[7] = CapSlot::pack(service_ep, Rights::SEND.union(Rights::GRANT));
-    caps[bootstrap::FIXED_CAPS] = CapSlot::pack(factory, Rights::ALL);
-    let mut total = bootstrap::FIXED_CAPS + 1;
     for (i, extra) in extras.iter().enumerate() {
         if let Some((handle, rights)) = extra {
-            caps[bootstrap::FIXED_CAPS + 1 + i] = CapSlot::pack(*handle, *rights);
-            total = bootstrap::FIXED_CAPS + 2 + i;
+            caps[bootstrap::FIXED_CAPS + i] = CapSlot::pack(*handle, *rights);
         }
+    }
+    caps[bootstrap::FIXED_CAPS + 4] = CapSlot::pack(factory, Rights::ALL);
+    let mut total = bootstrap::FIXED_CAPS + 5;
+    while total > bootstrap::FIXED_CAPS && caps[total - 1].handle() == ipc::NULL_HANDLE {
+        total -= 1;
     }
     // 6. PS's death binding on the child thread.
     let mut bind = Message::new(methods::thread::BIND_DEATH_NOTIFICATION);

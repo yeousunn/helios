@@ -190,7 +190,7 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
 
     // Steps 18–19: the console server. Spawned before everything else that
     // might want to print: it receives the kernel debug endpoint as its
-    // package tail (`optional[1]`) — the launcher is the only process that
+    // package tail (`optional[0]`) — the launcher is the only process that
     // holds it — and forwards console writes to the serial line. Later
     // spawns hand its service endpoint to children as stdio (design §2.3).
     let (console_svc, console_death) = {
@@ -1140,13 +1140,14 @@ fn spawn_server(
             .map_err(|e| fail_code(step, 0xE7_00 | (e as u64 & 0xFF)))?;
     }
 
-    // ADR-009 package: §2.3 prefix + ADR-023 tail[0] = Factory.
+    // ADR-009 package: §2.3 prefix + optional tail (vfs, stdin, stdout, stderr, factory).
+    // The `extra` cap (if any) goes to optional[0] (vfs position); factory at optional[4].
     let sr = Rights::SIGNAL.union(Rights::RECV).union(Rights::GRANT);
     let boot = bootstrap_ep;
     {
         let mut sys = Syscalls::new(raw);
         let mut hdr = Message::new(bootstrap::PACKAGE_LABEL);
-        hdr.words[0] = bootstrap::FIXED_CAPS as u64 + if extra.is_some() { 2 } else { 1 };
+        hdr.words[0] = bootstrap::FIXED_CAPS as u64 + 5; // 5 optional caps
         hdr.words[1] = pid;
         sys.send(boot, &hdr)
             .map_err(|e| fail_code(step, 0xE8_00 | (e as u64 & 0xFF)))?;
@@ -1169,15 +1170,21 @@ fn spawn_server(
         sys.send(boot, &c2)
             .map_err(|e| fail_code(step, 0xE8_02 | (e as u64 & 0xFF)))?;
 
-        let extra_count = if extra.is_some() { 2 } else { 1 };
         let mut c3 = Message::new(bootstrap::PACKAGE_LABEL);
-        c3.tag = c3.tag.with_caps(extra_count);
-        let _ = c3.set_descriptor(0, CapSlot::pack(info.factory, Rights::ALL));
+        c3.tag = c3.tag.with_caps(4);
+        // optional[0] = extra (vfs/debug), optional[1] = stdin, optional[2] = stdout, optional[3] = stderr
         if let Some(x) = extra {
-            let _ = c3.set_descriptor(1, x);
+            let _ = c3.set_descriptor(0, x);
         }
+        // optional[1], [2], [3] stay NULL (no stdin/stdout/stderr for system servers)
         sys.send(boot, &c3)
             .map_err(|e| fail_code(step, 0xE8_03 | (e as u64 & 0xFF)))?;
+
+        let mut c4 = Message::new(bootstrap::PACKAGE_LABEL);
+        c4.tag = c4.tag.with_caps(1);
+        let _ = c4.set_descriptor(0, CapSlot::pack(info.factory, Rights::ALL));
+        sys.send(boot, &c4)
+            .map_err(|e| fail_code(step, 0xE8_04 | (e as u64 & 0xFF)))?;
     }
 
     Ok(Spawned {

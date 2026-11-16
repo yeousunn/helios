@@ -171,8 +171,8 @@ fn vfs_main() -> ! {
         Syscalls::new(&mut raw).exit(0xE3_00 | (e & 0xFF));
     }
 
-    // 3. Service endpoint through the package Factory (tail[0]).
-    let factory = match package.optional[0] {
+    // 3. Service endpoint through the package Factory (optional[4]).
+    let factory = match package.optional[4] {
         Some(cap) => cap.handle(),
         None => Syscalls::new(&mut raw).exit(0xE1),
     };

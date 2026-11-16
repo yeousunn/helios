@@ -1,6 +1,6 @@
 //! Helios auth server (v0, ADR-048).
 //!
-//! Bootstrap: the standard server package — `optional[0]` = the Factory
+//! Bootstrap: the standard server package — `optional[4]` = the Factory
 //! (ADR-023). Mints its service endpoint, publishes it in the ready
 //! callback, then answers `auth::CHECK` calls (short credentials packed in
 //! four message words). `KILL` acks and exits (the v0 shutdown convention).
@@ -37,7 +37,7 @@ fn auth_main() -> ! {
             Err(e) => exit(e),
         }
     };
-    let factory = match package.optional[0] {
+    let factory = match package.optional[4] {
         Some(cap) => cap.handle(),
         None => exit(0xE1),
     };

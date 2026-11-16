@@ -47,7 +47,7 @@ pub const FAIL_NO_PACKAGE: i32 = FAIL_BASE | 0x100;
 
 /// Run every case against the live kernel; return `0` if all bad calls were
 /// rejected, else `FAIL_BASE | (index + 1)` for the first one that was not.
-/// `factory` is the Factory capability handle (from optional[0]) needed for
+/// `factory` is the Factory capability handle (from optional[4]) needed for
 /// cases that spawn threads (S2).
 pub fn run<R: RawSyscalls>(sys: &mut Syscalls<R>, pkg: &BootstrapPackage, factory: u32) -> i32 {
     // Append one entry per S-task as it lands. Keep the order stable: the

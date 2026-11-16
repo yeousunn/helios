@@ -67,13 +67,11 @@ fn child_main(argc: u64, argv_va: u64, _envp_va: u64) -> ! {
     //    the parent (shell), so handle 1 is invalid (EBADCAP) or points to a
     //    different capability (EBADARG). In that case we proceed without a
     //    package — the smoke path only needs argv[0].
+    //    Be permissive: any error means "no package", since a fresh spawn
+    //    would have succeeded and we only reach here for exec or attack mode.
     let package = {
         let mut sys = Syscalls::new(&mut raw);
-        match sdk::bootstrap::receive(&mut sys) {
-            Ok(p) => Some(p),
-            Err(ipc::status::EBADCAP) | Err(ipc::status::EBADARG) => None,
-            Err(e) => Syscalls::new(&mut raw).exit(e),
-        }
+        sdk::bootstrap::receive(&mut sys).ok()
     };
 
     // 2. Fast path: smoke test only needs argv[0] as decimal exit status.
@@ -121,8 +119,8 @@ fn child_main(argc: u64, argv_va: u64, _envp_va: u64) -> ! {
             Syscalls::new(&mut raw).exit(e);
         }
 
-        // Attack mode needs the factory cap (optional[0]) for spawning.
-        let factory = package.optional[0].expect("attack mode requires factory cap");
+        // Attack mode needs the factory cap (optional[4]) for spawning.
+        let factory = package.optional[4].expect("attack mode requires factory cap");
         let status = {
             let mut sys = Syscalls::new(&mut raw);
             sdk::attack::run(&mut sys, &package, factory.handle())

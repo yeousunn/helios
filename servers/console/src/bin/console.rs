@@ -1,8 +1,8 @@
 //! Helios console server binary (v0).
 //!
-//! Bootstrap: standard server package (prefix + `optional[0]` = Factory per
-//! ADR-023), plus `optional[1]` = the kernel debug endpoint (`SEND`), which
-//! the launcher supplies because only it holds that capability. The server
+//! Bootstrap: standard server package (prefix + `optional[0]` = vfs/debug,
+//! `optional[4]` = Factory per ADR-023). The launcher supplies the debug
+//! endpoint at optional[0] because only it holds that capability. The server
 //! mints its service endpoint, publishes it in the ready callback, then
 //! forwards every received message to the debug endpoint (serial output).
 //! `KILL` acks and exits (the v0 shutdown convention, same as PS/VFS).
@@ -38,11 +38,11 @@ fn console_main() -> ! {
         Err(e) => exit(e),
     };
 
-    let factory = match package.optional[0] {
+    let debug = match package.optional[0] {
         Some(cap) => cap.handle(),
         None => exit(0xE1),
     };
-    let debug = match package.optional[1] {
+    let factory = match package.optional[4] {
         Some(cap) => cap.handle(),
         None => exit(0xE2),
     };
