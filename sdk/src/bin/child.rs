@@ -119,11 +119,9 @@ fn child_main(argc: u64, argv_va: u64, _envp_va: u64) -> ! {
             Syscalls::new(&mut raw).exit(e);
         }
 
-        // Attack mode needs the factory cap (optional[4]) for spawning.
-        let factory = package.optional[4].expect("attack mode requires factory cap");
         let status = {
             let mut sys = Syscalls::new(&mut raw);
-            sdk::attack::run(&mut sys, &package, factory.handle())
+            sdk::attack::run(&mut sys, &package)
         };
         Syscalls::new(&mut raw).exit(status)
     }
