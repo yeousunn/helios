@@ -168,11 +168,17 @@ fn bench_call_reply(
 
     // Create a server endpoint for the call/reply test.
     let server_ep = mint_ep(&mut sys, factory_ep)?;
-    let client_ep = mint_ep(&mut sys, factory_ep)?;
 
     // Spawn a server thread that does reply_recv in a loop.
-    let (server_thread, _server_pid) =
-        spawn_thread(&mut sys, factory_ep, self_as, region, server_ep)?;
+    let server_entry = thread_entry_reply_recv_loop as *const () as u64;
+    let (server_thread, _server_pid) = spawn_thread(
+        &mut sys,
+        factory_ep,
+        self_as,
+        region,
+        server_ep,
+        server_entry,
+    )?;
 
     // Bind death notification to clean up.
     let death_notif = mint_notification(&mut sys, factory_ep)?;
@@ -192,14 +198,14 @@ fn bench_call_reply(
     // Warmup.
     for _ in 0..WARMUP_ITERS {
         let m = Message::new(0x1000);
-        let _ = sys.call(client_ep, &m).map_err(err_to_u64)?;
+        let _ = sys.call(server_ep, &m).map_err(err_to_u64)?;
     }
 
     // Measure.
     let start = rdtsc();
     for _ in 0..MEASURE_ITERS {
         let m = Message::new(0x1000);
-        let _ = sys.call(client_ep, &m).map_err(err_to_u64)?;
+        let _ = sys.call(server_ep, &m).map_err(err_to_u64)?;
     }
     let end = rdtsc();
 
@@ -254,8 +260,9 @@ fn bench_notification_wake(
     let notif = mint_notification(&mut sys, factory_ep)?;
 
     // Spawn a thread that blocks on the notification.
+    let recv_entry = thread_entry_recv_loop as *const () as u64;
     let (waiter_thread, _pid) =
-        spawn_thread_with_notif(&mut sys, factory_ep, self_as, region, notif)?;
+        spawn_thread_with_notif(&mut sys, factory_ep, self_as, region, notif, recv_entry)?;
 
     // Bind death notification.
     let death_notif = mint_notification(&mut sys, factory_ep)?;
@@ -314,8 +321,9 @@ fn bench_context_switch_same_as(
     let ep1 = mint_ep(&mut sys, factory_ep)?;
     let ep2 = mint_ep(&mut sys, factory_ep)?;
 
-    let (thread1, _) = spawn_thread(&mut sys, factory_ep, self_as, region, ep1)?;
-    let (thread2, _) = spawn_thread(&mut sys, factory_ep, self_as, region, ep2)?;
+    let recv_entry = thread_entry_recv_loop as *const () as u64;
+    let (thread1, _) = spawn_thread(&mut sys, factory_ep, self_as, region, ep1, recv_entry)?;
+    let (thread2, _) = spawn_thread(&mut sys, factory_ep, self_as, region, ep2, recv_entry)?;
 
     // Bind death notifications.
     let death1 = mint_notification(&mut sys, factory_ep)?;
@@ -406,10 +414,11 @@ fn bench_context_switch_diff_as(
     let ep = mint_ep(&mut sys, factory_ep)?;
 
     // Spawn thread in first AS.
-    let (thread1, _) = spawn_thread(&mut sys, factory_ep, self_as, region, ep)?;
+    let recv_entry = thread_entry_recv_loop as *const () as u64;
+    let (thread1, _) = spawn_thread(&mut sys, factory_ep, self_as, region, ep, recv_entry)?;
 
     // Spawn thread in second AS.
-    let (thread2, _) = spawn_thread(&mut sys, factory_ep, as2, region, ep)?;
+    let (thread2, _) = spawn_thread(&mut sys, factory_ep, as2, region, ep, recv_entry)?;
 
     // Bind death notifications.
     let death1 = mint_notification(&mut sys, factory_ep)?;
@@ -582,20 +591,41 @@ fn mint_notification(sys: &mut Syscalls<X86_64Syscalls>, factory: Handle) -> Res
     Ok(handle)
 }
 
-/// Spawn a thread that parks on `recv` at the given endpoint.
+/// Thread entry point: loops on `recv` using handle 1 (bootstrap endpoint).
+/// This runs in a fresh thread with no heap; uses only raw syscalls.
+extern "C" fn thread_entry_recv_loop() -> ! {
+    let mut raw = X86_64Syscalls;
+    let mut sys = Syscalls::new(&mut raw);
+    let bootstrap_ep: Handle = 1; // handle 1 = bootstrap endpoint installed by NEW_THREAD
+    loop {
+        let _ = sys.recv(bootstrap_ep);
+    }
+}
+
+/// Thread entry point: loops on `reply_recv` using handle 1 (bootstrap endpoint).
+/// Used for the call/reply benchmark server thread.
+extern "C" fn thread_entry_reply_recv_loop() -> ! {
+    let mut raw = X86_64Syscalls;
+    let mut sys = Syscalls::new(&mut raw);
+    let bootstrap_ep: Handle = 1; // handle 1 = bootstrap endpoint installed by NEW_THREAD
+    let msg = Message::new(0);
+    loop {
+        let _ = sys.reply_recv(bootstrap_ep, &msg);
+    }
+}
+
+/// Spawn a thread with the given entry function that parks on `recv`/`reply_recv` at the given endpoint.
 fn spawn_thread(
     sys: &mut Syscalls<X86_64Syscalls>,
     factory: Handle,
     aspace: Handle,
     _region: Handle,
     ep: Handle,
+    entry_pc: u64,
 ) -> Result<(Handle, u64)> {
-    // Create thread with entry point at a small stub that loops on recv.
-    let entry_stub = THREAD_ENTRY_STUB;
-
     let mut m = Message::new(methods::factory::NEW_THREAD);
     m.tag = m.tag.with_caps(3);
-    m.words[0] = entry_stub;
+    m.words[0] = entry_pc;
     let _ = m.set_descriptor(0, CapSlot::pack(aspace, Rights::MAP.union(Rights::GRANT)));
     let _ = m.set_descriptor(1, CapSlot::NULL); // fault EP
     let _ = m.set_descriptor(2, CapSlot::pack(ep, Rights::RECV)); // bootstrap EP = the endpoint to park on
@@ -610,7 +640,6 @@ fn spawn_thread(
         return Err(fail_code(STEP_SETUP, 0xE4));
     }
 
-    // The thread starts and immediately parks on recv at `ep`.
     Ok((thread_cap, pid))
 }
 
@@ -621,12 +650,11 @@ fn spawn_thread_with_notif(
     aspace: Handle,
     _region: Handle,
     notif: Handle,
+    entry_pc: u64,
 ) -> Result<(Handle, u64)> {
-    let entry_stub = THREAD_ENTRY_STUB;
-
     let mut m = Message::new(methods::factory::NEW_THREAD);
     m.tag = m.tag.with_caps(3);
-    m.words[0] = entry_stub;
+    m.words[0] = entry_pc;
     let _ = m.set_descriptor(0, CapSlot::pack(aspace, Rights::MAP.union(Rights::GRANT)));
     let _ = m.set_descriptor(1, CapSlot::NULL);
     let _ = m.set_descriptor(2, CapSlot::pack(notif, Rights::RECV)); // bootstrap EP = notification
@@ -666,14 +694,6 @@ fn carve_frame(sys: &mut Syscalls<X86_64Syscalls>, region: Handle) -> Result<Han
     }
     Ok(handle)
 }
-
-/// A minimal thread entry stub that parks on its bootstrap endpoint.
-/// This is a virtual address in the child's address space where we map
-/// a tiny piece of code that does `recv` in a loop.
-/// For simplicity, we use the kernel's ability to set the entry PC directly.
-/// The thread will start at this PC and execute the code we map there.
-/// We'll map a page at USER_STACK_TOP - 4096 with the stub code.
-const THREAD_ENTRY_STUB: u64 = 0x401000; // Same as SCRATCH_PC in attack.rs
 
 /// Exit with a failure code.
 fn exit_with(code: u64) -> ! {

@@ -139,7 +139,10 @@ fn case_regs_write_invalid_entry_pc<R: RawSyscalls>(
 ///
 /// `THREAD_CREATE` is a Thread-cap method (spec/abi::invoke), not a Factory
 /// method. The child holds CONTROL on its own thread cap (pkg.thread).
-fn case_thread_create_kernel_pc<R: RawSyscalls>(sys: &mut Syscalls<R>, pkg: &BootstrapPackage) -> bool {
+fn case_thread_create_kernel_pc<R: RawSyscalls>(
+    sys: &mut Syscalls<R>,
+    pkg: &BootstrapPackage,
+) -> bool {
     let mut m = Message::new(crate::methods::thread::THREAD_CREATE);
     m.words[0] = KERNEL_PC;
     sys.invoke(pkg.thread, &m).is_err()
