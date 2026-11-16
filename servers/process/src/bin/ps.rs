@@ -654,8 +654,8 @@ fn load_via_vfs(
         }
         // Map frames using WindowMapper to get MappedWindow for bounds-checked access.
         let mut mapper = WindowMapper::new(package.aspace, ARG_VA, 2);
-        let arg_window = mapper.window_of(sys, arg_frame as u64, FLAG_READ | FLAG_WRITE)?;
-        let result_window = mapper.window_of(sys, result_frame as u64, FLAG_READ | FLAG_WRITE)?;
+        let _arg_window = mapper.window_of(sys, arg_frame, FLAG_READ | FLAG_WRITE)?;
+        let _result_window = mapper.window_of(sys, result_frame, FLAG_READ | FLAG_WRITE)?;
         // Cache frames for potential future use (though WindowMapper is recreated each call).
         LOAD_ARG_FRAME.store(arg_frame, Ordering::Relaxed);
         LOAD_RESULT_FRAME.store(result_frame, Ordering::Relaxed);
