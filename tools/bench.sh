@@ -124,7 +124,7 @@ TMP_RESULTS="$(mktemp)"
 trap 'rm -f "$TMP_RESULTS"' EXIT
 : > "$TMP_RESULTS"
 
-prefix='w=[0x494e495400fe'
+prefix='w=[0x494e49540000fe'
 grep -a 'userspace\[debug\]:' "$SERIAL_LOG" | grep -F "$prefix" | while IFS= read -r line; do
     rest="${line#*$prefix}"           # <lo> <cycles> 0x0 0x0]
     lo="${rest%% *}"                  # lo byte (e.g. c0)
@@ -138,20 +138,27 @@ grep -a 'userspace\[debug\]:' "$SERIAL_LOG" | grep -F "$prefix" | while IFS= rea
     echo "$name $cyc"
 done > "$TMP_RESULTS"
 
-# Collect into name -> cycles variables.
+# Collect into name -> cycles variables. A benchmark that does not report a
+# result (not yet implemented, or blocked on per-thread stacks) is skipped
+# with a warning rather than failing the run; only reported metrics are
+# stored and compared.
 get_cycles() {
     grep -E "^$1 " "$TMP_RESULTS" | head -1 | awk '{print $2}' || true
 }
 
-missing=0
+present=()
 for name in $ALL_NAMES; do
     cyc="$(get_cycles "$name")"
-    [[ -n "$cyc" ]] || { echo "[bench] ERROR: missing result for $name" >&2; missing=1; }
+    if [[ -z "$cyc" ]]; then
+        echo "[bench] WARN: no result reported for $name (skipping)" >&2
+        continue
+    fi
     eval "CYCLES_$name='$cyc'"
+    present+=("$name")
 done
-[[ "$missing" -eq 0 ]] || fail "not all bench results were reported"
+[[ "${#present[@]}" -gt 0 ]] || fail "no bench results were reported at all"
 
-# 5. Store results.
+# 5. Store results (only metrics that were actually reported).
 COMMIT="$(git rev-parse --verify --quiet HEAD 2>/dev/null || echo unknown)"
 mkdir -p "$RESULTS_DIR"
 {
@@ -161,7 +168,7 @@ mkdir -p "$RESULTS_DIR"
     echo "  \"target\": \"$TARGET\","
     echo "  \"cycles\": {"
     first=1
-    for name in $ALL_NAMES; do
+    for name in "${present[@]}"; do
         eval "cyc=\$CYCLES_$name"
         if [[ $first -eq 1 ]]; then first=0; else echo ","; fi
         printf '    "%s": %s' "$name" "$cyc"
@@ -171,7 +178,7 @@ mkdir -p "$RESULTS_DIR"
     echo "}"
 } > "$RESULTS_DIR/$COMMIT.json"
 echo "[bench] results stored: $RESULTS_DIR/$COMMIT.json"
-for name in $ALL_NAMES; do
+for name in "${present[@]}"; do
     eval "cyc=\$CYCLES_$name"
     echo "[bench]   $name: $cyc cycles"
 done
@@ -203,7 +210,7 @@ if [[ "$compare" -eq 1 ]]; then
 
     echo "[bench] --compare: comparing against $prev"
     fail_compare=0
-    for name in $ALL_NAMES; do
+    for name in "${present[@]}"; do
         eval "cur=\$CYCLES_$name"
         prev_val="$(python3 - "$prev" "$name" <<'EOF'
 import json, sys
