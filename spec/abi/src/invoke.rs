@@ -385,7 +385,7 @@ pub const THREAD_REGS_WRITE: InvokeSpec = InvokeSpec {
             name: "image",
             range: (0, u64::MAX),
             range_error: ErrorCode::EBADARG,
-            description: "10 qwords of register image (w0..w3 = first 4, rest implicit)",
+            description: "10 qwords of register image (w0..w3 = first 4, rest implicit). Slot 1 (user RSP) and slot 2 (entry PC) must be canonical non-null user addresses (< 0x8000_0000_0000_0000); EBADARG otherwise. Slot 3 (RFLAGS) is masked, never an error.",
         },
     ],
     descriptors: &[
@@ -393,7 +393,7 @@ pub const THREAD_REGS_WRITE: InvokeSpec = InvokeSpec {
     ],
     errors: &[ErrorCode::OK, ErrorCode::EBADCAP, ErrorCode::ERIGHTS, ErrorCode::EBADARG, ErrorCode::EBADSTATE, ErrorCode::EREVOKED],
     commutativity: Commutativity::Commutes,
-    description: "Write the target thread's user register image. caps[0] = Frame cap (validating access). Image slot 2 (entry PC) must be canonical user address.",
+    description: "Write the target thread's user register image. caps[0] = Frame cap (validating access). Image slot 1 (user RSP, S2d) and slot 2 (entry PC, S2b) must be canonical user addresses — either faulting value would reach iretq from ring 0.",
 };
 
 // ============================================================================

@@ -669,6 +669,13 @@ fn thread_invoke(
                 if !sched::is_user_addr(image[2]) {
                     return SyscallReturn::err(ipc::status::EBADARG);
                 }
+                // S2d: validate the user RSP (image slot 1) the same way —
+                // the last iretq-loaded register reachable from the register
+                // image; a kernel-window, non-canonical or null value would
+                // fault in ring 0 at iretq.
+                if !sched::is_user_addr(image[1]) {
+                    return SyscallReturn::err(ipc::status::EBADARG);
+                }
                 match sched::regs_write(target, &image) {
                     Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
                     Err(sched::SchedError::BadArg) => SyscallReturn::err(ipc::status::EBADARG),
@@ -1843,6 +1850,95 @@ mod tests {
         let r = thread_invoke_for_test(pid, tc, m);
         assert_eq!(r.status, ipc::status::OK as i64, "valid REGS_WRITE pc");
         assert_eq!(sched::get(target).unwrap().initial_pc, 0x405000);
+
+        crate::proc::reset_for_test();
+        *crate::sched::SCHED.lock() = None;
+    }
+
+    /// S2d: REGS_WRITE must reject kernel-window, non-canonical and null
+    /// user RSPs (image slot 1) with EBADARG — the target's rebuilt init
+    /// context would fault in ring 0 at iretq, exactly like a bad entry PC
+    /// (S2b). Slot 1 is the last iretq-loaded register reachable from the
+    /// register image (RFLAGS is masked by S1, CS/SS are kernel constants).
+    #[test]
+    fn s2d_regs_write_rejects_invalid_user_rsp() {
+        let (pid, _tid, _factory) = setup();
+        let target = sched::spawn_with(ObjRef(1), 100, 0x401000).unwrap();
+        static FAKE: Mutex<[u64; 512]> = Mutex::new([0; 512]);
+        let base = FAKE.lock().as_ptr() as u64;
+        sched::set_kstack(target, base, 1).unwrap();
+        let top = base + crate::frame::FRAME_SIZE as u64;
+        crate::mem::seed_reg_image(top, &[0x1111; 10]);
+        let tc = proc::install_cap(
+            pid,
+            Capability {
+                obj: ObjId(target.0),
+                typ: ObjType::Thread,
+                rights: Rights::CONTROL.union(Rights::GRANT),
+            },
+        )
+        .unwrap();
+        let r = thread_invoke_for_test(pid, tc, Message::new(3));
+        assert_eq!(r.status, ipc::status::OK as i64, "SUSPEND");
+        let frame_h = proc::install_cap(
+            pid,
+            Capability {
+                obj: ObjId(0xE0_0000),
+                typ: ObjType::Frame,
+                rights: Rights::READ.union(Rights::WRITE),
+            },
+        )
+        .unwrap();
+
+        // Establish a known-good image first: arg=0xAAAA, RSP=0x7FFF_0000,
+        // PC=0x405000.
+        let mut m = Message::new(10);
+        m.words = [0xAAAA, 0x7FFF_0000, 0x405000, 0x202];
+        m.tag = m.tag.with_caps(1);
+        m.set_descriptor(0, CapSlot::pack(frame_h, Rights::READ))
+            .unwrap();
+        let r = thread_invoke_for_test(pid, tc, m);
+        assert_eq!(r.status, ipc::status::OK as i64, "valid REGS_WRITE");
+
+        // REGS_WRITE with invalid user RSPs in image[1]: kernel window,
+        // non-canonical, the user/kernel split itself, and null → all
+        // EBADARG, and nothing changes on rejection.
+        for bad in [
+            0xFFFF_8000_0100_0000, // kernel window (ADR-045)
+            0xFFFF_FFFF_FFFF_F000, // non-canonical
+            0x0000_8000_0000_0000, // user/kernel split
+            0,                     // null
+        ] {
+            let mut m = Message::new(10);
+            m.words = [0xAAAA, bad, 0x405000, 0x202];
+            m.tag = m.tag.with_caps(1);
+            m.set_descriptor(0, CapSlot::pack(frame_h, Rights::READ))
+                .unwrap();
+            let r = thread_invoke_for_test(pid, tc, m);
+            assert_eq!(
+                r.status,
+                ipc::status::EBADARG as i64,
+                "REGS_WRITE rsp={bad:#x}"
+            );
+            // The target's state must not change on rejection.
+            let t = sched::get(target).unwrap();
+            assert_eq!(t.state, crate::sched::State::Suspended);
+            assert_eq!(t.initial_pc, 0x405000, "pc unchanged after rejection");
+            assert_eq!(
+                t.user_regs[1], 0x7FFF_0000,
+                "user RSP unchanged after rejection"
+            );
+        }
+
+        // A valid user RSP still works after the rejections.
+        let mut m = Message::new(10);
+        m.words = [0xAAAA, 0x7FFF_F000, 0x405000, 0x202];
+        m.tag = m.tag.with_caps(1);
+        m.set_descriptor(0, CapSlot::pack(frame_h, Rights::READ))
+            .unwrap();
+        let r = thread_invoke_for_test(pid, tc, m);
+        assert_eq!(r.status, ipc::status::OK as i64, "valid REGS_WRITE rsp");
+        assert_eq!(sched::get(target).unwrap().user_regs[1], 0x7FFF_F000);
 
         crate::proc::reset_for_test();
         *crate::sched::SCHED.lock() = None;

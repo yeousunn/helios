@@ -787,6 +787,13 @@ pub fn regs_write(id: ThreadId, image: &[u64; REG_IMAGE_QWORDS]) -> SchedResult<
     if !is_user_addr(image[2]) {
         return Err(SchedError::BadArg);
     }
+    // S2d: validate the user RSP (image slot 1) the same way — the last
+    // iretq-loaded register reachable from the register image; a
+    // kernel-window, non-canonical or null value would fault in ring 0 at
+    // iretq.
+    if !is_user_addr(image[1]) {
+        return Err(SchedError::BadArg);
+    }
     let backend = *CTX.lock();
     let Some(b) = backend else {
         return Err(SchedError::NoSuchThread);
@@ -1483,6 +1490,9 @@ mod tests {
         regs_read(t, &mut image).unwrap();
         assert_eq!(image[0], 0, "arg");
         image[0] = 0xdead;
+        // S2d: the image must describe a valid entry context — a canonical
+        // non-null user RSP (image[1]); 0 is rejected like a null entry PC.
+        image[1] = 0x7FFF_F000;
         image[2] = 0x405000;
         regs_write(t, &image).unwrap();
 
