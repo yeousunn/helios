@@ -40,7 +40,7 @@
 //! o 16: u32 region_count
 //! o 20: u32 self_as handle (0 = none; v0.1+, ADR-023)
 //! o 24: u32 console_in handle (0 = none; v1 only, ADR-043)
-//! o 28: u32 reserved (0)
+//! o 28: u32 self_thread handle (0 = none; ADR-089; formerly reserved)
 //! o 32: region_count × { u32 handle; u32 reserved; u64 base; u64 len }
 //! ```
 //!
@@ -67,8 +67,11 @@ pub const OFF_REGION_COUNT: usize = 16;
 pub const OFF_SELF_AS: usize = 20;
 /// Offset of the console_in handle u32 (v1 only; 0 = none).
 pub const OFF_CONSOLE_IN: usize = 24;
-/// Offset of the reserved u32 (v1 only; always 0).
-pub const OFF_RESERVED: usize = 28;
+/// Offset of the self_thread handle u32 (ADR-089; 0 = none). The launcher's
+/// own Thread cap, so it can invoke THREAD_CREATE on itself (same-AS sibling
+/// threads with RFC-0004/ADR-085 stack tops). Occupies the word reserved
+/// since ADR-043; readers predating ADR-089 treat it as reserved.
+pub const OFF_SELF_THREAD: usize = 28;
 /// Header length in bytes of a v0 block (regions start here).
 pub const HEADER_LEN_V0: usize = 24;
 /// Header length in bytes of a v1 block (regions start here).
@@ -114,6 +117,7 @@ mod tests {
         let factory: u32 = 9;
         let self_as: u32 = 3;
         let console_in: u32 = 11;
+        let self_thread: u32 = 13;
         let (handle, base, len): (u32, u64, u64) = (5, 0x1000_0000, 0x4000_0000);
 
         let mut block = [0u8; BOOTINFO_MAX_LEN];
@@ -129,7 +133,7 @@ mod tests {
         put(OFF_REGION_COUNT, 1, 4);
         put(OFF_SELF_AS, self_as as u64, 4);
         put(OFF_CONSOLE_IN, console_in as u64, 4);
-        put(OFF_RESERVED, 0, 4);
+        put(OFF_SELF_THREAD, self_thread as u64, 4);
         put(HEADER_LEN_V1, handle as u64, 4);
         put(HEADER_LEN_V1 + 8, base, 8);
         put(HEADER_LEN_V1 + 16, len, 8);
@@ -143,7 +147,11 @@ mod tests {
         assert_eq!(rd32(OFF_REGION_COUNT), 1);
         assert_eq!(rd32(OFF_SELF_AS), self_as);
         assert_eq!(rd32(OFF_CONSOLE_IN), console_in);
-        assert_eq!(rd32(OFF_RESERVED), 0);
+        assert_eq!(
+            rd32(OFF_SELF_THREAD),
+            self_thread,
+            "self_thread at o28 (ADR-089)"
+        );
         assert_eq!(rd32(HEADER_LEN_V1), handle);
         assert_eq!(rd64(HEADER_LEN_V1 + 8), base);
         assert_eq!(rd64(HEADER_LEN_V1 + 16), len);
@@ -154,7 +162,7 @@ mod tests {
     #[test]
     fn length_constants_are_consistent() {
         assert_eq!(HEADER_LEN_V0, OFF_CONSOLE_IN);
-        assert_eq!(HEADER_LEN_V1, OFF_RESERVED + 4);
+        assert_eq!(HEADER_LEN_V1, OFF_SELF_THREAD + 4);
         assert_eq!(REGION_LEN, 4 + 4 + 8 + 8);
         assert_eq!(BOOTINFO_MAX_LEN, HEADER_LEN_V1 + MAX_REGIONS * REGION_LEN);
         assert!(HEADER_LEN_V0 < HEADER_LEN_V1);

@@ -38,6 +38,10 @@ pub struct BootInfoV0 {
     /// ADR-043: console-in endpoint cap handle (0 = none). Offset 24 (v1);
     /// init may delegate it (GRANT) to a server or the interactive shell.
     pub console_in: u32,
+    /// ADR-089: the launcher's own Thread cap handle (0 = none). Offset 28
+    /// (the formerly-reserved u32), so the launcher can invoke THREAD_CREATE
+    /// on itself (same-AS sibling threads, RFC-0004/ADR-085 stack tops).
+    pub self_thread: u32,
     /// (handle, base, len) triples, in grant order.
     pub regions: [(u32, u64, u64); MAX_BOOT_REGIONS],
     pub region_count: u32,
@@ -51,7 +55,7 @@ pub const MAX_BOOT_REGIONS: usize = helios_abi::entry::MAX_REGIONS;
 /// ```text
 /// u32 magic; u32 version(1); u32 debug_ep; u32 factory;
 /// u32 region_count; u32 self_as;
-/// u32 console_in; u32 reserved;
+/// u32 console_in; u32 self_thread (ADR-089, formerly reserved);
 /// then region_count × { u32 handle; u32 reserved; u64 base; u64 len }
 /// ```
 /// Returns the number of bytes written. Regions beyond `MAX_BOOT_REGIONS`
@@ -75,7 +79,7 @@ pub fn write_bootinfo(buf: &mut [u8], info: &BootInfoV0) -> usize {
     w(spec::OFF_REGION_COUNT, count as u64, 4);
     w(spec::OFF_SELF_AS, info.self_as as u64, 4);
     w(spec::OFF_CONSOLE_IN, info.console_in as u64, 4);
-    w(spec::OFF_RESERVED, 0, 4);
+    w(spec::OFF_SELF_THREAD, info.self_thread as u64, 4);
     for (i, &(handle, base, len)) in info.regions[..count].iter().enumerate() {
         let off = spec::HEADER_LEN_V1 + i * spec::REGION_LEN;
         w(off, handle as u64, 4);
@@ -139,6 +143,7 @@ pub fn start(regions: &[BootRegion]) -> Result<InitLaunch, &'static str> {
         factory,
         self_as: 0,
         console_in: 0,
+        self_thread: 0,
         regions: [(0, 0, 0); MAX_BOOT_REGIONS],
         region_count: regions.len() as u32,
     };
@@ -190,6 +195,22 @@ pub fn start(regions: &[BootRegion]) -> Result<InitLaunch, &'static str> {
 
     let thread = sched::spawn(ObjRef(pid.0), sched::DEFAULT_PRIORITY)
         .map_err(|_| "cannot spawn init thread")?;
+
+    // ADR-089: grant the launcher a Thread cap on itself (obj = the thread's
+    // scheduler slot id, rights CONTROL|GRANT — the same pair a NEW_THREAD
+    // parent and a THREAD_CREATE reply receive) so it can invoke
+    // THREAD_CREATE on itself: same-AS sibling threads with RFC-0004/ADR-085
+    // stack tops. Serialized into BootInfo at OFF_SELF_THREAD.
+    let self_thread = proc::install_cap(
+        pid,
+        Capability {
+            obj: ObjId(thread.0),
+            typ: ObjType::Thread,
+            rights: Rights::CONTROL.union(Rights::GRANT),
+        },
+    )
+    .map_err(|_| "cannot grant self-Thread")?;
+    info.self_thread = self_thread;
 
     Ok(InitLaunch {
         pid,
@@ -402,6 +423,7 @@ mod tests {
             factory: 3,
             self_as: 9,
             console_in: 7,
+            self_thread: 13,
             regions,
             region_count: 2,
         };
@@ -421,7 +443,11 @@ mod tests {
             7,
             "console_in at offset 24 (ADR-043)"
         );
-        assert_eq!(rd32(spec::OFF_RESERVED), 0, "reserved");
+        assert_eq!(
+            rd32(spec::OFF_SELF_THREAD),
+            13,
+            "self_thread at offset 28 (ADR-089, formerly reserved)"
+        );
         // Region records start at the v1 header length; base/len are u64
         // fields at +8/+16 inside the record.
         let rec0 = spec::HEADER_LEN_V1;
@@ -448,6 +474,7 @@ mod tests {
             factory: 3,
             self_as: 9,
             console_in: 7,
+            self_thread: 13,
             regions: [(4, 0x100000, 0x40000); MAX_BOOT_REGIONS],
             region_count: MAX_BOOT_REGIONS as u32,
         };
@@ -472,6 +499,7 @@ mod tests {
             factory: 0,
             self_as: 0,
             console_in: 0,
+            self_thread: 0,
             regions: [(0, 0, 0); MAX_BOOT_REGIONS],
             region_count: 0,
         };
@@ -515,6 +543,41 @@ mod tests {
         assert_eq!(len, 0x40000);
         // Thread spawned.
         assert!(sched::get(launch.thread).is_ok());
+    }
+
+    /// ADR-089 end-to-end: the launcher's BootInfo `self_thread` cap invokes
+    /// THREAD_CREATE on itself, and the sibling (custom RFC-0004/ADR-085
+    /// stack top) lands in the launcher's own process. This is the path B1's
+    /// same-AS benchmarks use once sdk parses the field (DS board task).
+    #[test]
+    fn bootinfo_self_thread_invokes_thread_create_on_itself() {
+        setup();
+        let launch = start(&[BootRegion {
+            base: PhysAddr::new(0x10_0000),
+            len: 0x40000,
+        }])
+        .unwrap();
+        // The BootInfo handle resolves to the launcher's own thread cap.
+        let cap = proc::get_cap(launch.pid, launch.bootinfo.self_thread).unwrap();
+        assert_eq!(cap.typ, ObjType::Thread);
+        assert_eq!(cap.obj, ObjId(launch.thread.0));
+        assert_eq!(cap.rights, Rights::CONTROL.union(Rights::GRANT));
+
+        // THREAD_CREATE through the self cap: sibling in the same process.
+        let mut m = Message::new(13); // THREAD_CREATE
+        m.words[0] = 0x402000; // entry PC
+        m.words[1] = 0x5000_0000; // RFC-0004/ADR-085 stack top (aligned user VA)
+        let r = crate::entry::thread_invoke_for_test(launch.pid, launch.bootinfo.self_thread, m);
+        assert_eq!(
+            r.status,
+            ipc::status::OK as i64,
+            "THREAD_CREATE via the self cap"
+        );
+        let sibling = ThreadId(r.w[1]);
+        assert_ne!(sibling, launch.thread);
+        let sib = sched::get(sibling).unwrap();
+        assert_eq!(sib.process, sched::get(launch.thread).unwrap().process);
+        assert_eq!(sib.initial_pc, 0x402000);
     }
 
     #[test]
