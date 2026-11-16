@@ -721,8 +721,9 @@ pub fn sys_exit(tid: ThreadId, status: i32) -> SysResult<bool> {
         }
     }
     // ADR-026: last thread out retires the process.
-    if !sched::process_has_live_threads(proc_ref) {
-        let pid = proc::from_ref(proc_ref);
+    let pid = proc::from_ref(proc_ref);
+    let process_dead = !sched::process_has_live_threads(proc_ref);
+    if process_dead {
         for (typ, obj) in crate::objreg::retire_owner(pid) {
             if obj.0 == 0 {
                 continue;
@@ -744,6 +745,16 @@ pub fn sys_exit(tid: ThreadId, status: i32) -> SysResult<bool> {
     // (QEMU exit code 0) so harnesses observe a fixed success state.
     if sched::thread_count() == 0 && crate::panic::has_exit_hook() {
         crate::panic::clean_exit();
+    }
+    // ADR-078: the launcher process (pid 1, the boot orchestrator) dying
+    // while other user threads are still live ends the boot — no component
+    // can manage the system any more. Without this the kernel idles with the
+    // parked servers until the harness timeout (observed at a9b9f63: init
+    // exits a step fail_code after a server/attack failure while the
+    // console/VFS/auth servers stay parked; QEMU hit its 90 s timeout and a
+    // fast, diagnosable boot failure was classified "boot hung").
+    if process_dead && pid.0 == 1 && sched::thread_count() > 0 && crate::panic::has_exit_hook() {
+        crate::panic::launcher_shutdown(status, sched::thread_count());
     }
     Ok(fired)
 }
@@ -1259,6 +1270,58 @@ mod tests {
             }
             Ok(_) => panic!("expected clean halt"),
         }
+    }
+
+    /// ADR-078: the launcher process (pid 1) dying while other user threads
+    /// are still live shuts the system down deterministically (code 0) — a
+    /// failed boot must not idle with parked servers until the harness
+    /// timeout. A launcher thread exiting while its process still has live
+    /// threads must NOT halt (the ADR-026/ADR-028 paths are unchanged).
+    #[test]
+    fn launcher_exit_with_live_threads_shuts_down() {
+        use std::string::{String, ToString};
+        let (_pid, _server, _client, _ep) = setup();
+        // A second process ("a server") whose thread stays live.
+        let srv_pid = proc::create().unwrap();
+        let _srv_thread = sched::spawn(ObjRef(srv_pid.0), 100).unwrap();
+        crate::panic::set_exit_code(|code| {
+            std::panic::panic_any(format_args!("LAUNCHER_SHUTDOWN_{}", code).to_string());
+        });
+        // Launcher thread exits, but the launcher process still has a live
+        // thread: no retire, no halt.
+        assert_eq!(sys_exit(_server, 0), Ok(false));
+        // The launcher process's LAST thread exits while the server thread is
+        // live: deterministic shutdown with code 0 (ADR-013).
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = sys_exit(_client, 2097141);
+        }));
+        match result {
+            Err(payload) => {
+                let msg = payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .unwrap_or_default();
+                assert_eq!(
+                    msg, "LAUNCHER_SHUTDOWN_0",
+                    "launcher shutdown must use code 0 (ADR-013)"
+                );
+            }
+            Ok(_) => panic!("expected deterministic launcher shutdown"),
+        }
+    }
+
+    /// ADR-078 negative: a non-launcher process's death never halts the
+    /// system — only the launcher process (pid 1) ends the boot.
+    #[test]
+    fn non_launcher_process_death_does_not_halt() {
+        let (_pid, _server, _client, _ep) = setup();
+        let owner_pid = proc::create().unwrap(); // pid 2 — not the launcher
+        let owner_thread = sched::spawn(ObjRef(owner_pid.0), 100).unwrap();
+        // No hook registered: even a pid-1 exit must not panic here (the
+        // ADR-078 path is inert without a hook, like ADR-028's).
+        assert_eq!(sys_exit(_server, 0), Ok(false));
+        assert_eq!(sys_exit(owner_thread, 0), Ok(false));
+        assert_eq!(sched::thread_count(), 1, "the launcher client stays live");
     }
 
     /// ADR-041: park with a past deadline → ETIMEDOUT without parking.

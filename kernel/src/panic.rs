@@ -41,6 +41,21 @@ pub fn clean_exit() -> ! {
     exit_with(0)
 }
 
+/// Deterministic shutdown when the launcher process dies while other user
+/// threads are still live (ADR-078): the launcher owns the boot sequence, so
+/// its death ends the boot even though parked servers keep thread_count > 0.
+/// Code 0 per ADR-013 (an orderly shutdown, not a panic); harnesses report
+/// the failed boot through the missing DONE marker. The line says "clean
+/// halt" so the harness's halt check matches an orderly halt.
+pub fn launcher_shutdown(status: i32, live_threads: usize) -> ! {
+    crate::kinfo!(
+        "LAUNCHER-EXIT: launcher exited (status {}) with {} user threads live — clean halt (ADR-078)",
+        status,
+        live_threads
+    );
+    exit_with(0)
+}
+
 #[cfg_attr(test, allow(dead_code))]
 fn panic_exit() -> ! {
     if let Some(f) = EXIT_HOOK.lock().take() {
