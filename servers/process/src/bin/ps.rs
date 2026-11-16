@@ -35,6 +35,7 @@ use sdk::methods;
 use sdk::sys::SysHeap;
 use sdk::sys::{raw_copy_from_va, raw_copy_from_va_to_u64x3, raw_copy_to_va};
 use sdk::syscall::{Syscalls, X86_64Syscalls, REPLY_CAP};
+use sdk::window::{MappedWindow, WindowMapper, FLAG_READ, FLAG_WRITE};
 
 include!(concat!(env!("OUT_DIR"), "/child_image.rs"));
 
@@ -82,6 +83,9 @@ static CONN_PIDS: [AtomicU64; MAX_CONNS] = [const { AtomicU64::new(0) }; MAX_CON
 /// so per-load connections exhausted the VFS's window mapper after ~60 loads.
 static LOAD_CONN: AtomicU32 = AtomicU32::new(0);
 static LOAD_ROOT: AtomicU64 = AtomicU64::new(0);
+/// Cached window frames for the dedicated load path (mapped once, reused).
+static LOAD_ARG_FRAME: AtomicU32 = AtomicU32::new(0);
+static LOAD_RESULT_FRAME: AtomicU32 = AtomicU32::new(0);
 
 fn child_slot(pid: u64) -> Option<usize> {
     if pid == 0 {
@@ -627,8 +631,8 @@ fn load_via_vfs(
     // Dedicated load-window area, clear of the per-connection window pairs
     // (`PS_WINDOW_VA_BASE + slot * 0x2000`). Mapped once and kept for the
     // whole run (the connection and its windows are cached).
-    let arg_va = PS_WINDOW_VA_BASE + 0x10_0000;
-    let result_va = PS_WINDOW_VA_BASE + 0x10_1000;
+    const ARG_VA: u64 = PS_WINDOW_VA_BASE + 0x10_0000;
+    const RESULT_VA: u64 = PS_WINDOW_VA_BASE + 0x10_1000;
     let mut conn_ep = LOAD_CONN.load(Ordering::Relaxed);
     let mut root = LOAD_ROOT.load(Ordering::Relaxed);
     if conn_ep == 0 {
@@ -648,9 +652,13 @@ fn load_via_vfs(
         if session == 0 || arg_frame == 0 || result_frame == 0 {
             return Err(ipc::status::ENOMEM);
         }
-        for (frame, va) in [(arg_frame, arg_va), (result_frame, result_va)] {
-            invoke_map(sys, package.aspace, va, 0b011, frame as u64)?;
-        }
+        // Map frames using WindowMapper to get MappedWindow for bounds-checked access.
+        let mut mapper = WindowMapper::new(package.aspace, ARG_VA, 2);
+        let arg_window = mapper.window_of(sys, arg_frame as u64, FLAG_READ | FLAG_WRITE)?;
+        let result_window = mapper.window_of(sys, result_frame as u64, FLAG_READ | FLAG_WRITE)?;
+        // Cache frames for potential future use (though WindowMapper is recreated each call).
+        LOAD_ARG_FRAME.store(arg_frame, Ordering::Relaxed);
+        LOAD_RESULT_FRAME.store(result_frame, Ordering::Relaxed);
         let mut connect = Message::new(methods::vfs::CONNECT);
         connect.tag = connect.tag.with_caps(3);
         connect.words[0] = 1;
@@ -686,7 +694,9 @@ fn load_via_vfs(
     // Read path from caller's window and copy to VFS arg window.
     let mut path = vec![0u8; path_len];
     raw_copy_from_va(params.win_base + path_off as u64, &mut path);
-    raw_copy_to_va(arg_va, &path);
+    // ARG_VA is a valid mapped window frame (mapped during initial connect).
+    let arg_window = MappedWindow::from_mapped_va(ARG_VA);
+    arg_window.write(0, &path)?;
     let mut open = Message::new(methods::vfs::OPEN);
     open.words[0] = root;
     open.words[1] = path_len as u64; // Span { off 0, len path_len }
@@ -728,7 +738,9 @@ fn load_via_vfs(
         }
         let start = buf.len();
         buf.resize(start + count, 0);
-        raw_copy_from_va(result_va, &mut buf[start..]);
+        // RESULT_VA is a valid mapped window frame (mapped during initial connect).
+        let result_window = MappedWindow::from_mapped_va(RESULT_VA);
+        result_window.read_into(0, count as u32, &mut buf[start..])?;
         offset += count as u64;
         if count < 4096 {
             break;

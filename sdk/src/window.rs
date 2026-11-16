@@ -30,13 +30,26 @@ pub const FLAG_WRITE: u32 = 1 << 1;
 /// A live window mapping in the current address space. Constructible by
 /// [`WindowMapper`] — and by SDK-internal code that has just performed the
 /// mapping invoke itself (the loader's scratch copies); the field is
-/// `pub(crate)` so external crates cannot fabricate one.
+/// `pub(crate)` so external crates cannot fabricate one directly.
+/// Use [`MappedWindow::from_mapped_va`] for trusted callers that manage
+/// their own window mappings (e.g., servers mapping frames into their own AS).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct MappedWindow {
     pub(crate) va: u64,
 }
 
 impl MappedWindow {
+    /// Create a `MappedWindow` from a known mapped VA.
+    ///
+    /// The caller must ensure that `va` is a valid, currently mapped window frame
+    /// with appropriate permissions for the intended access (read/write).
+    /// The VA must be page-aligned and point to a frame mapped via `AS::MAP`.
+    /// This function is safe to call but has a safety contract that is not
+    /// enforced by the type system; violating it can cause memory safety issues.
+    pub fn from_mapped_va(va: u64) -> Self {
+        Self { va }
+    }
+
     pub fn va(&self) -> u64 {
         self.va
     }
