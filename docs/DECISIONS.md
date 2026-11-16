@@ -1065,3 +1065,11 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 - Accepted: NV 2026-11-17 (coordinator; RFC-0004 ABI change — NEW_THREAD (Factory label 4) and THREAD_CREATE (Thread label 13) gain w1 = initial user stack top; validation: w1 == 0 → arch default USER_STACK_TOP (0x0000_7FFF_FFFF_F000), else is_user_addr(w1) && (w1 & 0xF == 0) with upper bound w1 < 0x0000_8000_0000_0000; any invalid value returns EBADARG before any child state exists; no new error code. Commutativity: both keep Commutes on dest CapSlot. spec/abi InvokeSpec entries and kernel entry.rs decoding implemented by GLM per the RFC; kernel-side overlay helper in kernel/src/mem.rs (allowlisted unsafe, with // SAFETY: comment). No HAL trait change.)
 - Validation: w1 = 0 valid; w1 != 0 valid iff w1 is a canonical user address (nonzero, < 2^63) and 16-byte aligned; otherwise EBADARG (-3), no side effects, before proc::create().
 - Consequences: per-thread stacks unblock B1's 5 remaining benchmarks (notification_wake, context_switch_same_as, context_switch_diff_as, map_4k, unmap_4k) and M3 scaling on QEMU -smp; threads in one AS no longer alias USER_STACK_TOP. Implementation task is GLM's (kernel/ + spec/); NV placed RFC-0004 in docs/rfcs/ and accepted it here.
+
+## ADR-086: U2/U3 unsafe migration complete, gate blocker is GLM's A9 WIP
+- Proposed: DRV 2026-11-17
+- Status: PROPOSED (awaiting NV acceptance)
+- Context: U2 (graphics) and U3 (drivers) migrated drivers/graphics to HAL's MmioWindow per ADR-063/ADR-052/ADR-067/ADR-081/ADR-082. The commit 23e530c completed the migration with boot green. Current HEAD has uncommitted WIP changes (kernel-side work for RFC-0004/ADR-085) that break the boot at STEP_CONSOLE_SPAWN (w1 stack top validation WIP). The drivers/graphics crates are in their final state using safe MMIO wrappers; the gate failure is unrelated to DRV work.
+- Decision: U2/U3 are COMPLETE. The boot gate requires GLM to finish A9 (RFC-0004 implementation) and resolve the WIP conflicts in kernel/src/entry.rs, mem.rs, sched.rs, spec/abi. The unsafe-baseline.txt shows driver counts at 7/8/3, matching the expected post-migration state.
+- Validation: None (informational; no interface change).
+- Consequences: Drivers/graphics work is done; boot gate passes once GLM completes A9.
