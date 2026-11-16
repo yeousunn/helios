@@ -48,6 +48,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
 ## W0: Fix gate blocker (BLOCKED)
 
+- [~ GLM started 2026-11-16] W3 GLM: kernel half of the boot hang — sys_exit discards the parked caller of a dead callee (implicit reply pair dropped), so init stayed Blocked(Reply) forever after PS's OOM exit (QEMU 124 at 9aa7935). Wake the parked caller with EDEAD on callee exit; host test; spec/abi CALL error list gains EDEAD (ErrorCode table re-aligned to ipc::status).
 - [x DS done 2026-11-16] U4c2b DS (SDK part): `MappedWindow::read_into` (no-alloc, bounds-checked like `write`) in `sdk/src/window.rs` with tests. Server integration (vfs.rs, ps.rs) pending.
 - [x DS done 2026-11-16 a682d1f] U4c3b DS: the shared safe guest-memory copy type in sdk per ADR-073; personality's local GuestMemory (U4c3a) is the interim until it lands.
 - [ ] U2 DRV: BLOCKED on DS boot fix. Make `graphics` `#![forbid(unsafe_code)]` through shared MMIO wrappers (ADR-067), drop `tools/unsafe-baseline.txt` entry.
