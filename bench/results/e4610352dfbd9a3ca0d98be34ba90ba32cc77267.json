@@ -1,0 +1,12 @@
+{
+  "commit": "e4610352dfbd9a3ca0d98be34ba90ba32cc77267",
+  "bin": "sdk --bin bench",
+  "target": "x86_64-unknown-none",
+  "runs": 3,
+  "timestamp": "2026-11-16T18:33:46Z",
+  "qemu": "accel=tcg cpu=max m=256M",
+  "cycles": {
+    "call_reply": 16855,
+    "send_recv": 2825
+  }
+}
