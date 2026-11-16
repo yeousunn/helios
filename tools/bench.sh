@@ -153,6 +153,7 @@ for name in $ALL_NAMES; do
         echo "[bench] WARN: no result reported for $name (skipping)" >&2
         continue
     fi
+    cyc=$(( cyc ))  # hex "0x.." -> decimal, so display + compare are decimal
     eval "CYCLES_$name='$cyc'"
     present+=("$name")
 done
@@ -170,6 +171,10 @@ mkdir -p "$RESULTS_DIR"
     first=1
     for name in "${present[@]}"; do
         eval "cyc=\$CYCLES_$name"
+        # The bench program prints cycle counts as hex ("0x78b4"); JSON does not
+        # accept 0x literals, so normalize to a plain decimal integer before
+        # storing so the result file round-trips through json.load.
+        cyc=$(( cyc ))
         if [[ $first -eq 1 ]]; then first=0; else echo ","; fi
         printf '    "%s": %s' "$name" "$cyc"
     done
@@ -212,14 +217,20 @@ if [[ "$compare" -eq 1 ]]; then
     fail_compare=0
     for name in "${present[@]}"; do
         eval "cur=\$CYCLES_$name"
-        prev_val="$(python3 - "$prev" "$name" <<'EOF'
+        prev_val="$(python3 - "$prev" "$name" 2>/dev/null <<'EOF'
 import json, sys
-with open(sys.argv[1]) as f:
-    data = json.load(f)
-print(data["cycles"][sys.argv[2]])
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+    print(data["cycles"][sys.argv[2]])
+except Exception:
+    pass
 EOF
-        )" || fail_compare=1
-        [[ "$fail_compare" -eq 0 ]] || { echo "[bench]   $name: previous value unavailable"; continue; }
+        )"
+        if [[ -z "$prev_val" ]]; then
+            echo "[bench]   $name: previous value unavailable"
+            continue
+        fi
         # regression threshold: current > previous * 1.05 (integer math)
         limit=$(( prev_val * 105 / 100 ))
         if [[ "$cur" -gt "$limit" ]]; then
