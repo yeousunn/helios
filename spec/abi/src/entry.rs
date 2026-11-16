@@ -18,6 +18,13 @@
 //!    its image entry with no register arguments. Its ADR-009 bootstrap
 //!    package arrives on the endpoint the spawner passed in caps[2]
 //!    (installed at the child's handle 1 per the NEW_THREAD invoke spec).
+//!    The package's optional tail is ordered
+//!    `[vfs, stdin, stdout, stderr, factory]` = tail[0..=4] (constants
+//!    [`PACKAGE_TAIL_*`] below); absent slots are NULL descriptors.
+//!    PROCESS_SPAWN's positional input caps (vfs, stdin, stdout, stderr)
+//!    map one-to-one onto tail[0..=3] and the spawner's Factory always
+//!    rides at tail[4] (contract shipped by 61568a9; pinned here per the
+//!    ADR-073 rule that every entry-path change updates this module first).
 //! 3. **EXEC entry.** A thread re-targeted by PROCESS_SET_ENTRY keeps its
 //!    thread identity and registers; the launcher crafts a 3-word stack
 //!    header read as `[rsp - 8]` = argc, `[rsp - 16]` = argv*,
@@ -72,6 +79,28 @@ pub const MAX_REGIONS: usize = 8;
 pub const REGION_LEN: usize = 24;
 /// Upper bound a parser may read: v1 header plus all regions.
 pub const BOOTINFO_MAX_LEN: usize = HEADER_LEN_V1 + MAX_REGIONS * REGION_LEN;
+
+/// ADR-009 bootstrap package: fixed prefix caps
+/// (aspace, thread, region, 4 session notifications, ps service endpoint).
+pub const PACKAGE_FIXED_CAPS: usize = 8;
+/// Tail slot 0: the VFS service endpoint the SPAWN caller supplied (or, for
+/// directly launched servers, the launcher's extra cap — the console's
+/// kernel debug endpoint).
+pub const PACKAGE_TAIL_VFS: usize = 0;
+/// Tail slot 1: stdin (stream endpoint; NULL = none).
+pub const PACKAGE_TAIL_STDIN: usize = 1;
+/// Tail slot 2: stdout (console endpoint; NULL = none).
+pub const PACKAGE_TAIL_STDOUT: usize = 2;
+/// Tail slot 3: stderr / the ADR-048 auth endpoint for `/login` (NULL = none).
+pub const PACKAGE_TAIL_STDERR: usize = 3;
+/// Tail slot 4: the spawner's FACTORY capability (`Rights::ALL`) — every
+/// spawned process can spawn further processes (attack mode, shells).
+pub const PACKAGE_TAIL_FACTORY: usize = 4;
+/// Tail slots a receiver materializes; [5..8) are reserved and absent.
+pub const PACKAGE_OPTIONAL_SLOTS: usize = 8;
+/// Upper bound on total package caps (fixed + tail) a deliverer may send:
+/// `deliver` fails ETOOBIG and a receiver fails EBADARG outside this range.
+pub const PACKAGE_MAX_CAPS: usize = 16;
 
 #[cfg(test)]
 mod tests {
@@ -132,5 +161,54 @@ mod tests {
         // A v0 region start (24) would collide with the v1 console_in word:
         // that is exactly why v0 and v1 blocks cannot share a parser path
         // without the version check.
+    }
+
+    /// ADR-009 package arithmetic: the 8-cap fixed prefix, five defined tail
+    /// slots in the shipped order (vfs, stdin, stdout, stderr, factory), the
+    /// reserved remainder of the 8 materialized tail slots, and the 16-cap
+    /// package ceiling.
+    #[test]
+    fn package_tail_constants_are_consistent() {
+        // Fixed prefix: aspace + thread + region + 4 sessions + ps ep.
+        assert_eq!(PACKAGE_FIXED_CAPS, 3 + 4 + 1);
+        // Tail order is dense from 0 and the factory is last.
+        let order = [
+            PACKAGE_TAIL_VFS,
+            PACKAGE_TAIL_STDIN,
+            PACKAGE_TAIL_STDOUT,
+            PACKAGE_TAIL_STDERR,
+            PACKAGE_TAIL_FACTORY,
+        ];
+        for (i, slot) in order.iter().enumerate() {
+            assert_eq!(*slot, i, "tail slot {i} drifted");
+        }
+        // Reserved tail slots exist above the factory.
+        assert!(PACKAGE_TAIL_FACTORY + 1 < PACKAGE_OPTIONAL_SLOTS);
+        // Package ceiling covers fixed prefix plus all tail slots.
+        assert_eq!(
+            PACKAGE_MAX_CAPS,
+            PACKAGE_FIXED_CAPS + PACKAGE_OPTIONAL_SLOTS
+        );
+    }
+
+    /// PROCESS_SPAWN's positional input caps (design §2.6: vfs, stdin,
+    /// stdout, stderr at descriptors 0..=3) land on the same tail slots, and
+    /// the spawner's Factory rides at tail[4] — the mapping the process
+    /// server (writer) and the personality (readers) must agree on.
+    #[test]
+    fn spawn_descriptors_map_onto_tail_slots() {
+        let spawn_order = [
+            PACKAGE_TAIL_VFS,
+            PACKAGE_TAIL_STDIN,
+            PACKAGE_TAIL_STDOUT,
+            PACKAGE_TAIL_STDERR,
+        ];
+        for (descriptor, slot) in spawn_order.iter().enumerate() {
+            assert_eq!(
+                *slot, descriptor,
+                "spawn descriptor {descriptor} left the tail order"
+            );
+        }
+        assert_eq!(PACKAGE_TAIL_FACTORY, PACKAGE_TAIL_STDERR + 1);
     }
 }
