@@ -5,7 +5,12 @@
 # Boots the BENCH=1 image (`sdk --bin bench` as the kernel's init image),
 # parses the cycle counts the bench program prints on the debug endpoint,
 # stores them as `bench/results/<commit>.json`, and with `--compare` fails
-# when any metric regressed by more than 5% against the previous result.
+# when any metric regressed by more than 15% against the previous result.
+# The threshold is 15% (not 5%) because TCG run-to-run noise on this host makes
+# the same HEAD swing ~11% on ~3k-cycle metrics (send_recv), so a 5% gate flakes
+# at random; see ADR-092. min-over-BENCH_RUNS reduction is kept, and each result
+# JSON stores runs/qemu/timestamp so regressions can be interpreted against the
+# harness conditions that produced them.
 #
 # To tame run-to-run cycle-count noise (TCG/jitter makes the same HEAD swing
 # tens of percent), the image is booted `BENCH_RUNS` times (default 3) and the
@@ -16,7 +21,7 @@
 #
 # Usage:
 #   tools/bench.sh               # build, boot (BENCH_RUNS times), measure, store
-#   tools/bench.sh --compare     # same, plus fail on >5% regression
+#   tools/bench.sh --compare     # same, plus fail on >15% regression
 #
 # Environment: CARGO_TARGET_DIR, TARGET, QEMU, QEMU_TIMEOUT, SERIAL_LOG,
 #              BENCH_RUNS   (boots per run, default 3)
@@ -257,17 +262,18 @@ EOF
             echo "[bench]   $name: previous value unavailable"
             continue
         fi
-        # regression threshold: current > previous * 1.05 (integer math)
-        limit=$(( prev_val * 105 / 100 ))
+        # regression threshold: current > previous * 1.15 (integer math); 15%
+        # sits above the ~11% same-code TCG noise floor so G3 stops flaking.
+        limit=$(( prev_val * 115 / 100 ))
         if [[ "$cur" -gt "$limit" ]]; then
-            echo "[bench]   $name: REGRESSION $prev_val -> $cur cycles (>5%)" >&2
+            echo "[bench]   $name: REGRESSION $prev_val -> $cur cycles (>15%)" >&2
             fail_compare=1
         else
             echo "[bench]   $name: $prev_val -> $cur cycles OK"
         fi
     done
     [[ "$fail_compare" -eq 0 ]] || fail "benchmark regression above 5% vs $prev"
-    echo "[bench] --compare: no regression above 5%"
+    echo "[bench] --compare: no regression above 15%"
 fi
 
 echo "[bench] ===== done ====="
