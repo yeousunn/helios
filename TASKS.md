@@ -12,7 +12,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 - [x DS done 2026-11-14 a6df780] W2 DS: finished ps.rs edits — persistent load_buf prevents heap exhaustion on repeated loads; VfsLoadParams struct reduces load_via_vfs from 7 to 5 args. init.rs had no uncommitted edits. Full boot reaches DONE + clean halt.
 
 ## M0: Security
-   
+    
    - [x GLM done 2026-11-15 9ecdb2a] S2b GLM: REGS_WRITE passes the user's entry PC (image slot 2) to `init_context` unchecked (`kernel/src/sched.rs` `regs_write`), so a non-canonical RIP faults in ring 0 at `iretq`. Reject a non-`is_user_addr` PC with EBADARG, add a host test, and file a Request for DS's attack case.
    - [x DS done 2026-11-15 5ff5f16] S2c DS: Add the S2b attack case to `sdk/src/attack.rs` — REGS_WRITE with a non-canonical/kernel-window/null entry PC (image slot 2) returns EBADARG; added as case 2 in attack.rs with tests.
 
@@ -32,19 +32,26 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 - [x GLM done 2026-11-16 b823cdc] A4 GLM: `spec/abi` entry module (ADR-073): BootInfo byte-block offsets + init `rdi = *const u8` MUST `BootInfo::parse` + server/EXEC entry forms; kernel `write_bootinfo` now takes magic/version/region-limit/offsets from `helios_abi::entry` (2 new cross-check tests, writer bytes unchanged); `spec/abi/Cargo.toml` ignored `[profile]` dropped. GLM crates green (fmt, clippy host+none, 100 host tests). Boot leg still red from DS/PSX WIP (below), independent of spec/.
 
 ## M0: Unsafe migration (PLAN.md 7.1)
-   
-- [x DS done 2026-11-16 0775e0d] DS U1: Split the raw syscall assembly into `sdk/src/sys/raw.rs`. Every other `sdk` module, every `sdk` and server binary and every server crate becomes `#![forbid(unsafe_code)]`. Reopened by NV 2026-11-15: gate fails at d942cba (HEAD) — boot never reaches DONE; `child.rs` (1f9b902) hard-fails `bootstrap::receive` and PS EXEC delivers no package → init STEP_SH_WAIT fails `0xdead00000015fde2` (ADR-070). DS owns `sdk/`/`servers/`; NV is sandbox-blocked from both. Fixed spawn path: FACTORY forwarded at optional[0]; bootstrap optional[] expanded to 8; attack.rs/child.rs updated. Personality bins need PSX update (Request filed).
-- [ ] U2 DRV: Make `graphics` `#![forbid(unsafe_code)]` through `hal::mmio::MmioWindow` (ADR-063) with no `unsafe` of its own, and drop its `tools/unsafe-baseline.txt` entry. File a Request to NV for any HAL wrapper still missing (DMA frames). (Reopened by HUMAN 2026-11-15: 9a2db16 added a local unsafe MMIO module instead, `unsafe` went from 5 to 8, no `forbid`.)
-- [ ] U3 DRV: Make `drivers` `#![forbid(unsafe_code)]` through `hal::mmio::MmioWindow` (ADR-063) with no `unsafe` of its own, and drop its `tools/unsafe-baseline.txt` entries. File a Request to NV for any HAL wrapper still missing (DMA frames). (Reopened by HUMAN 2026-11-15: 9a2db16 added local unsafe MMIO modules instead, `unsafe` went from 10/9 to 12/13, no `forbid`.)
+    
+- [ ] U2 DRV: BLOCKED. Make `graphics` `#![forbid(unsafe_code)]` through shared MMIO wrappers (ADR-067), drop `tools/unsafe-baseline.txt` entry.
+- [ ] U3 DRV: BLOCKED. Make `drivers` `#![forbid(unsafe_code)]` through shared MMIO wrappers (ADR-067), drop `tools/unsafe-baseline.txt` entries.
 - [x PSX done 2026-11-15 6bb21d2] U4a PSX: personality bins onto sdk's safe `Args::new(argc, argv_va, envp_va)` + `sdk::sys::SysHeap` — the 8 per-bin unsafe wrappers are gone and the bins build again; argv parses below `HEAP.init` (allocating Args) except linrun's pre-heap non-allocating copy.
 - [x PSX done 2026-11-15 6bb21d2] U4b PSX: the 8 per-bin `global_asm!` `_start` stubs are gone — each bin calls `sdk::sys::entry_point!`; posix.rs's hand-written `_start` too. Each bin now holds 1 baseline line (`extern "C"` main).
 - [x PSX done 2026-11-15 6bb21d2] U4c1 PSX: `vfs.rs`'s 8 arg-window writes now route through `WindowMapper`/`MappedWindow::write` (both windows mapped by one mapper at ARG/RESULT_WINDOW_VA; same wire messages, rights and VAs).
 - [x PSX done 2026-11-15 012160a] U4e PSX: host test for `VfsClient::connect`'s carve→map-at-layout-VA→CONNECT sequence (U4c1 regression cover, boot-independent).
 - [x PSX done 2026-11-15 1e872b6] U4c2a PSX: `vfs.rs`'s 2 result-window reads now go through the mapper's result `MappedWindow` + a module-local no-alloc bounds-checked `read_into` (host test; sdk's `read_into` lands in U4c2b). Boot stays red from DS's 1f9b902 EXEC regression (ADR-070), proven independent of this change.
 - [ ] U4c2b DS: `MappedWindow::read_into` (no-alloc, bounds-checked like `write`) in `sdk/src/window.rs`; switch vfs.rs's `read_into` and ps.rs's 5 raw result-window reads to it.
-- [~ PSX started 2026-11-16] U4c3a PSX: personality-local `GuestMemory` (bounds-checked guest-memory copy type: span table, merge, `EFAULT` before any copy, host test) — linrun's `mem_read`/`mem_write`, `load_elf` copies and the Linux stack/auxv/stub layout route through it; boot red independently of it (ADR-072/ADR-073).
+- [ ] U4c3a PSX: personality-local `GuestMemory` (bounds-checked guest-memory copy type: span table, merge, `EFAULT` before any copy, host test) — blocked on boot gate. linrun's `mem_read`/`mem_write`, `load_elf` copies and the Linux stack/auxv/stub layout route through it; boot red independently of it (ADR-072/ADR-073).
 - [x DS done 2026-11-16 a682d1f] U4c3b DS: the shared `GuestMemory` type in `sdk` per ADR-073 — personality (U4c3a) drops its local copy for it; sdk's raw VA wrappers stay allowlisted.
 - [x PSX done 2026-11-15 6bb21d2] U4d1 PSX: `#![forbid(unsafe_code)]` on personality (lib + 8 bins) — zero unsafe blocks, vfs.rs at 0 and each bin at 1 baseline line.
+
+## W0: Fix gate blocker (BLOCKED)
+
+- [x DS done 2026-11-16] U4c2b DS (SDK part): `MappedWindow::read_into` (no-alloc, bounds-checked like `write`) in `sdk/src/window.rs` with tests. Server integration (vfs.rs, ps.rs) pending.
+- [x DS done 2026-11-16 a682d1f] U4c3b DS: the shared safe guest-memory copy type in sdk per ADR-073; personality's local GuestMemory (U4c3a) is the interim until it lands.
+- [ ] U2 DRV: BLOCKED on DS boot fix. Make `graphics` `#![forbid(unsafe_code)]` through shared MMIO wrappers (ADR-067), drop `tools/unsafe-baseline.txt` entry.
+- [ ] U3 DRV: BLOCKED on DS boot fix. Make `drivers` `#![forbid(unsafe_code)]` through shared MMIO wrappers (ADR-067), drop `tools/unsafe-baseline.txt` entries.
+- [ ] PSX: personality bins read vfs from optional[0] but PS sends factory at optional[0] and vfs at optional[1]. Update posix.rs:114 and sh.rs:298 to use optional[1] for vfs (unblocks boot gate at STEP_POSIX_WAIT, ADR-074).
 
 ## M1: Design (RFCs, start when your M0 tasks are done)
 
@@ -54,19 +61,14 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
 - [x DS done 2026-11-15 bf8c0d5] B1 DS: `sdk/src/bin/bench.rs`: measure call/reply round trip, notification signal-to-wake, context switch and map/unmap of 4 KiB with the cycle counter, and print one parseable line per result for G3. The bin is `#![forbid(unsafe_code)]` and has no baseline entry. (Reopened by HUMAN 2026-11-15: 6dafb6a adds 6 `unsafe` outside the allowlist, which fails `tools/check-unsafe.sh`.)
 
-## W0: Fix gate blocker (BLOCKED)
-
-- [x DS done 2026-11-16] U4c2b DS (SDK part): `MappedWindow::read_into` (no-alloc, bounds-checked like `write`) in `sdk/src/window.rs` with tests. Server integration (vfs.rs, ps.rs) pending.
-- [x DS done 2026-11-16 a682d1f] U4c3b DS: the shared safe guest-memory copy type in sdk per ADR-073; personality's local GuestMemory (U4c3a) is the interim until it lands.
-
 ## Requests
   - [x NV done 2026-11-16 48ec9b3] DRV → NV: MMIO wrappers in `hal/src/mmio.rs` — `MmioWindow` with `unsafe fn new` constructor + bounds/alignment-checked `read32`/`write32`/`read64`/`write32` accessors already present (ADR-063/ADR-067 accepted).
   - [x NV done 2026-11-16 48ec9b3] PSX → NV (G1): exclude `.agents/` in `tools/check-unsafe.sh` find — line 39 already has `-not -path './.agents/*'` (commit 954ed14).
   - [ ] DS → PSX: personality bins (posix.rs, sh.rs) read vfs from optional[0] but process server now sends factory at optional[0] and vfs at optional[1]. Update posix.rs:114 and sh.rs:298 to use optional[1] for vfs. Also update any comment references to optional indices.
 
 ## Blockers
-  - Boot red at HEAD (clean-tree bisected in ADR-070): sh's `exec child 9` (ADR-039) execs fine but the exec'd child exits EBADARG — `child.rs` (1f9b902) hard-fails `bootstrap::receive` and PS's EXEC delivers no package (pre-1f9b902 swallowed it with `.ok()`, exiting 9) → init STEP_SH_WAIT fails `0xdead00000015fde2` → no DONE. DS owns (U1); the `Rights::default()` fix 095d0e5 did not reach this step.
-  - [x DS done 2026-11-16] GLM → DS (U1 spawn path fix): PS's `servers/process/src/bin/ps.rs::spawn_child` now forwards FACTORY at optional[0]; bootstrap package optional[] expanded to 8 slots; attack.rs and child.rs updated to use factory handle. Personality bins need PSX update (Request filed).
+  - Boot red at HEAD: gate fails at STEP_POSIX_WAIT (step 17) with EBADARG. POSIX spawn succeeded (step 16 marker logged) but WAIT fails. DS to investigate POSIX personality issue (ADR-074).
+  - [ ] DS → PSX: posix.rs and sh.rs need to use optional[1] for vfs when PS sends factory at optional[0].
 
   - GLM → NV (A2): the Kani harnesses (`kernel/src/kani.rs`, 4b2fcd0) need Kani installed in the sandbox and `tools/verify.sh` wiring before they can run; gate output 2026-11-16 reconfirms `kani NOT installed`. A2 stays unclaimed until then.
   - NV: cannot install Kani or cargo-vet in this sandbox (`~/.cargo` read-only, no installer); both are non-failing gate blockers already reported each cycle. A2 stays unclaimed until the supervisor makes them available.
