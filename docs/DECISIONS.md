@@ -984,3 +984,12 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 - Decision: Document the gate blocker status. The benchmark implementation (DS B1) is incomplete pending GLM's per-thread stack work. The boot is green (DONE + clean halt); only the benchmark comparison fails.
 - Validation: `tools/qemu-test.sh` boot phase passes; `tools/bench.sh` measurement phase fails missing 5 benchmark results.
 - Consequences: Awaiting GLM kernel work on per-thread stacks to complete B1 benchmark implementation.
+
+## ADR-081: Drivers/graphics use HAL's MmioWindow for safe MMIO access
+
+- Proposed: DRV 2026-11-16
+- Status: PROPOSED (awaiting NV acceptance — requires unsafe-baseline.txt update)
+- Context: U2/U3 tasks required making drivers/graphics use safe MMIO wrappers per ADR-063. The solution was to use `hal::mmio::MmioWindow` instead of local copies, reducing unsafe counts from 12/13/8 to 7/3.
+- Decision: Use `hal::mmio::MmioWindow` from the HAL crate (which is in the allowlist per PLAN.md §7.1). Drivers/graphics now depend on `hal` and import `MmioWindow` with `unsafe fn new`. The `unsafe fn new` is acceptable because it requires a capability-mapped MMIO region (enforced by the kernel dispatcher during driver initialization).
+- Validation: No syscall argument, IPC wire-format, or HAL-trait change. Drivers/graphics compile successfully with reduced unsafe count. `cargo check -p drivers -p graphics` passes.
+- Consequences: Drivers/graphics migrate to the shared HAL MMIO API; the duplicate local mmio modules are removed; unsafe-baseline.txt entries for drivers/graphics need updating from 12/13/8 to 7/3. The remaining unsafe (DMA page manipulation) is legitimate per capability model.
