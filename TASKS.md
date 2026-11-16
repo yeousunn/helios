@@ -67,7 +67,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
   - [x DS done 2026-11-16 61568a9] DS → PSX: personality bins read vfs from optional[0] but PS sent factory at optional[0]. Fixed by moving factory to optional[4] in PS spawn_child; vfs/stdin/stdout/stderr now at optional[0..3] as personality expects.
 
 ## Blockers
-  - Boot red at HEAD: VFS server (pid 5) exits early with status 0xBAD0000 (195887104) during shutdown sequence. POSIX spawn (step 16) now works; VFS receives KILL with unexpected status. DS to investigate VFS KILL handling.
+  - Boot red at HEAD: PS server (pid 5) panics at STEP_LINRUN_WAIT (linrun wait) with exit 0x0BAD_0000. VFS KILL handling fixed (commit 2071a58). DS to investigate PS panic in wait_reply/exec_reply path.
   - [x DS done 2026-11-16 61568a9] DS → PSX: posix.rs and sh.rs need to use optional[1] for vfs — resolved by moving factory to optional[4] in PS.
 
   - GLM → NV (A2): the Kani harnesses (`kernel/src/kani.rs`, 4b2fcd0) need Kani installed in the sandbox and `tools/verify.sh` wiring before they can run; gate output 2026-11-16 reconfirms `kani NOT installed`. A2 stays unclaimed until then.
