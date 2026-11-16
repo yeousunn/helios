@@ -200,7 +200,23 @@ pub fn park_result(tid: ThreadId) -> Option<SyscallReturn> {
         });
     }
 
-    // 5. Still parked.
+    // 5. Dead callee (ADR-076): the callee of this thread's parked `call`
+    //    exited before any reply could arrive — sys_exit consumed the
+    //    implicit reply pair, so no reply envelope can ever be delivered for
+    //    this park. Complete the call with EDEAD (a dead callee must not
+    //    wedge its client; observed as the 9aa7935 boot hang).
+    if thread.call_dead {
+        sched::clear_call_dead(tid);
+        syscall::clear_park_entry(tid);
+        return Some(SyscallReturn {
+            status: status::EDEAD as i64,
+            tag: Tag(0),
+            w: [0; 4],
+            r10: 0,
+        });
+    }
+
+    // 6. Still parked.
     None
 }
 
@@ -2379,5 +2395,41 @@ mod tests {
             assert_eq!(spec.num, num, "syscall {num} number mismatch");
         }
         assert_eq!(syscall_count(), 9, "spec should have exactly 9 syscalls");
+    }
+
+    /// ADR-076: helios_abi::ErrorCode mirrors ipc::status (schema §7)
+    /// exactly. The spec enum's values had drifted (it listed ESRCH/EPERM/
+    /// EIO/EINTR codes the kernel never returns and misnumbered
+    /// ETIMEDOUT/EBADSTATE); this cross-check pins the two tables together.
+    #[test]
+    fn abi_error_codes_match_ipc_status() {
+        use helios_abi::ErrorCode;
+        assert_eq!(ErrorCode::OK.value(), ipc::status::OK);
+        assert_eq!(ErrorCode::EBADCAP.value(), ipc::status::EBADCAP);
+        assert_eq!(ErrorCode::ERIGHTS.value(), ipc::status::ERIGHTS);
+        assert_eq!(ErrorCode::EBADARG.value(), ipc::status::EBADARG);
+        assert_eq!(ErrorCode::EWOULDBLOCK.value(), ipc::status::EWOULDBLOCK);
+        assert_eq!(ErrorCode::ECANCELED.value(), ipc::status::ECANCELED);
+        assert_eq!(ErrorCode::EREVOKED.value(), ipc::status::EREVOKED);
+        assert_eq!(ErrorCode::EFAULT.value(), ipc::status::EFAULT);
+        assert_eq!(ErrorCode::ENOMEM.value(), ipc::status::ENOMEM);
+        assert_eq!(ErrorCode::ETIMEDOUT.value(), ipc::status::ETIMEDOUT);
+        assert_eq!(ErrorCode::EBUSY.value(), ipc::status::EBUSY);
+        assert_eq!(ErrorCode::EDEAD.value(), ipc::status::EDEAD);
+        assert_eq!(ErrorCode::EBADSTATE.value(), ipc::status::EBADSTATE);
+        assert_eq!(ErrorCode::ETOOBIG.value(), ipc::status::ETOOBIG);
+        assert_eq!(ErrorCode::ENOSYS.value(), ipc::status::ENOSYS);
+        assert_eq!(ErrorCode::ENOENT.value(), ipc::status::ENOENT);
+        assert_eq!(ErrorCode::EEXIST.value(), ipc::status::EEXIST);
+        assert_eq!(ErrorCode::EISDIR.value(), ipc::status::EISDIR);
+        assert_eq!(ErrorCode::ENOTDIR.value(), ipc::status::ENOTDIR);
+        assert_eq!(ErrorCode::ENOTEMPTY.value(), ipc::status::ENOTEMPTY);
+        assert_eq!(ErrorCode::EMFILE.value(), ipc::status::EMFILE);
+        assert_eq!(ErrorCode::EACCES.value(), ipc::status::EACCES);
+        assert_eq!(
+            ErrorCode::ALL.len(),
+            22,
+            "every ipc status code is mirrored"
+        );
     }
 }

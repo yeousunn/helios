@@ -188,11 +188,12 @@ pub const CALL_SPEC: SyscallSpec = SyscallSpec {
         ErrorCode::EBADCAP,
         ErrorCode::ERIGHTS,
         ErrorCode::EWOULDBLOCK,
+        ErrorCode::EDEAD,
         ErrorCode::EBADARG,
         ErrorCode::ENOMEM,
     ],
     commutativity: Commutativity::Commutes,
-    description: "Synchronous call to an endpoint. Blocks until a reply is received. Creates an implicit reply capability.",
+    description: "Synchronous call to an endpoint. Blocks until a reply is received. Creates an implicit reply capability. EDEAD when the callee exits before replying (ADR-076).",
 };
 
 /// The RECV syscall (3): receive a message from an endpoint

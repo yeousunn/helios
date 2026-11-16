@@ -2,7 +2,9 @@
 
 use core::fmt;
 
-/// Kernel error codes (must match ipc::status)
+/// Kernel error codes (must match ipc::status, schema §7 — cross-checked by
+/// the kernel's `abi_error_codes_match_ipc_status` test so the tables cannot
+/// drift again; ADR-076)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(i32)]
 pub enum ErrorCode {
@@ -14,28 +16,42 @@ pub enum ErrorCode {
     ERIGHTS = -2,
     /// Invalid argument
     EBADARG = -3,
-    /// Out of memory / kernel resources
-    ENOMEM = -4,
     /// Would block (non-blocking operation)
-    EWOULDBLOCK = -5,
-    /// Timeout expired
-    ETIMEDOUT = -6,
-    /// System call not implemented
-    ENOSYS = -7,
-    /// Invalid state for operation
-    EBADSTATE = -8,
+    EWOULDBLOCK = -4,
+    /// Operation canceled
+    ECANCELED = -5,
     /// Object was revoked
-    EREVOKED = -9,
+    EREVOKED = -6,
+    /// Bad address
+    EFAULT = -7,
+    /// Out of memory / kernel resources
+    ENOMEM = -8,
+    /// Timeout expired
+    ETIMEDOUT = -9,
+    /// Resource busy
+    EBUSY = -10,
+    /// Dead callee/caller — the other side of a call is gone
+    EDEAD = -11,
+    /// Invalid state for operation
+    EBADSTATE = -12,
+    /// Message or capability list too large
+    ETOOBIG = -13,
+    /// System call not implemented
+    ENOSYS = -14,
+    /// No such file or directory
+    ENOENT = -15,
     /// Object already exists
-    EEXIST = -10,
-    /// No such process/thread
-    ESRCH = -11,
+    EEXIST = -16,
+    /// Not a directory
+    EISDIR = -17,
+    /// Is a directory
+    ENOTDIR = -18,
+    /// Directory not empty
+    ENOTEMPTY = -19,
+    /// Too many open files
+    EMFILE = -20,
     /// Permission denied
-    EPERM = -12,
-    /// I/O error
-    EIO = -13,
-    /// Interrupted
-    EINTR = -14,
+    EACCES = -21,
 }
 
 impl ErrorCode {
@@ -45,17 +61,24 @@ impl ErrorCode {
         ErrorCode::EBADCAP,
         ErrorCode::ERIGHTS,
         ErrorCode::EBADARG,
-        ErrorCode::ENOMEM,
         ErrorCode::EWOULDBLOCK,
-        ErrorCode::ETIMEDOUT,
-        ErrorCode::ENOSYS,
-        ErrorCode::EBADSTATE,
+        ErrorCode::ECANCELED,
         ErrorCode::EREVOKED,
+        ErrorCode::EFAULT,
+        ErrorCode::ENOMEM,
+        ErrorCode::ETIMEDOUT,
+        ErrorCode::EBUSY,
+        ErrorCode::EDEAD,
+        ErrorCode::EBADSTATE,
+        ErrorCode::ETOOBIG,
+        ErrorCode::ENOSYS,
+        ErrorCode::ENOENT,
         ErrorCode::EEXIST,
-        ErrorCode::ESRCH,
-        ErrorCode::EPERM,
-        ErrorCode::EIO,
-        ErrorCode::EINTR,
+        ErrorCode::EISDIR,
+        ErrorCode::ENOTDIR,
+        ErrorCode::ENOTEMPTY,
+        ErrorCode::EMFILE,
+        ErrorCode::EACCES,
     ];
 
     /// Get the numeric value

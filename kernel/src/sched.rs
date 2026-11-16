@@ -66,6 +66,10 @@ pub struct Thread {
     /// Set by `expire_timeouts` when the deadline fired; consumed by
     /// `park_result` (returns ETIMEDOUT).
     pub(crate) timed_out: bool,
+    /// Set by `sys_exit` when the callee of this thread's parked `call`
+    /// exited before any reply could arrive (ADR-076); consumed by
+    /// `park_result`, which completes the call with EDEAD.
+    pub(crate) call_dead: bool,
     /// ADR-044: foreign-syscall endpoint — when set, every syscall trap from
     /// this thread (except exit) routes there as a FOREIGN_SYSCALL call.
     pub(crate) foreign_ep: Option<ObjRef>,
@@ -99,6 +103,7 @@ impl Thread {
             ksp: 0,
             deadline_ns: 0,
             timed_out: false,
+            call_dead: false,
             foreign_ep: None,
             fs_base: 0,
             trap_frame: [0; 7],
@@ -496,6 +501,7 @@ pub fn block_with_deadline(id: ThreadId, reason: BlockReason, deadline_ns: u64) 
         let t = s.slots.threads[slot].as_mut().unwrap();
         t.deadline_ns = deadline_ns;
         t.timed_out = false;
+        t.call_dead = false;
     }
     block(id, reason)
 }
@@ -506,6 +512,26 @@ pub fn clear_timed_out(id: ThreadId) {
     let Some(s) = guard.as_mut() else { return };
     if let Ok(slot) = find_slot(s, id) {
         s.slots.threads[slot].as_mut().unwrap().timed_out = false;
+    }
+}
+
+/// Mark a parked `call` dead (ADR-076): its callee exited before replying.
+/// Consumed by `entry::park_result`; no-op for unknown threads.
+pub fn mark_call_dead(id: ThreadId) {
+    let mut guard = SCHED.lock();
+    let Some(s) = guard.as_mut() else { return };
+    if let Ok(slot) = find_slot(s, id) {
+        s.slots.threads[slot].as_mut().unwrap().call_dead = true;
+    }
+}
+
+/// Clear the ADR-076 dead-call flag (a real reply or timeout consumed the
+/// park first).
+pub fn clear_call_dead(id: ThreadId) {
+    let mut guard = SCHED.lock();
+    let Some(s) = guard.as_mut() else { return };
+    if let Ok(slot) = find_slot(s, id) {
+        s.slots.threads[slot].as_mut().unwrap().call_dead = false;
     }
 }
 

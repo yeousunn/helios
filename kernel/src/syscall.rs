@@ -67,12 +67,6 @@ fn take_reply(callee: ThreadId) -> Option<ThreadId> {
     REPLY.lock().who[k].take().map(|(_, caller)| caller)
 }
 
-fn clear_reply(callee: ThreadId) {
-    if let Some(k) = reply_key(callee) {
-        REPLY.lock().who[k] = None;
-    }
-}
-
 /// Test hook: clear all implicit reply state.
 #[cfg(test)]
 pub(crate) fn reset_reply_for_test() {
@@ -302,8 +296,10 @@ pub(crate) fn clear_park_entry(tid: ThreadId) {
 
 fn clear_park(tid: ThreadId) {
     // A normal completion also clears a (raced, unused) timeout flag from
-    // ADR-041 expiry, so it cannot leak into this thread's next park.
+    // ADR-041 expiry — and a raced ADR-076 dead-call flag — so neither can
+    // leak into this thread's next park.
     sched::clear_timed_out(tid);
+    sched::clear_call_dead(tid);
     let mut p = PARKS.lock();
     for slot in p.who.iter_mut() {
         if let Some((t, _, _)) = slot {
@@ -681,8 +677,12 @@ pub fn sys_cap_revoke(pid: ProcessId, handle: u32, mode: u64) -> SysResult<usize
 /// objects and its capability table (ADR-026).
 pub fn sys_exit(tid: ThreadId, status: i32) -> SysResult<bool> {
     crate::kinfo!("thread {} exited (status {})", tid.0, status);
-    // Clear any pending reply/park state so late replies are discarded.
-    clear_reply(tid);
+    // A caller parked in `call` on this exiting thread can never be answered
+    // (ADR-076): take the implicit reply slot and — if the caller is still
+    // parked on the reply — complete its call with EDEAD instead of
+    // discarding it (a dead callee must not wedge its client; observed as
+    // the 9aa7935 boot hang: init parked in SPAWN forever after PS died).
+    let parked_caller = take_reply(tid);
     clear_park(tid);
     let proc_ref = sched::get(tid)
         .map_err(|_| err(ipc::status::EBADCAP))?
@@ -692,6 +692,24 @@ pub fn sys_exit(tid: ThreadId, status: i32) -> SysResult<bool> {
     // ADR-031: the exiting thread's kernel stack goes to the graveyard
     // (cannot be freed while this exit runs on it); the idle path drains.
     sched::bury_thread_kstack_for_exit(tid);
+    if let Some(caller) = parked_caller {
+        // Only a caller still parked on the reply is completed with EDEAD;
+        // one already resumed (reply raced in, timeout fired, it exited)
+        // handles itself. The pair was consumed above, so reply_only can no
+        // longer reach this caller — the two completions are exclusive.
+        let parked = sched::get(caller)
+            .map(|t| matches!(t.state, sched::State::Blocked(BlockReason::Reply)))
+            .unwrap_or(false);
+        if parked {
+            crate::kinfo!(
+                "DEADCALL: callee={} caller={} parked call completes EDEAD",
+                tid.0,
+                caller.0
+            );
+            sched::mark_call_dead(caller);
+            let _ = sched::make_ready(caller);
+        }
+    }
     if fired {
         // Read the bound notification from the (now Exited) record and signal.
         // Payload convention (v0, consumed by PS's `WAIT` reaper): bit 0 = the
@@ -985,6 +1003,44 @@ mod tests {
         assert_eq!(sys_exit(server, 0), Ok(true));
         assert_eq!(notification::pending(n), Ok(1));
         assert_eq!(take_reply(server), None);
+    }
+
+    #[test]
+    fn dead_callee_completes_parked_call_with_edead() {
+        // ADR-076 regression (the 9aa7935 boot hang): the callee of a parked
+        // `call` exits mid-call — the parked caller must wake with EDEAD,
+        // not stay Blocked(Reply) forever.
+        let (pid, server, client, ep_h) = setup();
+        // Client calls: the message queues and the caller parks in Reply.
+        assert_eq!(sys_call(pid, client, ep_h, msg(1, 1)), Ok(0));
+        // Server receives: the implicit reply slot records (server, client).
+        let _ = sys_recv(pid, server, ep_h, false, 0).unwrap();
+        assert!(matches!(
+            sched::get(client).unwrap().state,
+            State::Blocked(BlockReason::Reply)
+        ));
+        // The callee dies mid-call (PS's OOM abort, init parked in SPAWN).
+        assert_eq!(sys_exit(server, 0), Ok(false));
+        assert!(matches!(sched::get(client).unwrap().state, State::Ready));
+        let r = crate::entry::park_result(client).expect("dead callee completes the call");
+        assert_eq!(r.status, ipc::status::EDEAD as i64);
+        // Consumed: the flag must not leak into the caller's next park.
+        assert!(!sched::get(client).unwrap().call_dead);
+    }
+
+    #[test]
+    fn exit_after_reply_leaves_caller_done() {
+        // A reply that raced in first owns the completion: a later exit must
+        // not mark the caller's (already finished) call dead.
+        let (pid, server, client, ep_h) = setup();
+        assert_eq!(sys_call(pid, client, ep_h, msg(1, 1)), Ok(0));
+        let _ = sys_recv(pid, server, ep_h, false, 0).unwrap();
+        let env = Envelope::new(msg(2, 0), server);
+        assert_eq!(reply_only_for_test(server, env), Ok(ipc::status::OK));
+        assert!(matches!(sched::get(client).unwrap().state, State::Ready));
+        // The reply consumed the pair — exit has nothing to wake.
+        assert_eq!(sys_exit(server, 0), Ok(false));
+        assert!(!sched::get(client).unwrap().call_dead);
     }
     #[test]
     fn failed_sender_descriptor_nulls_wire_word() {
