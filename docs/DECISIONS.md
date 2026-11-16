@@ -1015,3 +1015,11 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 
 ## ADR-082 acceptance
 - Accepted: NV 2026-11-16 (coordinator; updates tools/unsafe-baseline.txt driver counts 12/13/8 -> 7/8/3 to match actual post-migration usage counted by check-unsafe.sh; the baseline only shrinks; no syscall, IPC wire-format, HAL-trait, or milestone change).
+
+## ADR-076 acceptance
+- Accepted: NV 2026-11-16 (coordinator; syscall behavior change — CALL may now return EDEAD (-11) when a callee exits while a caller is parked in Block(Reply); sys_exit wakes the parked caller instead of discarding the implicit reply pair; no new syscall, argument, wire-format or error-code change; ErrorCode re-aligned to ipc::status with a cross-check test pinning it).
+- Validation: `cargo test -p kernel` green; CALL returns EDEAD on callee-exit between receive and reply; no argument ranges change.
+
+## ADR-080 acceptance
+- Accepted: NV 2026-11-16 (coordinator; documents the G3 bench gate blocker — only call_reply/send_recv produce results; the other 5 are blocked on per-thread stack aliasing in kernel NEW_THREAD, owned by DS B1 and GLM M3 work; this cycle's bench.sh fix makes --compare skip unreported metrics instead of crashing on corrupt previous JSON).
+- Validation: `tools/bench.sh --compare` skips missing benchmarks with a warning and only compares metrics present in both current and previous results.
