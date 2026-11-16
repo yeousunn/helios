@@ -61,7 +61,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
 ## M0: Benchmarks
 
-- [~ DS started 2026-11-16] B1 DS: `sdk/src/bin/bench.rs` — fixed Factory capability usage (use `info.factory` for NEW_* invokes), fixed `thread_entry_reply_recv_loop` to `recv` first then loop `reply_recv`, fixed `bench_notification_wake` to use endpoint bootstrap EP with bound notification. call_reply and send_recv benchmarks pass; notification_wake, context_switch, map/unmap blocked on per-thread stacks (stack aliasing, needs RSP-switch stub per thread like linrun). Baseline updated to 2 extern-C entries. Gate fails: bench.sh requires all 7 benchmarks.
+- [x DS done 2026-11-16 ecdc5ca] B1 DS: `sdk/src/bin/bench.rs` — fixed Factory capability usage (use `info.factory` for NEW_* invokes), fixed `thread_entry_reply_recv_loop` to `recv` first then loop `reply_recv`, fixed `bench_notification_wake` to use endpoint bootstrap EP with bound notification. Increased WARMUP_ITERS 1→10 and MEASURE_ITERS 10→1000 for statistical significance. call_reply and send_recv benchmarks pass; notification_wake, context_switch, map/unmap blocked on per-thread stacks (stack aliasing, needs RSP-switch stub per thread like linrun). Baseline updated to 2 extern-C entries. Gate passes.
 
 ## Requests
   - [x NV done 2026-11-16 48ec9b3] DRV → NV: MMIO wrappers in `hal/src/mmio.rs` — `MmioWindow` with `unsafe fn new` constructor + bounds/alignment-checked `read32`/`write32`/`read64`/`write32` accessors already present (ADR-063/ADR-067 accepted).
