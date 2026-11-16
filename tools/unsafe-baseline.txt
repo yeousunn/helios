@@ -12,9 +12,9 @@
 # (DMA page manipulation plus local mmio modules) from 10/9/5 to 12/13/8. The
 # baseline now matches actual usage; going forward it may only shrink as DMA is
 # moved behind safe wrappers (ADR-052).
-drivers/src/virtio_blk.rs 12
-drivers/src/virtio_net.rs 13
-graphics/src/virtio_gpu.rs 8
+drivers/src/virtio_blk.rs 7
+drivers/src/virtio_net.rs 8
+graphics/src/virtio_gpu.rs 3
 personality/src/bin/cat.rs 1
 personality/src/bin/echo.rs 1
 personality/src/bin/linrun.rs 1
