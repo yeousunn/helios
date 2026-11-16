@@ -51,7 +51,7 @@ build for `x86_64-linux-musl`. `lin_hello` and `lin_args` link no libc at all
 | `musl_stat` | `src/musl_stat.c` | `size=13 mode=644` | `stat`; hand-rolled integer formatting |
 | `musl_sig` | `src/musl_sig.c` | `helios-before-raise` (exit 143) | `raise(SIGTERM)` self-delivery |
 | `musl_cwd` | `src/musl_cwd.c` | `cwd:/` then `exe:/linrun` | `getcwd` + `readlink("/proc/self/exe")` |
-| `musl_time` | `src/musl_time.c` | `mono: …` then `tls: fs=… ok` then `helios-musl-time: ALL OK` | `clock_gettime` (MONOTONIC/REALTIME), a real `nanosleep`, `arch_prctl(ARCH_GET_FS)`, plus `getcwd`/`readlink` |
+| `musl_time` | `src/musl_time.c` | `mono: …`, `tls: fs=… ok`, `argv0: …`, `cwd:/`, `exe:/linrun`, `helios-musl-time: ALL OK` | `clock_gettime` (MONOTONIC/REALTIME), a real `nanosleep`, `arch_prctl(ARCH_GET_FS)`, argv off the crafted Linux stack, plus `getcwd`/`readlink` |
 | `musl_all` | `src/musl_all.c` | `helios-musl: printf ok` … `helios-musl: ALL OK` | printf + I/O + stat + readdir + mmap in one run |
 
 ## Fidelity
