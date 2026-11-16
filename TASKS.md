@@ -34,8 +34,8 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
 ## M0: Unsafe migration (PLAN.md 7.1)
      
-- [~ DRV started 2026-11-16] U2 DRV: Made `graphics` use `hal::mmio::MmioWindow` for safe MMIO wrappers (ADR-067). Remaining unsafe is DMA page manipulation (ptr::read_volatile, write_bytes, copy_nonoverlapping) which needs safe wrappers. Full `#![forbid(unsafe_code)]` pending ADR-052 DMA wrapper.
-- [~ DRV started 2026-11-16] U3 DRV: Made `drivers` use `hal::mmio::MmioWindow` for safe MMIO wrappers (ADR-067). Remaining unsafe is DMA page manipulation which needs safe wrappers. Full `#![forbid(unsafe_code)]` pending ADR-052 DMA wrapper.
+- [~ DRV started 2026-11-16] U2 DRV: drivers/graphics compile with zero formatting issues; boot is green. MMIO wrapper migration blocked: drivers/graphics cannot depend on kernel-only `hal/` (PLAN.md §7.1), need `sdk/` wrapper per ADR-073/ADR-075/ADR-062.
+- [~ DRV started 2026-11-16] U3 DRV: drivers/graphics compile with zero formatting issues; boot is green. MMIO wrapper migration blocked: drivers/graphics cannot depend on kernel-only `hal/` (PLAN.md §7.1), need `sdk/` wrapper per ADR-073/ADR-075/ADR-062.
 - [x PSX done 2026-11-15 6bb21d2] U4a PSX: personality bins onto sdk's safe `Args::new(argc, argv_va, envp_va)` + `sdk::sys::SysHeap` — the 8 per-bin unsafe wrappers are gone and the bins build again; argv parses below `HEAP.init` (allocating Args) except linrun's pre-heap non-allocating copy.
 - [x PSX done 2026-11-15 6bb21d2] U4b PSX: the 8 per-bin `global_asm!` `_start` stubs are gone — each bin calls `sdk::sys::entry_point!`; posix.rs's hand-written `_start` too. Each bin now holds 1 baseline line (`extern "C"` main).
 - [x PSX done 2026-11-15 6bb21d2] U4c1 PSX: `vfs.rs`'s 8 arg-window writes now route through `WindowMapper`/`MappedWindow::write` (both windows mapped by one mapper at ARG/RESULT_WINDOW_VA; same wire messages, rights and VAs).
