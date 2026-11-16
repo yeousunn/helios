@@ -74,6 +74,19 @@ pub const ARCH_SET_FS: u64 = 0x1002;
 pub const ARCH_GET_FS: u64 = 0x1003;
 pub const ARCH_GET_GS: u64 = 0x1004;
 
+/// `clock_gettime` clock ids the emulator answers (Linux x86_64 values).
+pub const CLOCK_REALTIME: u64 = 0;
+pub const CLOCK_MONOTONIC: u64 = 1;
+pub const CLOCK_MONOTONIC_RAW: u64 = 4;
+pub const CLOCK_BOOTTIME: u64 = 7;
+
+/// Upper bound on the yields one `nanosleep` will spend waiting. A sleep
+/// longer than this — or a monotonic clock that does not advance — stops the
+/// wait and answers success, so a guest's sleep can never park the emulator
+/// (and with it the whole boot) forever. Linux would still be sleeping; the
+/// bound goes away when the personality gets a kernel-backed sleep.
+pub const MAX_SLEEP_YIELDS: u32 = 200_000;
+
 /// Linux errno values (returned negated, as Linux does).
 pub const EFAULT: i64 = -14;
 pub const EINVAL: i64 = -22;
@@ -227,6 +240,16 @@ pub trait Host {
     /// resulting absolute offset or a negative Linux errno (`ESPIPE` for a
     /// non-seekable fd, `EBADF`, `EINVAL`).
     fn lseek(&mut self, fd: i32, offset: i64, whence: u32) -> i64;
+    /// Read this thread's `IA32_FS_BASE` (TLS) — the base `ARCH_SET_FS` set;
+    /// `arch_prctl(ARCH_GET_FS)` writes it into the guest's pointer.
+    fn get_tls(&mut self) -> u64;
+    /// Monotonic nanoseconds since boot (`CLOCK_MONOTONIC`/`BOOTTIME` and the
+    /// `nanosleep` deadline). Never decreases within one run; a value is not
+    /// a wall-clock time.
+    fn monotonic_ns(&mut self) -> u64;
+    /// Give up the CPU (the emulator's only way to wait: it has no
+    /// timer-backed sleep of its own).
+    fn yield_cpu(&mut self);
     /// Map `len` anonymous zeroed bytes; returns the base address or a
     /// negative errno (libc uses this for the heap/TLS/thread stacks).
     fn mmap_anon(&mut self, len: usize) -> i64;
@@ -356,7 +379,28 @@ pub fn dispatch<H: Host>(num: u64, args: [u64; 6], host: &mut H) -> Action {
             // any %fs access). The kernel applies it via Thread::SET_TLS.
             ARCH_SET_FS => Action::Return(host.set_tls(args[1])),
             ARCH_SET_GS => Action::Return(0), // no %gs use in v0 userspace
-            ARCH_GET_FS | ARCH_GET_GS => Action::Return(0),
+            // GET writes the base into the guest's pointer (the value is not
+            // the return value, as Linux returns it). Before this both GET
+            // arms answered 0 without touching the buffer, so a guest's
+            // `arch_prctl(ARCH_GET_FS, &fs)` read its own uninitialized
+            // slot; %gs is never set in v0 userspace, so GET_GS stays 0.
+            ARCH_GET_FS => {
+                let mut out = [0u8; 8];
+                out.copy_from_slice(&host.get_tls().to_le_bytes());
+                if host.mem_write(args[1], &out) < 0 {
+                    Action::Return(EFAULT)
+                } else {
+                    Action::Return(0)
+                }
+            }
+            ARCH_GET_GS => {
+                let out = [0u8; 8];
+                if host.mem_write(args[1], &out) < 0 {
+                    Action::Return(EFAULT)
+                } else {
+                    Action::Return(0)
+                }
+            }
             _ => Action::Return(EINVAL),
         },
         // musl's stdio `__stdio_write` emits `writev` (gather of up to three
@@ -502,9 +546,44 @@ pub fn dispatch<H: Host>(num: u64, args: [u64; 6], host: &mut H) -> Action {
             let w = host.mem_write(args[0], &b[..r as usize]);
             Action::Return(if w < 0 { EFAULT } else { r })
         }
-        // Single-threaded v0: futexes/sleeps are no-ops (no contention).
+        // Single-threaded v0: futexes are no-ops (no contention).
         linux::FUTEX => Action::Return(0),
-        linux::NANOSLEEP => Action::Return(0),
+        // A real sleep: wait until the monotonic clock passes the deadline,
+        // yielding the CPU between checks (v0 has one cooperative scheduler
+        // and no timer-backed sleep of its own). Before this the call
+        // answered 0 immediately, so an emulated `sleep`/`usleep` returned
+        // instantly and a guest's delay loop spun.
+        linux::NANOSLEEP => {
+            let mut ts = [0u8; 16];
+            if host.mem_read(args[0], &mut ts) < 0 {
+                return Action::Return(EFAULT);
+            }
+            let tv_sec = i64::from_le_bytes(ts[..8].try_into().unwrap_or([0; 8]));
+            let tv_nsec = i64::from_le_bytes(ts[8..].try_into().unwrap_or([0; 8]));
+            // Linux's own bounds: a negative field or an nsec outside
+            // [0, 999_999_999] is EINVAL, never a wrapped or instant sleep.
+            if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
+                return Action::Return(EINVAL);
+            }
+            let want = (tv_sec as u64)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(tv_nsec as u64);
+            // Zero length returns at once (a deadline already past).
+            let deadline = host.monotonic_ns().saturating_add(want);
+            let mut yields = 0u32;
+            while host.monotonic_ns() < deadline {
+                if yields >= MAX_SLEEP_YIELDS {
+                    // Either the sleep is longer than this many yields cover
+                    // or the clock is not advancing: stop waiting and report
+                    // success rather than parking the emulator — and with it
+                    // the whole boot — indefinitely.
+                    break;
+                }
+                host.yield_cpu();
+                yields += 1;
+            }
+            Action::Return(0)
+        }
         linux::RT_SIGRETURN => Action::Return(0),
         linux::GETUID | linux::GETGID | linux::GETEUID | linux::GETEGID => Action::Return(0),
         linux::GETPPID => Action::Return(1),
@@ -520,12 +599,30 @@ pub fn dispatch<H: Host>(num: u64, args: [u64; 6], host: &mut H) -> Action {
                 Action::Return(0)
             }
         }
+        // Monotonic clocks, at last: a `timespec` at args[1] filled from the
+        // monotonic source. `CLOCK_REALTIME` keeps the epoch (the system has
+        // no wall-clock source anywhere yet — nothing carries a time and
+        // the VFS carries no mtimes), the per-process CPU-time clocks are
+        // refused with EINVAL rather than answered with a number this
+        // emulator cannot compute, and an unknown clockid is EINVAL as it is
+        // in Linux.
         linux::CLOCK_GETTIME => {
-            let ts = [0u64; 2];
-            let mut bytes = [0u8; 16];
-            for (i, v) in ts.iter().enumerate() {
-                bytes[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+            let clockid = args[0];
+            if !matches!(
+                clockid,
+                CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_BOOTTIME
+            ) {
+                return Action::Return(EINVAL);
             }
+            let now = host.monotonic_ns();
+            let (secs, nanos) = if clockid == CLOCK_REALTIME {
+                (0, 0) // no wall clock: the epoch, reported as before
+            } else {
+                (now / 1_000_000_000, now % 1_000_000_000)
+            };
+            let mut bytes = [0u8; 16];
+            bytes[..8].copy_from_slice(&(secs as i64).to_le_bytes());
+            bytes[8..].copy_from_slice(&(nanos as i64).to_le_bytes());
             if host.mem_write(args[1], &bytes) < 0 {
                 Action::Return(EFAULT)
             } else {
@@ -608,6 +705,10 @@ mod tests {
         tls: u64,
         /// Cursor of the one seekable mock fd (Linux fd 4, size 11).
         fd_off: u64,
+        /// Controllable monotonic clock, in nanoseconds since boot.
+        mono: u64,
+        /// Times the guest asked to yield (`nanosleep`'s only wait step).
+        yields: u32,
     }
     impl Mock {
         fn new() -> Self {
@@ -620,6 +721,8 @@ mod tests {
                 mmap_bump: 0x1000_0000,
                 tls: 0,
                 fd_off: 2,
+                mono: 0,
+                yields: 0,
             }
         }
     }
@@ -730,6 +833,16 @@ mod tests {
         fn set_tls(&mut self, base: u64) -> i64 {
             self.tls = base;
             0
+        }
+        fn get_tls(&mut self) -> u64 {
+            self.tls
+        }
+        fn monotonic_ns(&mut self) -> u64 {
+            self.mono
+        }
+        fn yield_cpu(&mut self) {
+            self.yields += 1;
+            self.mono += 5_000_000; // 5 ms of "clock" per yield
         }
         fn openat(&mut self, _dirfd: i32, _path: &[u8], _flags: u32) -> i64 {
             3
@@ -1175,5 +1288,151 @@ mod tests {
         // protocol codes — the map never collapses two different codes onto
         // two different answers by accident.
         assert_ne!(status::ERIGHTS, status::EACCES);
+    }
+
+    /// `clock_gettime` reads the `timespec` at args[1] from the monotonic
+    /// source, refuses an unknown or per-process clock id with EINVAL and a
+    /// bad buffer with EFAULT. `CLOCK_REALTIME` keeps the epoch: no
+    /// wall-clock source exists anywhere in the system yet, so reporting the
+    /// monotonic clock as a date would be a lie the guest cannot detect.
+    #[test]
+    fn clock_gettime_reads_the_monotonic_clock() {
+        let mut m = Mock::new();
+        m.mono = 1_500_000_000; // 1.5 s since boot
+        assert_eq!(
+            dispatch(
+                linux::CLOCK_GETTIME,
+                [CLOCK_MONOTONIC, 64, 0, 0, 0, 0],
+                &mut m
+            ),
+            Action::Return(0)
+        );
+        assert_eq!(i64::from_le_bytes(m.mem[64..72].try_into().unwrap()), 1);
+        assert_eq!(
+            i64::from_le_bytes(m.mem[72..80].try_into().unwrap()),
+            500_000_000
+        );
+        // BOOTTIME is the same monotonic source.
+        assert_eq!(
+            dispatch(
+                linux::CLOCK_GETTIME,
+                [CLOCK_BOOTTIME, 96, 0, 0, 0, 0],
+                &mut m
+            ),
+            Action::Return(0)
+        );
+        assert_eq!(&m.mem[96..112], &m.mem[64..80]);
+        // REALTIME: the epoch, written like any other clock.
+        assert_eq!(
+            dispatch(
+                linux::CLOCK_GETTIME,
+                [CLOCK_REALTIME, 128, 0, 0, 0, 0],
+                &mut m
+            ),
+            Action::Return(0)
+        );
+        assert_eq!(&m.mem[128..144], &[0u8; 16]);
+        // A per-process/unknown clock id is refused, not invented.
+        assert_eq!(
+            dispatch(linux::CLOCK_GETTIME, [2, 64, 0, 0, 0, 0], &mut m),
+            Action::Return(EINVAL)
+        );
+        assert_eq!(
+            dispatch(linux::CLOCK_GETTIME, [99, 64, 0, 0, 0, 0], &mut m),
+            Action::Return(EINVAL)
+        );
+        // A buffer the guest cannot write is EFAULT.
+        assert_eq!(
+            dispatch(
+                linux::CLOCK_GETTIME,
+                [CLOCK_MONOTONIC, 100_000, 0, 0, 0, 0],
+                &mut m
+            ),
+            Action::Return(EFAULT)
+        );
+    }
+
+    /// `nanosleep` waits on the monotonic clock (the mock advances 5 ms per
+    /// yield) and returns 0 at the deadline; Linux's argument bounds apply
+    /// (negative field or nsec >= 1e9 is EINVAL) and a bad `timespec` pointer
+    /// is EFAULT.
+    #[test]
+    fn nanosleep_waits_until_the_monotonic_deadline() {
+        let mut m = Mock::new();
+        // request = { 0 s, 20 ms } at clock 0: four yields cross it.
+        m.mem[8..16].copy_from_slice(&20_000_000i64.to_le_bytes());
+        let a = dispatch(linux::NANOSLEEP, [0, 0, 0, 0, 0, 0], &mut m);
+        assert_eq!(a, Action::Return(0));
+        assert_eq!(m.yields, 4);
+        assert_eq!(m.mono, 20_000_000);
+        // A zero-length sleep does not yield at all.
+        let mut m = Mock::new();
+        let a = dispatch(linux::NANOSLEEP, [0, 0, 0, 0, 0, 0], &mut m);
+        assert_eq!(a, Action::Return(0));
+        assert_eq!(m.yields, 0);
+        // nsec at or past 1e9, or a negative field: EINVAL.
+        let mut m = Mock::new();
+        m.mem[8..16].copy_from_slice(&1_000_000_000i64.to_le_bytes());
+        assert_eq!(
+            dispatch(linux::NANOSLEEP, [0, 0, 0, 0, 0, 0], &mut m),
+            Action::Return(EINVAL)
+        );
+        let mut m = Mock::new();
+        m.mem[..8].copy_from_slice(&(-1i64).to_le_bytes());
+        assert_eq!(
+            dispatch(linux::NANOSLEEP, [0, 0, 0, 0, 0, 0], &mut m),
+            Action::Return(EINVAL)
+        );
+        // A `timespec` the guest cannot read is EFAULT.
+        let mut m = Mock::new();
+        assert_eq!(
+            dispatch(linux::NANOSLEEP, [100_000, 0, 0, 0, 0, 0], &mut m),
+            Action::Return(EFAULT)
+        );
+    }
+
+    /// `arch_prctl(ARCH_GET_FS)` answers the TLS base `ARCH_SET_FS` set — by
+    /// writing it into the guest's pointer (the return value stays 0), and a
+    /// bad pointer is EFAULT. Before this the arm answered 0 without touching
+    /// the buffer, so the guest read its own uninitialized slot.
+    #[test]
+    fn arch_prctl_get_fs_answers_the_tls_base() {
+        let mut m = Mock::new();
+        assert_eq!(
+            dispatch(
+                linux::ARCH_PRCTL,
+                [ARCH_SET_FS, 0x7f00_1000, 0, 0, 0, 0],
+                &mut m
+            ),
+            Action::Return(0)
+        );
+        assert_eq!(
+            dispatch(linux::ARCH_PRCTL, [ARCH_GET_FS, 128, 0, 0, 0, 0], &mut m),
+            Action::Return(0)
+        );
+        assert_eq!(
+            u64::from_le_bytes(m.mem[128..136].try_into().unwrap()),
+            0x7f00_1000
+        );
+        // GET_GS: v0 userspace never sets %gs, so it answers 0 in the buffer.
+        assert_eq!(
+            dispatch(linux::ARCH_PRCTL, [ARCH_GET_GS, 160, 0, 0, 0, 0], &mut m),
+            Action::Return(0)
+        );
+        assert_eq!(&m.mem[160..168], &[0u8; 8]);
+        // A pointer the guest cannot write is EFAULT.
+        assert_eq!(
+            dispatch(
+                linux::ARCH_PRCTL,
+                [ARCH_GET_FS, 100_000, 0, 0, 0, 0],
+                &mut m
+            ),
+            Action::Return(EFAULT)
+        );
+        // An unknown sub-code stays EINVAL.
+        assert_eq!(
+            dispatch(linux::ARCH_PRCTL, [0x1009, 128, 0, 0, 0, 0], &mut m),
+            Action::Return(EINVAL)
+        );
     }
 }

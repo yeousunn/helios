@@ -26,7 +26,7 @@ use personality::layout::HEAP_VA_BASE;
 use sdk::guest::GuestMemory;
 use sdk::heap::RegionSource;
 use sdk::layout::{HEAP_CHUNK, HEAP_CHUNKS};
-use sdk::sys::{raw_copy_from_va, raw_cstr_from_va, SysHeap};
+use sdk::sys::{raw_copy_from_va, raw_cstr_from_va, rdtsc, SysHeap};
 use sdk::syscall::{Syscalls, X86_64Syscalls};
 
 #[global_allocator]
@@ -34,7 +34,7 @@ static HEAP: SysHeap = SysHeap::new();
 
 /// The foreign program to run: a freestanding static x86_64-linux ELF (no
 /// libc; raw `write`+`exit`). Loaded and executed like any Linux binary.
-static LIN_ELF: &[u8] = include_bytes!("../../assets/musl_cwd");
+static LIN_ELF: &[u8] = include_bytes!("../../assets/musl_time");
 
 /// The default demo program's argv[0].
 const DEFAULT_ARGV0: &[u8] = b"helios-linux-abi\n";
@@ -122,12 +122,30 @@ struct Emu<'a> {
     /// Per-VFS-fd directory cursor for emulated `getdents64`
     /// (`u64::MAX` = end-of-directory reached).
     dents_cookie: &'a mut [u64; 16],
+    /// The emulated thread's current TLS base (`ARCH_SET_FS`), so
+    /// `ARCH_GET_FS` can answer what was set.
+    tls_cur: &'a mut u64,
 }
 
 /// Base VAs for emulated anonymous memory (distinct from the image, the Linux
 /// stack, the stub and the personality heap/windows).
 const MMAP_VA_BASE: u64 = 0x0000_6000_0000_0000;
 const BRK_VA_BASE: u64 = 0x0000_6100_0000_0000;
+
+/// Nominal TSC frequency the monotonic clock is divided by. The kernel's own
+/// HAL timer reads `rdtsc` the same way ("assume ~2.5 GHz, fine for bring-up
+/// scheduling hints", `hal/x86_64/src/impl_x86_64.rs`), so the emulator's
+/// clock and the kernel's share one time base instead of drifting apart by a
+/// calibration factor neither side can measure.
+const TSC_HZ_NOMINAL: u64 = 2_500_000_000;
+
+/// Monotonic nanoseconds since boot for the emulated program: the cycle
+/// counter at the nominal TSC frequency, the same approximation the kernel
+/// HAL timer uses. There is no wall-clock source anywhere in the system, so
+/// this is a duration, not a date (CLOCK_REALTIME keeps the epoch).
+fn monotonic_ns() -> u64 {
+    rdtsc() * 1_000_000_000 / TSC_HZ_NOMINAL
+}
 
 impl Emu<'_> {
     /// Carve + map `len` bytes of zero-filled anonymous RW memory at `va`,
@@ -268,9 +286,22 @@ impl personality::foreign::Host for Emu<'_> {
         let mut m = Message::new(sdk::methods::thread::SET_TLS);
         m.words[0] = base;
         match sys.invoke(self.child, &m) {
-            Ok(_) => 0,
+            Ok(_) => {
+                *self.tls_cur = base; // what ARCH_GET_FS will answer
+                0
+            }
             Err(e) => linux_errno(e),
         }
+    }
+    fn get_tls(&mut self) -> u64 {
+        *self.tls_cur
+    }
+    fn monotonic_ns(&mut self) -> u64 {
+        monotonic_ns()
+    }
+    fn yield_cpu(&mut self) {
+        let mut sys = Syscalls::new(self.raw);
+        let _ = sys.yield_now();
     }
     fn openat(&mut self, _dirfd: i32, path: &[u8], flags: u32) -> i64 {
         let Some(vfs) = self.vfs.as_deref_mut() else {
@@ -782,6 +813,9 @@ extern "C" fn linrun_main(argc: u64, argv_va: u64, _envp_va: u64) -> ! {
     let mut mmap_bump = MMAP_VA_BASE;
     let mut brk_cur = BRK_VA_BASE;
     let mut dents_cookie = [0u64; 16];
+    // The emulated thread's TLS base (ARCH_SET_FS); starts at 0, as Linux
+    // reports it before libc's startup sets it.
+    let mut tls_cur = 0u64;
     let mut outbuf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     loop {
         let routed = {
@@ -834,6 +868,7 @@ extern "C" fn linrun_main(argc: u64, argv_va: u64, _envp_va: u64) -> ! {
                         mmap_bump: &mut mmap_bump,
                         brk_cur: &mut brk_cur,
                         dents_cookie: &mut dents_cookie,
+                        tls_cur: &mut tls_cur,
                     };
                     personality::foreign::dispatch(num, args, &mut host)
                 };

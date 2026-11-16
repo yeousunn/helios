@@ -25,7 +25,7 @@ else
     mkdir -p "$out"
 fi
 
-c_srcs="musl_noop musl_write musl_exit musl_hello musl_open musl_mmap musl_ls musl_stat musl_sig musl_cwd musl_all"
+c_srcs="musl_noop musl_write musl_exit musl_hello musl_open musl_mmap musl_ls musl_stat musl_sig musl_cwd musl_time musl_all"
 s_srcs="lin_hello lin_args"
 
 echo "zig: $($ZIG version 2>/dev/null || echo 'not found')"
