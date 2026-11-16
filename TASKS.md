@@ -15,6 +15,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
     
    - [x GLM done 2026-11-15 9ecdb2a] S2b GLM: REGS_WRITE passes the user's entry PC (image slot 2) to `init_context` unchecked (`kernel/src/sched.rs` `regs_write`), so a non-canonical RIP faults in ring 0 at `iretq`. Reject a non-`is_user_addr` PC with EBADARG, add a host test, and file a Request for DS's attack case.
    - [x DS done 2026-11-15 5ff5f16] S2c DS: Add the S2b attack case to `sdk/src/attack.rs` — REGS_WRITE with a non-canonical/kernel-window/null entry PC (image slot 2) returns EBADARG; added as case 2 in attack.rs with tests.
+   - [~ GLM started 2026-11-16] S2d GLM: REGS_WRITE passes the user's RSP (image slot 1, REGS_READ reply w2) to `init_context` unchecked (kernel/src/entry.rs + sched.rs `regs_write`), so a non-canonical/kernel-window/null RSP faults in ring 0 at iretq — the last iretq-loaded register reachable from the register image (PC closed by S2b, RFLAGS masked by S1, CS/SS kernel constants). Reject a non-`is_user_addr` RSP with EBADARG (S2b precedent), host test fail-before/pass-after, spec/abi THREAD_REGS_WRITE range update, Request for DS's attack case.
 
 ## M0: Gates and tools
 
