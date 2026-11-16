@@ -9,80 +9,11 @@
 //!    used for the virtqueue (descriptors + rings + command/data area).
 //!
 //! All device register access goes through the mapped MMIO window via the
-//! safe `MmioWindow` wrapper defined below. DMA allocation is the launcher's
+//! safe `hal::mmio::MmioWindow` wrapper. DMA allocation is the launcher's
 //! job (Frame cap + `AS::MAP`), so the driver does not depend on `hal::Dma`
 //! either. HAL traits stay kernel-internal.
 
-mod mmio {
-    use core::ptr;
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum MmioError {
-        OutOfBounds,
-        Misaligned,
-    }
-
-    pub struct MmioWindow {
-        base: usize,
-        len: usize,
-    }
-
-    impl MmioWindow {
-        pub unsafe fn new(base: usize, len: usize) -> Self {
-            Self { base, len }
-        }
-
-        pub fn read32(&self, offset: usize) -> Result<u32, MmioError> {
-            let end = offset.checked_add(4).ok_or(MmioError::OutOfBounds)?;
-            if end > self.len {
-                return Err(MmioError::OutOfBounds);
-            }
-            if !offset.is_multiple_of(4) {
-                return Err(MmioError::Misaligned);
-            }
-            Ok(unsafe { ptr::read_volatile((self.base + offset) as *const u32) })
-        }
-
-        pub fn write32(&self, offset: usize, value: u32) -> Result<(), MmioError> {
-            let end = offset.checked_add(4).ok_or(MmioError::OutOfBounds)?;
-            if end > self.len {
-                return Err(MmioError::OutOfBounds);
-            }
-            if !offset.is_multiple_of(4) {
-                return Err(MmioError::Misaligned);
-            }
-            unsafe {
-                ptr::write_volatile((self.base + offset) as *mut u32, value);
-            }
-            Ok(())
-        }
-
-        #[allow(dead_code)]
-        pub fn read64(&self, offset: usize) -> Result<u64, MmioError> {
-            let end = offset.checked_add(8).ok_or(MmioError::OutOfBounds)?;
-            if end > self.len {
-                return Err(MmioError::OutOfBounds);
-            }
-            if !offset.is_multiple_of(8) {
-                return Err(MmioError::Misaligned);
-            }
-            Ok(unsafe { ptr::read_volatile((self.base + offset) as *const u64) })
-        }
-
-        #[allow(dead_code)]
-        pub fn write64(&self, offset: usize, value: u64) -> Result<(), MmioError> {
-            let end = offset.checked_add(8).ok_or(MmioError::OutOfBounds)?;
-            if end > self.len {
-                return Err(MmioError::OutOfBounds);
-            }
-            if !offset.is_multiple_of(8) {
-                return Err(MmioError::Misaligned);
-            }
-            unsafe { ptr::write_volatile((self.base + offset) as *mut u64, value) }
-            Ok(())
-        }
-    }
-}
+use hal::mmio::MmioWindow;
 
 /// Virtio PCI vendor ID (Red Hat / virtio).
 const VIRTIO_VENDOR_ID: u16 = 0x1AF4;
@@ -164,7 +95,7 @@ struct VirtQueue {
 /// A virtio-gpu display device.
 pub struct VirtioGpu {
     /// Mapped MMIO window over the device BAR (from an `MmioRegion` cap).
-    mmio: mmio::MmioWindow,
+    mmio: MmioWindow,
     /// Virtual address of the DMA page holding the virtqueue (from a `Frame`
     /// cap mapped via `AS::MAP`), or None until `init`.
     queue_vaddr: Option<usize>,
@@ -184,7 +115,7 @@ impl VirtioGpu {
     /// region.
     pub fn new(mmio_base: usize, mmio_len: usize) -> Self {
         Self {
-            mmio: unsafe { mmio::MmioWindow::new(mmio_base, mmio_len) },
+            mmio: unsafe { MmioWindow::new(mmio_base, mmio_len) },
             queue_vaddr: None,
             queue_paddr: 0,
             width: 0,
