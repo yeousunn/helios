@@ -1,72 +1,213 @@
-## RFC-0004: Per-thread initial user stack for NEW_THREAD/THREAD_CREATE
+## RFC-0004: Per-thread initial user stack — explicit stack-top argument for NEW_THREAD and THREAD_CREATE
 
-- Proposed: NV 2026-11-17
-- Status: PROPOSED
-- Links: PLAN.md section 2 principle 5 (finite verifiable ABI), PLAN.md M3 (multicore), PLAN.md bet B1 (verified scaling); cites [R-SEL4], [R-NROS], [R-COMMUTER], [R-MCS], [R-SKYLOFT]
+- Proposed: GLM 2026-11-17
+- Status: ACCEPTED (NV 2026-11-17 as ADR-085; changes two invoke ABIs)
+- Links: cites `docs/research/BIBLIOGRAPHY.md` entries [R-SEL4], [R-ZIRCON], [R-HYPERKERNEL], [R-COMMUTER], [R-KANI], [R-NROS], [R-MCS]
 
-### Problem
+## Problem
 
-Today `NEW_THREAD` (FACTORY invoke label 4) and `THREAD_CREATE` (Thread invoke label 13) take only `w0 = entry_pc`. The kernel stages the child's initial user stack at the arch constant `USER_STACK_TOP` (hal/x86_64/src/layout.rs:31) for every thread in the same address space. All threads in one AS therefore share one stack and alias each other's frames. This is sound for the v0 cooperative scheduler but blocks M3 scaling and bet B1's `bench/scale`: commuting map/unmap operations on disjoint ranges cannot run on separate threads because the threads clobber one another's stacks. It also blocks B1's remaining 5 benchmarks (notification_wake, context_switch_same_as, context_switch_diff_as, map_4k, unmap_4k), which need per-thread stacks.
+Every thread the kernel starts enters userspace with the same initial stack
+pointer: `USER_STACK_TOP` (`hal/x86_64/src/layout.rs:11`,
+`0x0000_7FFF_FFFF_F000`), hardcoded by the arch backend's `init_context`
+(`hal/x86_64/src/impl_x86_64.rs:1296,1345`). `NEW_THREAD` (Factory method 4)
+and `THREAD_CREATE` (Thread method 13) take only the entry PC (`w0`,
+`kernel/src/entry.rs:686-711,880-955`); there is no way for a caller to name a
+different initial RSP.
 
-This serves principle 5 (finite, explicit ABI: every argument is named and range-checked) and principle 2 (the stack is per-thread state the principal pays for through its own Untyped, not an implicit kernel global).
+The first thread of a process works because its launcher maps a stack region
+ending at `USER_STACK_TOP` before the thread starts. Every additional thread
+in the same address space enters on top of a live stack: its first pushes
+overwrite the parent's (or sibling's) frames. This is the stack-aliasing
+blocker recorded in ADR-080 and on the board (PSX, 2026-11-16): 5 of the 7
+G3 benchmarks (`notification_wake`, `context_switch_same_as`,
+`context_switch_diff_as`, `map_4k`, `unmap_4k`) cannot be implemented because
+`bench` cannot give its spawned threads distinct stacks
+(`sdk/src/bin/bench.rs` `spawn_thread`), and any future multi-threaded
+server hits the same wall.
 
-### Research basis
+The working precedent (linrun's RSP-switch stub,
+`personality/src/bin/linrun.rs:730`) papers over the gap in userspace: the
+spawner carves a stack and writes a stub that switches RSP after entry. That
+is per-program boilerplate every multi-threaded program must re-implement,
+and it wastes a double entry on every thread start. The kernel owns thread
+context creation; the initial RSP belongs in the thread-creation ABI.
 
-- **[R-SEL4]** Capabilities as the only authority; every object is created and managed by its owner. The initial stack is memory the caller owns, so it should be an explicit capability argument, not an arch constant.
-- **[R-NROS]** Per-node replicas wrap a sequential core; commuting operations run in parallel. Per-thread stacks let disjoint-thread operations (map/unmap on disjoint ranges) run on different cores without aliasing.
-- **[R-COMMUTER]** Every operation declares its commutativity. NEW_THREAD/THREAD_CREATE on disjoint cap slots commute; per-thread stacks are a per-thread resource, so they do not introduce cross-thread conflicts.
-- **[R-MCS]** Time is a capability; each thread runs on a scheduling context with its own budget. The stack is the thread's own runtime storage, paired with its context.
-- **[R-SKYLOFT]** Preemption reaches userspace through a HAL primitive; a preempted thread must resume on its own stack, never a shared one.
+This serves PLAN.md principle 5 (a finite ABI takes explicit slot arguments
+instead of letting the kernel pick, validates every argument against a stated
+range) and principle 3 (the principal pays: the caller maps the stack it
+names). It breaks no principle: the kernel continues to interpret no user
+memory, and the change is additive (0 = today's behavior).
 
-### Design
+## Research basis
 
-`NEW_THREAD` and `THREAD_CREATE` gain a second argument `w1 = initial_stack_top`:
+- **[R-ZIRCON]** Zircon's `zx_process_start` takes an explicit initial stack
+  pointer (`sp`) alongside the entry point — the initial register state of a
+  new thread is caller-supplied, not kernel-chosen. Helios already follows
+  this shape for the entry PC (`w0`); this RFC completes it for the stack.
+- **[R-SEL4]** seL4 configures a new thread's entire initial context through
+  TCB register writes (`seL4_TCB_WriteRegisters`), including SP; the kernel
+  never invents user register values. Helios's REGS_WRITE path (S1/ADR-050)
+  is the same mechanism; this RFC gives thread creation the same power in
+  one step instead of a create-suspend-write-resume dance.
+- **[R-HYPERKERNEL]** Hyperkernel restricts each syscall to bounded, easily
+  validated work. The new argument is validated with the same two tests the
+  entry PC already uses (`is_user_addr` + an alignment mask) before any
+  kernel state is created.
+- **[R-COMMUTER]** The scalable commutativity rule: state the commutativity
+  of every operation. Thread creation already declares `Commutes`; the
+  stack top is a value copied into the child's frame, so the class is
+  unchanged (see ABI).
+- **[R-KANI]** Kani checks panic freedom of syscall entry decoding. The new
+  argument's decode path (u64 word, no arithmetic beyond an alignment mask)
+  joins the A2 harness scope.
+- **[R-NROS]** Per-node replicas wrap a sequential core; commuting operations
+  run in parallel. Per-thread stacks let disjoint-thread operations (map/unmap
+  on disjoint ranges) run on different cores without aliasing.
+- **[R-MCS]** Time is a capability; each thread runs on a scheduling context
+  with its own budget. The stack is the thread's own runtime storage, paired
+  with its context.
 
-- `w1 = 0` (default): the kernel uses the arch default `USER_STACK_TOP` for the thread's initial user stack. Preserves v0 behavior.
-- `w1 != 0`: must be a canonical user address (`is_user_addr(w1)`) and 16-byte aligned. The kernel uses `w1` as the child's initial user stack pointer (`rsp` at entry). If out of range or misaligned, the invoke returns `EBADARG` before any child state (thread cap, stack allocation, register frame) is created.
+## Design
 
-Validation happens before any mutation: `is_user_addr(w1)` and `(w1 & 0xF) == 0` are checked first; on failure, `EBADARG` and no side effects. The stack memory itself must already be mapped in the target address space (the caller is responsible; a stack that is not mapped faults on first use, which is the caller's error, not a kernel hole).
+`NEW_THREAD` and `THREAD_CREATE` gain a second message word: `w1` = the
+initial user stack top (the RSP the thread enters with). The kernel treats it
+as a value to validate and copy into the child's initial context — it never
+reads, maps or tracks the stack itself.
 
-The thread cap returned carries `CONTROL | GRANT` as before. `THREAD_SET_ENTRY` (label 14) is unchanged; it sets the entry PC only, not the stack.
+Validation (both invocations, identical rule):
 
-### ABI
+1. `w1 == 0` → arch default `USER_STACK_TOP` (today's behavior, bit for bit).
+2. `w1 != 0` → require `is_user_addr(w1)` (nonzero, canonical lower half,
+   the S2 rule already used for the entry PC) **and** `w1 & 0xF == 0`
+   (16-byte aligned, the x86-64 SysV stack discipline; note the default
+   `USER_STACK_TOP` itself satisfies this). Anything else → `EBADARG`,
+   returned **before** `proc::create()` or any child state exists (the S2b/S8
+   "a bad call costs no process slot" precedent).
 
-Changed invoke methods:
+Form, not mapping: like the entry PC, the kernel validates the address form
+only. An unmapped stack top faults in the child at its first push and routes
+to the child's fault endpoint (ADR-007) — the same contract as jumping to an
+unmapped PC. Mapping the region `[w1 - size, w1)` is the caller's job, done
+through the MAP invoke on the AS cap it already passes (principle 3: the
+principal pays for the memory it names).
 
-| Label | Name | New arg | Range | Error | Commutativity |
-|---|---|---|---|---|---|
-| FACTORY invoke 4 | NEW_THREAD | `w1 = initial_stack_top` | 0 = arch default; else canonical user addr, 16-byte aligned | `EBADARG` if `!is_user_addr(w1)` or `w1 & 0xF != 0` | `Commutes` (dest CapSlot; per-thread stack, no shared state) |
-| Thread invoke 13 | THREAD_CREATE | `w1 = initial_stack_top` | 0 = arch default; else canonical user addr, 16-byte aligned | `EBADARG` if `!is_user_addr(w1)` or `w1 & 0xF != 0` | `Commutes` (dest CapSlot; per-thread stack, no shared state) |
+Implementation (kernel-internal, no HAL trait change): the existing rebuild
+discipline already proves the pattern. `regs_write` (S1/ADR-050,
+`kernel/src/sched.rs:802-806`) builds a fresh frame with `init_context` and
+then overlays the user-owned slots with `mem::write_reg_image_user`
+(`kernel/src/mem.rs:90`), which writes slot 1 (user RSP) into the real
+iretq frame. Thread creation reuses exactly this: after
+`b.init_context(kstack_top, entry_pc)` in `set_initial_pc`, the kernel
+overwrites frame slot 1 and `user_regs[1]` with the validated stack top (one
+new single-slot write helper in `kernel/src/mem.rs`, the allowlisted unsafe
+module, with a `// SAFETY:` comment mirroring `write_reg_image_user`).
+`REGS_READ` of the fresh thread then reports the caller's RSP, and a later
+`REGS_WRITE` keeps working unchanged.
 
-Validation ranges are stated per argument above; every violation returns the stated error, nothing else. `spec/abi` (A1) `InvokeSpec` entries for `FACTORY_NEW_THREAD` and `THREAD_CREATE` gain the `w1` argument with the same `range_error: EBADARG`; `spec/abi/src/commutativity.rs` entries keep `Commutativity::Commutes` with `ResourceExtractor::CapSlot`. No syscall number, error code, or wire-format change beyond the added argument word.
+Failure modes: (a) caller passes a top outside its own mapping → child
+faults at first push, observed on its fault EP — caller bug, same as a bad
+entry PC; (b) two threads given the same top → they alias, which is exactly
+what the argument exists to avoid and is undetectable by the kernel without
+walking the AS on every spawn (rejected: cost on the creation path);
+(c) misaligned top → rejected up front, so a thread never starts in a state
+that violates the ABI's stack alignment invariant.
 
-Commutativity note: NEW_THREAD/THREAD_CREATE create independent thread state (cap slot, register frame, stack pointer). Two creates on disjoint destination slots commute even in the same address space, because each thread's initial stack pointer is distinct. Only operations on the same destination slot conflict.
+## ABI
 
-### Verification plan
+Changed invocations (message words; descriptors, reply words and rights are
+unchanged):
 
-| Component | Tool | Scope |
-|---|---|---|
-| w1 argument decoding | Kani | Panic-freedom of `is_user_addr(w1) && (w1 & 0xF) == 0` for all u64 inputs; no side effects on failure. |
-| Validation range | Flux | Index/bounds: `w1` is either 0 or a valid user address; alignment check is exact. |
-| spec/abi cross-check | Test | `spec/abi` host test asserts the `w1` InvokeArg matches the kernel's entry.rs decoding. |
-| Attack suite | Testing | `w1` = kernel address → EBADARG; `w1` = misaligned user addr → EBADARG; `w1` = 0 → arch default (OK); `w1` = valid user addr → OK, thread starts at w1 rsp. |
+- **NEW_THREAD** (Factory, label 4): `w0` = entry PC (unchanged), **`w1` =
+  initial user stack top (new)**, `w2`/`w3` reserved.
+- **THREAD_CREATE** (Thread, label 13): `w0` = entry PC (unchanged), **`w1` =
+  initial user stack top (new)**, `w2`/`w3` reserved.
 
-### Benchmark and success metric
+Validation ranges:
 
-- `bench/scale`: map/unmap on disjoint ranges by different threads in one AS, 1→8 cores on QEMU `-smp`, within 80% of linear (bet B1 target). Previously blocked by stack aliasing; unblocked by per-thread `w1`.
-- B1's remaining 5 benchmarks (notification_wake, context_switch_same_as, context_switch_diff_as, map_4k, unmap_4k) become implementable with per-thread stacks.
+- `w1 == 0`: valid; initial RSP = `USER_STACK_TOP` (`0x0000_7FFF_FFFF_F000`),
+  the current behavior.
+- `w1 != 0`: valid iff `w1 < 0x0000_8000_0000_0000` and `w1 != 0`
+  (`is_user_addr`) and `w1 & 0xF == 0`; otherwise **`EBADARG`** (`-3`),
+  returned before any child process, thread or capability state is created.
+- No new error code is introduced (`EBADARG` is already in both invocations'
+  error lists in `spec/abi::invoke`).
 
-### Kill criterion
+Commutativity ([R-COMMUTER], `spec/abi::commutativity`): both invocations
+keep class `Commutes`. The stack top is a value copied into the child's
+frame; the kernel reads no shared state to process it. `NEW_THREAD` on the
+same factory concurrently still creates independent objects. The one
+ordering constraint is caller-visible, not kernel-visible: two threads
+created with the same top in one AS alias — callers choose disjoint regions,
+the same way two MAP callers choose disjoint VAs.
 
-If per-thread stacks cannot be validated without a kernel-side mapping check (i.e., the kernel must walk the VSpace to confirm `w1` is mapped before accepting it, adding unbounded work to the ABI), fall back to `w1 = 0` arch-default only and require userspace to switch stacks explicitly via an RSP-switch stub (linrun precedent). The commutativity and ABI structure are unchanged; only the default differs.
+`spec/abi` update (in the implementation task, per the ADR-073 rule that the
+spec lands with or before the code): `FACTORY_NEW_THREAD` and
+`THREAD_CREATE` `InvokeSpec`s gain the `stack_top` argument (range
+`(0, 0x0000_8000_0000_0000)` with the 16-alignment refinement in the
+description, `range_error: EBADARG`), the commutativity notes gain the
+disjoint-tops rule, and the kernel cross-check test family (A1 precedent)
+pins the kernel's validation against the spec's stated range.
 
-### Alternatives considered
+Attack-suite cases (DS, after the kernel lands): `NEW_THREAD` and
+`THREAD_CREATE` with `w1` = kernel-window (`0xFFFF_8000_0000_0000`),
+non-canonical (≥ 2^63), null-adjacent misaligned (`0x8`), and misaligned
+user (`USER_STACK_TOP - 8`) → all `EBADARG`, and the factory still mints a
+fresh endpoint afterwards (no child state leaked). Same case shape as
+S2b/S2c/S2d.
 
-1. **Always arch default (status quo)** — rejected: stack aliasing blocks per-core scaling and B1's 5 benchmarks.
-2. **Kernel-validated mapped stack** — rejected: requires a VSpace walk (potentially unbounded page-table traversal), violating principle 5 (bounded ABI). The caller is responsible for mapping; unmapped stack faults on first use.
-3. **Separate SET_STACK invoke** — rejected: adds a syscall for what is naturally a creation argument; two-step creation races (create then set stack) leave a window where the thread runs on the wrong stack.
-4. **Stack cap argument (cap slot instead of VA)** — rejected: would require a new Stack object type (M1+ scope); a raw VA is simpler and the caller already owns the memory.
+## Verification plan
 
----
+- **Host unit tests (kernel, fail-before/pass-after):** (1) `NEW_THREAD` with
+  a kernel-window `w1` returns `EBADARG` and creates no process (fails
+  before: the word is ignored today and the call succeeds); (2) `THREAD_CREATE`
+  with a misaligned user `w1` → `EBADARG`; (3) valid `w1` → the child's
+  `REGS_READ` image slot 1 equals `w1` (mock backend; the overlay is
+  kernel-side, backend-independent); (4) `w1 = 0` → image slot 1 equals the
+  backend default, pinning the compat path.
+- **Kani (A2 harness family, when available):** the decode of `w1`
+  (`is_user_addr` + alignment) cannot panic for any u64 input.
+- **Attack suite (DS):** the four `w1` rejection cases above.
+- **Full gate:** the boot is unaffected (all current callers pass `w1 = 0`);
+  `tools/qemu-test.sh` must stay green with DONE + clean halt.
 
-This RFC proposes an ABI change to NEW_THREAD and THREAD_CREATE. NV acceptance is required (changes syscall arguments, PLAN.md principle 5).
+## Benchmark and success metric
+
+- The five blocked G3 benchmarks become implementable: `bench` maps a
+  per-thread stack region (ANON frames via MAP on the AS cap it already
+  holds) and passes its top in `w1` — no RSP-switch stub. Success: all 7
+  benchmarks report results and `tools/bench.sh --compare` compares them.
+- `call_reply` / `send_recv` numbers must not move (their `w1 = 0` path is
+  byte-identical); the `--compare` 5% gate catches an accidental change.
+
+## Kill criterion
+
+If the spawn-time overlay proves unsound on a future arch backend (for
+example one that builds the user context lazily at first dispatch, so a
+pre-resume frame write is a no-op), the fallback is extending
+`ContextBackend::init_context` with the initial RSP as a parameter — a HAL
+trait change coordinated through NV. The ABI proposed here (`w1`) does not
+change in that case; only the kernel-internal plumbing does.
+
+## Alternatives considered
+
+1. **RSP-switch stub per thread (linrun precedent).** Userspace-only, no ABI
+   change, works today. Rejected as the permanent design: every
+   multi-threaded program re-implements stub generation, and each thread
+   start pays a double entry. Acceptable as DS's interim before this lands.
+2. **Create → suspend → REGS_WRITE → resume dance.** Works today with the
+   existing ABI (the returned child cap carries CONTROL|GRANT,
+   `kernel/src/entry.rs:944-953`; `regs_write` rebuilds the frame with the
+   caller's RSP; under the v0 cooperative scheduler the parent stays
+   runnable until it blocks, so the child cannot run first). Rejected as the
+   permanent design: four invocations per thread, a preemption race window
+   between create and suspend that M3 opens, and `THREAD_CREATE`'s stated
+   semantics ("starts at the aliased default") remain a footgun. Documented
+   as the interim path on the board.
+3. **Kernel picks the slot** (`RSP = USER_STACK_TOP - ordinal * 64 KiB`).
+   Violates principle 5 (the kernel must not pick) and principle 3 (the
+   kernel would map or track user stacks it did not get from the principal);
+   also silently returns unmapped RSPs today's launchers never mapped.
+   Rejected.
+4. **Extend SET_ENTRY with the stack top too.** Unnecessary: REGS_WRITE
+   already retargets RSP (S2d) on a quiescent thread; SET_ENTRY stays
+   PC-only. Not taken — smaller ABI surface.
