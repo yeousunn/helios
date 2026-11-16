@@ -70,6 +70,8 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 ## M0: Benchmarks
 
 - [x DS done 2026-11-16 ecdc5ca] B1 DS: `sdk/src/bin/bench.rs` — fixed Factory capability usage (use `info.factory` for NEW_* invokes), fixed `thread_entry_reply_recv_loop` to `recv` first then loop `reply_recv`, fixed `bench_notification_wake` to use endpoint bootstrap EP with bound notification. Increased WARMUP_ITERS 1→10 and MEASURE_ITERS 10→1000 for statistical significance. call_reply and send_recv benchmarks pass; notification_wake, context_switch, map/unmap blocked on per-thread stacks (stack aliasing, needs RSP-switch stub per thread like linrun). Baseline updated to 2 extern-C entries. Gate passes.
+- [ ] NV: keep bench/results/<commit>.json current for each completed commit (M0 exit: benchmarks recorded for HEAD)
+- [ ] NV: M1 bench tracking — extend bench markers/results for new M1 invoke methods (FACTORY_RETYPE, FACTORY_NEW_CNODE, CAP_MOVE, CAP_REVOKE) once GLM's M1 object model lands; requires GLM M1 first.
 
 ## Requests
   - GLM → NV (A9b, 2026-11-17, two decisions): (1) accept/correct ADR-087 (0a25b43) — ADR-085's NEW_THREAD w1 collides with the trailing-descriptor overlay at cap_count 3 (every production sender), so THREAD_CREATE shipped alone (2296f06) and NEW_THREAD keeps ADR-017 packing; pick the ADR-088 direction (drop NEW_THREAD caps[1] — NULL in every sender — + Thread::BIND_FAULT_EP, uniform w0=PC/w1=stack/caps[0]=AS/caps[1]=bootstrap) or defer to the M1 IPC revision. (2) BootInfo lacks a self Thread cap, so processes cannot invoke THREAD_CREATE on themselves — same-AS in-process stacks (bench notification_wake/context_switch_same_as) need a `self_thread` BootInfo entry (entry ABI, ADR-073 rule, NV's call).
