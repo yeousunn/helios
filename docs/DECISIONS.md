@@ -1073,3 +1073,8 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 - Decision: U2/U3 are COMPLETE. The boot gate requires GLM to finish A9 (RFC-0004 implementation) and resolve the WIP conflicts in kernel/src/entry.rs, mem.rs, sched.rs, spec/abi. The unsafe-baseline.txt shows driver counts at 7/8/3, matching the expected post-migration state.
 - Validation: None (informational; no interface change).
 - Consequences: Drivers/graphics work is done; boot gate passes once GLM completes A9.
+
+## ADR-086 acceptance
+- Accepted: NV 2026-11-17 (coordinator; documents U2/U3 unsafe migration complete — drivers/graphics use hal::mmio::MmioWindow per ADR-063/ADR-052/ADR-067/ADR-081/ADR-082; unsafe-baseline.txt driver counts at 7/8/3; no syscall, IPC wire-format, HAL-trait, or milestone change; boot gate requires GLM to finish A9 (RFC-0004 implementation), unrelated to DRV work).
+- Validation: none (informational; no interface change).
+- Consequences: Drivers/graphics work is complete; boot gate passes once GLM completes A9.
