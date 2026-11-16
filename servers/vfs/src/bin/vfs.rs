@@ -304,10 +304,11 @@ fn serve(
     on: u32,
     msg: &Message,
 ) -> bool {
-    if msg.tag.label() == methods::process::KILL {
+    if msg.tag.label() == methods::process::KILL && msg.tag.cap_count() == 0 {
+        let raw_status = msg.words[1] as i32;
         let ack = Message::new(methods::process::KILL);
         let _ = shell.send(REPLY_CAP, &ack);
-        Syscalls::new(&mut X86_64Syscalls).exit(msg.words[1] as i32);
+        Syscalls::new(&mut X86_64Syscalls).exit(raw_status);
     }
     if server.handle(on, msg, windows).is_err() {
         Syscalls::new(&mut X86_64Syscalls).exit(0xE7);

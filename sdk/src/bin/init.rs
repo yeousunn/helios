@@ -935,7 +935,9 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
     // Shutdown: console down (KILL acks, then it exits) and reap.
     {
         let mut sys = Syscalls::new(raw);
-        let kill = Message::new(methods::process::KILL);
+        let mut kill = Message::new(methods::process::KILL);
+        kill.words[0] = 0; // pid = 0 (launcher shutdown)
+        kill.words[1] = 0; // raw_status = 0
         let ack = sys
             .call(console_svc, &kill)
             .map_err(|e| fail_code(STEP_CHILD_EXIT, e as u64))?;
@@ -950,7 +952,9 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
     }
     {
         let mut sys = Syscalls::new(raw);
-        let kill = Message::new(methods::process::KILL);
+        let mut kill = Message::new(methods::process::KILL);
+        kill.words[0] = 0; // pid = 0 (no child to kill, launcher shutdown)
+        kill.words[1] = 0; // raw_status = 0
         let ack = sys
             .call(vfs_conn, &kill)
             .map_err(|e| fail_code(STEP_CHILD_EXIT, e as u64))?;
@@ -966,7 +970,9 @@ fn heap_and_spawn(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
     // Shutdown: auth down (KILL acks, then it exits) and reap.
     {
         let mut sys = Syscalls::new(raw);
-        let kill = Message::new(methods::process::KILL);
+        let mut kill = Message::new(methods::process::KILL);
+        kill.words[0] = 0; // pid = 0 (launcher shutdown)
+        kill.words[1] = 0; // raw_status = 0
         let ack = sys
             .call(auth_svc, &kill)
             .map_err(|e| fail_code(STEP_CHILD_EXIT, e as u64))?;

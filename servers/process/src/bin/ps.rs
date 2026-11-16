@@ -282,10 +282,13 @@ fn ps_main() -> ! {
                         r
                     } else {
                         // v0 launcher shutdown: ack, then exit with the
-                        // caller's raw status (design §2.6).
+                        // caller's raw status (design §2.6). The launcher (init)
+                        // always sends raw_status = 0; clamp to u8 range to
+                        // defend against bogus messages.
+                        let raw_status = (req.words[1] & 0xFF) as i32;
                         let ack = Message::new(methods::process::KILL);
                         let _ = sys.send(REPLY_CAP, &ack);
-                        Syscalls::new(&mut raw).exit(req.words[1] as i32);
+                        Syscalls::new(&mut raw).exit(raw_status);
                     }
                 }),
                 label => Some({
