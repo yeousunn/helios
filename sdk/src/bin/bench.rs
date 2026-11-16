@@ -48,8 +48,8 @@ static HEAP: SysHeap = SysHeap::new();
 type Result<T> = core::result::Result<T, u64>;
 
 /// Minimal bench configuration.
-const WARMUP_ITERS: u64 = 1;
-const MEASURE_ITERS: u64 = 10;
+const WARMUP_ITERS: u64 = 10;
+const MEASURE_ITERS: u64 = 1000;
 const BENCH_HEAP_CHUNKS: u64 = 2;
 
 init_entry_point!(bench_main);
