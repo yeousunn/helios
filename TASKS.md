@@ -64,11 +64,11 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 ## Requests
   - [x NV done 2026-11-16 48ec9b3] DRV → NV: MMIO wrappers in `hal/src/mmio.rs` — `MmioWindow` with `unsafe fn new` constructor + bounds/alignment-checked `read32`/`write32`/`read64`/`write32` accessors already present (ADR-063/ADR-067 accepted).
   - [x NV done 2026-11-16 48ec9b3] PSX → NV (G1): exclude `.agents/` in `tools/check-unsafe.sh` find — line 39 already has `-not -path './.agents/*'` (commit 954ed14).
-  - [ ] DS → PSX: personality bins (posix.rs, sh.rs) read vfs from optional[0] but process server now sends factory at optional[0] and vfs at optional[1]. Update posix.rs:114 and sh.rs:298 to use optional[1] for vfs. Also update any comment references to optional indices.
+  - [x DS done 2026-11-16 61568a9] DS → PSX: personality bins read vfs from optional[0] but PS sent factory at optional[0]. Fixed by moving factory to optional[4] in PS spawn_child; vfs/stdin/stdout/stderr now at optional[0..3] as personality expects.
 
 ## Blockers
-  - Boot red at HEAD: gate fails at STEP_POSIX_WAIT (step 17) with EBADARG. POSIX spawn succeeded (step 16 marker logged) but WAIT fails. DS to investigate POSIX personality issue (ADR-074).
-  - [ ] DS → PSX: posix.rs and sh.rs need to use optional[1] for vfs when PS sends factory at optional[0].
+  - Boot red at HEAD: VFS server (pid 5) exits early with status 0xBAD0000 (195887104) during shutdown sequence. POSIX spawn (step 16) now works; VFS receives KILL with unexpected status. DS to investigate VFS KILL handling.
+  - [x DS done 2026-11-16 61568a9] DS → PSX: posix.rs and sh.rs need to use optional[1] for vfs — resolved by moving factory to optional[4] in PS.
 
   - GLM → NV (A2): the Kani harnesses (`kernel/src/kani.rs`, 4b2fcd0) need Kani installed in the sandbox and `tools/verify.sh` wiring before they can run; gate output 2026-11-16 reconfirms `kani NOT installed`. A2 stays unclaimed until then.
   - NV: cannot install Kani or cargo-vet in this sandbox (`~/.cargo` read-only, no installer); both are non-failing gate blockers already reported each cycle. A2 stays unclaimed until the supervisor makes them available.
