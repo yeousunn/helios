@@ -62,16 +62,16 @@ pub fn run<R: RawSyscalls>(sys: &mut Syscalls<R>, pkg: &BootstrapPackage) -> i32
     let outcomes = [
         case_orphan_handle(sys),
         case_regs_write_non_frame_cap(sys, pkg),
-        case_regs_write_invalid_entry_pc(sys, pkg),    // S2b
-        case_regs_write_invalid_user_rsp(sys, pkg),    // S2d
-        case_thread_create_kernel_pc(sys, pkg),        // S2
-        case_set_entry_kernel_pc(sys, pkg),            // S2
-        case_set_tls_non_canonical(sys, pkg),          // S3
-        case_map_kernel_window(sys, pkg),              // S4/S5
-        case_unmap_kernel_window(sys, pkg),            // S4
-        case_protect_kernel_window(sys, pkg),          // S4
-        case_map_null(sys, pkg),                       // S4
-        case_unmap_oversized_count(sys, pkg),          // S9
+        case_regs_write_invalid_entry_pc(sys, pkg), // S2b
+        case_regs_write_invalid_user_rsp(sys, pkg), // S2d
+        case_thread_create_kernel_pc(sys, pkg),     // S2
+        case_set_entry_kernel_pc(sys, pkg),         // S2
+        case_set_tls_non_canonical(sys, pkg),       // S3
+        case_map_kernel_window(sys, pkg),           // S4/S5
+        case_unmap_kernel_window(sys, pkg),         // S4
+        case_protect_kernel_window(sys, pkg),       // S4
+        case_map_null(sys, pkg),                    // S4
+        case_unmap_oversized_count(sys, pkg),       // S9
     ];
     classify(&outcomes)
 }
@@ -343,8 +343,8 @@ mod tests {
             use ipc::status::{EBADARG, EBADCAP, OK};
             MockKernel {
                 statuses: [
-                    EBADCAP, EBADARG, OK, EBADARG, OK, EBADARG, EBADARG, EBADARG, EBADARG,
-                    OK, OK, EBADARG, OK, OK, EBADARG, EBADARG, EBADARG, EBADARG, EBADARG, EBADARG,
+                    EBADCAP, EBADARG, OK, EBADARG, OK, EBADARG, EBADARG, EBADARG, EBADARG, OK, OK,
+                    EBADARG, OK, OK, EBADARG, EBADARG, EBADARG, EBADARG, EBADARG, EBADARG,
                 ],
                 len: 20,
                 i: 0,
