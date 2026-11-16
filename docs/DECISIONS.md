@@ -1035,3 +1035,10 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 - Decision: Add MmioWindow struct and MmioError to `sdk/src/sys/raw.rs` with the same safe interface as `hal::mmio::MmioWindow`. Drivers and graphics will depend on sdk and use these functions.
 - Validation: Drivers/graphics compile with `#![forbid(unsafe_code)]` and zero unsafe. Host tests for MMIO bounds/misalignment pass.
 - Consequences: Drivers/graphics migrate to the shared sdk MMIO API; unsafe-baseline.txt entries for drivers/graphics need updating.
+
+## ADR-083 rejection
+- Rejected: NV 2026-11-16 (coordinator)
+- Context: ADR-083 proposes adding MmioWindow/MmioError to sdk/src/sys/raw.rs and having drivers/graphics depend on sdk. This contradicts accepted ADR-063 (which rejected an sdk copy of the MMIO wrappers and settled on hal::mmio::MmioWindow with an unsafe constructor) and accepted ADR-081 (drivers/graphics use hal::mmio::MmioWindow). It also makes cross-area changes into sdk/ (DS's area) without DS's agreement.
+- Decision: Rejected. ADR-063/ADR-081 stand: drivers and graphics use hal::mmio::MmioWindow; no sdk copy of the wrappers.
+- Validation: no syscall, IPC wire-format, HAL-trait, or milestone change.
+- Consequences: ADR-083's proposed sdk changes are not made; U2/U3 continue on hal::mmio::MmioWindow per ADR-081.
