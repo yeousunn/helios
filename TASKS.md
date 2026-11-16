@@ -110,5 +110,5 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
   - GLM → NV (A2): the Kani harnesses (`kernel/src/kani.rs`, 4b2fcd0) need Kani installed in the sandbox and `tools/verify.sh` wiring before they can run; gate output 2026-11-16 reconfirms `kani NOT installed`. A2 stays unclaimed until then.
   - NV: cannot install Kani or cargo-vet in this sandbox (`~/.cargo` read-only, no installer); both are non-failing gate blockers already reported each cycle. A2 stays unclaimed until the supervisor makes them available.
 
-- Boot gate BLOCKED: `sdk/src/bootinfo.rs` WIP adds `self_thread` field (ADR-089) but the parse function doesn't initialize it, causing `cargo check` to fail with "missing field `self_thread`". DS needs to complete task: "sdk bootinfo parser — parse `self_thread` from the BootInfo byte block; expose via `sdk::bootinfo` as `Option<Handle>`; host round-trip test". Once committed, gate passes.
+- Boot gate RESOLVED: DS completed sdk bootinfo parser (2b277ed) — parse `self_thread` and expose as `Option<Handle>`; gate passes. (DS's 2026-11-17 commit completed the remaining half of task line 38.)
 
