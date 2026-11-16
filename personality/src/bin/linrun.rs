@@ -5,9 +5,9 @@
 //! the native operation, and replies with the Linux result.
 //!
 //! The emulated thread and this emulator share one address space (v0 model),
-//! so pointer arguments are direct addresses. This demo runs a small
-//! in-binary raw-syscall stub (`write(1, …)` + `exit(0)`); the ELF loader for
-//! an external musl binary builds on the same loop.
+//! so pointer arguments are direct addresses. The emulated thread is spawned
+//! with `Thread::THREAD_CREATE` onto a carved Linux stack (w1 = the stack
+//! top, RFC-0004/ADR-085) and loads an embedded static ELF.
 //!
 //! Package: optional[0] = VFS, [1] = stdin, [2] = stdout (console),
 //! [3] = the foreign route endpoint (minted by the launcher, ADR-046).
@@ -128,7 +128,7 @@ struct Emu<'a> {
 }
 
 /// Base VAs for emulated anonymous memory (distinct from the image, the Linux
-/// stack, the stub and the personality heap/windows).
+/// stack and the personality heap/windows).
 const MMAP_VA_BASE: u64 = 0x0000_6000_0000_0000;
 const BRK_VA_BASE: u64 = 0x0000_6100_0000_0000;
 
@@ -594,12 +594,12 @@ extern "C" fn linrun_main(argc: u64, argv_va: u64, _envp_va: u64) -> ! {
     // Craft the Linux initial stack at a DEDICATED VA — NOT USER_STACK_TOP,
     // which is where the emulator's OWN main-thread Rust stack lives (sharing
     // it corrupts the emulated thread as soon as the emulator nests deeper
-    // into the serve loop). A stackless stub, set as the child's entry, moves
-    // RSP to here then jumps to the ELF entry.
+    // into the serve loop). THREAD_CREATE's w1 (RFC-0004/ADR-085, ADR-087)
+    // hands the carved stack top to the kernel, so the emulated thread enters
+    // the ELF on its own stack and no RSP-switch stub page is needed.
     const STACK_BASE: u64 = 0x0000_7F00_0000_0000;
     const STACK_PAGES: u64 = 8; // 32 KiB
-    const STUB_PAGE: u64 = 0x0000_0000_4000_0000;
-    {
+    let child = {
         let mut sys = Syscalls::new(&mut raw);
         // Map STACK_PAGES for the Linux stack.
         for i in 0..STACK_PAGES {
@@ -622,34 +622,13 @@ extern "C" fn linrun_main(argc: u64, argv_va: u64, _envp_va: u64) -> ! {
                 exit(&mut raw, 0x61 | (e & 0xF));
             }
         }
-        // Map one page for the RSP-switch stub.
-        let mut carve2 = Message::new(sdk::methods::region::CARVE);
-        carve2.words[0] = 4096;
-        carve2.words[1] = 4096;
-        let sframe = match sys.invoke(package.region, &carve2) {
-            Ok(r) => r.words[0] as u32,
-            Err(e) => exit(&mut raw, 0x62 | (e & 0xF)),
-        };
-        let mut smap = Message::new(sdk::methods::aspace::MAP);
-        smap.tag = smap.tag.with_caps(1);
-        smap.words[0] = STUB_PAGE;
-        smap.words[1] = 0b111; // R | W | X (no W^X yet; we write the stub)
-        let _ = smap.set_descriptor(
-            0,
-            ipc::CapSlot::pack(sframe, ipc::Rights::READ.union(ipc::Rights::WRITE)),
-        );
-        if let Err(e) = sys.invoke(package.aspace, &smap) {
-            exit(&mut raw, 0x63 | (e & 0xF));
-        }
-        // The guest stack pages and the stub page are mapped R|W|X in this AS
-        // by the loops above: record both ranges in guest memory (U4c3) and
-        // route the Linux startup layout (argv strings, envp/auxv block) and
-        // the RSP-switch stub through the bounds-checked guest writer.
+        // The guest stack pages are mapped R|W in this AS by the loop above:
+        // record the range in guest memory (U4c3) and route the Linux startup
+        // layout (argv strings, envp/auxv block) through the bounds-checked
+        // guest writer. No stub page: THREAD_CREATE's w1 carries the stack
+        // top to the kernel and the emulated thread enters the ELF directly.
         if guest.add(STACK_BASE, STACK_PAGES * 4096).is_err() {
             exit(&mut raw, 0x64);
-        }
-        if guest.add(STUB_PAGE, 4096).is_err() {
-            exit(&mut raw, 0x65);
         }
         // Guest argv. Default: the freestanding demo reads argv[0].
         // busybox: argv[0]="busybox" selects applet-arg dispatch, and the
@@ -674,10 +653,10 @@ extern "C" fn linrun_main(argc: u64, argv_va: u64, _envp_va: u64) -> ! {
         for a in &guest_argv {
             let p = str_area + off as u64;
             if guest.write(p, a).is_err() {
-                exit(&mut raw, 0x66);
+                exit(&mut raw, 0x65);
             }
             if guest.write(p + a.len() as u64, &[0u8]).is_err() {
-                exit(&mut raw, 0x66);
+                exit(&mut raw, 0x65);
             }
             arg_ptrs.push(p);
             off += a.len() + 1;
@@ -686,7 +665,7 @@ extern "C" fn linrun_main(argc: u64, argv_va: u64, _envp_va: u64) -> ! {
         let rnd = STACK_BASE + 0x200;
         for i in 0..16u64 {
             if guest.write(rnd + i, &[(0xA5 ^ i as u8)]).is_err() {
-                exit(&mut raw, 0x67);
+                exit(&mut raw, 0x66);
             }
         }
         // AT_PHDR/PHNUM/PHENT must describe ALL program headers (musl
@@ -727,10 +706,13 @@ extern "C" fn linrun_main(argc: u64, argv_va: u64, _envp_va: u64) -> ! {
         // The initial block sits at the TOP of the stack with rsp pointing
         // at argc; the block runs upward, calls grow down into the pages.
         // Layout: argc, argv…, NULL, envp…, NULL, auxv pairs (the program
-        // reads envp right after the argv NULL, then the auxv).
+        // reads envp right after the argv NULL, then the auxv). The top is
+        // aligned down to 16 bytes: THREAD_CREATE validates w1 alignment
+        // (RFC-0004/ADR-085) and the SysV ABI wants a 16-aligned RSP at
+        // function entry. An odd qword count would otherwise be rejected.
         let n = arg_ptrs.len();
         let n_qwords = 1 + (n + 1) + 1 + auxv.len() * 2;
-        let rsp = STACK_BASE + STACK_PAGES * 4096 - (n_qwords as u64) * 8;
+        let rsp = (STACK_BASE + STACK_PAGES * 4096 - (n_qwords as u64) * 8) & !0xF;
         let mut k = 0usize;
         // Every layout write below goes through guest memory (U4c3): the
         // ranges were recorded above, so a rejection is an internal invariant
@@ -739,7 +721,7 @@ extern "C" fn linrun_main(argc: u64, argv_va: u64, _envp_va: u64) -> ! {
         let mut layout_fail = 0i32;
         let mut put = |at: usize, v: u64| {
             if layout_fail == 0 && guest.write_u64(rsp + (at as u64) * 8, v).is_err() {
-                layout_fail = 0x68;
+                layout_fail = 0x67;
             }
         };
         put(k, n as u64); // argc
@@ -757,39 +739,24 @@ extern "C" fn linrun_main(argc: u64, argv_va: u64, _envp_va: u64) -> ! {
             put(k + 1, v);
             k += 2;
         }
-        // The stub: mov rsp, <rsp> (48 BC imm64); mov rax, entry
-        // (48 B8 imm64); jmp rax (FF E0).
-        if guest.write(STUB_PAGE, &[0x48, 0xBC]).is_err() {
-            layout_fail = 0x69;
-        }
-        if layout_fail == 0 && guest.write_u64(STUB_PAGE + 2, rsp).is_err() {
-            layout_fail = 0x69;
-        }
-        if layout_fail == 0 && guest.write(STUB_PAGE + 10, &[0x48, 0xB8]).is_err() {
-            layout_fail = 0x69;
-        }
-        if layout_fail == 0 && guest.write_u64(STUB_PAGE + 12, entry).is_err() {
-            layout_fail = 0x69;
-        }
-        if layout_fail == 0 && guest.write(STUB_PAGE + 20, &[0xFF, 0xE0]).is_err() {
-            layout_fail = 0x69;
-        }
         if layout_fail != 0 {
             exit(&mut raw, layout_fail);
         }
-    }
-    let child = {
-        let mut sys = Syscalls::new(&mut raw);
-        let mut m = Message::new(sdk::methods::thread::THREAD_CREATE);
-        m.words[0] = STUB_PAGE; // run the RSP-switch stub first, not entry
-        match sys.invoke(package.thread, &m) {
+        // The emulated thread enters the ELF directly, on the crafted stack:
+        // THREAD_CREATE's w1 is the initial user stack top (RFC-0004/ADR-085
+        // as scoped by ADR-087) and w0 the entry PC.
+        let mut tc = Message::new(sdk::methods::thread::THREAD_CREATE);
+        tc.words[0] = entry;
+        tc.words[1] = rsp;
+        let child = match sys.invoke(package.thread, &tc) {
             Ok(r) => r.words[0] as u32,
             Err(e) => exit(&mut raw, 0x51 | (e & 0xF)),
+        };
+        if child == 0 {
+            exit(&mut raw, 0x52);
         }
+        child
     };
-    if child == 0 {
-        exit(&mut raw, 0x52);
-    }
     {
         let mut sys = Syscalls::new(&mut raw);
         // SUSPEND → SET_FOREIGN(handle) → BIND_DEATH → RESUME.

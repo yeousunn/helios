@@ -6,10 +6,12 @@
  *   "tls: fs=<base> ok"
  *   "cwd:<root>" then "exe:/linrun" (kept from the musl_cwd demo)
  *   "helios-musl-time: ALL OK"
- * Exits 1 (with "tls-fail" / "mono-fail" / "sleep-short") if the emulator
- * answers something Linux would not: a base of 0 for ARCH_GET_FS (musl's
- * startup sets TLS through ARCH_SET_FS), or a nanosleep that came back
- * before its own deadline.
+ * Exits 1 (with "tls-fail" / "mono-fail" / "sleep-short" / "argv-fail") if
+ * the emulator answers something Linux would not: a base of 0 for
+ * ARCH_GET_FS (musl's startup sets TLS through ARCH_SET_FS), a nanosleep
+ * that came back before its own deadline, or an empty argv[0] (which would
+ * mean the crafted Linux stack was not handed to the emulated thread
+ * intact).
  *
  * Build (see ../build.sh):
  *   zig cc -target x86_64-linux-musl -static -Os -s -o musl_time musl_time.c
@@ -25,7 +27,7 @@ static long arch_prctl_get_fs(unsigned long *out) {
     return syscall(SYS_arch_prctl, 0x1003, out);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     struct timespec t0, t1;
     if (clock_gettime(CLOCK_MONOTONIC, &t0) != 0) {
         write(1, "mono-fail\n", 10);
@@ -44,6 +46,14 @@ int main(void) {
     unsigned long fs = 0;
     if (arch_prctl_get_fs(&fs) != 0 || fs == 0) {
         write(1, "tls-fail\n", 9);
+        return 1;
+    }
+
+    /* argv[0] comes off the crafted Linux stack the emulator handed to
+     * THREAD_CREATE as its initial RSP; an empty one means the stack did
+     * not survive the spawn. */
+    if (argc != 1 || argv[0] == 0 || argv[0][0] == 0) {
+        write(1, "argv-fail\n", 10);
         return 1;
     }
 
@@ -71,6 +81,7 @@ int main(void) {
         write(1, p, n);
         write(1, "\n", 1);
     }
+    printf("argv0: %s\n", argv[0]);
     if (dt < 20 * 1000 * 1000) {
         write(1, "sleep-short\n", 12);
         return 1;
