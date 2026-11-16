@@ -580,30 +580,35 @@ pub fn sys_reply_recv(
 ) -> SysResult<Option<Message>> {
     // Deadline already passed (ADR-041): the reply half still completes (it
     // unblocks the caller we owe an answer to); the recv half times out.
+    // With no pending reply there is nothing to flush: report the recv
+    // half's own outcome (ETIMEDOUT) — EBADSTATE is not a spec/abi
+    // REPLY_RECV error (ADR-080).
     if expired(deadline_ns) {
-        match take_reply(tid) {
-            Some(caller) => {
-                let (env, _) = resolve_transfers(pid, &reply, tid);
-                crate::endpoint::DELIVERED_FOR_REPLY
-                    .lock()
-                    .insert(caller, env);
-                sched::make_ready(caller).map_err(|_| err(ipc::status::EDEAD))?;
-            }
-            None => return Err(err(ipc::status::EBADSTATE)),
-        }
-        return Err(err(ipc::status::ETIMEDOUT));
-    }
-    match take_reply(tid) {
-        Some(caller) => {
-            // Same contract as `reply_only`: resolve descriptors before the
-            // parked caller installs them on resume (ADR-011 §1).
+        if let Some(caller) = take_reply(tid) {
             let (env, _) = resolve_transfers(pid, &reply, tid);
             crate::endpoint::DELIVERED_FOR_REPLY
                 .lock()
                 .insert(caller, env);
             sched::make_ready(caller).map_err(|_| err(ipc::status::EDEAD))?;
         }
-        None => return Err(err(ipc::status::EBADSTATE)),
+        return Err(err(ipc::status::ETIMEDOUT));
+    }
+    // ADR-080: the reply half is conditional on a pending call. The implicit
+    // reply slot holds a caller only after a `call` was delivered, so a
+    // server's FIRST reply_recv has nothing to answer and must still run
+    // its recv half (and park). The slot-empty EBADSTATE was not a
+    // spec/abi REPLY_RECV error, and a server loop that ignored it
+    // hot-spun forever — under the cooperative scheduler that starves the
+    // rest of the system (observed: bench's reply_recv server wedged the
+    // bench boot before its first call).
+    if let Some(caller) = take_reply(tid) {
+        // Same contract as `reply_only`: resolve descriptors before the
+        // parked caller installs them on resume (ADR-011 §1).
+        let (env, _) = resolve_transfers(pid, &reply, tid);
+        crate::endpoint::DELIVERED_FOR_REPLY
+            .lock()
+            .insert(caller, env);
+        sched::make_ready(caller).map_err(|_| err(ipc::status::EDEAD))?;
     }
     sys_recv(pid, tid, src_handle, false, deadline_ns)
 }
@@ -1037,6 +1042,57 @@ mod tests {
         assert_eq!(r.status, ipc::status::EDEAD as i64);
         // Consumed: the flag must not leak into the caller's next park.
         assert!(!sched::get(client).unwrap().call_dead);
+    }
+
+    #[test]
+    fn reply_recv_without_pending_call_still_receives() {
+        // ADR-080 regression: a server's FIRST reply_recv has no pending
+        // call, so its reply half has nothing to answer — the recv half
+        // must still run (and park on an empty mailbox). The old
+        // slot-empty EBADSTATE was not a spec/abi REPLY_RECV error and
+        // left ignore-the-result server loops hot-spinning forever.
+        let (pid, server, _client, ep_h) = setup();
+        // Empty mailbox: the recv half parks instead of failing.
+        let reply = msg(0x0999, 0);
+        assert_eq!(
+            sys_reply_recv(pid, server, ep_h, reply, 0),
+            Ok(None),
+            "no pending reply: recv half runs and parks"
+        );
+        assert!(matches!(
+            sched::get(server).unwrap().state,
+            State::Blocked(BlockReason::Recv(_))
+        ));
+        assert_eq!(take_reply(server), None, "no reply slot was consumed");
+        // Queued message: the recv half returns it immediately.
+        let (pid2, server2, client2, ep_h2) = setup();
+        assert_eq!(sys_send(pid2, client2, ep_h2, msg(0x0110, 7), false), Ok(0));
+        let got = sys_reply_recv(pid2, server2, ep_h2, msg(0x0999, 0), 0)
+            .expect("no pending reply: recv half completes")
+            .expect("queued message delivered");
+        assert_eq!(got.words[0], 7);
+    }
+
+    #[test]
+    fn reply_recv_expired_without_pending_reply_times_out() {
+        // ADR-080: an expired deadline with nothing to reply still reports
+        // the recv half's own outcome (ETIMEDOUT), not the undocumented
+        // slot-empty EBADSTATE. A pending reply is still flushed first.
+        let (pid, server, _client, ep_h) = setup();
+        time::set_clock(|| 5_000);
+        assert_eq!(
+            sys_reply_recv(pid, server, ep_h, msg(0x0999, 0), 1),
+            Err(ipc::status::ETIMEDOUT)
+        );
+        // With a pending reply, the expired path still completes it.
+        let (pid2, server2, client2, ep_h2) = setup();
+        assert_eq!(sys_call(pid2, client2, ep_h2, msg(1, 1)), Ok(0));
+        let _ = sys_recv(pid2, server2, ep_h2, false, 0).unwrap();
+        assert_eq!(
+            sys_reply_recv(pid2, server2, ep_h2, msg(0x0999, 0), 1),
+            Err(ipc::status::ETIMEDOUT)
+        );
+        assert!(matches!(sched::get(client2).unwrap().state, State::Ready));
     }
 
     #[test]
