@@ -22,9 +22,10 @@ use core::panic::PanicInfo;
 
 use ipc::Message;
 use personality::layout::HEAP_VA_BASE;
+use sdk::guest::GuestMemory;
 use sdk::heap::RegionSource;
 use sdk::layout::{HEAP_CHUNK, HEAP_CHUNKS};
-use sdk::sys::{raw_copy_from_va, raw_copy_to_va, raw_cstr_from_va, SysHeap};
+use sdk::sys::{raw_copy_from_va, raw_cstr_from_va, SysHeap};
 use sdk::syscall::{Syscalls, X86_64Syscalls};
 
 #[global_allocator]
@@ -45,12 +46,15 @@ static BUSYBOX_ELF: &[u8] = include_bytes!("../../assets/busybox");
 
 /// Load an ET_EXEC ELF into this process's own AS (shared with the emulated
 /// thread): carve + map a frame per page of every PT_LOAD, then copy the file
-/// bytes straight to the segment VA. Returns the entry PC.
+/// bytes straight to the segment VA. Returns the entry PC. Every mapping is
+/// recorded in `guest`, and every copy goes through it (U4c3): the loader
+/// cannot write anywhere it did not just map.
 fn load_elf<R: sdk::syscall::RawSyscalls>(
     sys: &mut Syscalls<R>,
     as_cap: u32,
     region: u32,
     bytes: &[u8],
+    guest: &mut GuestMemory,
 ) -> Result<u64, i32> {
     let elf = sdk::elf::ElfImage::parse(bytes)?;
     for i in 0..elf.segment_count {
@@ -76,17 +80,22 @@ fn load_elf<R: sdk::syscall::RawSyscalls>(
             );
             sys.invoke(as_cap, &map)?;
         }
-        // The segment pages are mapped R|W|X in this AS by the loop above.
+        // Record the segment as one guest range, then copy through it: the
+        // pages were mapped R|W|X in this AS by the loop above, so every
+        // write below is in range.
+        guest.add(first, pages * 4096).map_err(|_| -12i32)?;
         // Zero the whole region (BSS = memsz - filesz) one page at a time,
         // then copy the file contents over it.
         const ZERO_PAGE: [u8; 4096] = [0; 4096];
         for p in 0..pages {
-            raw_copy_to_va(first + p * 4096, &ZERO_PAGE);
+            guest
+                .write(first + p * 4096, &ZERO_PAGE)
+                .map_err(|_| -12i32)?;
         }
         let off = seg.offset as usize;
         let filesz = seg.filesz as usize;
         if let Some(src) = bytes.get(off..).and_then(|s| s.get(..filesz)) {
-            raw_copy_to_va(seg.vaddr, src);
+            guest.write(seg.vaddr, src).map_err(|_| -12i32)?;
         }
     }
     Ok(elf.entry)
@@ -101,6 +110,10 @@ struct Emu<'a> {
     vfs: Option<&'a mut personality::vfs::VfsClient>,
     region: u32,
     aspace: u32,
+    /// Bounds-checked guest memory (U4c3): every guest copy goes through it,
+    /// so a wild guest pointer is `EFAULT` instead of an arbitrary read or
+    /// write of this process's own mappings.
+    guest: &'a mut GuestMemory,
     /// Bump pointer for emulated anonymous `mmap`.
     mmap_bump: &'a mut u64,
     /// Current emulated program break.
@@ -116,7 +129,8 @@ const MMAP_VA_BASE: u64 = 0x0000_6000_0000_0000;
 const BRK_VA_BASE: u64 = 0x0000_6100_0000_0000;
 
 impl Emu<'_> {
-    /// Carve + map `len` bytes of zero-filled anonymous RW memory at `va`.
+    /// Carve + map `len` bytes of zero-filled anonymous RW memory at `va`,
+    /// recording the range in guest memory so the guest can use it (U4c3).
     fn map_pages(&mut self, va: u64, len: usize) -> bool {
         let pages = len.div_ceil(4096);
         for i in 0..pages {
@@ -140,22 +154,29 @@ impl Emu<'_> {
                 return false;
             }
         }
-        true
+        // The mapping succeeded, so the guest may address it from now on; a
+        // span-table failure is reported to the caller as a failed mapping.
+        self.guest.add(va, pages as u64 * 4096).is_ok()
     }
 }
 
 impl personality::foreign::Host for Emu<'_> {
     fn mem_read(&mut self, addr: u64, buf: &mut [u8]) -> i64 {
-        // The emulated image shares this AS, and `addr` is a guest VA the
-        // emulator mapped itself (load_elf / map_pages), so the copy target
-        // is valid and `buf.len()` bytes fit inside the mapped span.
-        raw_copy_from_va(addr, buf);
-        buf.len() as i64
+        // The emulated image shares this AS. `addr` must name a range the
+        // emulator mapped for the guest (load_elf / map_pages / the Linux
+        // stack); anything else — including the emulator's own stack and
+        // heap — is EFAULT (U4c3).
+        match self.guest.read(addr, buf) {
+            Ok(n) => n as i64,
+            Err(e) => e,
+        }
     }
     fn mem_write(&mut self, addr: u64, data: &[u8]) -> i64 {
-        // As `mem_read`: the emulator owns every guest page it maps.
-        raw_copy_to_va(addr, data);
-        data.len() as i64
+        // As `mem_read`: only ranges recorded in guest memory are writable.
+        match self.guest.write(addr, data) {
+            Ok(n) => n as i64,
+            Err(e) => e,
+        }
     }
     fn write_fd(&mut self, fd: i32, data: &[u8]) -> i64 {
         if fd != 1 && fd != 2 {
@@ -438,6 +459,11 @@ extern "C" fn linrun_main(argc: u64, argv_va: u64, _envp_va: u64) -> ! {
     }
     let busybox = argn >= 1;
     let elf: &[u8] = if busybox { BUSYBOX_ELF } else { LIN_ELF };
+    // Guest memory bookkeeping (U4c3): every range the emulator maps for the
+    // emulated thread is recorded here, and every guest copy goes through it.
+    // It is a fixed-size span table, so it needs no heap and can be created
+    // before `HEAP.init`.
+    let mut guest = GuestMemory::new();
     let package = {
         let mut sys = Syscalls::new(&mut raw);
         match sdk::bootstrap::receive(&mut sys) {
@@ -515,7 +541,7 @@ extern "C" fn linrun_main(argc: u64, argv_va: u64, _envp_va: u64) -> ! {
     // Create the emulated thread, quiesce it, flag it foreign, bind its death.
     let entry = {
         let mut sys = Syscalls::new(&mut raw);
-        match load_elf(&mut sys, package.aspace, package.region, elf) {
+        match load_elf(&mut sys, package.aspace, package.region, elf, &mut guest) {
             Ok(e) => e,
             Err(e) => exit(&mut raw, 0x40 | (e & 0xF)),
         }
@@ -572,10 +598,15 @@ extern "C" fn linrun_main(argc: u64, argv_va: u64, _envp_va: u64) -> ! {
             exit(&mut raw, 0x63 | (e & 0xF));
         }
         // The guest stack pages and the stub page are mapped R|W|X in this AS
-        // by the loops above, so every VA written here is valid: the Linux
-        // startup layout (argv strings, envp/auxv block) and the RSP-switch
-        // stub (mov rsp, rsp; mov rax, entry; jmp rax) go through the SDK's
-        // raw VA writers instead of raw pointers (U4c).
+        // by the loops above: record both ranges in guest memory (U4c3) and
+        // route the Linux startup layout (argv strings, envp/auxv block) and
+        // the RSP-switch stub through the bounds-checked guest writer.
+        if guest.add(STACK_BASE, STACK_PAGES * 4096).is_err() {
+            exit(&mut raw, 0x64);
+        }
+        if guest.add(STUB_PAGE, 4096).is_err() {
+            exit(&mut raw, 0x65);
+        }
         // Guest argv. Default: the freestanding demo reads argv[0].
         // busybox: argv[0]="busybox" selects applet-arg dispatch, and the
         // launcher's native argv[1..] become the applet and its arguments.
@@ -598,15 +629,21 @@ extern "C" fn linrun_main(argc: u64, argv_va: u64, _envp_va: u64) -> ! {
         let mut arg_ptrs: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
         for a in &guest_argv {
             let p = str_area + off as u64;
-            raw_copy_to_va(p, a);
-            raw_copy_to_va(p + a.len() as u64, &[0u8]); // NUL terminator
+            if guest.write(p, a).is_err() {
+                exit(&mut raw, 0x66);
+            }
+            if guest.write(p + a.len() as u64, &[0u8]).is_err() {
+                exit(&mut raw, 0x66);
+            }
             arg_ptrs.push(p);
             off += a.len() + 1;
         }
         debug_assert!(off <= 0x100, "guest argv strings overflow 0x100");
         let rnd = STACK_BASE + 0x200;
         for i in 0..16u64 {
-            raw_copy_to_va(rnd + i, &[(0xA5 ^ i as u8)]);
+            if guest.write(rnd + i, &[(0xA5 ^ i as u8)]).is_err() {
+                exit(&mut raw, 0x67);
+            }
         }
         // AT_PHDR/PHNUM/PHENT must describe ALL program headers (musl
         // walks them to find PT_TLS/PT_PHDR), not just the LOAD count.
@@ -651,7 +688,16 @@ extern "C" fn linrun_main(argc: u64, argv_va: u64, _envp_va: u64) -> ! {
         let n_qwords = 1 + (n + 1) + 1 + auxv.len() * 2;
         let rsp = STACK_BASE + STACK_PAGES * 4096 - (n_qwords as u64) * 8;
         let mut k = 0usize;
-        let put = |at: usize, v: u64| raw_copy_to_va(rsp + (at as u64) * 8, &v.to_le_bytes());
+        // Every layout write below goes through guest memory (U4c3): the
+        // ranges were recorded above, so a rejection is an internal invariant
+        // break. The failure is latched (a closure cannot exit while it holds
+        // these borrows) and reported once, after the block.
+        let mut layout_fail = 0i32;
+        let mut put = |at: usize, v: u64| {
+            if layout_fail == 0 && guest.write_u64(rsp + (at as u64) * 8, v).is_err() {
+                layout_fail = 0x68;
+            }
+        };
         put(k, n as u64); // argc
         k += 1;
         for p in &arg_ptrs {
@@ -669,11 +715,24 @@ extern "C" fn linrun_main(argc: u64, argv_va: u64, _envp_va: u64) -> ! {
         }
         // The stub: mov rsp, <rsp> (48 BC imm64); mov rax, entry
         // (48 B8 imm64); jmp rax (FF E0).
-        raw_copy_to_va(STUB_PAGE, &[0x48, 0xBC]);
-        raw_copy_to_va(STUB_PAGE + 2, &rsp.to_le_bytes());
-        raw_copy_to_va(STUB_PAGE + 10, &[0x48, 0xB8]);
-        raw_copy_to_va(STUB_PAGE + 12, &entry.to_le_bytes());
-        raw_copy_to_va(STUB_PAGE + 20, &[0xFF, 0xE0]);
+        if guest.write(STUB_PAGE, &[0x48, 0xBC]).is_err() {
+            layout_fail = 0x69;
+        }
+        if layout_fail == 0 && guest.write_u64(STUB_PAGE + 2, rsp).is_err() {
+            layout_fail = 0x69;
+        }
+        if layout_fail == 0 && guest.write(STUB_PAGE + 10, &[0x48, 0xB8]).is_err() {
+            layout_fail = 0x69;
+        }
+        if layout_fail == 0 && guest.write_u64(STUB_PAGE + 12, entry).is_err() {
+            layout_fail = 0x69;
+        }
+        if layout_fail == 0 && guest.write(STUB_PAGE + 20, &[0xFF, 0xE0]).is_err() {
+            layout_fail = 0x69;
+        }
+        if layout_fail != 0 {
+            exit(&mut raw, layout_fail);
+        }
     }
     let child = {
         let mut sys = Syscalls::new(&mut raw);
@@ -758,6 +817,7 @@ extern "C" fn linrun_main(argc: u64, argv_va: u64, _envp_va: u64) -> ! {
                         vfs: vfs.as_mut(),
                         region: region_h,
                         aspace: aspace_h,
+                        guest: &mut guest,
                         mmap_bump: &mut mmap_bump,
                         brk_cur: &mut brk_cur,
                         dents_cookie: &mut dents_cookie,

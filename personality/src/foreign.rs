@@ -681,6 +681,43 @@ mod tests {
         assert_eq!(a, Action::Return(EFAULT));
     }
 
+    /// The personality's guest-memory boundary is the SDK's shared
+    /// `GuestMemory` (U4c3a), and a violation must reach the emulated program
+    /// as the real Linux errno: `Host::mem_read`/`mem_write` (linrun) return
+    /// the SDK error verbatim, so the SDK's code has to stay `EFAULT` (-14).
+    /// A host array stands in for one mapped guest range — the raw VA wrappers
+    /// the SDK type uses address real host memory.
+    #[test]
+    fn wild_guest_pointer_surfaces_linux_efault() {
+        let mut mem = [0u8; 4096];
+        let mut guest = sdk::guest::GuestMemory::new();
+        let base = mem.as_ptr() as u64;
+        guest
+            .add(base, mem.len() as u64)
+            .expect("record the one guest range");
+        mem[16..21].copy_from_slice(b"hello");
+        // In range: the copy works through the bounds-checked type.
+        let mut out = [0u8; 5];
+        assert_eq!(guest.read(base + 16, &mut out), Ok(5));
+        assert_eq!(&out, b"hello");
+        assert_eq!(guest.write(base + 32, b"abc"), Ok(3));
+        assert_eq!(&mem[32..35], b"abc");
+        // Out of range: the Linux errno, and nothing is touched — the check
+        // runs before any copy (the destination stays at its pattern).
+        let mut dst = [0xAAu8; 8];
+        assert_eq!(guest.read(base + 4089, &mut dst), Err(EFAULT));
+        assert_eq!(dst, [0xAAu8; 8]);
+        assert_eq!(guest.write(base + 4096, b"x"), Err(EFAULT));
+        let spans = guest.spans();
+        assert_eq!(spans.len(), 1, "the one range is merged into one span");
+        assert_eq!(spans[0].base, base);
+        assert_eq!(spans[0].len, mem.len() as u64);
+        // The bridge: the SDK's errno value is the Linux one this module
+        // returns to the emulated program.
+        assert_eq!(sdk::guest::EFAULT, EFAULT);
+        assert_eq!(EFAULT, -14);
+    }
+
     #[test]
     fn read_writes_guest_memory() {
         let mut m = Mock::new();
