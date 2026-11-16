@@ -1,7 +1,6 @@
 //! Virtio-gpu display driver (capability-based, per ADR-052).
 //!
-//! The driver never touches raw HAL traits or physical addresses directly. It
-//! receives:
+//! The driver receives:
 //!  * a mapped MMIO window base (`mmio_base`) — the virtual address of an
 //!    `MmioRegion` capability the kernel dispatcher mapped over the device's
 //!    MMIO BAR, and
@@ -272,14 +271,16 @@ impl VirtioGpu {
 
     /// Program the virtqueue into the granted DMA page.
     fn setup_queue(&mut self, dma_virt: usize, dma_phys: usize) -> Result<(), &'static str> {
-        self.wr32(MMIO_QUEUE_SEL, 0)?; // select queue 0
-        let max = self.rd32(MMIO_QUEUE_NUM_MAX)?;
+        self.wr32(MMIO_QUEUE_SEL, 0).map_err(|_| "MMIO write error")?; // select queue 0
+        let max = self.rd32(MMIO_QUEUE_NUM_MAX).map_err(|_| "MMIO read error")?;
         if max < QUEUE_SIZE as u32 {
             return Err("virtio-gpu: queue too small");
         }
-        self.wr32(MMIO_QUEUE_NUM, QUEUE_SIZE as u32)?;
-        self.wr32(MMIO_QUEUE_PFN, (dma_phys / DMA_PAGE) as u32)?;
-        self.wr32(MMIO_QUEUE_READY, 1)?;
+        self.wr32(MMIO_QUEUE_NUM, QUEUE_SIZE as u32)
+            .map_err(|_| "MMIO write error")?;
+        self.wr32(MMIO_QUEUE_PFN, (dma_phys / DMA_PAGE) as u32)
+            .map_err(|_| "MMIO write error")?;
+        self.wr32(MMIO_QUEUE_READY, 1).map_err(|_| "MMIO write error")?;
 
         // Zero and type-pun the granted DMA page as a VirtQueue, touching
         // every queue struct type so the layout is exercised.

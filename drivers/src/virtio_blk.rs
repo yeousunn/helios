@@ -314,7 +314,9 @@ impl VirtioBlk {
 
         // Zero the queue page.
         // SAFETY: `dma_virt` is the granted DMA page, exclusively ours.
-        unsafe { ptr::write_bytes(dma_virt as *mut u8, 0, DMA_PAGE) };
+        unsafe {
+            ptr::write_bytes(dma_virt as *mut u8, 0, DMA_PAGE);
+        }
 
         self.queue_vaddr = Some(dma_virt);
         self.queue_paddr = dma_phys;
@@ -423,6 +425,11 @@ impl VirtioBlk {
     /// The device capacity in bytes.
     pub fn capacity_bytes(&self) -> u64 {
         self.capacity_sectors * SECTOR_SIZE as u64
+    }
+
+    /// Whether the virtqueue has been set up.
+    pub fn queue_ready(&self) -> bool {
+        self.queue_vaddr.is_some()
     }
 }
 

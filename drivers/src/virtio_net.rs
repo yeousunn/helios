@@ -307,19 +307,21 @@ impl VirtioNet {
 
     /// Program the virtqueue into the granted DMA page.
     fn setup_queue(&mut self, dma_virt: usize, dma_phys: usize) -> Result<(), &'static str> {
-        // Tell the device the queue size.
-        self.wr32(MMIO_QUEUE_SEL, 0)?; // select queue 0
-        let max = self.rd32(MMIO_QUEUE_NUM_MAX)?;
+        self.wr32(MMIO_QUEUE_SEL, 0).map_err(|_| "MMIO write error")?; // select queue 0
+        let max = self.rd32(MMIO_QUEUE_NUM_MAX).map_err(|_| "MMIO read error")?;
         if max < QUEUE_SIZE as u32 {
             return Err("virtio-net: queue too small");
         }
-        self.wr32(MMIO_QUEUE_NUM, QUEUE_SIZE as u32)?;
-        self.wr32(MMIO_QUEUE_PFN, (dma_phys / DMA_PAGE) as u32)?;
-        self.wr32(MMIO_QUEUE_READY, 1)?;
+        self.wr32(MMIO_QUEUE_NUM, QUEUE_SIZE as u32)
+            .map_err(|_| "MMIO write error")?;
+        self.wr32(MMIO_QUEUE_PFN, (dma_phys / DMA_PAGE) as u32)
+            .map_err(|_| "MMIO write error")?;
+        self.wr32(MMIO_QUEUE_READY, 1).map_err(|_| "MMIO write error")?;
 
         // Zero the queue page.
-        // SAFETY: `dma_virt` is the granted DMA page, exclusively ours.
-        unsafe { ptr::write_bytes(dma_virt as *mut u8, 0, DMA_PAGE) };
+        unsafe {
+            ptr::write_bytes(dma_virt as *mut u8, 0, DMA_PAGE);
+        }
 
         self.queue_vaddr = Some(dma_virt);
         self.queue_paddr = dma_phys;
@@ -392,8 +394,8 @@ impl VirtioNet {
         self.next_avail_idx = self.next_avail_idx.wrapping_add(1);
         self.next_desc_idx = (self.next_desc_idx + 2) % QUEUE_SIZE;
 
-        // Notify the device (`Virtio::notify` -> MMIO_QUEUE_NOTIFY write).
-        self.wr32(MMIO_QUEUE_NOTIFY, 0)?;
+        // Notify the device.
+        self.wr32(MMIO_QUEUE_NOTIFY, 0).map_err(|_| "MMIO write error")?;
 
         // Wait for the device to signal completion (spin on the used ring).
         let target_idx = head.wrapping_sub(1);
@@ -429,7 +431,6 @@ impl VirtioNet {
         // For a receive, copy the frame (after the 12-byte header) back out.
         let mut copied = 0;
         if !rx.is_empty() {
-            // SAFETY: reading from the granted DMA page we own.
             unsafe {
                 let base = queue_vaddr as *mut u8;
                 copied = written.min(rx.len());
@@ -437,7 +438,7 @@ impl VirtioNet {
             }
         }
 
-        // Acknowledge the used buffer (`Virtio::ack_used` -> MMIO_ISR read).
+        // Acknowledge the used buffer.
         let _ = self.rd32(MMIO_ISR);
 
         Ok(copied)
