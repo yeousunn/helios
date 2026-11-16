@@ -22,7 +22,6 @@
 
 use core::panic::PanicInfo;
 
-#[allow(unused_imports)]
 use ipc::Message;
 use sdk::sys::SysHeap;
 use sdk::syscall::{Syscalls, X86_64Syscalls};
@@ -136,7 +135,7 @@ fn child_main(argc: u64, argv_va: u64, _envp_va: u64) -> ! {
         if let Some(console) = pkg.optional.get(2).copied().flatten() {
             if argc != 0 {
                 let mut sys = Syscalls::new(&mut raw);
-                let mut m = ipc::Message::new(sdk::methods::console::WRITE);
+                let mut m = Message::new(sdk::methods::console::WRITE);
                 let mut n = 0usize;
                 let mut put = |bytes: &[u8]| {
                     for &b in bytes {

@@ -179,6 +179,9 @@ fn invoke_map(
         if flags & methods::map_flags::X != 0 {
             rights = rights.union(ipc::Rights::EXEC);
         }
+        if rights.is_empty() {
+            rights = ipc::Rights::READ;
+        }
         let _ = m.set_descriptor(0, CapSlot::pack(frame, rights));
     }
     sys.invoke(as_cap, &m)?;

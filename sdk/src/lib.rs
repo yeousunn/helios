@@ -13,6 +13,7 @@ pub mod attack;
 pub mod bootinfo;
 pub mod bootstrap;
 pub mod elf;
+pub mod guest;
 pub mod heap;
 pub mod layout;
 pub mod loader;
