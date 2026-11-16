@@ -64,7 +64,11 @@ pub fn run<R: RawSyscalls>(sys: &mut Syscalls<R>, pkg: &BootstrapPackage) -> i32
         case_regs_write_non_frame_cap(sys, pkg),
         case_regs_write_invalid_entry_pc(sys, pkg), // S2b
         case_regs_write_invalid_user_rsp(sys, pkg), // S2d
-        case_thread_create_kernel_pc(sys, pkg),     // S2
+        case_thread_create_kernel_pc(sys, pkg),     // S2 (entry PC)
+        case_thread_create_kernel_stack(sys, pkg),  // S2 (stack top)
+        case_thread_create_non_canonical_stack(sys, pkg), // S2 (stack top)
+        case_thread_create_misaligned_stack(sys, pkg), // S2 (stack top)
+        case_thread_create_with_descriptor(sys, pkg), // S2 (descriptor)
         case_set_entry_kernel_pc(sys, pkg),         // S2
         case_set_tls_non_canonical(sys, pkg),       // S3
         case_map_kernel_window(sys, pkg),           // S4/S5
@@ -190,6 +194,59 @@ fn case_thread_create_kernel_pc<R: RawSyscalls>(
     sys.invoke(pkg.thread, &m).is_err()
 }
 
+/// `THREAD_CREATE` with a kernel-window stack top (w1) must be rejected
+/// with EBADARG (ADR-085 / RFC-0004). The kernel validates `is_user_addr`
+/// on the initial user stack top before creating any child state. Case 4.
+fn case_thread_create_kernel_stack<R: RawSyscalls>(
+    sys: &mut Syscalls<R>,
+    pkg: &BootstrapPackage,
+) -> bool {
+    let mut m = Message::new(crate::methods::thread::THREAD_CREATE);
+    m.words[0] = 0x401000; // valid entry PC
+    m.words[1] = KERNEL_PC; // kernel-window stack top
+    sys.invoke(pkg.thread, &m).is_err()
+}
+
+/// `THREAD_CREATE` with a non-canonical stack top (w1) must be rejected
+/// with EBADARG (ADR-085). Case 5.
+fn case_thread_create_non_canonical_stack<R: RawSyscalls>(
+    sys: &mut Syscalls<R>,
+    pkg: &BootstrapPackage,
+) -> bool {
+    let mut m = Message::new(crate::methods::thread::THREAD_CREATE);
+    m.words[0] = 0x401000;
+    m.words[1] = NON_CANONICAL;
+    sys.invoke(pkg.thread, &m).is_err()
+}
+
+/// `THREAD_CREATE` with a misaligned stack top (w1) must be rejected
+/// with EBADARG (ADR-085 requires 16-byte alignment). Case 6.
+fn case_thread_create_misaligned_stack<R: RawSyscalls>(
+    sys: &mut Syscalls<R>,
+    pkg: &BootstrapPackage,
+) -> bool {
+    let mut m = Message::new(crate::methods::thread::THREAD_CREATE);
+    m.words[0] = 0x401000;
+    m.words[1] = 0x401008; // misaligned (not 16-byte aligned)
+    sys.invoke(pkg.thread, &m).is_err()
+}
+
+/// `THREAD_CREATE` with an attached descriptor must be rejected with
+/// EBADARG (ADR-087: NEW_THREAD's w1 is descriptor-overlay territory;
+/// THREAD_CREATE does not accept descriptors in the trailing words).
+/// Case 7.
+fn case_thread_create_with_descriptor<R: RawSyscalls>(
+    sys: &mut Syscalls<R>,
+    pkg: &BootstrapPackage,
+) -> bool {
+    let mut m = Message::new(crate::methods::thread::THREAD_CREATE);
+    m.words[0] = 0x401000;
+    m.words[1] = 0; // default stack
+    m.tag = m.tag.with_caps(1);
+    let _ = m.set_descriptor(0, CapSlot::pack(pkg.aspace, Rights::READ));
+    sys.invoke(pkg.thread, &m).is_err()
+}
+
 /// `SET_ENTRY` with a kernel-window PC must be rejected (S2). Case 4.
 ///
 /// `SET_ENTRY` only accepts a Suspended/Blocked target, so the case first
@@ -310,7 +367,7 @@ mod tests {
     /// case 5 makes 5 calls: create, suspend, set_entry, kill, cap_revoke;
     /// the rest make one); the mock replays the matching statuses.
     struct MockKernel {
-        statuses: [i32; 20],
+        statuses: [i32; 24],
         len: usize,
         i: usize,
     }
@@ -328,25 +385,30 @@ mod tests {
         /// 6: regs_write_invalid_user_rsp REGS_WRITE(kernel-window RSP) (invoke thread) -> EBADARG
         /// 7: regs_write_invalid_user_rsp REGS_WRITE(null RSP) (invoke thread) -> EBADARG
         /// 8: thread_create_kernel_pc THREAD_CREATE (invoke pkg.thread) -> EBADARG
-        /// 9: set_entry_kernel_pc THREAD_CREATE (invoke pkg.thread) -> OK (scratch thread)
-        /// 10: set_entry_kernel_pc SUSPEND (invoke scratch) -> OK
-        /// 11: set_entry_kernel_pc SET_ENTRY (invoke scratch) -> EBADARG
-        /// 12: set_entry_kernel_pc KILL (invoke scratch) -> OK
-        /// 13: set_entry_kernel_pc cap_revoke (invoke scratch) -> OK
-        /// 14: set_tls_non_canonical (invoke pkg.thread) -> EBADARG
-        /// 15: map_kernel_window (invoke pkg.aspace) -> EBADARG
-        /// 16: unmap_kernel_window (invoke pkg.aspace) -> EBADARG
-        /// 17: protect_kernel_window (invoke pkg.aspace) -> EBADARG
-        /// 18: map_null (invoke pkg.aspace) -> EBADARG
-        /// 19: unmap_oversized_count (invoke pkg.aspace) -> EBADARG
+        /// 9: thread_create_kernel_stack THREAD_CREATE (invoke pkg.thread) -> EBADARG
+        /// 10: thread_create_non_canonical_stack THREAD_CREATE (invoke pkg.thread) -> EBADARG
+        /// 11: thread_create_misaligned_stack THREAD_CREATE (invoke pkg.thread) -> EBADARG
+        /// 12: thread_create_with_descriptor THREAD_CREATE (invoke pkg.thread) -> EBADARG
+        /// 13: set_entry_kernel_pc THREAD_CREATE (invoke pkg.thread) -> OK (scratch thread)
+        /// 14: set_entry_kernel_pc SUSPEND (invoke scratch) -> OK
+        /// 15: set_entry_kernel_pc SET_ENTRY (invoke scratch) -> EBADARG
+        /// 16: set_entry_kernel_pc KILL (invoke scratch) -> OK
+        /// 17: set_entry_kernel_pc cap_revoke (invoke scratch) -> OK
+        /// 18: set_tls_non_canonical (invoke pkg.thread) -> EBADARG
+        /// 19: map_kernel_window (invoke pkg.aspace) -> EBADARG
+        /// 20: unmap_kernel_window (invoke pkg.aspace) -> EBADARG
+        /// 21: protect_kernel_window (invoke pkg.aspace) -> EBADARG
+        /// 22: map_null (invoke pkg.aspace) -> EBADARG
+        /// 23: unmap_oversized_count (invoke pkg.aspace) -> EBADARG
         fn rejects() -> Self {
             use ipc::status::{EBADARG, EBADCAP, OK};
             MockKernel {
                 statuses: [
-                    EBADCAP, EBADARG, OK, EBADARG, OK, EBADARG, EBADARG, EBADARG, EBADARG, OK, OK,
-                    EBADARG, OK, OK, EBADARG, EBADARG, EBADARG, EBADARG, EBADARG, EBADARG,
+                    EBADCAP, EBADARG, OK, EBADARG, OK, EBADARG, EBADARG, EBADARG, EBADARG, EBADARG,
+                    EBADARG, EBADARG, EBADARG, OK, OK, EBADARG, OK, OK, EBADARG, EBADARG, EBADARG,
+                    EBADARG, EBADARG, EBADARG,
                 ],
-                len: 20,
+                len: 24,
                 i: 0,
             }
         }
@@ -354,8 +416,8 @@ mod tests {
         /// A kernel that accepts every bad call (a security regression).
         fn accepts() -> Self {
             MockKernel {
-                statuses: [ipc::status::OK; 20],
-                len: 20,
+                statuses: [ipc::status::OK; 24],
+                len: 24,
                 i: 0,
             }
         }
@@ -438,60 +500,64 @@ mod tests {
     }
 
     #[test]
-    fn accepted_set_entry_kernel_pc_is_case_6() {
-        // Kernel accepts SET_ENTRY(kernel pc) at case index 5; cases
-        // 0-4 still reject → failure at case index 5.
-        // SET_ENTRY call is at statuses[11].
+    fn accepted_thread_create_kernel_stack_is_case_6() {
+        // Kernel accepts THREAD_CREATE(kernel stack) at case index 5; cases
+        // 0-4 still reject → first non-rejected case is index 5.
+        // THREAD_CREATE call is at statuses[9].
         let mut k = MockKernel::rejects();
-        k.statuses[11] = ipc::status::OK;
+        k.statuses[9] = ipc::status::OK;
         let mut sys = Syscalls::new(&mut k);
         assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 6);
     }
 
     #[test]
-    fn accepted_set_tls_is_case_7() {
-        // Kernel accepts SET_TLS(non-canonical) at case index 6.
-        // SET_TLS call is at statuses[14].
+    fn accepted_thread_create_non_canonical_stack_is_case_7() {
+        // Kernel accepts THREAD_CREATE(non-canonical stack) at case index 6; cases
+        // 0-5 still reject → first non-rejected case is index 6.
+        // THREAD_CREATE call is at statuses[10].
         let mut k = MockKernel::rejects();
-        k.statuses[14] = ipc::status::OK;
+        k.statuses[10] = ipc::status::OK;
         let mut sys = Syscalls::new(&mut k);
         assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 7);
     }
 
     #[test]
-    fn accepted_map_kernel_window_is_case_8() {
-        // Kernel accepts MAP(kernel window) at case index 7.
-        // MAP call is at statuses[15].
+    fn accepted_thread_create_misaligned_stack_is_case_8() {
+        // Kernel accepts THREAD_CREATE(misaligned stack) at case index 7; cases
+        // 0-6 still reject → first non-rejected case is index 7.
+        // THREAD_CREATE call is at statuses[11].
         let mut k = MockKernel::rejects();
-        k.statuses[15] = ipc::status::OK;
+        k.statuses[11] = ipc::status::OK;
         let mut sys = Syscalls::new(&mut k);
         assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 8);
     }
 
     #[test]
-    fn accepted_unmap_kernel_window_is_case_9() {
-        // Kernel accepts UNMAP(kernel window) at case index 8.
-        // UNMAP call is at statuses[16].
+    fn accepted_thread_create_with_descriptor_is_case_9() {
+        // Kernel accepts THREAD_CREATE(with descriptor) at case index 8; cases
+        // 0-7 still reject → first non-rejected case is index 8.
+        // THREAD_CREATE call is at statuses[12].
         let mut k = MockKernel::rejects();
-        k.statuses[16] = ipc::status::OK;
+        k.statuses[12] = ipc::status::OK;
         let mut sys = Syscalls::new(&mut k);
         assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 9);
     }
 
     #[test]
-    fn accepted_protect_kernel_window_is_case_10() {
-        // Kernel accepts PROTECT(kernel window) at case index 9.
-        // PROTECT call is at statuses[17].
+    fn accepted_set_entry_kernel_pc_is_case_10() {
+        // Kernel accepts SET_ENTRY(kernel pc) at case index 9; cases
+        // 0-8 still reject → failure at case index 9.
+        // SET_ENTRY call is at statuses[15].
         let mut k = MockKernel::rejects();
-        k.statuses[17] = ipc::status::OK;
+        k.statuses[15] = ipc::status::OK;
         let mut sys = Syscalls::new(&mut k);
         assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 10);
     }
 
     #[test]
-    fn accepted_map_null_is_case_11() {
-        // Kernel accepts MAP(null) at case index 10.
-        // MAP call is at statuses[18].
+    fn accepted_set_tls_is_case_11() {
+        // Kernel accepts SET_TLS(non-canonical) at case index 10.
+        // SET_TLS call is at statuses[18].
         let mut k = MockKernel::rejects();
         k.statuses[18] = ipc::status::OK;
         let mut sys = Syscalls::new(&mut k);
@@ -499,13 +565,53 @@ mod tests {
     }
 
     #[test]
-    fn accepted_unmap_oversized_is_case_12() {
-        // Kernel accepts UNMAP(oversized count) at case index 11.
-        // UNMAP call is at statuses[19].
+    fn accepted_map_kernel_window_is_case_12() {
+        // Kernel accepts MAP(kernel window) at case index 11.
+        // MAP call is at statuses[19].
         let mut k = MockKernel::rejects();
         k.statuses[19] = ipc::status::OK;
         let mut sys = Syscalls::new(&mut k);
         assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 12);
+    }
+
+    #[test]
+    fn accepted_unmap_kernel_window_is_case_13() {
+        // Kernel accepts UNMAP(kernel window) at case index 12.
+        // UNMAP call is at statuses[20].
+        let mut k = MockKernel::rejects();
+        k.statuses[20] = ipc::status::OK;
+        let mut sys = Syscalls::new(&mut k);
+        assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 13);
+    }
+
+    #[test]
+    fn accepted_protect_kernel_window_is_case_14() {
+        // Kernel accepts PROTECT(kernel window) at case index 13.
+        // PROTECT call is at statuses[21].
+        let mut k = MockKernel::rejects();
+        k.statuses[21] = ipc::status::OK;
+        let mut sys = Syscalls::new(&mut k);
+        assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 14);
+    }
+
+    #[test]
+    fn accepted_map_null_is_case_15() {
+        // Kernel accepts MAP(null) at case index 14.
+        // MAP call is at statuses[22].
+        let mut k = MockKernel::rejects();
+        k.statuses[22] = ipc::status::OK;
+        let mut sys = Syscalls::new(&mut k);
+        assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 15);
+    }
+
+    #[test]
+    fn accepted_unmap_oversized_is_case_16() {
+        // Kernel accepts UNMAP(oversized count) at case index 15.
+        // UNMAP call is at statuses[23].
+        let mut k = MockKernel::rejects();
+        k.statuses[23] = ipc::status::OK;
+        let mut sys = Syscalls::new(&mut k);
+        assert_eq!(run(&mut sys, &pkg()), FAIL_BASE | 16);
     }
 
     #[test]
