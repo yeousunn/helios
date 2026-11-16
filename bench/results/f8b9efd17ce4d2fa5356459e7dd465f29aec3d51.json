@@ -1,0 +1,9 @@
+{
+  "commit": "f8b9efd17ce4d2fa5356459e7dd465f29aec3d51",
+  "bin": "sdk --bin bench",
+  "target": "x86_64-unknown-none",
+  "cycles": {
+    "call_reply": 18286,
+    "send_recv": 2908
+  }
+}
