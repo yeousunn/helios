@@ -2056,6 +2056,63 @@ mod tests {
         let _ = child_tid;
     }
 
+    /// The B1b `context_switch_diff_as` recipe pinned kernel-side: a
+    /// NEW_THREAD child whose caps[0] is a FORKED (foreign) AddressSpace
+    /// runs in that AS — no kernel code-mapping support is needed. Fork
+    /// the caller's AS (ADR-024 COW clone; the real x86_64 backend
+    /// implements copy_page + activate_as and is registered at boot),
+    /// then NEW_THREAD (ADR-088 uniform packing) with caps[0] = the
+    /// forked AS: the child's recorded AS (proc::as_of) must be the
+    /// fork, and the bootstrap EP still lands at child handle 1 with
+    /// rights ∩ requested (S8). The scheduler's per-thread CR3 switch
+    /// (sched::switch_to, foreign-CR3 refusal) does the rest.
+    #[test]
+    fn new_thread_foreign_as_child_runs_in_forked_as() {
+        let (pid, _tid, factory) = setup();
+
+        // Mint the caller's own AS (the bench's self_as stand-in) and
+        // fork it (AS::FORK, label 5, ADR-024).
+        let r_as = dispatch(args(num::INVOKE, factory, Tag::new(3), [0; 4]));
+        let as_h = r_as.w[0] as u32;
+        let m_fork = Message::new(5);
+        let r_fork = dispatch(args(num::INVOKE, as_h, m_fork.tag, m_fork.words));
+        assert_eq!(r_fork.status, ipc::status::OK as i64, "FORK must succeed");
+        let fork_h = r_fork.w[0] as u32;
+        let fork_id = proc::get_cap(pid, fork_h).unwrap().obj;
+
+        // Bootstrap endpoint for the child.
+        let r_ep = dispatch(args(num::INVOKE, factory, Tag::new(1), [0; 4]));
+        let boot_ep_h = r_ep.w[0] as u32;
+
+        // NEW_THREAD uniform packing with caps[0] = the FOREIGN (forked) AS.
+        let mut m = Message::new(4);
+        m.words[0] = 0x403000; // canonical user entry PC
+        m.words[1] = 0x5001_0000; // 16-byte-aligned user stack top
+        m.tag = m.tag.with_caps(2);
+        m.set_descriptor(0, CapSlot::pack(fork_h, Rights::MAP.union(Rights::GRANT)))
+            .unwrap();
+        m.set_descriptor(1, CapSlot::pack(boot_ep_h, Rights::RECV))
+            .unwrap();
+        let r = dispatch(args(num::INVOKE, factory, m.tag, m.words));
+        assert_eq!(r.status, ipc::status::OK as i64, "foreign-AS NEW_THREAD");
+        let child_pid = ObjId(r.w[2]);
+        assert_eq!(
+            proc::as_of(child_pid),
+            Some(fork_id),
+            "child must run in the forked AS, not the caller's"
+        );
+        let boot = proc::get_cap(child_pid, 1).unwrap();
+        assert_eq!(boot.typ, ObjType::Endpoint);
+        assert_eq!(boot.obj, proc::get_cap(pid, boot_ep_h).unwrap().obj);
+        assert_eq!(boot.rights, Rights::RECV, "bootstrap = rights ∩ requested");
+        let _child_tid = ThreadId(r.w[3]);
+        proc::destroy(child_pid).unwrap();
+
+        // Teardown so the frame allocator returns clean for later modules.
+        let _ = crate::aspace::destroy(fork_id);
+        let _ = crate::aspace::destroy(proc::get_cap(pid, as_h).unwrap().obj);
+    }
+
     /// ADR-088 fail-before: at the pre-ADR-088 kernel a cap_count-2
     /// NEW_THREAD was accepted with ANY w1 (the legacy reader ignored it),
     /// so a kernel-window or misaligned stack top silently spawned a
