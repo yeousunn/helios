@@ -736,7 +736,7 @@ mod tests {
         i: usize,
     }
 
-impl MockKernel {
+    impl MockKernel {
         /// A kernel that rejects each bad call with the error the case names.
         fn rejects() -> Self {
             use ipc::status::{EBADARG, EBADCAP, OK};
@@ -811,8 +811,8 @@ impl MockKernel {
             statuses.push(OK); // KILL
             statuses.push(OK); // NEW_ENDPOINT
             statuses.push(EBADARG); // BIND_FFAULT_EP on dead target
-            // M1 cases (Retype/Revoke/CAP_MOVE) temporarily disabled until kernel implements M1.
-            // See run() outcomes array for the list of disabled cases.
+                                    // M1 cases (Retype/Revoke/CAP_MOVE) temporarily disabled until kernel implements M1.
+                                    // See run() outcomes array for the list of disabled cases.
 
             MockKernel { statuses, i: 0 }
         }
