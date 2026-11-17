@@ -24,13 +24,13 @@ if [ -n "$last_gate" ]; then
     [ "${last_gate##*.}" = fail ] && grep -E 'ERROR|FAIL|error(\[|:)' "$CTRL/gate/$last_gate" | clean | head -n 3 | cut -c1-110 | sed 's/^/  /'
 fi
 
-for a in nv glm ds drv psx; do
+for a in nv glm ds; do
     echo "== $a (last 4 events)"
     tail -n 4 "$CTRL/$a.history" 2>/dev/null | clean | sed 's/^/  /' || echo "  no history"
 done
 
 echo "== last commit per agent"
-for t in NV GLM DS DRV PSX; do
+for t in NV GLM DS; do
     printf '  %-5s %s\n' "$t" "$(git log -1 --format='%ad %h %s' --date=format:'%m-%d %H:%M' --grep="^\[$t\]" | clean | cut -c1-100)"
 done
 

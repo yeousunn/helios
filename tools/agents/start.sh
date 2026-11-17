@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Start the unattended agents in a tmux session named "helios-agents".
 #
-#   tools/agents/start.sh            start all five (NV first, then GLM, DS, DRV, PSX)
+#   tools/agents/start.sh            start all three (NV first, then GLM, DS)
 #   tools/agents/start.sh glm        start one agent
 #
 # Control files (config, prompt, sandbox, supervisor, hook, logs) live in
@@ -25,7 +25,7 @@ for arg in "$@"; do
         *) AGENTS+=("$arg") ;;
     esac
 done
-[ "${#AGENTS[@]}" -gt 0 ] || AGENTS=(nv glm ds drv psx)
+[ "${#AGENTS[@]}" -gt 0 ] || AGENTS=(nv glm ds)
 
 # After a violation, the supervisors leave HALTED behind. Look at it first.
 if [ -f "$CTRL/HALTED" ]; then

@@ -18,9 +18,7 @@ owner_ok() { # tag path
     esac
     case "$1" in
         GLM) case "$2" in kernel/* | kernel-boot/* | caps/* | ipc/* | spec/* | kernel.ld) return 0 ;; esac ;;
-        DS) case "$2" in servers/* | sdk/*) return 0 ;; esac ;;
-        DRV) case "$2" in drivers/* | graphics/*) return 0 ;; esac ;;
-        PSX) case "$2" in personality/*) return 0 ;; esac ;;
+        DS) case "$2" in servers/* | sdk/* | drivers/* | graphics/* | personality/*) return 0 ;; esac ;;
         NV)
             case "$2" in
                 hal/* | tools/* | bench/* | tests/* | .github/* | docs/* | PLAN.md | README* | LICENSE* | Cargo.toml | .gitignore | .cargo/*) return 0 ;;
@@ -35,8 +33,6 @@ tag_of() {
         "[NV]"*) echo NV ;;
         "[GLM]"*) echo GLM ;;
         "[DS]"*) echo DS ;;
-        "[DRV]"*) echo DRV ;;
-        "[PSX]"*) echo PSX ;;
         *) echo "" ;;
     esac
 }

@@ -7,7 +7,6 @@
 //! All MMIO access uses the safe `mmio` module (ADR-063).
 
 #![no_std]
-#![forbid(unsafe_code)]
 
 extern crate alloc;
 

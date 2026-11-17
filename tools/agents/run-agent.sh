@@ -5,7 +5,7 @@
 # The loop ends when $CTRL/STOP or $CTRL/STOP-<name> exists, or on any
 # integrity or ownership violation (fail closed).
 #
-# Usage: run-agent.sh nv|glm|ds|drv|psx
+# Usage: run-agent.sh nv|glm|ds
 set -uo pipefail
 
 # The supervisor never runs programs from PATH entries an agent could reach.
@@ -13,7 +13,7 @@ set -uo pipefail
 # sandbox, where every directory on it is read-only.
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
 
-NAME="${1:?usage: run-agent.sh nv|glm|ds|drv|psx}"
+NAME="${1:?usage: run-agent.sh nv|glm|ds}"
 CTRL="${HELIOS_CTRL:-$HOME/.local/state/helios-agents}"
 REPO="$(cat "$CTRL/repo-path")"
 AGENT_PATH="$(cat "$CTRL/agent-path")"
@@ -37,20 +37,8 @@ case "$NAME" in
         IDLE_SLEEP=1200
         ;;
     ds)
-        TAG="[DS]"; LABEL="DeepSeek"; ROLE="userspace worker"
+        TAG="[DS]"; LABEL="DeepSeek"; ROLE="userspace, drivers and POSIX personality worker"
         MODEL="nvidia/deepseek-ai/deepseek-v4.1-flash"
-        ROLE_NOTE="You are a worker. Nemotron [NV] is the coordinator. Work your own tasks in board order."
-        IDLE_SLEEP=1200
-        ;;
-    drv)
-        TAG="[DRV]"; LABEL="Drivers"; ROLE="drivers and graphics worker"
-        MODEL="nvidia/poolside/laguna-xs-2.1"
-        ROLE_NOTE="You are a worker. Nemotron [NV] is the coordinator. Work your own tasks in board order."
-        IDLE_SLEEP=1200
-        ;;
-    psx)
-        TAG="[PSX]"; LABEL="POSIX"; ROLE="POSIX personality worker"
-        MODEL="nvidia/stepfun-ai/step-5-preview"
         ROLE_NOTE="You are a worker. Nemotron [NV] is the coordinator. Work your own tasks in board order."
         IDLE_SLEEP=1200
         ;;
@@ -80,9 +68,7 @@ g() { git -C "$REPO" -c core.hooksPath=/dev/null -c core.fsmonitor= "$@"; }
 # own directories only. Ownership is enforced by the file system, not by tags.
 case "$NAME" in
     glm) OWN_DIRS="kernel kernel-boot caps ipc spec"; OWN_ROOT="kernel.ld" ;;
-    ds) OWN_DIRS="servers sdk"; OWN_ROOT="" ;;
-    drv) OWN_DIRS="drivers graphics"; OWN_ROOT="" ;;
-    psx) OWN_DIRS="personality"; OWN_ROOT="" ;;
+    ds) OWN_DIRS="servers sdk drivers graphics personality"; OWN_ROOT="" ;;
     nv) OWN_DIRS="hal tools bench tests .github docs .cargo"
         OWN_ROOT="PLAN.md Cargo.toml .gitignore .gitattributes README.md LICENSE LICENSE-MIT LICENSE-APACHE" ;;
 esac
@@ -165,7 +151,7 @@ audit() { # start-commit refs-before
     for c in $(g rev-list --reverse "$1"..HEAD); do
         subject="$(g log -1 --format=%s "$c")"
         case "$subject" in
-            "[NV]"* | "[GLM]"* | "[DS]"* | "[DRV]"* | "[PSX]"*) ;;
+            "[NV]"* | "[GLM]"* | "[DS]"*) ;;
             *) halt_all "untagged commit $c during a $TAG cycle: $subject" ;;
         esac
         (cd "$REPO" && env -u HELIOS_AGENT "$CTRL/commit-msg" --audit "$c" 2>>"$CTRL/violations.log") ||
