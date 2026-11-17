@@ -15,8 +15,7 @@
 //! job (Frame cap + `AS::MAP`), so the driver does not depend on `hal::Dma`
 //! either. HAL traits stay kernel-internal.
 
-use core::ptr;
-
+use hal::dma::DmaBuffer;
 use hal::mmio::MmioWindow;
 
 /// Virtio PCI vendor ID (Red Hat / virtio).
@@ -72,6 +71,7 @@ struct Desc {
 
 /// Available ring (host reads from this).
 #[repr(C, align(2))]
+#[derive(Clone, Copy, Default)]
 struct Avail {
     flags: u16,
     idx: u16,
@@ -81,22 +81,29 @@ struct Avail {
 
 /// Used ring (device writes to this).
 #[repr(C, align(4))]
+#[derive(Clone, Copy, Default)]
 struct UsedElem {
     id: u32,
     len: u32,
 }
 
 #[repr(C, align(4))]
+#[derive(Clone, Copy, Default)]
 struct Used {
     flags: u16,
     idx: u16,
     ring: [UsedElem; QUEUE_SIZE as usize],
     avail_event: u16,
+    _pad: u16, // Padding to make size a multiple of align (4)
 }
 
 /// The full virtqueue (descriptor table + available ring + used ring), laid
 /// out contiguously in one DMA page.
+/// NOTE: Not Pod due to inter-field padding and page-size trailing padding.
+/// Components are copied separately.
 #[repr(C, align(4096))]
+#[derive(Clone, Copy, Default)]
+#[allow(dead_code)]
 struct VirtQueue {
     desc: [Desc; QUEUE_SIZE as usize],
     avail: Avail,
@@ -243,11 +250,10 @@ impl VirtioBlk {
         self.wr32(MMIO_QUEUE_PFN, (dma_phys / DMA_PAGE) as u32)?;
         self.wr32(MMIO_QUEUE_READY, 1)?;
 
-        // Zero the queue page.
-        // SAFETY: `dma_virt` is the granted DMA page, exclusively ours.
-        unsafe {
-            ptr::write_bytes(dma_virt as *mut u8, 0, DMA_PAGE);
-        }
+        // Zero the queue page using the safe DmaBuffer wrapper.
+        let mut dma = DmaBuffer::from_cap(dma_virt, dma_phys, DMA_PAGE)
+            .map_err(|_| "DMA buffer validation failed")?;
+        dma.zero();
 
         self.queue_vaddr = Some(dma_virt);
         self.queue_paddr = dma_phys;
@@ -260,6 +266,7 @@ impl VirtioBlk {
     /// Submit a one-sector read. The device fills `buf` (512 bytes) with
     /// sector `sector` contents. `buf` need not be DMA-accessible; the data
     /// stages through the granted DMA page.
+    #[allow(clippy::field_reassign_with_default, clippy::needless_range_loop)]
     pub fn read_sector(
         &mut self,
         sector: u64,
@@ -273,37 +280,90 @@ impl VirtioBlk {
         let header_phys = queue_paddr + header_addr as u64;
         let data_phys = queue_paddr + data_addr as u64;
 
-        // Build the request header + stage the data into the DMA page.
-        // SAFETY: writing to the granted DMA page we own; header/data offsets
-        // are within the 4 KiB page.
-        unsafe {
-            let base = queue_vaddr as *mut u8;
-            let header_ptr = base.add(header_addr) as *mut u32;
-            ptr::write_volatile(header_ptr, 0); // type = read
-            ptr::write_volatile(header_ptr.add(4), 0); // reserved
-            ptr::write_volatile(header_ptr.add(8) as *mut u64, sector); // sector
-            ptr::copy_nonoverlapping(buf.as_ptr(), base.add(data_addr), SECTOR_SIZE);
+        let mut dma = DmaBuffer::from_cap(queue_vaddr, queue_paddr as usize, DMA_PAGE)
+            .map_err(|_| "DMA buffer validation failed")?;
+
+        // Read desc array from DMA (16 descriptors, each 16 bytes at offset 0)
+        let mut desc = [Desc::default(); QUEUE_SIZE as usize];
+        for i in 0..QUEUE_SIZE as usize {
+            let base = i * 16;
+            desc[i].addr = dma.read64(base).map_err(|_| "DMA read failed")?;
+            desc[i].len = dma.read32(base + 8).map_err(|_| "DMA read failed")?;
+            desc[i].flags = dma.read16(base + 12).map_err(|_| "DMA read failed")?;
+            desc[i].next = dma.read16(base + 14).map_err(|_| "DMA read failed")?;
         }
 
-        // Descriptor chain, via a temporary reference over the DMA page.
-        // SAFETY: `queue_vaddr` is an aligned VirtQueue over the granted DMA
-        // page; descriptor phys addrs are `queue_paddr + offset`.
-        unsafe {
-            let queue = &mut *(queue_vaddr as *mut VirtQueue);
-            queue.desc[0].addr = header_phys;
-            queue.desc[0].len = 16;
-            queue.desc[0].flags = DESC_FLAG_NEXT;
-            queue.desc[0].next = 1;
-            queue.desc[1].addr = data_phys;
-            queue.desc[1].len = SECTOR_SIZE as u32;
-            queue.desc[1].flags = DESC_FLAG_WRITE;
-            queue.desc[1].next = 0;
-
-            // Publish descriptor chain head to the available ring.
-            queue.avail.ring[self.next_avail_idx as usize % QUEUE_SIZE as usize] =
-                self.next_desc_idx;
-            queue.avail.idx = self.next_avail_idx.wrapping_add(1);
+        // Read avail from DMA (offset 256)
+        let avail_base = 256;
+        let mut avail: Avail = Default::default();
+        avail.flags = dma.read16(avail_base).map_err(|_| "DMA read failed")?;
+        avail.idx = dma.read16(avail_base + 2).map_err(|_| "DMA read failed")?;
+        for i in 0..QUEUE_SIZE as usize {
+            avail.ring[i] = dma.read16(avail_base + 4 + i * 2).map_err(|_| "DMA read failed")?;
         }
+        avail.used_event = dma.read16(avail_base + 4 + QUEUE_SIZE as usize * 2).map_err(|_| "DMA read failed")?;
+
+        // Read used from DMA (offset 296)
+        let used_base = 296;
+        let mut used: Used = Default::default();
+        used.flags = dma.read16(used_base).map_err(|_| "DMA read failed")?;
+        used.idx = dma.read16(used_base + 2).map_err(|_| "DMA read failed")?;
+        for i in 0..QUEUE_SIZE as usize {
+            let elem_base = used_base + 4 + i * 8;
+            used.ring[i].id = dma.read32(elem_base).map_err(|_| "DMA read failed")?;
+            used.ring[i].len = dma.read32(elem_base + 4).map_err(|_| "DMA read failed")?;
+        }
+        used.avail_event = dma.read16(used_base + 4 + QUEUE_SIZE as usize * 8).map_err(|_| "DMA read failed")?;
+        used._pad = dma.read16(used_base + 6 + QUEUE_SIZE as usize * 8).map_err(|_| "DMA read failed")?;
+
+        // Build the request header in the data area (after the VirtQueue struct).
+        let mut header = [0u8; 16];
+        header[0..4].copy_from_slice(&0u32.to_le_bytes()); // type = read
+        header[4..8].copy_from_slice(&0u32.to_le_bytes()); // reserved
+        header[8..16].copy_from_slice(&sector.to_le_bytes()); // sector
+        dma.copy_from_slice(data_addr, &header)
+            .map_err(|_| "DMA copy failed")?;
+
+        // Set up descriptor chain.
+        desc[0].addr = header_phys;
+        desc[0].len = 16;
+        desc[0].flags = DESC_FLAG_NEXT;
+        desc[0].next = 1;
+        desc[1].addr = data_phys;
+        desc[1].len = SECTOR_SIZE as u32;
+        desc[1].flags = DESC_FLAG_WRITE;
+        desc[1].next = 0;
+
+        // Publish descriptor chain head to the available ring.
+        avail.ring[self.next_avail_idx as usize % QUEUE_SIZE as usize] = self.next_desc_idx;
+        avail.idx = self.next_avail_idx.wrapping_add(1);
+
+        // Write the updated virtqueue components back to DMA.
+        for i in 0..QUEUE_SIZE as usize {
+            let base = i * 16;
+            dma.write64(base, desc[i].addr).map_err(|_| "DMA write failed")?;
+            dma.write32(base + 8, desc[i].len).map_err(|_| "DMA write failed")?;
+            dma.write16(base + 12, desc[i].flags).map_err(|_| "DMA write failed")?;
+            dma.write16(base + 14, desc[i].next).map_err(|_| "DMA write failed")?;
+        }
+
+        dma.write16(avail_base, avail.flags).map_err(|_| "DMA write failed")?;
+        dma.write16(avail_base + 2, avail.idx).map_err(|_| "DMA write failed")?;
+        for i in 0..QUEUE_SIZE as usize {
+            dma.write16(avail_base + 4 + i * 2, avail.ring[i]).map_err(|_| "DMA write failed")?;
+        }
+        dma.write16(avail_base + 4 + QUEUE_SIZE as usize * 2, avail.used_event).map_err(|_| "DMA write failed")?;
+
+        dma.write16(used_base, used.flags).map_err(|_| "DMA write failed")?;
+        dma.write16(used_base + 2, used.idx).map_err(|_| "DMA write failed")?;
+        for i in 0..QUEUE_SIZE as usize {
+            let elem_base = used_base + 4 + i * 8;
+            dma.write32(elem_base, used.ring[i].id).map_err(|_| "DMA write failed")?;
+            dma.write32(elem_base + 4, used.ring[i].len).map_err(|_| "DMA write failed")?;
+        }
+        dma.write16(used_base + 4 + QUEUE_SIZE as usize * 8, used.avail_event).map_err(|_| "DMA write failed")?;
+        dma.write16(used_base + 6 + QUEUE_SIZE as usize * 8, used._pad).map_err(|_| "DMA write failed")?;
+
         self.next_avail_idx = self.next_avail_idx.wrapping_add(1);
         self.next_desc_idx = (self.next_desc_idx + 2) % QUEUE_SIZE;
 
@@ -313,22 +373,15 @@ impl VirtioBlk {
         // Wait for the device to signal completion (spin on the used ring).
         let target_idx = self.next_avail_idx.wrapping_sub(1);
         let mut spins = 0;
-        let used_idx = unsafe {
-            let queue = &*(queue_vaddr as *const VirtQueue);
-            let used_idx_ptr = &queue.used.idx as *const u16;
-            // SAFETY: `used_idx_ptr` points into the granted DMA page; a
-            // volatile read of the device-written used index.
-            ptr::read_volatile(used_idx_ptr)
-        };
-        let mut used_idx = used_idx;
-        while used_idx != target_idx {
+        let used_idx_offset = 296 + core::mem::offset_of!(Used, idx);
+        loop {
+            // Copy the used index from DMA.
+            let used_idx = dma.read16(used_idx_offset).map_err(|_| "DMA read failed")?;
+
+            if used_idx == target_idx {
+                break;
+            }
             core::hint::spin_loop();
-            used_idx = unsafe {
-                let queue = &*(queue_vaddr as *const VirtQueue);
-                // SAFETY: `used_idx_ptr` points into the granted DMA page;
-                // re-read the device-written used index.
-                ptr::read_volatile(&queue.used.idx as *const u16)
-            };
             spins += 1;
             if spins > 1_000_000 {
                 return Err("virtio-blk: device did not complete request");
@@ -336,11 +389,10 @@ impl VirtioBlk {
         }
 
         // Read back the data (device wrote it into the DMA page).
-        // SAFETY: reading from the granted DMA page we own.
-        unsafe {
-            let base = queue_vaddr as *mut u8;
-            ptr::copy_nonoverlapping(base.add(data_addr), buf.as_mut_ptr(), SECTOR_SIZE);
-        }
+        let mut data = [0u8; SECTOR_SIZE];
+        dma.copy_to_slice(data_addr, &mut data)
+            .map_err(|_| "DMA copy failed")?;
+        buf.copy_from_slice(&data);
 
         // Acknowledge the used buffer (`Virtio::ack_used` -> MMIO_ISR read).
         let _ = self.rd32(MMIO_ISR);

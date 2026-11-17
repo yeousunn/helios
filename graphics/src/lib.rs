@@ -4,9 +4,11 @@
 //! compositor foundation for Phase 4; a real display server presents scanout
 //! memory as a `Framebuffer` view and the driver flushes it.
 //!
-//! All MMIO access uses the safe `mmio` module (ADR-063).
+//! All MMIO access uses the safe `mmio` module (ADR-063). DMA access uses
+//! the safe `DmaBuffer` wrapper (ADR-098).
 
 #![no_std]
+#![forbid(unsafe_code)]
 
 extern crate alloc;
 

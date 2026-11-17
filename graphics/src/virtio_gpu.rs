@@ -13,6 +13,7 @@
 //! job (Frame cap + `AS::MAP`), so the driver does not depend on `hal::Dma`
 //! either. HAL traits stay kernel-internal.
 
+use hal::dma::DmaBuffer;
 use hal::mmio::MmioWindow;
 
 /// Virtio PCI vendor ID (Red Hat / virtio).
@@ -80,12 +81,16 @@ struct Used {
     idx: u16,
     ring: [UsedElem; QUEUE_SIZE as usize],
     avail_event: u16,
+    _pad: u16, // Padding to make size a multiple of align (4)
 }
 
 /// The full virtqueue (descriptor table + available ring + used ring), laid
 /// out contiguously in one DMA page.
+/// NOTE: Not Pod due to inter-field padding and page-size trailing padding.
+/// Components are copied separately.
 #[repr(C, align(4096))]
 #[derive(Clone, Copy, Default)]
+#[allow(dead_code)]
 struct VirtQueue {
     desc: [Desc; QUEUE_SIZE as usize],
     avail: Avail,
@@ -217,25 +222,39 @@ impl VirtioGpu {
         self.wr32(MMIO_QUEUE_READY, 1)
             .map_err(|_| "MMIO write error")?;
 
-        // Zero and type-pun the granted DMA page as a VirtQueue, touching
-        // every queue struct type so the layout is exercised.
-        // SAFETY: `dma_virt` is the granted DMA page, exclusively ours, and is
-        // 4 KiB-aligned for `VirtQueue`.
-        let queue = unsafe { &mut *(dma_virt as *mut VirtQueue) };
-        unsafe { core::ptr::write_bytes(queue as *mut VirtQueue as *mut u8, 0, DMA_PAGE) };
-        queue.desc[0] = Desc::default();
-        queue.avail = Avail {
-            flags: 0,
-            idx: 0,
-            ring: [0; QUEUE_SIZE as usize],
-            used_event: 0,
-        };
-        queue.used = Used {
-            flags: 0,
-            idx: 0,
-            ring: [UsedElem { id: 0, len: 0 }; QUEUE_SIZE as usize],
-            avail_event: 0,
-        };
+        let mut dma = DmaBuffer::from_cap(dma_virt, dma_phys, DMA_PAGE)
+            .map_err(|_| "DMA buffer validation failed")?;
+        dma.zero();
+
+        // Copy desc array (offset 0) - 16 descriptors, each 16 bytes
+        for i in 0..QUEUE_SIZE as usize {
+            let base = i * 16;
+            dma.write64(base, 0).map_err(|_| "DMA write failed")?; // addr
+            dma.write32(base + 8, 0).map_err(|_| "DMA write failed")?; // len
+            dma.write16(base + 12, 0).map_err(|_| "DMA write failed")?; // flags
+            dma.write16(base + 14, 0).map_err(|_| "DMA write failed")?; // next
+        }
+
+        // Copy avail (offset 256 = 16 * 16)
+        let avail_base = 256;
+        dma.write16(avail_base, 0).map_err(|_| "DMA write failed")?; // flags
+        dma.write16(avail_base + 2, 0).map_err(|_| "DMA write failed")?; // idx
+        for i in 0..QUEUE_SIZE as usize {
+            dma.write16(avail_base + 4 + i * 2, 0).map_err(|_| "DMA write failed")?; // ring[i]
+        }
+        dma.write16(avail_base + 4 + QUEUE_SIZE as usize * 2, 0).map_err(|_| "DMA write failed")?; // used_event
+
+        // Copy used (offset 296 = 256 + 38 + 2 padding)
+        let used_base = 296;
+        dma.write16(used_base, 0).map_err(|_| "DMA write failed")?; // flags
+        dma.write16(used_base + 2, 0).map_err(|_| "DMA write failed")?; // idx
+        for i in 0..QUEUE_SIZE as usize {
+            let elem_base = used_base + 4 + i * 8;
+            dma.write32(elem_base, 0).map_err(|_| "DMA write failed")?; // id
+            dma.write32(elem_base + 4, 0).map_err(|_| "DMA write failed")?; // len
+        }
+        dma.write16(used_base + 4 + QUEUE_SIZE as usize * 8, 0).map_err(|_| "DMA write failed")?; // avail_event
+        dma.write16(used_base + 6 + QUEUE_SIZE as usize * 8, 0).map_err(|_| "DMA write failed")?; // _pad
 
         self.queue_vaddr = Some(dma_virt);
         self.queue_paddr = dma_phys;
