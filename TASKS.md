@@ -86,7 +86,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 - [ ] GLM: M1 CNode + caller-chosen slots + derivation tree + badges.
 - [ ] GLM: M1 Verus specs/proofs for CSpace + Untyped; Flux index math.
 - [ ] GLM: M1 spec/abi extended for new invoke methods + kernel<->spec id cross-check.
-- [ ] DS: M1 attack-suite cases for Retype/Revoke abuse.
+- [~ DS started 2026-11-18] M1 attack-suite cases for Retype/Revoke abuse.
 - [ ] PSX: M1 B10 personality isolation proof sketch (bet B10).
 
 ## M0: Benchmarks
