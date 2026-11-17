@@ -22,12 +22,13 @@
 extern crate alloc;
 
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use ipc::{CapSlot, Message, Rights};
 
 use sdk::bootinfo::BootInfo;
 use sdk::heap::RegionSource;
-use sdk::layout::{HEAP_CHUNK, INIT_HEAP_VA_BASE};
+use sdk::layout::{CHILD_STACK_PAGES, HEAP_CHUNK, INIT_HEAP_VA_BASE, USER_STACK_TOP};
 use sdk::methods;
 use sdk::sys::{init_entry_point, rdtsc, SysHeap};
 use sdk::syscall::{Handle, Status, Syscalls, X86_64Syscalls};
@@ -51,6 +52,17 @@ type Result<T> = core::result::Result<T, u64>;
 const WARMUP_ITERS: u64 = 10;
 const MEASURE_ITERS: u64 = 1000;
 const BENCH_HEAP_CHUNKS: u64 = 2;
+
+/// Stack size for bench threads (64 KiB = 16 pages).
+const THREAD_STACK_PAGES: u64 = CHILD_STACK_PAGES;
+const THREAD_STACK_SIZE: u64 = THREAD_STACK_PAGES * 4096;
+
+/// Next available stack top (starts below initial stack, decrements per thread).
+static NEXT_STACK_TOP: AtomicU64 = AtomicU64::new(USER_STACK_TOP - THREAD_STACK_SIZE);
+
+/// Global handle for thread entry points to find their endpoint (THREAD_CREATE
+/// threads share the cap table; no bootstrap endpoint at handle 1).
+static THREAD_ENTRY_EP: AtomicU32 = AtomicU32::new(0);
 
 init_entry_point!(bench_main);
 
@@ -84,27 +96,12 @@ fn bench_main(bootinfo_ptr: *const u8) -> ! {
 fn run(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
     let debug_ep = info.debug_ep;
 
-    // Factory endpoint round-trip (like init).
-    let factory_ep = {
-        let mut sys = Syscalls::new(raw);
-        let reply = sys
-            .invoke(info.factory, &Message::new(methods::factory::NEW_ENDPOINT))
-            .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
-        reply.words[0] as Handle
-    };
-    if factory_ep == 0 {
-        return Err(fail_code(STEP_SETUP, 0xE0));
-    }
-    {
-        let mut sys = Syscalls::new(raw);
-        mark(&mut sys, debug_ep, STEP_SETUP, factory_ep as u64);
-    }
-
     // The actual Factory capability from BootInfo for creating kernel objects.
     let factory_cap = info.factory;
 
     // Bootstrap heap (smaller than init for faster bench startup).
     let self_as = info.self_as.ok_or(fail_code(STEP_SETUP, 0xE4))?;
+    let self_thread = info.self_thread.ok_or(fail_code(STEP_SETUP, 0xEA))?;
     let region = info.region(0).ok_or(fail_code(STEP_SETUP, 0xE5))?.handle;
     let heap_span = {
         let mut src = RegionSource::new(raw, region, self_as, INIT_HEAP_VA_BASE, HEAP_CHUNK);
@@ -126,12 +123,12 @@ fn run(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
     }
 
     // Run all benchmarks.
-    bench_call_reply(raw, debug_ep, factory_cap, self_as, region)?;
+    bench_call_reply(raw, debug_ep, factory_cap, self_as, self_thread, region)?;
     bench_send_recv(raw, debug_ep, factory_cap)?;
-    // bench_notification_wake(raw, debug_ep, factory_cap, self_as, region)?;
-    // bench_context_switch_same_as(raw, debug_ep, factory_cap, self_as, region)?;
-    // bench_context_switch_diff_as(raw, debug_ep, factory_cap, self_as, region)?;
-    // bench_map_unmap_4k(raw, debug_ep, factory_cap, self_as, region)?;
+    bench_notification_wake(raw, debug_ep, factory_cap, self_as, self_thread, region)?;
+    bench_context_switch_same_as(raw, debug_ep, factory_cap, self_as, self_thread, region)?;
+    bench_context_switch_diff_as(raw, debug_ep, factory_cap, self_as, self_thread, region)?;
+    bench_map_unmap_4k(raw, debug_ep, factory_cap, self_as, region)?;
 
     Ok(())
 }
@@ -161,28 +158,154 @@ fn err_to_u64(e: Status) -> u64 {
     e as u64
 }
 
+/// Carve and map a stack region for a new thread.
+/// Uses a custom stack top below the initial thread's stack to avoid overlap.
+/// Returns (stack_top_va, stack_frame_handle, stack_base).
+fn carve_stack(
+    sys: &mut Syscalls<X86_64Syscalls>,
+    region: Handle,
+    aspace: Handle,
+) -> Result<(u64, Handle, u64)> {
+    // Carve a contiguous region for the stack (THREAD_STACK_PAGES * 4 KiB).
+    let mut carve = Message::new(methods::region::CARVE);
+    carve.words[0] = THREAD_STACK_SIZE;
+    carve.words[1] = 4096; // page-aligned
+    let reply = sys
+        .invoke(region, &carve)
+        .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
+    let frame_handle = reply.words[0] as Handle;
+    if frame_handle == 0 {
+        return Err(fail_code(STEP_SETUP, 0xE7));
+    }
+
+    // Get a unique stack top for this thread.
+    let stack_top = NEXT_STACK_TOP.fetch_sub(THREAD_STACK_SIZE, Ordering::SeqCst);
+    let stack_base = stack_top - THREAD_STACK_SIZE;
+
+    // Map the stack frames.
+    for i in 0..THREAD_STACK_PAGES {
+        let vaddr = stack_base + i * 4096;
+        let mut m = Message::new(methods::aspace::MAP);
+        m.words[0] = vaddr;
+        m.words[1] =
+            u64::from(methods::map_flags::R | methods::map_flags::W | methods::map_flags::ANON);
+        sys.invoke(aspace, &m).map_err(err_to_u64)?;
+    }
+
+    Ok((stack_top, frame_handle, stack_base))
+}
+
+/// Spawn a thread in the same address space using THREAD_CREATE on self_thread.
+/// Returns (thread_cap, stack_frame_handle, stack_base).
+fn spawn_thread_same_as(
+    sys: &mut Syscalls<X86_64Syscalls>,
+    self_thread: Handle,
+    self_as: Handle,
+    region: Handle,
+    entry_pc: u64,
+) -> Result<(Handle, Handle, u64)> {
+    // Carve a custom stack for this thread (unique stack top per thread).
+    let (stack_top, frame_handle, stack_base) = carve_stack(sys, region, self_as)?;
+
+    // THREAD_CREATE on self_thread (same process): w0 = entry_pc, w1 = stack_top.
+    let mut m = Message::new(methods::thread::THREAD_CREATE);
+    m.words[0] = entry_pc;
+    m.words[1] = stack_top;
+
+    let reply = sys
+        .invoke(self_thread, &m)
+        .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
+
+    let thread_cap = reply.words[0] as Handle;
+    if thread_cap == 0 {
+        return Err(fail_code(STEP_SETUP, 0xE8));
+    }
+
+    Ok((thread_cap, frame_handle, stack_base))
+}
+
+/// Spawn a thread in a different address space using NEW_THREAD (ADR-088 uniform packing).
+/// Returns (thread_cap, pid).
+fn spawn_thread_diff_as(
+    sys: &mut Syscalls<X86_64Syscalls>,
+    factory: Handle,
+    aspace: Handle,
+    region: Handle,
+    bootstrap_ep: Handle,
+    entry_pc: u64,
+) -> Result<(Handle, u64)> {
+    // Carve a custom stack for this thread in the target AS.
+    let (stack_top, _frame_handle, _stack_base) = carve_stack(sys, region, aspace)?;
+
+    // NEW_THREAD with ADR-088 uniform packing (cap_count=2):
+    // w0 = entry PC, w1 = initial user stack top
+    // caps[0] = AddressSpace (with MAP|GRANT), caps[1] = bootstrap endpoint (with RECV)
+    let mut m = Message::new(methods::factory::NEW_THREAD);
+    m.tag = m.tag.with_caps(2);
+    m.words[0] = entry_pc;
+    m.words[1] = stack_top;
+    let _ = m.set_descriptor(0, CapSlot::pack(aspace, Rights::MAP.union(Rights::GRANT)));
+    let _ = m.set_descriptor(1, CapSlot::pack(bootstrap_ep, Rights::RECV));
+
+    let reply = sys
+        .invoke(factory, &m)
+        .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
+
+    let thread_cap = reply.words[0] as Handle;
+    let pid = reply.words[2];
+    if thread_cap == 0 {
+        return Err(fail_code(STEP_SETUP, 0xE9));
+    }
+
+    Ok((thread_cap, pid))
+}
+
+/// Create a message with a single capability descriptor.
+fn msg_with_cap(method: u16, cap: Handle, rights: Rights) -> Message {
+    let mut m = Message::new(method);
+    m.tag = m.tag.with_caps(1);
+    let _ = m.set_descriptor(0, CapSlot::pack(cap, rights));
+    m
+}
+
 /// Benchmark: call/reply round trip.
 fn bench_call_reply(
     raw: &mut X86_64Syscalls,
     debug_ep: Handle,
     factory: Handle,
     self_as: Handle,
+    self_thread: Handle,
     region: Handle,
 ) -> Result<()> {
     let mut sys = Syscalls::new(raw);
 
     // Create a server endpoint for the call/reply test.
-    let server_ep = mint_ep(&mut sys, factory)?;
+    let server_ep = {
+        let reply = sys
+            .invoke(factory, &Message::new(methods::factory::NEW_ENDPOINT))
+            .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
+        reply.words[0] as Handle
+    };
+    if server_ep == 0 {
+        return Err(fail_code(STEP_SETUP, 0xE0));
+    }
 
-    // Spawn a server thread that does recv then reply_recv in a loop.
+    // Spawn a server thread in the same AS that does recv then reply_recv in a loop.
+    // For THREAD_CREATE, the thread shares the cap table, so it can use server_ep directly.
+    THREAD_ENTRY_EP.store(server_ep, Ordering::SeqCst);
     let server_entry = thread_entry_reply_recv_loop as *const () as u64;
-    let (server_thread, _server_pid) =
-        spawn_thread(&mut sys, factory, self_as, region, server_ep, server_entry)?;
+    let (server_thread, _server_frame, _server_stack_base) =
+        spawn_thread_same_as(&mut sys, self_thread, self_as, region, server_entry)?;
 
-    mark(&mut sys, debug_ep, 0xF0, 1); // debug: after spawn_thread
+    mark(&mut sys, debug_ep, 0xF0, 1); // debug: after spawn_thread_same_as
 
     // Bind death notification to clean up.
-    let death_notif = mint_notification(&mut sys, factory)?;
+    let death_notif = {
+        let reply = sys
+            .invoke(factory, &Message::new(methods::factory::NEW_NOTIFICATION))
+            .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
+        reply.words[0] as Handle
+    };
     mark(&mut sys, debug_ep, 0xF0, 2); // debug: after mint_notification
 
     sys.invoke(
@@ -232,7 +355,12 @@ fn bench_call_reply(
 fn bench_send_recv(raw: &mut X86_64Syscalls, debug_ep: Handle, factory: Handle) -> Result<()> {
     let mut sys = Syscalls::new(raw);
 
-    let ep = mint_ep(&mut sys, factory)?;
+    let ep = {
+        let reply = sys
+            .invoke(factory, &Message::new(methods::factory::NEW_ENDPOINT))
+            .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
+        reply.words[0] as Handle
+    };
 
     // Warmup: send and recv in same thread (measures send+recv path without thread switch).
     for _ in 0..WARMUP_ITERS {
@@ -256,31 +384,43 @@ fn bench_send_recv(raw: &mut X86_64Syscalls, debug_ep: Handle, factory: Handle) 
     Ok(())
 }
 
-#[allow(dead_code)]
 /// Benchmark: notification signal-to-wake.
 fn bench_notification_wake(
     raw: &mut X86_64Syscalls,
     debug_ep: Handle,
     factory: Handle,
     self_as: Handle,
+    self_thread: Handle,
     region: Handle,
 ) -> Result<()> {
     let mut sys = Syscalls::new(raw);
     mark(&mut sys, debug_ep, 0xF2, 1); // debug: notification_wake start
 
     // Create bootstrap endpoint for the waiter thread.
-    let bootstrap_ep = mint_ep(&mut sys, factory)?;
+    let bootstrap_ep = {
+        let reply = sys
+            .invoke(factory, &Message::new(methods::factory::NEW_ENDPOINT))
+            .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
+        reply.words[0] as Handle
+    };
     mark(&mut sys, debug_ep, 0xF2, 2); // debug: after mint_ep bootstrap
 
     // Create notification for signaling.
-    let notif = mint_notification(&mut sys, factory)?;
+    let notif = {
+        let reply = sys
+            .invoke(factory, &Message::new(methods::factory::NEW_NOTIFICATION))
+            .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
+        reply.words[0] as Handle
+    };
     mark(&mut sys, debug_ep, 0xF2, 3); // debug: after mint_notification
 
-    // Spawn a thread that blocks on the bootstrap endpoint.
+    // Spawn a thread in the same AS that blocks on the bootstrap endpoint.
+    // For THREAD_CREATE, the thread shares the cap table, so it can use bootstrap_ep directly.
+    THREAD_ENTRY_EP.store(bootstrap_ep, Ordering::SeqCst);
     let recv_entry = thread_entry_recv_loop as *const () as u64;
-    let (waiter_thread, _pid) =
-        spawn_thread(&mut sys, factory, self_as, region, bootstrap_ep, recv_entry)?;
-    mark(&mut sys, debug_ep, 0xF2, 4); // debug: after spawn_thread
+    let (waiter_thread, _waiter_frame, _waiter_stack_base) =
+        spawn_thread_same_as(&mut sys, self_thread, self_as, region, recv_entry)?;
+    mark(&mut sys, debug_ep, 0xF2, 4); // debug: after spawn_thread_same_as
 
     // Bind notification to the waiter thread (so recv on bootstrap_ep wakes on signal).
     sys.invoke(
@@ -291,7 +431,12 @@ fn bench_notification_wake(
     mark(&mut sys, debug_ep, 0xF2, 5); // debug: after BIND_NOTIFICATION
 
     // Bind death notification.
-    let death_notif = mint_notification(&mut sys, factory)?;
+    let death_notif = {
+        let reply = sys
+            .invoke(factory, &Message::new(methods::factory::NEW_NOTIFICATION))
+            .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
+        reply.words[0] as Handle
+    };
     mark(&mut sys, debug_ep, 0xF2, 6); // debug: after mint_notification death
     sys.invoke(
         waiter_thread,
@@ -338,31 +483,60 @@ fn bench_notification_wake(
     Ok(())
 }
 
-#[allow(dead_code)]
 /// Benchmark: context switch between threads in the same address space.
 fn bench_context_switch_same_as(
     raw: &mut X86_64Syscalls,
     debug_ep: Handle,
     factory: Handle,
     self_as: Handle,
+    self_thread: Handle,
     region: Handle,
 ) -> Result<()> {
     let mut sys = Syscalls::new(raw);
     mark(&mut sys, debug_ep, 0xF3, 1); // debug: context_switch_same_as start
 
-    // Create two threads in the same AS that ping-pong via endpoints.
-    let ep1 = mint_ep(&mut sys, factory)?;
-    let ep2 = mint_ep(&mut sys, factory)?;
+    // Create two endpoints for ping-pong.
+    let ep1 = {
+        let reply = sys
+            .invoke(factory, &Message::new(methods::factory::NEW_ENDPOINT))
+            .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
+        reply.words[0] as Handle
+    };
+    let ep2 = {
+        let reply = sys
+            .invoke(factory, &Message::new(methods::factory::NEW_ENDPOINT))
+            .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
+        reply.words[0] as Handle
+    };
     mark(&mut sys, debug_ep, 0xF3, 2); // debug: after mint_ep
 
     let recv_entry = thread_entry_recv_loop as *const () as u64;
-    let (thread1, _) = spawn_thread(&mut sys, factory, self_as, region, ep1, recv_entry)?;
-    let (thread2, _) = spawn_thread(&mut sys, factory, self_as, region, ep2, recv_entry)?;
-    mark(&mut sys, debug_ep, 0xF3, 3); // debug: after spawn_thread
+
+    // Spawn thread1 using ep1.
+    THREAD_ENTRY_EP.store(ep1, Ordering::SeqCst);
+    let (thread1, _frame1, _stack_base1) =
+        spawn_thread_same_as(&mut sys, self_thread, self_as, region, recv_entry)?;
+
+    // Spawn thread2 using ep2.
+    THREAD_ENTRY_EP.store(ep2, Ordering::SeqCst);
+    let (thread2, _frame2, _stack_base2) =
+        spawn_thread_same_as(&mut sys, self_thread, self_as, region, recv_entry)?;
+
+    mark(&mut sys, debug_ep, 0xF3, 3); // debug: after spawn_thread_same_as
 
     // Bind death notifications.
-    let death1 = mint_notification(&mut sys, factory)?;
-    let death2 = mint_notification(&mut sys, factory)?;
+    let death1 = {
+        let reply = sys
+            .invoke(factory, &Message::new(methods::factory::NEW_NOTIFICATION))
+            .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
+        reply.words[0] as Handle
+    };
+    let death2 = {
+        let reply = sys
+            .invoke(factory, &Message::new(methods::factory::NEW_NOTIFICATION))
+            .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
+        reply.words[0] as Handle
+    };
     mark(&mut sys, debug_ep, 0xF3, 4); // debug: after mint_notification
     sys.invoke(
         thread1,
@@ -426,13 +600,13 @@ fn bench_context_switch_same_as(
     Ok(())
 }
 
-#[allow(dead_code)]
 /// Benchmark: context switch between threads in different address spaces.
 fn bench_context_switch_diff_as(
     raw: &mut X86_64Syscalls,
     debug_ep: Handle,
     factory: Handle,
     self_as: Handle,
+    self_thread: Handle,
     region: Handle,
 ) -> Result<()> {
     let mut sys = Syscalls::new(raw);
@@ -450,18 +624,50 @@ fn bench_context_switch_diff_as(
     }
 
     // Endpoints are kernel objects not tied to AS, so we can use the same endpoint.
-    let ep = mint_ep(&mut sys, factory)?;
+    let ep = {
+        let reply = sys
+            .invoke(factory, &Message::new(methods::factory::NEW_ENDPOINT))
+            .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
+        reply.words[0] as Handle
+    };
 
-    // Spawn thread in first AS.
+    // Create bootstrap endpoints for each thread.
+    let _bootstrap_ep1 = {
+        let reply = sys
+            .invoke(factory, &Message::new(methods::factory::NEW_ENDPOINT))
+            .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
+        reply.words[0] as Handle
+    };
+    let bootstrap_ep2 = {
+        let reply = sys
+            .invoke(factory, &Message::new(methods::factory::NEW_ENDPOINT))
+            .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
+        reply.words[0] as Handle
+    };
+
+    // Spawn thread in first AS (same AS as bench) using THREAD_CREATE.
     let recv_entry = thread_entry_recv_loop as *const () as u64;
-    let (thread1, _) = spawn_thread(&mut sys, factory, self_as, region, ep, recv_entry)?;
+    THREAD_ENTRY_EP.store(ep, Ordering::SeqCst);
+    let (thread1, _frame1, _stack_base1) =
+        spawn_thread_same_as(&mut sys, self_thread, self_as, region, recv_entry)?;
 
-    // Spawn thread in second AS.
-    let (thread2, _) = spawn_thread(&mut sys, factory, as2, region, ep, recv_entry)?;
+    // Spawn thread in second AS using NEW_THREAD with ADR-088 uniform packing.
+    let (thread2, _pid) =
+        spawn_thread_diff_as(&mut sys, factory, as2, region, bootstrap_ep2, recv_entry)?;
 
     // Bind death notifications.
-    let death1 = mint_notification(&mut sys, factory)?;
-    let death2 = mint_notification(&mut sys, factory)?;
+    let death1 = {
+        let reply = sys
+            .invoke(factory, &Message::new(methods::factory::NEW_NOTIFICATION))
+            .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
+        reply.words[0] as Handle
+    };
+    let death2 = {
+        let reply = sys
+            .invoke(factory, &Message::new(methods::factory::NEW_NOTIFICATION))
+            .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
+        reply.words[0] as Handle
+    };
     sys.invoke(
         thread1,
         &msg_with_cap(
@@ -523,7 +729,6 @@ fn bench_context_switch_diff_as(
     Ok(())
 }
 
-#[allow(dead_code)]
 /// Benchmark: map and unmap 4 KiB page.
 fn bench_map_unmap_4k(
     raw: &mut X86_64Syscalls,
@@ -536,7 +741,15 @@ fn bench_map_unmap_4k(
 
     // Carve a frame for mapping (we use ANON for benchmarks so we don't need the frame cap).
     // But we carve one anyway to have it available if needed.
-    let _frame = carve_frame(&mut sys, region)?;
+    let _frame = {
+        let mut carve = Message::new(methods::region::CARVE);
+        carve.words[0] = 4096;
+        carve.words[1] = 4096;
+        let reply = sys
+            .invoke(region, &carve)
+            .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
+        reply.words[0] as Handle
+    };
 
     // Map benchmark: MAP a 4 KiB page at a fixed VA.
     const MAP_VA: u64 = 0x200000; // 2 MiB, page-aligned
@@ -607,108 +820,32 @@ fn bench_map_unmap_4k(
     Ok(())
 }
 
-/// Mint a new endpoint capability using the Factory capability.
-fn mint_ep(sys: &mut Syscalls<X86_64Syscalls>, factory: Handle) -> Result<Handle> {
-    let reply = sys
-        .invoke(factory, &Message::new(methods::factory::NEW_ENDPOINT))
-        .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
-    let handle = reply.words[0] as Handle;
-    if handle == 0 {
-        return Err(fail_code(STEP_SETUP, 0xE2));
-    }
-    Ok(handle)
-}
-
-/// Mint a new notification capability using the Factory capability.
-fn mint_notification(sys: &mut Syscalls<X86_64Syscalls>, factory: Handle) -> Result<Handle> {
-    let reply = sys
-        .invoke(factory, &Message::new(methods::factory::NEW_NOTIFICATION))
-        .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
-    let handle = reply.words[0] as Handle;
-    if handle == 0 {
-        return Err(fail_code(STEP_SETUP, 0xE3));
-    }
-    Ok(handle)
-}
-
-/// Thread entry point: loops on `recv` using handle 1 (bootstrap endpoint).
-/// This runs in a fresh thread with no heap; uses only raw syscalls.
-extern "C" fn thread_entry_recv_loop() -> ! {
+/// Thread entry point for THREAD_CREATE threads: loops on `recv` using the
+/// endpoint handle stored in THREAD_ENTRY_EP (shared cap table, no bootstrap EP).
+fn thread_entry_recv_loop() -> ! {
     let mut raw = X86_64Syscalls;
     let mut sys = Syscalls::new(&mut raw);
-    let bootstrap_ep: Handle = 1; // handle 1 = bootstrap endpoint installed by NEW_THREAD
+    let ep = THREAD_ENTRY_EP.load(Ordering::SeqCst);
     loop {
-        let _ = sys.recv(bootstrap_ep);
+        let _ = sys.recv(ep);
     }
 }
 
-/// Thread entry point: loops on `recv` then `reply_recv` using handle 1 (bootstrap endpoint).
-/// Used for the call/reply benchmark server thread.
-/// First `recv` binds the implicit reply cap for this thread, then `reply_recv` loops.
-extern "C" fn thread_entry_reply_recv_loop() -> ! {
+/// Thread entry point for THREAD_CREATE threads: loops on `recv` then `reply_recv`
+/// using the endpoint handle stored in THREAD_ENTRY_EP.
+fn thread_entry_reply_recv_loop() -> ! {
     let mut raw = X86_64Syscalls;
     let mut sys = Syscalls::new(&mut raw);
-    let bootstrap_ep: Handle = 1; // handle 1 = bootstrap endpoint installed by NEW_THREAD
-                                  // First recv: blocks until a call arrives, sets implicit reply cap, returns the call message.
-    let _msg = sys.recv(bootstrap_ep).unwrap_or_else(|_| Message::new(0));
+    let ep = THREAD_ENTRY_EP.load(Ordering::SeqCst);
+    // First recv: blocks until a call arrives, sets implicit reply cap, returns the call message.
+    let _msg = sys.recv(ep).unwrap_or_else(|_| Message::new(0));
     // Reply to the first call and enter the reply_recv loop.
     let mut reply_msg = Message::new(0);
     loop {
         reply_msg = sys
-            .reply_recv(bootstrap_ep, &reply_msg)
+            .reply_recv(ep, &reply_msg)
             .unwrap_or_else(|_| Message::new(0));
     }
-}
-
-/// Spawn a thread with the default stack (arch-defined USER_STACK_TOP).
-fn spawn_thread(
-    sys: &mut Syscalls<X86_64Syscalls>,
-    factory: Handle,
-    aspace: Handle,
-    _region: Handle,
-    ep: Handle,
-    entry_pc: u64,
-) -> Result<(Handle, u64)> {
-    let mut m = Message::new(methods::factory::NEW_THREAD);
-    m.tag = m.tag.with_caps(2);
-    m.words[0] = entry_pc;
-    let _ = m.set_descriptor(0, CapSlot::pack(aspace, Rights::MAP.union(Rights::GRANT)));
-    let _ = m.set_descriptor(1, CapSlot::pack(ep, Rights::RECV));
-
-    let reply = sys
-        .invoke(factory, &m)
-        .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
-
-    let thread_cap = reply.words[0] as Handle;
-    let pid = reply.words[2];
-    if thread_cap == 0 {
-        return Err(fail_code(STEP_SETUP, 0xE4));
-    }
-
-    Ok((thread_cap, pid))
-}
-
-/// Create a message with a single capability descriptor.
-fn msg_with_cap(method: u16, cap: Handle, rights: Rights) -> Message {
-    let mut m = Message::new(method);
-    m.tag = m.tag.with_caps(1);
-    let _ = m.set_descriptor(0, CapSlot::pack(cap, rights));
-    m
-}
-
-/// Carve a 4 KiB frame from the region.
-fn carve_frame(sys: &mut Syscalls<X86_64Syscalls>, region: Handle) -> Result<Handle> {
-    let mut carve = Message::new(methods::region::CARVE);
-    carve.words[0] = 4096;
-    carve.words[1] = 4096;
-    let reply = sys
-        .invoke(region, &carve)
-        .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
-    let handle = reply.words[0] as Handle;
-    if handle == 0 {
-        return Err(fail_code(STEP_SETUP, 0xE6));
-    }
-    Ok(handle)
 }
 
 /// Exit with a failure code.
