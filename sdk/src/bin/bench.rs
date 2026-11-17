@@ -352,7 +352,7 @@ fn bench_call_reply(
 
     // Cleanup: kill server thread.
     let _ = sys.invoke(server_thread, &Message::new(methods::thread::KILL));
-    let _ = sys.cap_revoke(server_thread, 1);
+    let _ = sys.cap_revoke_simple(server_thread, 1);
 
     Ok(())
 }
@@ -485,7 +485,7 @@ fn bench_notification_wake(
 
     // Cleanup.
     let _ = sys.invoke(waiter_thread, &Message::new(methods::thread::KILL));
-    let _ = sys.cap_revoke(waiter_thread, 1);
+    let _ = sys.cap_revoke_simple(waiter_thread, 1);
 
     Ok(())
 }
@@ -611,28 +611,138 @@ fn bench_context_switch_same_as(
 
     // Cleanup.
     let _ = sys.invoke(thread1, &Message::new(methods::thread::KILL));
-    let _ = sys.cap_revoke(thread1, 1);
+    let _ = sys.cap_revoke_simple(thread1, 1);
     let _ = sys.invoke(thread2, &Message::new(methods::thread::KILL));
-    let _ = sys.cap_revoke(thread2, 1);
+    let _ = sys.cap_revoke_simple(thread2, 1);
 
     Ok(())
 }
 
 /// Benchmark: context switch between threads in different address spaces.
 fn bench_context_switch_diff_as(
-    _raw: &mut X86_64Syscalls,
+    raw: &mut X86_64Syscalls,
     debug_ep: Handle,
-    _factory: Handle,
-    _self_as: Handle,
+    factory: Handle,
+    self_as: Handle,
     _self_thread: Handle,
-    _region: Handle,
+    region: Handle,
 ) -> Result<()> {
-    let mut sys = Syscalls::new(_raw);
+    let mut sys = Syscalls::new(raw);
     mark(&mut sys, debug_ep, 0xF1, 1); // debug: bench_context_switch_diff_as start
 
-    // Creating a thread in a different AS requires mapping code pages into that AS,
-    // which is not yet supported without kernel assistance. Skip this benchmark.
-    mark(&mut sys, debug_ep, 0xF1, 0xFF); // debug: diff_as not implemented
+    // FORK self_as to create a new AS (as2) with COW-cloned code pages.
+    let fork_msg = Message::new(methods::aspace::FORK);
+    let fork_reply = sys
+        .invoke(self_as, &fork_msg)
+        .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
+    let as2 = fork_reply.words[0] as Handle;
+    if as2 == 0 {
+        return Err(fail_code(STEP_SETUP, 0xEA));
+    }
+    mark(&mut sys, debug_ep, 0xF1, 2); // debug: FORK done
+
+    // Carve a stack for the child thread in the new AS.
+    let (stack_top, _frame_handle, _stack_base) = carve_stack(&mut sys, region, as2)?;
+    mark(&mut sys, debug_ep, 0xF1, 3); // debug: carve_stack done
+
+    // Create bootstrap endpoint for the child thread.
+    let bootstrap_ep = {
+        let reply = sys
+            .invoke(factory, &Message::new(methods::factory::NEW_ENDPOINT))
+            .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
+        reply.words[0] as Handle
+    };
+    if bootstrap_ep == 0 {
+        return Err(fail_code(STEP_SETUP, 0xEB));
+    }
+    mark(&mut sys, debug_ep, 0xF1, 4); // debug: bootstrap_ep minted
+
+    // Create done endpoint for completion signaling.
+    let done_ep = {
+        let reply = sys
+            .invoke(factory, &Message::new(methods::factory::NEW_ENDPOINT))
+            .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
+        reply.words[0] as Handle
+    };
+    if done_ep == 0 {
+        return Err(fail_code(STEP_SETUP, 0xED));
+    }
+    mark(&mut sys, debug_ep, 0xF1, 5); // debug: done_ep minted
+
+    // Spawn child thread in as2 using NEW_THREAD (ADR-088 uniform packing, cap_count=2).
+    // w0 = entry PC, w1 = stack top
+    // caps[0] = as2 (MAP|GRANT), caps[1] = bootstrap_ep (RECV -> child handle 1)
+    // Child entry: recv on bootstrap_ep (handle 1), send to done_ep.
+    let child_entry = thread_entry_new_thread_diff_as as *const () as u64;
+    let mut new_thread = Message::new(methods::factory::NEW_THREAD);
+    new_thread.tag = new_thread.tag.with_caps(2);
+    new_thread.words[0] = child_entry;
+    new_thread.words[1] = stack_top;
+    let _ = new_thread.set_descriptor(0, CapSlot::pack(as2, Rights::MAP.union(Rights::GRANT)));
+    let _ = new_thread.set_descriptor(1, CapSlot::pack(bootstrap_ep, Rights::RECV));
+
+    let nt_reply = sys
+        .invoke(factory, &new_thread)
+        .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
+    let child_thread = nt_reply.words[0] as Handle;
+    if child_thread == 0 {
+        return Err(fail_code(STEP_SETUP, 0xEC));
+    }
+    mark(&mut sys, debug_ep, 0xF1, 6); // debug: NEW_THREAD done
+
+    // Pass done_ep to child via THREAD_ENTRY_DONE_EP (child reads it as done_ep).
+    THREAD_ENTRY_DONE_EP.store(done_ep, Ordering::SeqCst);
+    mark(&mut sys, debug_ep, 0xF1, 7); // debug: globals set
+
+    // Bind death notification for cleanup.
+    let death_notif = {
+        let reply = sys
+            .invoke(factory, &Message::new(methods::factory::NEW_NOTIFICATION))
+            .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
+        reply.words[0] as Handle
+    };
+    sys.invoke(
+        child_thread,
+        &msg_with_cap(
+            methods::thread::BIND_DEATH_NOTIFICATION,
+            death_notif,
+            Rights::SIGNAL,
+        ),
+    )
+    .map_err(err_to_u64)?;
+    mark(&mut sys, debug_ep, 0xF1, 8); // debug: BIND_DEATH_NOTIFICATION done
+
+    // Yield to let the child start and park on recv(bootstrap_ep).
+    sys.yield_now().map_err(err_to_u64)?;
+    mark(&mut sys, debug_ep, 0xF1, 9); // debug: yield done
+
+    // Warmup: one context switch (main -> child via bootstrap_ep -> main via done_ep).
+    let m = Message::new(0x1003);
+    sys.send(bootstrap_ep, &m).map_err(err_to_u64)?;
+    let _ = sys.recv(done_ep).map_err(err_to_u64)?;
+    mark(&mut sys, debug_ep, 0xF1, 0xA); // debug: warmup done
+
+    // Measure: MEASURE_ITERS context switches.
+    let start = rdtsc();
+    for _ in 0..MEASURE_ITERS {
+        sys.send(bootstrap_ep, &m).map_err(err_to_u64)?;
+        let _ = sys.recv(done_ep).map_err(err_to_u64)?;
+    }
+    let end = rdtsc();
+    mark(&mut sys, debug_ep, 0xF1, 0xB); // debug: measure done
+
+    let cycles_per_iter = (end - start) / MEASURE_ITERS;
+    mark_bench(
+        &mut sys,
+        debug_ep,
+        "context_switch_diff_as",
+        cycles_per_iter,
+    );
+
+    // Cleanup.
+    let _ = sys.invoke(child_thread, &Message::new(methods::thread::KILL));
+    let _ = sys.cap_revoke_simple(child_thread, 1);
+
     Ok(())
 }
 
@@ -833,6 +943,23 @@ fn thread_entry_new_thread_ping_pong_done() -> ! {
     loop {
         let _ = sys.recv(bootstrap_ep);
         let _ = sys.send(shared_ep, &msg);
+        let _ = sys.send(done_ep, &msg);
+    }
+}
+
+/// Thread entry point for NEW_THREAD children in diff_as benchmark:
+/// Receives on bootstrap EP (handle 1), sends to done EP (from THREAD_ENTRY_DONE_EP).
+#[allow(dead_code)]
+fn thread_entry_new_thread_diff_as() -> ! {
+    let mut raw = X86_64Syscalls;
+    let mut sys = Syscalls::new(&mut raw);
+    // Bootstrap endpoint is at handle 1 (first cap from NEW_THREAD).
+    let bootstrap_ep = 1;
+    // Done endpoint is passed via THREAD_ENTRY_DONE_EP.
+    let done_ep = THREAD_ENTRY_DONE_EP.load(Ordering::SeqCst);
+    let msg = Message::new(0);
+    loop {
+        let _ = sys.recv(bootstrap_ep);
         let _ = sys.send(done_ep, &msg);
     }
 }

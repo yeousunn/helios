@@ -11,6 +11,8 @@ pub mod factory {
     pub const NEW_NOTIFICATION: u16 = 2;
     pub const NEW_ADDRESS_SPACE: u16 = 3;
     pub const NEW_THREAD: u16 = 4;
+    /// RFC-0005 / ADR-088: Retype an Untyped into a concrete kernel object.
+    pub const RETYPE: u16 = 5;
 }
 
 pub mod region {

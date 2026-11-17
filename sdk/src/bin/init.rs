@@ -144,7 +144,7 @@ fn run(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
     mark(raw, info.debug_ep, STEP_IPC, echo.words[0]);
     {
         let mut sys = Syscalls::new(raw);
-        sys.cap_revoke(endpoint, 1)
+        sys.cap_revoke_simple(endpoint, 1)
             .map_err(|e| fail_code(STEP_REVOKE, e as u64))?;
     }
     mark(raw, info.debug_ep, STEP_REVOKE, 0);

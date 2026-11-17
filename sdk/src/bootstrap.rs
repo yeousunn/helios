@@ -116,7 +116,7 @@ pub fn receive<R: RawSyscalls>(sys: &mut Syscalls<R>) -> Result<BootstrapPackage
     }
 
     // The package is complete; the endpoint has served its purpose.
-    sys.cap_revoke(BOOTSTRAP_HANDLE, 1)?;
+    sys.cap_revoke_simple(BOOTSTRAP_HANDLE, 1)?;
 
     let mut session_notifications = [0 as Handle; SESSION_POOL];
     for (i, slot) in session_notifications.iter_mut().enumerate() {

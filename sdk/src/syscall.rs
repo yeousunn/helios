@@ -11,7 +11,7 @@ use ipc::{Message, Rights, Tag};
 /// Status codes are the shared `ipc::status` space (negative = error).
 pub type Status = i32;
 
-/// Syscall numbers (frozen set, ADR-005).
+/// Syscall numbers (frozen set, ADR-005; CAP_MOVE = 9 per RFC-0001).
 pub mod number {
     pub const YIELD: u32 = 0;
     pub const SEND: u32 = 1;
@@ -22,6 +22,7 @@ pub mod number {
     pub const CAP_MINT: u32 = 6;
     pub const CAP_REVOKE: u32 = 7;
     pub const EXIT: u32 = 8;
+    pub const CAP_MOVE: u32 = 9;
 }
 
 /// `send` to this handle routes through the implicit reply cap (ADR-009).
@@ -157,11 +158,58 @@ impl<'a, R: RawSyscalls> Syscalls<'a, R> {
     }
 
     /// `cap_revoke`: mode 0 = `REVOKE_DERIVED` (keep cap), 1 = `DELETE`.
-    pub fn cap_revoke(&mut self, cap: Handle, mode: u32) -> Result<(), Status> {
-        // The kernel reads `mode` from w0 — not the tag slot (which is where
-        // it used to land, making every revoke a silent no-op).
-        let args = [cap as u64, 0, mode as u64, 0, 0, 0];
-        check(self.raw.raw(number::CAP_REVOKE, args).status)
+    /// M1 extension: `max_steps` bounds the walk (default 256), `resume_token`
+    /// continues a previous revoke (0 = new revoke). On `EAGAIN` (-22), the reply
+    /// carries the next `resume_token` in `words[0]`.
+    pub fn cap_revoke(
+        &mut self,
+        cap: Handle,
+        mode: u32,
+        max_steps: u32,
+        resume_token: u64,
+    ) -> Result<Option<u64>, Status> {
+        let args = [
+            cap as u64,
+            0,
+            mode as u64,
+            max_steps as u64,
+            resume_token,
+            0,
+        ];
+        let r = self.raw.raw(number::CAP_REVOKE, args);
+        // EAGAIN = -22 (to be added to ipc::status by GLM per Request)
+        const EAGAIN: i32 = -22;
+        if r.status == EAGAIN {
+            return Ok(Some(r.words[0]));
+        }
+        check(r.status).map(|_| None)
+    }
+
+    /// Convenience wrapper for the common case (mode + defaults for M1 extension).
+    pub fn cap_revoke_simple(&mut self, cap: Handle, mode: u32) -> Result<(), Status> {
+        self.cap_revoke(cap, mode, 256, 0).map(|_| ())
+    }
+
+    /// `cap_move`: transfer a capability to another CNode/slot without creating
+    /// a derivation edge. `src` must have GRANT; `dest_cnode` (0 = current
+    /// process CNode) must have GRANT. `dest_slot` = `0xFFFF_FFFF` for first-free.
+    /// `flags` bit 0 = delete source after move; other bits must be 0.
+    pub fn cap_move(
+        &mut self,
+        src: Handle,
+        dest_cnode: Handle,
+        dest_slot: u32,
+        flags: u32,
+    ) -> Result<(), Status> {
+        let args = [
+            src as u64,
+            0,
+            dest_cnode as u64,
+            dest_slot as u64,
+            flags as u64,
+            0,
+        ];
+        check(self.raw.raw(number::CAP_MOVE, args).status)
     }
 
     /// `yield`: voluntarily deschedule.
@@ -255,7 +303,7 @@ mod tests {
             let mut sys = Syscalls::new(&mut raw);
             assert_eq!(sys.recv(3), Err(status::EBADCAP));
             sys.send(3, &msg(1)).unwrap_err();
-            assert_eq!(sys.cap_revoke(3, 0).unwrap_err(), status::EBADCAP);
+            assert_eq!(sys.cap_revoke_simple(3, 0).unwrap_err(), status::EBADCAP);
             assert_eq!(
                 sys.cap_mint(3, Rights::SEND, None).unwrap_err(),
                 status::EBADCAP
@@ -321,11 +369,13 @@ mod tests {
         {
             let mut sys = Syscalls::new(&mut raw);
             sys.yield_now().unwrap();
-            sys.cap_revoke(5, 1).unwrap();
+            sys.cap_revoke_simple(5, 1).unwrap();
         }
         assert_eq!(raw.calls[0], (number::YIELD, [0; 6]));
         assert_eq!(raw.calls[1].0, number::CAP_REVOKE);
         assert_eq!(raw.calls[1].1[0], 5, "cap");
         assert_eq!(raw.calls[1].1[2], 1, "mode in w0");
+        assert_eq!(raw.calls[1].1[3], 256, "max_steps default");
+        assert_eq!(raw.calls[1].1[4], 0, "resume_token default");
     }
 }

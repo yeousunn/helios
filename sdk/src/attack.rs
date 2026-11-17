@@ -86,6 +86,16 @@ pub fn run<R: RawSyscalls>(sys: &mut Syscalls<R>, pkg: &BootstrapPackage) -> i32
         case_bind_fault_ep_no_control(sys, pkg),
         case_bind_fault_ep_non_endpoint(sys, pkg),
         case_bind_fault_ep_dead_target(sys, pkg),
+        // M1 / RFC-0001 / RFC-0005: Retype/Revoke/CAP_MOVE abuse
+        case_retype_capcount_invalid(sys, pkg),
+        case_retype_invalid_type(sys, pkg),
+        case_retype_wrong_source_type(sys, pkg),
+        case_cap_move_oob_slot(sys, pkg),
+        case_cap_move_unknown_flags(sys, pkg),
+        case_cap_move_no_grant_src(sys, pkg),
+        case_revoke_invalid_mode(sys, pkg),
+        case_revoke_invalid_max_steps(sys, pkg),
+        case_revoke_invalid_resume_token(sys, pkg),
     ];
     classify(&outcomes)
 }
@@ -288,7 +298,7 @@ fn case_set_entry_kernel_pc<R: RawSyscalls>(sys: &mut Syscalls<R>, pkg: &Bootstr
     // which would leak a live thread and stop the boot from reaching its clean
     // halt), then drop its cap.
     let _ = sys.invoke(scratch, &Message::new(crate::methods::thread::KILL));
-    let _ = sys.cap_revoke(scratch, 1);
+    let _ = sys.cap_revoke_simple(scratch, 1);
     rejected
 }
 
@@ -556,6 +566,153 @@ fn case_bind_fault_ep_dead_target<R: RawSyscalls>(
     sys.invoke(scratch, &m).is_err()
 }
 
+/// `FACTORY_RETYPE` with `cap_count != 1` must be rejected with EBADARG.
+/// RFC-0005: RETYPE requires exactly cap_count = 1. Case 18.
+fn case_retype_capcount_invalid<R: RawSyscalls>(
+    sys: &mut Syscalls<R>,
+    pkg: &BootstrapPackage,
+) -> bool {
+    let factory = pkg.optional[4].expect("factory cap missing");
+    // Test cap_count = 0
+    let mut m = Message::new(crate::methods::factory::RETYPE);
+    m.tag = m.tag.with_caps(0);
+    m.words[0] = 1; // type = Frame (example)
+    m.words[1] = 4096;
+    m.words[2] = 0;
+    if sys.invoke(factory.handle(), &m).is_ok() {
+        return false;
+    }
+    // Test cap_count = 2
+    m.tag = m.tag.with_caps(2);
+    // caps[0] = some cap (not Untyped, but we test cap_count first)
+    let _ = m.set_descriptor(0, CapSlot::pack(pkg.aspace, Rights::MAP));
+    let _ = m.set_descriptor(1, CapSlot::pack(pkg.thread, Rights::MAP));
+    if sys.invoke(factory.handle(), &m).is_ok() {
+        return false;
+    }
+    true
+}
+
+/// `FACTORY_RETYPE` with an invalid target type must be rejected with EBADARG.
+/// Case 19.
+fn case_retype_invalid_type<R: RawSyscalls>(sys: &mut Syscalls<R>, pkg: &BootstrapPackage) -> bool {
+    let factory = pkg.optional[4].expect("factory cap missing");
+    let mut m = Message::new(crate::methods::factory::RETYPE);
+    m.tag = m.tag.with_caps(1);
+    m.words[0] = 0xFFFF; // invalid ObjType
+    m.words[1] = 4096;
+    m.words[2] = 0;
+    // caps[0] = factory cap itself (not Untyped, but we test type validation first)
+    let _ = m.set_descriptor(0, CapSlot::pack(factory.handle(), Rights::MAP));
+    sys.invoke(factory.handle(), &m).is_err()
+}
+
+/// `FACTORY_RETYPE` with a non-Untyped source cap must be rejected (EBADCAP/EBADARG).
+/// Case 20.
+fn case_retype_wrong_source_type<R: RawSyscalls>(
+    sys: &mut Syscalls<R>,
+    pkg: &BootstrapPackage,
+) -> bool {
+    let factory = pkg.optional[4].expect("factory cap missing");
+    let mut m = Message::new(crate::methods::factory::RETYPE);
+    m.tag = m.tag.with_caps(1);
+    m.words[0] = 1; // type = Frame
+    m.words[1] = 4096;
+    m.words[2] = 0;
+    // caps[0] = AddressSpace cap (not Untyped)
+    let _ = m.set_descriptor(0, CapSlot::pack(pkg.aspace, Rights::MAP));
+    sys.invoke(factory.handle(), &m).is_err()
+}
+
+/// `CAP_MOVE` with an out-of-bounds destination slot must be rejected with EBADARG.
+/// Case 21.
+fn case_cap_move_oob_slot<R: RawSyscalls>(sys: &mut Syscalls<R>, pkg: &BootstrapPackage) -> bool {
+    let factory = pkg.optional[4].expect("factory cap missing");
+    // Create a source endpoint to move
+    let ep_m = Message::new(crate::methods::factory::NEW_ENDPOINT);
+    let Ok(ep_reply) = sys.invoke(factory.handle(), &ep_m) else {
+        return false;
+    };
+    let src = ep_reply.words[0] as u32;
+    // Try to move to slot 2048 (OOB for default 1024-slot CNode)
+    sys.cap_move(src, 0, 2048, 0).is_err()
+}
+
+/// `CAP_MOVE` with unknown flag bits must be rejected with EBADARG.
+/// Case 22.
+fn case_cap_move_unknown_flags<R: RawSyscalls>(
+    sys: &mut Syscalls<R>,
+    pkg: &BootstrapPackage,
+) -> bool {
+    let factory = pkg.optional[4].expect("factory cap missing");
+    let ep_m = Message::new(crate::methods::factory::NEW_ENDPOINT);
+    let Ok(ep_reply) = sys.invoke(factory.handle(), &ep_m) else {
+        return false;
+    };
+    let src = ep_reply.words[0] as u32;
+    // Unknown flag bit (bit 1)
+    sys.cap_move(src, 0, 0xFFFF_FFFF, 0b10).is_err()
+}
+
+/// `CAP_MOVE` without GRANT on the source cap must be rejected with ERIGHTS.
+/// Case 23.
+fn case_cap_move_no_grant_src<R: RawSyscalls>(
+    sys: &mut Syscalls<R>,
+    pkg: &BootstrapPackage,
+) -> bool {
+    let factory = pkg.optional[4].expect("factory cap missing");
+    let ep_m = Message::new(crate::methods::factory::NEW_ENDPOINT);
+    let Ok(ep_reply) = sys.invoke(factory.handle(), &ep_m) else {
+        return false;
+    };
+    let src = ep_reply.words[0] as u32;
+    // Mint a copy without GRANT
+    let src_no_grant = sys
+        .cap_mint(src, Rights::SEND.union(Rights::RECV), None)
+        .unwrap_or(0);
+    if src_no_grant == 0 {
+        return false;
+    }
+    // Try to move the non-GRANT cap
+    sys.cap_move(src_no_grant, 0, 0xFFFF_FFFF, 0).is_err()
+}
+
+/// `CAP_REVOKE` with an invalid mode must be rejected with EBADARG.
+/// Case 24.
+fn case_revoke_invalid_mode<R: RawSyscalls>(sys: &mut Syscalls<R>, pkg: &BootstrapPackage) -> bool {
+    // Mode must be 0 (REVOKE_DERIVED) or 1 (DELETE)
+    sys.cap_revoke(pkg.thread, 2, 256, 0).is_err()
+}
+
+/// `CAP_REVOKE` with invalid max_steps (0 or > 4096) must be rejected with EBADARG.
+/// Case 25.
+fn case_revoke_invalid_max_steps<R: RawSyscalls>(
+    sys: &mut Syscalls<R>,
+    pkg: &BootstrapPackage,
+) -> bool {
+    // max_steps = 0
+    if sys.cap_revoke(pkg.thread, 0, 0, 0).is_ok() {
+        return false;
+    }
+    // max_steps = 5000 (> 4096)
+    if sys.cap_revoke(pkg.thread, 0, 5000, 0).is_ok() {
+        return false;
+    }
+    true
+}
+
+/// `CAP_REVOKE` with an invalid resume_token (not held by this process) must
+/// be rejected with EBADARG.
+/// Case 26.
+fn case_revoke_invalid_resume_token<R: RawSyscalls>(
+    sys: &mut Syscalls<R>,
+    pkg: &BootstrapPackage,
+) -> bool {
+    // Use a bogus resume token
+    sys.cap_revoke(pkg.thread, 0, 256, 0xDEAD_BEEF_CAFE_BABE)
+        .is_err()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,7 +729,7 @@ mod tests {
     impl MockKernel {
         /// A kernel that rejects each bad call with the error the case names.
         fn rejects() -> Self {
-            use ipc::status::{EBADARG, EBADCAP, OK};
+            use ipc::status::{EBADARG, EBADCAP, ERIGHTS, OK};
             // Build statuses in exact order of syscalls made by run()
             let mut statuses = Vec::new();
             // Case 0: orphan handle (invoke) -> EBADCAP
@@ -644,6 +801,30 @@ mod tests {
             statuses.push(OK); // KILL
             statuses.push(OK); // NEW_ENDPOINT
             statuses.push(EBADARG); // BIND_FAULT_EP on dead thread
+                                    // Case 24 (index 18): retype_capcount_invalid (2 invokes: cap_count=0, cap_count=2) -> EBADARG x2
+            statuses.push(EBADARG);
+            statuses.push(EBADARG);
+            // Case 25 (index 19): retype_invalid_type (1 invoke) -> EBADARG
+            statuses.push(EBADARG);
+            // Case 26 (index 20): retype_wrong_source_type (1 invoke) -> EBADARG
+            statuses.push(EBADARG);
+            // Case 27 (index 21): cap_move_oob_slot (2 invokes: NEW_ENDPOINT OK, CAP_MOVE EBADARG)
+            statuses.push(OK);
+            statuses.push(EBADARG);
+            // Case 28 (index 22): cap_move_unknown_flags (2 invokes: NEW_ENDPOINT OK, CAP_MOVE EBADARG)
+            statuses.push(OK);
+            statuses.push(EBADARG);
+            // Case 29 (index 23): cap_move_no_grant_src (3 invokes: NEW_ENDPOINT OK, cap_mint OK, CAP_MOVE ERIGHTS)
+            statuses.push(OK);
+            statuses.push(OK);
+            statuses.push(ERIGHTS);
+            // Case 30 (index 24): revoke_invalid_mode (1 cap_revoke) -> EBADARG
+            statuses.push(EBADARG);
+            // Case 31 (index 25): revoke_invalid_max_steps (2 cap_revoke) -> EBADARG x2
+            statuses.push(EBADARG);
+            statuses.push(EBADARG);
+            // Case 32 (index 26): revoke_invalid_resume_token (1 cap_revoke) -> EBADARG
+            statuses.push(EBADARG);
 
             MockKernel { statuses, i: 0 }
         }
