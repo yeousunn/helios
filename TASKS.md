@@ -89,6 +89,10 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 - [~ DS started 2026-11-18] M1 attack-suite cases for Retype/Revoke abuse.
 - [ ] PSX: M1 B10 personality isolation proof sketch (bet B10).
 
+## M1: Object model (kernel; ADR-064 = RFC-0001 as corrected by ADR-088/RFC-0005)
+
+- [~ GLM started 2026-11-18] M1a1 GLM: kernel Untyped object + FACTORY_RETYPE (label 5) dispatch for the fixed-size targets (Endpoint, Notification) per the accepted spec/abi packing (cap_count exactly 1, w0 target set, w1 exact fixed size = engine slot bytes, w2 align order, all-or-nothing source reduction, reply w0 = handle / w1 = remaining); caps::ObjType gains explicit spec-matching discriminants + Untyped (spec header says "must match kernel's caps::ObjType" — Region/Reply/Factory currently drift); kernel↔spec discriminant cross-check test; owner-death frees the Untyped state. Root Untyped grant at boot (spec/abi::entry + BootInfo) is M1a2; unimplemented in-set targets stay ENOSYS (AS_FORK precedent). ADR-103.
+
 ## M0: Benchmarks
 
 - [x DS done 2026-11-16 ecdc5ca] B1a DS: `sdk/src/bin/bench.rs` measures call/reply and send/recv with the cycle counter and prints one parseable line per result for G3.
