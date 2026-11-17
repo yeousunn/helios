@@ -1257,3 +1257,81 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 - Decision: (1) Land the parked WIP as A12: Thread label 8 BIND_NOTIFICATION dispatches — caps[0] must be the caller's live Notification cap or absent/NULL (clear); anything else is EBADARG before any state change; OK otherwise. The wake binding (`Thread.bound_notification`, ADR-019 §2 select primitive) is split from the death notification: a new `Thread.death_notification` field carries ADR-031's exit payload (label 12 BIND_DEATH_NOTIFICATION, sys_exit/sched::exit), so one thread carries both independently. spec/abi gains the THREAD_BIND_NOTIFICATION InvokeSpec + commutativity entry (Thread label 8, CONTROL, caps[0] = Notification optional/NULL-to-clear) and clarifies label 12's description (ADR-031 death payload, independent of label 8); the WIP's duplicate THREAD_BIND_DEATH_NOTIFICATION registrations (already at HEAD) were dropped per ADR-100. Parked patch file removed — landed. (2) Select-wake cancellation discipline: `notification::signal`'s bound-wake now unqueues the parked thread from its endpoint (Recv/Send → `endpoint::unqueue_waiter`, the same unqueue-before-wake rule ADR-041's expire path already applies; Reply parks have no queue → make_ready as before), so a later delivery can no longer complete a syscall the wake already cancelled and re-parks stop leaking waiter slots. (3) Park retirement on NOTIFIED resumes: `entry::park_result` steps 2 and 3 call `syscall::clear_park_entry` before returning, matching steps 1/4/5 — no stale park record per wake and no raced timed_out/call_dead flag poisoning the next park (PS's WAIT-class deadline parks ride these paths).
 - Validation: BIND_NOTIFICATION (Thread label 8, INVOKE, CONTROL required else ERIGHTS per the invoke gate): caps[0] absent/NULL → OK, wake binding cleared; caps[0] = live Notification (SIGNAL right in the descriptor) → OK, `bound_notification` = that object; caps[0] = wrong type or dead object → EBADARG (-3) with the previous binding unchanged; target thread dead/handle invalid → EBADCAP. Independent of label 12: binding one does not disturb the other; a thread exit fires only the death payload on the death notification. spec/abi InvokeSpec carries these ranges (errors OK/EBADCAP/ERIGHTS/EBADARG/EBADSTATE/EREVOKED per the label-12 template); commutativity Commutes (resource = the target thread's own binding). Kernel host tests 103 → 105: `bind_notification_wake_cancels_the_parked_recv_queue_entry` and `..._send_queue_entry` drive the REAL park path (sys_recv/sys_send → park_recv/park_send) for 70 bind/signal-wake/resume cycles (> MAX_WAITERS = 64) plus a final FIFO delivery assert — fail-before verified this cycle by reverting only the fix hunks: cycle 64's park fails with the queue exhausted (recv and send both), passes with the fix. Gate green on the working tree: fmt, all three clippy lines, 385 workspace tests, full boot DONE + clean halt, G3 --compare OK (call_reply 17325→18061, send_recv 2896→2895, context_switch_same_as 31338→33244, map_4k 68310→69472, unmap_4k 68363→69978 — all under the 15% limit) — and the bench now RUNS notification_wake on all 5 boots: 19789 cycles (min over 5 runs), measured for the first time (previously skipped ENOSYS; no previous baseline, so --compare skipped it). No bootloader/BootInfo change; kernel-boot codegen shift is safe post-37e8d10 (full boot green).
 - Consequences: DS's B1b notification_wake unblocks (kernel label 8 live; the metric now appears in bench results for NV's baseline tracking). M0-close's GLM half is half-done: BIND_NOTIFICATION landed; AS code mapping for context_switch_diff_as remains (kernel-side spawn-into-different-AS support — no board task yet; needs NV to add it or an RFC if it touches an ABI). Residual (same leak class, NOT fixed here, no known wedge): `sched::exit`/Thread::KILL of a Recv/Send-parked thread unlinks only the run queue — the dead thread's endpoint queue entry stays until a delivery pops it or the endpoint dies; bench's KILL cleanup and PS's kill paths can leak slots that way. A future kernel task should unqueue on exit (the expire-path discipline generalized), with a host test like the ones added here.
+
+## ADR-102: M0 milestone closed — baseline and guardrails complete
+- Proposed: NV 2026-11-18
+- Status: ACCEPTED (NV coordinator)
+- Context: M0 (baseline and guardrails, PLAN.md section 9) began on 2026-11-14 at baseline cda0a19. The working tree held uncommitted edits from stopped cycles that broke the boot; W-tasks fixed those first. All M0 exit checks are now in the gate and green: `tools/check-unsafe.sh`, `cargo deny check`, `tools/bench.sh --compare`, `tools/verify.sh` (cargo-vet/kani/verus not installed in sandbox — documented non-failing blockers), full QEMU boot reaches DONE marker `0x494e49540000000f` + clean halt. `spec/abi` covers every current syscall (A1). Benchmarks are recorded for HEAD (bench/results/3d87b62.json).
+- Decision: M0 is closed. Every M0 task below is marked `[x ... <hash>]` on TASKS.md except A2, which is deferred: Kani harnesses are written (kernel/src/kani.rs, 4b2fcd0) but Kani is not installed in the sandbox and `~/.cargo` is read-only, so A2 cannot run; it is a non-failing gate blocker reported each cycle, unblocked when the supervisor installs Kani. One task on the board (W7, PSX optional[1] vfs shift) was cancelled as moot per ADR-075.
+- Validation: `tools/qemu-test.sh` green at HEAD 3d87b62 — DONE marker + clean halt, userspace clippy `-D warnings` clean, check-unsafe OK, cargo deny check ok, G3 --compare no regression above 15% vs rolling-median baseline. `cargo fmt --check` and all three clippy lines clean. `cargo test --workspace --exclude kernel-boot` green. Boot result: `call_reply` 18144, `send_recv` 2931, `notification_wake` 19782, `context_switch_same_as` 33387, `map_4k` 68287, `unmap_4k` 69372 cycles (min over 5 runs).
+- Consequences: M1 work may now begin. M1 RFCs R5a (170c703) and R3a (4b84a79) are already accepted (ADR-088, ADR-058). New M1 work starts from PLAN.md section 9. A2 remains deferred pending Kani installation.
+
+M0 task list with commit hashes:
+
+Working tree:
+- W1 PSX: 07a3a3f
+- W2 DS: a6df780
+
+Security:
+- S2b GLM: 9ecdb2a
+- S2c DS: 5ff5f16
+- S2d GLM: a58777a
+- S12 DS: d46c3ae
+
+Gates and tools:
+- G1 NV: 4073688
+- G2 NV: 309828e
+- G3 NV: 662de4d
+- G4 NV: 281cd2f
+- G5 NV: 4ae7629
+- G6 NV: a4630b4
+
+ABI and proofs:
+- A1 GLM: bc44452
+- A2 GLM: DEFERRED (Kani not installed in sandbox; harnesses at 4b2fcd0)
+- A3 GLM: 4b2fcd0
+- A4 GLM: b823cdc
+- A5 GLM: ed977a4
+- A8 GLM: 3c1ddb7
+- A9a GLM: 2296f06
+- A9b GLM: 54517fb
+- A9b self_thread GLM: 7299221
+- A9c GLM: 75cce7b
+- A10 PSX: 2780b07
+- A11 PSX: e1c6ea9
+- A12 GLM: a3d0050
+
+Unsafe migration (PLAN.md 7.1):
+- U2a/U3a DRV: 3b9d83a
+- U2b DS: f53ba85
+- U3b DS: f53ba85
+- U4a PSX: 6bb21d2
+- U4b PSX: 6bb21d2
+- U4c1 PSX: 012160a
+- U4c2a PSX: 4266d5b
+- U4c2b DS: ec07d04
+- U4c3a PSX: a682d1f
+- U4c3b DS: a682d1f
+- U4d1 PSX: 6bb21d2
+- U4e PSX: 1e872b6
+- NV hal/dma.rs: f887634
+
+W0 gate blocker fixes:
+- W3 GLM: a82a138
+- W4 GLM: 0837468
+- W5 GLM: 99ca2ec5b75e7918ff7c755688490c9f3d2af8f0
+- W6 GLM: f27a416
+- W7 PSX: cancelled (moot, ADR-075)
+
+Benchmarks:
+- B1a DS: ecdc5ca
+- B1b DS: 20bc6ff
+- NV bench tracking: fbb344d
+- B2 DS: 3ac2639
+
+M0 close:
+- M0-close NV: 6532845 (board commit marking done; bench results recorded at 6532845 and 2d2fc01)
+
+M1 RFCs already on the board (accepted, not part of M0):
+- R3a PSX: 4b84a79 (ADR-058)
+- R5a GLM: 170c703 (ADR-088)
