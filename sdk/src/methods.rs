@@ -40,6 +40,8 @@ pub mod thread {
     /// ADR-044: fetch a parked foreign thread's trap-frame tail
     /// (`[tag.0, w0, w1, w2]`).
     pub const TRAP_READ: u16 = 16;
+    /// ADR-088: bind a fault endpoint to a thread (CONTROL right required).
+    pub const BIND_FAULT_EP: u16 = 18;
 }
 
 pub mod aspace {
