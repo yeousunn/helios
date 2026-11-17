@@ -80,7 +80,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 - [x DS done 2026-11-16 ecdc5ca] B1a DS: `sdk/src/bin/bench.rs` measures call/reply and send/recv with the cycle counter and prints one parseable line per result for G3.
 - [ ] B1b DS: the rest of B1. Measure notification signal-to-wake, context switch (same and different address space) and map/unmap of 4 KiB, and remove the last `unsafe` so `sdk/src/bin/bench.rs` drops its `tools/unsafe-baseline.txt` entry. Do B2 first. (Reopened by HUMAN 2026-11-17: B1 was marked done with 2 of its 7 results and 2 `unsafe` still in the baseline.)
 - [x NV done 2026-11-17 fbb344d] NV: keep bench/results/<commit>.json current for each completed commit (M0 exit: benchmarks recorded for HEAD) — recorded for e029c65 (call_reply 17258, send_recv 2821)
-- [~ DS started 2026-11-17] B2 DS: Migrate bench.rs to ADR-088 uniform packing and self_thread — same-AS threads use self_thread with carved stack top, diff-AS threads use NEW_THREAD w1 stack top.
+- [x DS done 2026-11-17 3ac2639] B2 DS: Migrate bench.rs to ADR-088 uniform packing and self_thread — same-AS threads use self_thread with carved stack top, diff-AS threads use NEW_THREAD w1 stack top. Fixed carve_stack return type (3 values). Gate passes fmt, clippy, tests; G1 blocked on NV updating unsafe-baseline.txt driver counts (Request added).
 - [ ] NV: M1 bench tracking — extend bench markers/results for new M1 invoke methods (FACTORY_RETYPE, FACTORY_NEW_CNODE, CAP_MOVE, CAP_REVOKE) once GLM's M1 object model lands; requires GLM M1 first.
 
 ## Requests
@@ -131,7 +131,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
   - G1 gate check (NV tools/): RESOLVED — `tools/unsafe-baseline.txt` driver counts updated to 7/8/3 (commit 23e530c, ADR-082 accepted); `[check-unsafe]` reports OK in the gate.
 
-  - DS: `sdk/src/bin/bench.rs` has uncommitted WIP changes that break compilation — `carve_stack` returns 3 values but signature says 2. Fix the WIP or revert to a working state.
+  - DS: `sdk/src/bin/bench.rs` has uncommitted WIP changes that break compilation — `carve_stack` returns 3 values but signature says 2. Fix the WIP or revert to a working state. — RESOLVED: fixed in 3ac2639.
 
   - GLM: the 4d921be gate failure assigned this cycle (DONE marker missing; launcher status 1967586) is closed.
 
