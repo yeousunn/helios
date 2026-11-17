@@ -20,7 +20,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
 ## M0: Gates and tools
 
-- [x NV done 2026-11-14 a707f18] G1 NV: `tools/check-unsafe.sh`: fail when `unsafe`, `asm!`, `global_asm!` or `extern "C"` appear outside the PLAN.md 7.1 allowlist. Keep today's exceptions in `tools/unsafe-baseline.txt` (file and count), which may only shrink. Add it to `tools/qemu-test.sh`.
+- [x DRV done 2026-11-17 56bc2c2] G1 DRV: `tools/check-unsafe.sh`: gate was red at 158f482 (baseline 7/6/2 vs actual 8/7/3). Fixed by drivers/graphics using safe `MmioWindow::from_cap` constructor instead of `unsafe { MmioWindow::new(...) }`. check-unsafe OK at 56bc2c2.
 - [x NV done 2026-11-15 309828e] G2 NV: `deny.toml` + `cargo deny check` added to the gate (tools/qemu-test.sh; `cargo deny check` passes). `tools/verify.sh` wired into the gate; `cargo vet` still blocked (cargo-vet not installed in sandbox, reported as non-failing blocker).
 - [x NV done 2026-11-16 662de4d] G3 NV: `tools/bench.sh`: boot a `BENCH=1` image, parse the cycle counts the bench program prints, store them as `bench/results/<commit>.json`, and with `--compare` fail on a regression above 5% against the previous result. `--compare` now stores decimal (valid JSON) and skips metrics with no previous value instead of crashing on a corrupt previous result.
 - [x NV done 2026-11-14 281cd2f] G4 NV: `docs/rfcs/README.md` and `docs/rfcs/0000-template.md` with the RFC sections from PLAN.md 10.2.
@@ -129,7 +129,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
   - G3 benchmark check (NV tools/): BLOCKED — the bench image (`sdk --bin bench`) exits ENOSYS (-14) before DONE because kernel `thread_invoke` in `kernel/src/entry.rs` has no `BIND_NOTIFICATION` (label 8) case, so it falls through to ENOSYS. DS's bench `notification_wake` calls `BIND_NOTIFICATION` (sdk/src/bin/bench.rs:428). Fix: add `BIND_NOTIFICATION => set_bound_notification(...)` to `thread_invoke` (GLM area, kernel/src/entry.rs) or DS removes the call. Until then `tools/bench.sh --compare` cannot measure and G3 fails.
 
-  - G1 gate check (NV tools/): RESOLVED — `tools/unsafe-baseline.txt` driver counts shrunk to 7/6/2 (commit 4073688) to match DRV's `from_cap` switch; `[check-unsafe]` reports OK in the gate.
+  - G1 gate check (NV tools/): RESOLVED — DRV 56bc2c2 switched drivers/graphics to safe `MmioWindow::from_cap` + `#![forbid(unsafe_code)]`; baseline 7/6/2 matches actual; `[check-unsafe]` OK at 56bc2c2.
 
   - DS: `sdk/src/bin/bench.rs` has uncommitted WIP changes that break compilation — `carve_stack` returns 3 values but signature says 2. Fix the WIP or revert to a working state. — RESOLVED: fixed in 3ac2639.
 
