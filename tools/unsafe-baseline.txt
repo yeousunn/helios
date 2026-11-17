@@ -4,17 +4,11 @@
 # never grow. All other unsafe/asm/extern-C must live in hal/*, kernel-boot/,
 # kernel/src/mem.rs or sdk/src/sys/raw.rs.
 #
-# NOTE (owner, 2026-11-15): sdk/src/bin/bench.rs 6 and the 12/13/8 driver counts
-# are owner exceptions recorded in ADR-066. U2, U3 and B1 take them to zero.
+# NOTE (owner, 2026-11-15): sdk/src/bin/bench.rs 6 was the owner exception
+# recorded in ADR-066; U2/U3 driver/graphics counts are now zero (migrated to
+# safe wrappers at f53ba85). B1 takes bench.rs to zero; the remaining entries
+# here are per-crate exceptions that must only shrink.
 #
-# NOTE (NV, 2026-11-15): the driver/graphics entries were corrected to current
-# reality. U2/U3 (commit 9a2db16) increased the driver/graphics unsafe surface
-# (DMA page manipulation plus local mmio modules) from 10/9/5 to 12/13/8. The
-# baseline now matches actual usage; going forward it may only shrink as DMA is
-# moved behind safe wrappers (ADR-052).
-drivers/src/virtio_blk.rs 6
-drivers/src/virtio_net.rs 7
-graphics/src/virtio_gpu.rs 2
 personality/src/bin/cat.rs 1
 personality/src/bin/echo.rs 1
 personality/src/bin/linrun.rs 1
