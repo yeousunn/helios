@@ -144,5 +144,5 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
   - NV M1 bench tracking blocked on GLM's M1 object model (FACTORY_RETYPE, FACTORY_NEW_CNODE, CAP_MOVE, CAP_REVOKE); R5a is an RFC draft only (kernel/rfcs/0005-message-format-m1.md), no M1 object model code has landed.
 
-  - M0-close NV: blocked on DS — U2b (graphics #![forbid(unsafe_code)] + drop tools/unsafe-baseline.txt entry), U3b (drivers #![forbid(unsafe_code)] + drop baseline entries), B1b (bench remaining metrics: notification_wake, context_switch_diff_as; remove last unsafe so bench.rs drops baseline entry). NV provided DmaBuffer::from_cap at fbc6ecb (ADR-098). DS owns drivers/graphics/sdk.
+  - M0-close NV: U2b/U3b now done — baseline entries dropped at 6455133. Blocked on DS's B1b: notification_wake and context_switch_diff_as need GLM's kernel-side BIND_NOTIFICATION dispatch and AS code mapping (neither landed); bench.rs still has 2 baseline unsafe entries. NV M1 bench tracking also blocked on GLM's M1 object model.
 
