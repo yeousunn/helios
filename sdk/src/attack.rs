@@ -383,7 +383,7 @@ fn case_new_thread_capcount2_kernel_stack<R: RawSyscalls>(
         CapSlot::pack(pkg.aspace, Rights::MAP.union(Rights::GRANT)),
     );
     let _ = m.set_descriptor(1, CapSlot::pack(pkg.thread, Rights::RECV)); // bootstrap EP
-    let factory = pkg.optional[0].expect("factory cap missing");
+    let factory = pkg.optional[4].expect("factory cap missing");
     sys.invoke(factory.handle(), &m).is_err()
 }
 
@@ -402,7 +402,7 @@ fn case_new_thread_capcount2_non_canonical_stack<R: RawSyscalls>(
         CapSlot::pack(pkg.aspace, Rights::MAP.union(Rights::GRANT)),
     );
     let _ = m.set_descriptor(1, CapSlot::pack(pkg.thread, Rights::RECV));
-    let factory = pkg.optional[0].expect("factory cap missing");
+    let factory = pkg.optional[4].expect("factory cap missing");
     sys.invoke(factory.handle(), &m).is_err()
 }
 
@@ -421,15 +421,16 @@ fn case_new_thread_capcount2_misaligned_stack<R: RawSyscalls>(
         CapSlot::pack(pkg.aspace, Rights::MAP.union(Rights::GRANT)),
     );
     let _ = m.set_descriptor(1, CapSlot::pack(pkg.thread, Rights::RECV));
-    let factory = pkg.optional[0].expect("factory cap missing");
+    let factory = pkg.optional[4].expect("factory cap missing");
     sys.invoke(factory.handle(), &m).is_err()
 }
 
 /// `NEW_THREAD` with `cap_count = 2` and a valid stack top in `w1` must
-/// succeed in validation but create no child if the bootstrap EP is invalid.
+/// be rejected if the bootstrap EP is an invalid capability (wrong type).
 /// This case tests that the kernel rejects the call at the validation layer
-/// (not by creating a child that immediately faults). We use a NULL bootstrap
-/// EP handle which the kernel will reject as EBADCAP. Case 13.
+/// (not by creating a child that immediately faults). We use the ASpace cap
+/// as the bootstrap EP (wrong type: not an Endpoint), which the kernel will
+/// reject as EBADARG. Case 13.
 fn case_new_thread_capcount2_valid_stack_no_child<R: RawSyscalls>(
     sys: &mut Syscalls<R>,
     pkg: &BootstrapPackage,
@@ -442,9 +443,9 @@ fn case_new_thread_capcount2_valid_stack_no_child<R: RawSyscalls>(
         0,
         CapSlot::pack(pkg.aspace, Rights::MAP.union(Rights::GRANT)),
     );
-    // Descriptor 1: NULL bootstrap EP (invalid)
-    let _ = m.set_descriptor(1, CapSlot::pack(0, Rights::RECV));
-    let factory = pkg.optional[0].expect("factory cap missing");
+    // Descriptor 1: ASpace cap as bootstrap EP (invalid type: not an Endpoint)
+    let _ = m.set_descriptor(1, CapSlot::pack(pkg.aspace, Rights::RECV));
+    let factory = pkg.optional[4].expect("factory cap missing");
     sys.invoke(factory.handle(), &m).is_err()
 }
 
@@ -454,7 +455,7 @@ fn case_new_thread_capcount_invalid<R: RawSyscalls>(
     sys: &mut Syscalls<R>,
     pkg: &BootstrapPackage,
 ) -> bool {
-    let factory = pkg.optional[0].expect("factory cap missing");
+    let factory = pkg.optional[4].expect("factory cap missing");
     // Test cap_count = 0
     let mut m = Message::new(crate::methods::factory::NEW_THREAD);
     m.tag = m.tag.with_caps(0);
@@ -545,7 +546,7 @@ fn case_bind_fault_ep_dead_target<R: RawSyscalls>(
     let mut m = Message::new(crate::methods::thread::BIND_FAULT_EP);
     m.tag = m.tag.with_caps(1);
     // We need a valid endpoint cap - create a real endpoint first
-    let factory = pkg.optional[0].expect("factory cap missing");
+    let factory = pkg.optional[4].expect("factory cap missing");
     let ep_m = Message::new(crate::methods::factory::NEW_ENDPOINT);
     let Ok(ep_reply) = sys.invoke(factory.handle(), &ep_m) else {
         return false;
@@ -680,7 +681,7 @@ mod tests {
 
     fn pkg() -> BootstrapPackage {
         let mut optional = [None; crate::bootstrap::OPTIONAL_CAPS];
-        optional[0] = Some(ipc::CapSlot::pack(18, ipc::Rights::ALL)); // factory
+        optional[4] = Some(ipc::CapSlot::pack(18, ipc::Rights::ALL)); // factory
         BootstrapPackage {
             aspace: 10,
             thread: 11,
