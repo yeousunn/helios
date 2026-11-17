@@ -238,23 +238,30 @@ impl VirtioGpu {
         // Copy avail (offset 256 = 16 * 16)
         let avail_base = 256;
         dma.write16(avail_base, 0).map_err(|_| "DMA write failed")?; // flags
-        dma.write16(avail_base + 2, 0).map_err(|_| "DMA write failed")?; // idx
+        dma.write16(avail_base + 2, 0)
+            .map_err(|_| "DMA write failed")?; // idx
         for i in 0..QUEUE_SIZE as usize {
-            dma.write16(avail_base + 4 + i * 2, 0).map_err(|_| "DMA write failed")?; // ring[i]
+            dma.write16(avail_base + 4 + i * 2, 0)
+                .map_err(|_| "DMA write failed")?; // ring[i]
         }
-        dma.write16(avail_base + 4 + QUEUE_SIZE as usize * 2, 0).map_err(|_| "DMA write failed")?; // used_event
+        dma.write16(avail_base + 4 + QUEUE_SIZE as usize * 2, 0)
+            .map_err(|_| "DMA write failed")?; // used_event
 
         // Copy used (offset 296 = 256 + 38 + 2 padding)
         let used_base = 296;
         dma.write16(used_base, 0).map_err(|_| "DMA write failed")?; // flags
-        dma.write16(used_base + 2, 0).map_err(|_| "DMA write failed")?; // idx
+        dma.write16(used_base + 2, 0)
+            .map_err(|_| "DMA write failed")?; // idx
         for i in 0..QUEUE_SIZE as usize {
             let elem_base = used_base + 4 + i * 8;
             dma.write32(elem_base, 0).map_err(|_| "DMA write failed")?; // id
-            dma.write32(elem_base + 4, 0).map_err(|_| "DMA write failed")?; // len
+            dma.write32(elem_base + 4, 0)
+                .map_err(|_| "DMA write failed")?; // len
         }
-        dma.write16(used_base + 4 + QUEUE_SIZE as usize * 8, 0).map_err(|_| "DMA write failed")?; // avail_event
-        dma.write16(used_base + 6 + QUEUE_SIZE as usize * 8, 0).map_err(|_| "DMA write failed")?; // _pad
+        dma.write16(used_base + 4 + QUEUE_SIZE as usize * 8, 0)
+            .map_err(|_| "DMA write failed")?; // avail_event
+        dma.write16(used_base + 6 + QUEUE_SIZE as usize * 8, 0)
+            .map_err(|_| "DMA write failed")?; // _pad
 
         self.queue_vaddr = Some(dma_virt);
         self.queue_paddr = dma_phys;

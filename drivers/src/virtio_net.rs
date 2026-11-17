@@ -321,9 +321,13 @@ impl VirtioNet {
         avail.flags = dma.read16(avail_base).map_err(|_| "DMA read failed")?;
         avail.idx = dma.read16(avail_base + 2).map_err(|_| "DMA read failed")?;
         for i in 0..QUEUE_SIZE as usize {
-            avail.ring[i] = dma.read16(avail_base + 4 + i * 2).map_err(|_| "DMA read failed")?;
+            avail.ring[i] = dma
+                .read16(avail_base + 4 + i * 2)
+                .map_err(|_| "DMA read failed")?;
         }
-        avail.used_event = dma.read16(avail_base + 4 + QUEUE_SIZE as usize * 2).map_err(|_| "DMA read failed")?;
+        avail.used_event = dma
+            .read16(avail_base + 4 + QUEUE_SIZE as usize * 2)
+            .map_err(|_| "DMA read failed")?;
 
         // Read used from DMA (offset 296)
         let used_base = 296;
@@ -335,8 +339,12 @@ impl VirtioNet {
             used.ring[i].id = dma.read32(elem_base).map_err(|_| "DMA read failed")?;
             used.ring[i].len = dma.read32(elem_base + 4).map_err(|_| "DMA read failed")?;
         }
-        used.avail_event = dma.read16(used_base + 4 + QUEUE_SIZE as usize * 8).map_err(|_| "DMA read failed")?;
-        used._pad = dma.read16(used_base + 6 + QUEUE_SIZE as usize * 8).map_err(|_| "DMA read failed")?;
+        used.avail_event = dma
+            .read16(used_base + 4 + QUEUE_SIZE as usize * 8)
+            .map_err(|_| "DMA read failed")?;
+        used._pad = dma
+            .read16(used_base + 6 + QUEUE_SIZE as usize * 8)
+            .map_err(|_| "DMA read failed")?;
 
         // Stage the header (zeroed) and transmit data into the DMA page.
         let header = [0u8; 12];
@@ -364,28 +372,42 @@ impl VirtioNet {
         // Write the updated virtqueue components back to DMA.
         for i in 0..QUEUE_SIZE as usize {
             let base = i * 16;
-            dma.write64(base, desc[i].addr).map_err(|_| "DMA write failed")?;
-            dma.write32(base + 8, desc[i].len).map_err(|_| "DMA write failed")?;
-            dma.write16(base + 12, desc[i].flags).map_err(|_| "DMA write failed")?;
-            dma.write16(base + 14, desc[i].next).map_err(|_| "DMA write failed")?;
+            dma.write64(base, desc[i].addr)
+                .map_err(|_| "DMA write failed")?;
+            dma.write32(base + 8, desc[i].len)
+                .map_err(|_| "DMA write failed")?;
+            dma.write16(base + 12, desc[i].flags)
+                .map_err(|_| "DMA write failed")?;
+            dma.write16(base + 14, desc[i].next)
+                .map_err(|_| "DMA write failed")?;
         }
 
-        dma.write16(avail_base, avail.flags).map_err(|_| "DMA write failed")?;
-        dma.write16(avail_base + 2, avail.idx).map_err(|_| "DMA write failed")?;
+        dma.write16(avail_base, avail.flags)
+            .map_err(|_| "DMA write failed")?;
+        dma.write16(avail_base + 2, avail.idx)
+            .map_err(|_| "DMA write failed")?;
         for i in 0..QUEUE_SIZE as usize {
-            dma.write16(avail_base + 4 + i * 2, avail.ring[i]).map_err(|_| "DMA write failed")?;
+            dma.write16(avail_base + 4 + i * 2, avail.ring[i])
+                .map_err(|_| "DMA write failed")?;
         }
-        dma.write16(avail_base + 4 + QUEUE_SIZE as usize * 2, avail.used_event).map_err(|_| "DMA write failed")?;
+        dma.write16(avail_base + 4 + QUEUE_SIZE as usize * 2, avail.used_event)
+            .map_err(|_| "DMA write failed")?;
 
-        dma.write16(used_base, used.flags).map_err(|_| "DMA write failed")?;
-        dma.write16(used_base + 2, used.idx).map_err(|_| "DMA write failed")?;
+        dma.write16(used_base, used.flags)
+            .map_err(|_| "DMA write failed")?;
+        dma.write16(used_base + 2, used.idx)
+            .map_err(|_| "DMA write failed")?;
         for i in 0..QUEUE_SIZE as usize {
             let elem_base = used_base + 4 + i * 8;
-            dma.write32(elem_base, used.ring[i].id).map_err(|_| "DMA write failed")?;
-            dma.write32(elem_base + 4, used.ring[i].len).map_err(|_| "DMA write failed")?;
+            dma.write32(elem_base, used.ring[i].id)
+                .map_err(|_| "DMA write failed")?;
+            dma.write32(elem_base + 4, used.ring[i].len)
+                .map_err(|_| "DMA write failed")?;
         }
-        dma.write16(used_base + 4 + QUEUE_SIZE as usize * 8, used.avail_event).map_err(|_| "DMA write failed")?;
-        dma.write16(used_base + 6 + QUEUE_SIZE as usize * 8, used._pad).map_err(|_| "DMA write failed")?;
+        dma.write16(used_base + 4 + QUEUE_SIZE as usize * 8, used.avail_event)
+            .map_err(|_| "DMA write failed")?;
+        dma.write16(used_base + 6 + QUEUE_SIZE as usize * 8, used._pad)
+            .map_err(|_| "DMA write failed")?;
 
         let head = self.next_avail_idx;
         self.next_avail_idx = self.next_avail_idx.wrapping_add(1);
@@ -420,7 +442,9 @@ impl VirtioNet {
             + core::mem::offset_of!(Used, ring)
             + slot * core::mem::size_of::<UsedElem>()
             + core::mem::offset_of!(UsedElem, len);
-        let written = dma.read32(used_ring_offset).map_err(|_| "DMA read failed")? as usize;
+        let written = dma
+            .read32(used_ring_offset)
+            .map_err(|_| "DMA read failed")? as usize;
 
         // For a receive, copy the frame (after the 12-byte header) back out.
         let mut copied = 0;
