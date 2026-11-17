@@ -202,6 +202,19 @@ pub enum Action {
     Exit(i32),
 }
 
+/// The emulated thread's exit status, decoded from the death-notification
+/// payload the kernel signals when it dies (ADR-031 convention, the same
+/// word PS's `WAIT` reaps): bit 0 = the death event, bits 32.. = the raw
+/// exit status. A payload without the event bit is not a death (a spurious
+/// signal), so it carries no status. A `-1` from a `KILL`/unroutable-syscall
+/// death stays `-1`: a killed guest must fail the boot, not pass silently.
+pub fn death_exit_status(mask: u64) -> i32 {
+    if mask & 1 == 0 {
+        return 0;
+    }
+    (mask >> 32) as u32 as i32
+}
+
 /// Native operations the emulator performs on behalf of the emulated binary.
 /// Implemented over the personality `Runtime` in production; recorded by a
 /// mock in tests.
@@ -1017,6 +1030,18 @@ mod tests {
             dispatch(linux::EXIT_GROUP, [9, 0, 0, 0, 0, 0], &mut Mock::new()),
             Action::Exit(9)
         );
+    }
+
+    #[test]
+    fn death_exit_status_decodes_the_notification_payload() {
+        // Death event + status 7 (the guest's Linux exit code).
+        assert_eq!(death_exit_status(1 | (7 << 32)), 7);
+        // Death event + the kill status 0xFFFFFFFF: a killed guest stays -1.
+        assert_eq!(death_exit_status(1 | (u32::MAX as u64) << 32), -1);
+        // Event-only payload: the death fired, nothing beyond bit 0.
+        assert_eq!(death_exit_status(1), 0);
+        // No event bit: a spurious signal carries no status at all.
+        assert_eq!(death_exit_status(7 << 32), 0);
     }
 
     #[test]

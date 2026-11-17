@@ -776,6 +776,11 @@ extern "C" fn linrun_main(argc: u64, argv_va: u64, _envp_va: u64) -> ! {
     // Emulate: serve routed syscalls until the emulated thread dies.
     // Emulated stdout is buffered and flushed after each reply (never a
     // nested send while a foreign reply is pending).
+    // The guest's exit status, latched from its Linux exit or its death
+    // notification and reported as this process's own exit code (ADR-099).
+    // Every exit from the serve loop assigns it first; zero (a guest that
+    // exited 0) keeps the boot green exactly as before.
+    let guest_status: i32;
     let (region_h, aspace_h) = (package.region, package.aspace);
     let mut mmap_bump = MMAP_VA_BASE;
     let mut brk_cur = BRK_VA_BASE;
@@ -861,6 +866,9 @@ extern "C" fn linrun_main(argc: u64, argv_va: u64, _envp_va: u64) -> ! {
                         // Linux `exit`: terminate the emulated thread (the
                         // kernel's own exit is not on its routable set). The
                         // child is parked in its exit syscall — force it out.
+                        // The guest's status is latched and reported: a
+                        // failing guest must fail the boot (ADR-099).
+                        guest_status = code;
                         let mut e = Message::new(sdk::methods::thread::EXIT);
                         e.words[0] = code as i64 as u64;
                         let mut sys = Syscalls::new(&mut raw);
@@ -875,11 +883,21 @@ extern "C" fn linrun_main(argc: u64, argv_va: u64, _envp_va: u64) -> ! {
             }
             Err(_) => {
                 // No routed call pending: has the emulated thread died?
-                let dead = {
+                // The bound death notification (ADR-031) signals bit 0 and
+                // carries the raw exit status in bits 32.. — the guest's own
+                // exit code when it died through the kernel (KILL, an
+                // unroutable syscall, a fault), decoded and latched so the
+                // emulator reports it downstream (ADR-099).
+                let died = {
                     let mut sys = Syscalls::new(&mut raw);
-                    sys.recv_nonblock(notif).is_ok()
+                    match sys.recv_nonblock(notif) {
+                        Ok(m) if m.words[0] & 1 != 0 => Some(m.words[0]),
+                        // A spurious signal drains without ending the run.
+                        _ => None,
+                    }
                 };
-                if dead {
+                if let Some(mask) = died {
+                    guest_status = personality::foreign::death_exit_status(mask);
                     break;
                 }
                 let mut sys = Syscalls::new(&mut raw);
@@ -888,7 +906,10 @@ extern "C" fn linrun_main(argc: u64, argv_va: u64, _envp_va: u64) -> ! {
         }
     }
 
-    exit(&mut raw, 0)
+    // Report the guest's status: a failing emulated binary now fails the
+    // boot gate instead of being swallowed (ADR-099). Zero stays zero, so
+    // the passing demo and the busybox applet are unaffected.
+    exit(&mut raw, guest_status)
 }
 
 fn exit(raw: &mut X86_64Syscalls, code: i32) -> ! {
