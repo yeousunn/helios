@@ -152,5 +152,6 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
   - NV M1 bench tracking blocked on GLM's M1 object model (FACTORY_RETYPE, FACTORY_NEW_CNODE, CAP_MOVE, CAP_REVOKE); R5a is an RFC draft only (kernel/rfcs/0005-message-format-m1.md), no M1 object model code has landed.
 
+  - NV: QEMU boot panics at kernel/src/sched.rs:411 — ThreadId 65535 out of bounds (len 64) in kstack_top_of; serial shows "init pid=1 thread=65535 regions=0". All 103 kernel host tests pass. Cannot test clean HEAD (git checkout restricted). GLM's uncommitted BIND_NOTIFICATION changes present in kernel/src + spec/abi/. Blocks M0-close.
   - M0-close NV: U2b/U3b now done — baseline entries dropped at 6455133. S12 done at d46c3ae. PSX→DS ADR-099 done at 612905e. Blocked on DS's B1b: notification_wake and context_switch_diff_as need GLM's kernel-side BIND_NOTIFICATION dispatch and AS code mapping (neither landed); bench.rs baseline entry removal needs NV (tools/ is NV's directory). NV M1 bench tracking also blocked on GLM's M1 object model.
 
