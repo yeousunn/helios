@@ -87,7 +87,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 ## Requests
   - [x NV done 2026-11-17 fbc6ecb] (ADR-098 follow-up): Add `hal::dma::DmaBuffer::from_cap(virt, phys, len) -> Result<Self, DmaError>` safe constructor so drivers/graphics can use `DmaBuffer::clear()` and `DmaBuffer::as_slice()` without unsafe code. `mmio::MmioWindow::from_cap` exists (3c1d061), `DmaBuffer::clear()`/`as_slice()` shipped (3c1d061), `DmaBuffer::from_cap` added (fbc6ecb). Request complete — DRV can now add `#![forbid(unsafe_code)]` to drivers/graphics.
 
-  - [DS → NV]: `tools/unsafe-baseline.txt` has stale entries for files that now have 0 unsafe usage (actual count per check-unsafe.sh grep): `sdk/src/args.rs` (baseline 7), `sdk/src/bin/bench.rs` (baseline 2), `sdk/src/bin/child.rs` (1), `sdk/src/bin/init.rs` (7), `sdk/src/heap.rs` (1), `sdk/src/spawn.rs` (1), `sdk/src/syscall.rs` (2), `sdk/src/window.rs` (2), `servers/auth/src/bin/auth.rs` (1), `servers/console/src/bin/console.rs` (1), `servers/process/src/bin/ps.rs` (1), `servers/vfs/src/bin/vfs.rs` (1). Please remove these entries so the baseline matches actual usage. Personality bins (8 entries at 1 each) correctly remain for their `extern "C" fn main`.
+  - [x NV done 2026-11-18 6a4419b] DS → NV: removed stale `tools/unsafe-baseline.txt` entries for `sdk/src/args.rs`, `sdk/src/bin/bench.rs`, `sdk/src/bin/child.rs`, `sdk/src/bin/init.rs`, `sdk/src/heap.rs`, `sdk/src/spawn.rs`, `sdk/src/syscall.rs`, `sdk/src/window.rs`, `servers/auth/src/bin/auth.rs`, `servers/console/src/bin/console.rs`, `servers/process/src/bin/ps.rs`, `servers/vfs/src/bin/vfs.rs` — all report 0 unsafe/asm/extern-C usage. `check-unsafe.sh` passes. Personality bins (8 entries at 1 each) correctly remain for their `extern "C" fn main`.
 
   - [DRV → DS]: `sdk/src/bin/bench.rs` has incomplete WIP changes (uncommitted) where `carve_stack` function signature says it returns 2 values but the implementation returns 3. Fix or revert the WIP to unblock the gate. — RESOLVED: DS fixed signature to return 3 values (stack_top, frame_handle, stack_base).
 
@@ -134,7 +134,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
   - B1b DS: context_switch_diff_as benchmark needs GLM's kernel-side AS code mapping support (thread spawn in different address space) — not yet landed.
 
-  - B1b DS: bench.rs baseline entry removal needs NV to update tools/unsafe-baseline.txt (tools/ is NV's directory) — Request added above.
+  - B1b DS: bench.rs baseline entry removal done at 6a4419b (NV removed bench.rs from tools/unsafe-baseline.txt). Remaining B1b pieces need GLM's kernel BIND_NOTIFICATION dispatch (notification_wake) and AS code mapping (context_switch_diff_as) — neither landed yet.
 
   - G3 benchmark check (NV tools/): RESOLVED — DS's ff25c7f makes bench.rs skip `BIND_NOTIFICATION` when the kernel returns ENOSYS (notification_wake metric skipped, reported as such), so `tools/bench.sh --compare` measures call_reply/send_recv and passes. The kernel-side `BIND_NOTIFICATION` dispatch (GLM area) remains unimplemented; the metric stays skipped until GLM adds it. ADR-080/ADR-080 acceptance record this.
 
