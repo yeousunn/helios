@@ -1154,30 +1154,37 @@ unsafe fn cr4_write(value: u64) {
 /// CPUID leaf 7, sub-leaf 0: return (EBX, ECX) feature bits.
 ///
 /// EBX holds SMEP (bit 7) and SMAP (bit 20); ECX holds UMIP (bit 2).
-/// `cpuid` clobbers EBX, which LLVM treats as callee-saved and cannot name as
-/// an operand, so RBX is saved before the instruction and restored after;
-/// EBX's output is read back into a general register between the two.
+/// `cpuid` architecturally clobbers EBX (callee-saved in SysV) and EDX.
+/// RBX cannot be named as an inline-asm operand on this target (LLVM reserves
+/// it), so it is preserved with a balanced `push rbx`/`pop rbx` around `cpuid`;
+/// the cpuid EBX result is copied to an output register before `pop rbx`.
+/// `out("edx") _` declares EDX destroyed.
 #[inline(never)]
 fn cpuid_leaf7() -> (u32, u32) {
+    let leaf = crate::host::CPUID_LEAF_FEATURES;
     let mut subleaf: u32 = crate::host::CPUID_SUB_LEAF_0; // in: 0, out: ECX
-    let mut ebx: u64 = 0;
-    let rbx_save: u64;
+    let mut ebx: u32 = 0;
+    let mut edx: u32 = 0;
     // SAFETY: `cpuid` leaf 7 sub-leaf 0 is always valid on x86_64.
     unsafe {
-        core::arch::asm!("mov {0}, rbx", out(reg) rbx_save, options(nostack));
-        core::arch::asm!("cpuid",
-            in("eax") crate::host::CPUID_LEAF_FEATURES,
-            inout("ecx") subleaf,
+        core::arch::asm!("push rbx; mov eax, {0:e}; mov ecx, {1:e}; cpuid; mov {2:e}, ebx; mov {1:e}, ecx; mov {3:e}, edx; pop rbx",
+            in(reg) leaf,         // {0}
+            inout(reg) subleaf,   // {1}
+            out(reg) ebx,         // {2}
+            out(reg) edx,         // {3}
             options(nostack));
-        core::arch::asm!("mov {0}, rbx", out(reg) ebx, options(nostack));
-        core::arch::asm!("mov rbx, {0}", in(reg) rbx_save, options(nostack));
     }
-    (ebx as u32, subleaf)
+    // `cpuid` clobbers EDX; read the output operand so it counts as used.
+    let _ = edx;
+    (ebx, subleaf)
 }
 
-/// Read CPUID `(leaf, subleaf)` into `(eax, ebx, ecx, edx)`. `cpuid` clobbers
-/// RBX (callee-saved in the SysV ABI), so RBX is saved/restored around it and
-/// the EBX output is read back into a general register.
+/// Read CPUID `(leaf, subleaf)` into `(eax, ebx, ecx, edx)`. `cpuid`
+/// architecturally clobbers EBX (callee-saved in SysV) and EDX. RBX cannot be
+/// named as an inline-asm operand on this target (LLVM reserves it), so it is
+/// preserved with a balanced `push rbx`/`pop rbx` around `cpuid`; the cpuid
+/// EBX result is copied to an output register before `pop rbx`. `out("edx")`
+/// declares EDX destroyed.
 ///
 /// # Safety
 ///
@@ -1188,17 +1195,15 @@ fn cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
     let mut ebx: u32 = 0;
     let mut ecx: u32 = subleaf;
     let mut edx: u32 = 0;
-    let rbx_save: u64;
-    // SAFETY: `cpuid` is always valid on x86_64; RBX is preserved for LLVM.
+    // SAFETY: `cpuid` is always valid on x86_64; RBX is preserved by the
+    // balanced push/pop around `cpuid`.
     unsafe {
-        core::arch::asm!("mov {0}, rbx", out(reg) rbx_save, options(nostack));
-        core::arch::asm!("cpuid",
-            inout("eax") eax,
-            inout("ecx") ecx,
-            out("edx") edx,
+        core::arch::asm!("push rbx; mov eax, {0:e}; mov ecx, {1:e}; cpuid; mov {0:e}, eax; mov {2:e}, ebx; mov {1:e}, ecx; mov {3:e}, edx; pop rbx",
+            inout(reg) eax,   // {0}: in=leaf, out=eax result
+            inout(reg) ecx,   // {1}: in=subleaf, out=ecx result
+            out(reg) ebx,     // {2}
+            out(reg) edx,     // {3}
             options(nostack));
-        core::arch::asm!("mov {0:e}, rbx", out(reg) ebx, options(nostack));
-        core::arch::asm!("mov rbx, {0}", in(reg) rbx_save, options(nostack));
     }
     (eax, ebx, ecx, edx)
 }
