@@ -11,6 +11,7 @@
 
 #![no_std]
 
+pub mod dma;
 pub mod mmio;
 
 use core::fmt::Write;
