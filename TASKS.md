@@ -127,7 +127,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 ## Blockers
   - GATE BLOCKED at HEAD 5252b27: RESOLVED — DS's S12 (d46c3ae) fixed pkg.optional[0] → pkg.optional[4] for the factory cap, so case_bind_fault_ep_dead_target setup now passes. The boot gate should now pass; verify on the next clean cycle.
 
-  - G3 benchmark check (NV tools/): BLOCKED — the bench image (`sdk --bin bench`) exits ENOSYS (-14) before DONE because kernel `thread_invoke` in `kernel/src/entry.rs` has no `BIND_NOTIFICATION` (label 8) case, so it falls through to ENOSYS. DS's bench `notification_wake` calls `BIND_NOTIFICATION` (sdk/src/bin/bench.rs:428). Fix: add `BIND_NOTIFICATION => set_bound_notification(...)` to `thread_invoke` (GLM area, kernel/src/entry.rs) or DS removes the call. Until then `tools/bench.sh --compare` cannot measure and G3 fails.
+  - G3 benchmark check (NV tools/): RESOLVED — DS's ff25c7f makes bench.rs skip `BIND_NOTIFICATION` when the kernel returns ENOSYS (notification_wake metric skipped, reported as such), so `tools/bench.sh --compare` measures call_reply/send_recv and passes. The kernel-side `BIND_NOTIFICATION` dispatch (GLM area) remains unimplemented; the metric stays skipped until GLM adds it. ADR-080/ADR-080 acceptance record this.
 
   - G1 gate check (NV tools/): RESOLVED — DRV 56bc2c2 switched drivers/graphics to safe `MmioWindow::from_cap` + `#![forbid(unsafe_code)]`; baseline 7/6/2 matches actual; `[check-unsafe]` OK at 56bc2c2.
 
