@@ -39,6 +39,27 @@ impl MmioWindow {
         Self { base, len }
     }
 
+    /// Create a window over a mapped MMIO region granted by a
+    /// [`crate::MmioRegion`] capability.
+    ///
+    /// The capability system has already validated that `[base, base + len)`
+    /// is a mapped device MMIO region; this safe constructor only sanity-
+    /// checks the arguments before handing a window to safe driver code. The
+    /// unsafe [`MmioWindow::new`] remains for the kernel's capability-mapping
+    /// path (ADR-052).
+    ///
+    /// # Errors
+    ///
+    /// Returns `MmioError::OutOfBounds` if `len` is zero or `base + len`
+    /// overflows a `usize`.
+    pub fn from_cap(base: usize, len: usize) -> Result<Self, MmioError> {
+        if len == 0 {
+            return Err(MmioError::OutOfBounds);
+        }
+        base.checked_add(len).ok_or(MmioError::OutOfBounds)?;
+        Ok(Self { base, len })
+    }
+
     /// Returns the window's base address.
     pub fn base(&self) -> usize {
         self.base
@@ -187,5 +208,32 @@ mod tests {
         let base = buf.as_mut_ptr() as usize;
         let win = unsafe { MmioWindow::new(base, buf.len()) };
         assert_eq!(win.read32(usize::MAX), Err(MmioError::OutOfBounds));
+    }
+
+    #[test]
+    fn from_cap_ok() {
+        let mut buf = [0u8; 16];
+        let base = buf.as_mut_ptr() as usize;
+        let win = MmioWindow::from_cap(base, buf.len()).unwrap();
+        assert_eq!(win.base(), base);
+        assert_eq!(win.len(), buf.len());
+        assert!(!win.is_empty());
+    }
+
+    #[test]
+    fn from_cap_rejects_zero_len() {
+        let base = 0x1000;
+        assert!(matches!(
+            MmioWindow::from_cap(base, 0),
+            Err(MmioError::OutOfBounds)
+        ));
+    }
+
+    #[test]
+    fn from_cap_rejects_overflow() {
+        assert!(matches!(
+            MmioWindow::from_cap(usize::MAX, 1),
+            Err(MmioError::OutOfBounds)
+        ));
     }
 }

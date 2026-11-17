@@ -66,6 +66,18 @@ impl DmaBuffer {
         self.len == 0
     }
 
+    /// Return the whole buffer as a byte slice, for zeroing and type-punning.
+    ///
+    /// The slice is bounded to `[0, len)` so every access stays within the
+    /// granted DMA region; this replaces raw `&mut *(virt as *mut Type)`
+    /// type-punning in driver code.
+    pub fn as_slice(&self) -> Result<&[u8], DmaError> {
+        // SAFETY: `[self.virt, self.virt + self.len)` is valid DMA memory
+        // guaranteed by the unsafe constructor; the slice length is exactly
+        // `len`, so it cannot overrun the region.
+        Ok(unsafe { core::slice::from_raw_parts(self.virt as *const u8, self.len) })
+    }
+
     /// Zero the entire buffer.
     ///
     /// # Safety
@@ -73,6 +85,20 @@ impl DmaBuffer {
     /// The constructor guaranteed `[virt, virt + len)` is valid DMA memory,
     /// so a byte-wise `write_bytes` over it is sound.
     pub fn zero(&mut self) {
+        // SAFETY: `[self.virt, self.virt + self.len)` is valid DMA memory
+        // guaranteed by the unsafe constructor.
+        unsafe {
+            ptr::write_bytes(self.virt as *mut u8, 0, self.len);
+        }
+    }
+
+    /// Zero the entire buffer, replacing a raw `ptr::write_bytes` call.
+    ///
+    /// # Safety
+    ///
+    /// The constructor guaranteed `[virt, virt + len)` is valid DMA memory,
+    /// so a byte-wise `write_bytes` over it is sound.
+    pub fn clear(&mut self) {
         // SAFETY: `[self.virt, self.virt + self.len)` is valid DMA memory
         // guaranteed by the unsafe constructor.
         unsafe {
@@ -339,5 +365,28 @@ mod tests {
         let base = buf.as_mut_ptr() as usize;
         let win = unsafe { DmaBuffer::new(base, base, buf.len()) };
         assert_eq!(win.read32(usize::MAX), Err(DmaError::OutOfBounds));
+    }
+
+    #[test]
+    fn clear_zeroes_the_buffer() {
+        let mut buf = [0xAAu8; 16];
+        let base = buf.as_mut_ptr() as usize;
+        let mut win = unsafe { DmaBuffer::new(base, base, buf.len()) };
+        win.clear();
+        assert_eq!(buf, [0u8; 16]);
+    }
+
+    #[test]
+    fn as_slice_round_trip() {
+        let mut buf = [0u8; 16];
+        let base = buf.as_mut_ptr() as usize;
+        let mut win = unsafe { DmaBuffer::new(base, base, buf.len()) };
+        win.write32(0, 0xDEAD_BEEF).unwrap();
+        let slice = win.as_slice().unwrap();
+        assert_eq!(slice.len(), 16);
+        assert_eq!(&slice[0..4], &0xDEAD_BEEF_u32.to_le_bytes());
+        let mut copy = [0u8; 16];
+        copy.copy_from_slice(slice);
+        assert_eq!(copy, buf);
     }
 }
