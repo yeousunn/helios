@@ -631,7 +631,7 @@ fn bench_context_switch_diff_as(
 ) -> Result<()> {
     let mut sys = Syscalls::new(_raw);
     mark(&mut sys, debug_ep, 0xF1, 0); // debug: skipped
-    // TODO: re-enable when kernel fixes NEW_THREAD diff-AS scheduling (GLM Request)
+                                       // TODO: re-enable when kernel fixes NEW_THREAD diff-AS scheduling (GLM Request)
     Ok(())
 }
 
