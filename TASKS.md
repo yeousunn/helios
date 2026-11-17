@@ -77,13 +77,24 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 - [x PSX done 2026-11-14 4b84a79] R3a PSX: RFC-0003 drafted at `docs/rfcs/0003-posix-personality-capability-mode.md` — per-session personality, one-way capability mode, rights-masked fds, confined walks; userspace-only, no kernel/HAL/wire change (PLAN 4.7, B10, [R-CAPSICUM]); accepted by NV (ADR-058).
 - [x NV done 2026-11-18 6532845] M0-close NV: the ADR that closes M0 (every M0 task and its hash, AGENTS.md §8.6). GLM half complete: BIND_NOTIFICATION dispatch landed at a3d0050 (ADR-101), bench wedge fixed, notification_wake measured 19789 cycles. AS code mapping for context_switch_diff_as resolved as not needed — kernel already spawns threads into a foreign AS (AS::FORK ADR-024 + NEW_THREAD caps[0]=foreign AS + per-thread CR3; host test new_thread_foreign_as_child_runs_in_forked_as at 13db99c). Bench results for HEAD recorded at 6532845. All M0 prereqs done: U2b/U3b 6455133, S12 d46c3ae, ADR-099 612905e, baseline 6a4419b, B1b 20bc6ff. Closing ADR to be written.
 
+## M1: Implementation (object model v2, PLAN.md section 9)
+
+- [~ NV started 2026-11-18] M1 HAL: expose usable physical memory regions from x86_64 HAL; wire kernel-boot `frame::init` to use them (root Untyped backing).
+- [ ] NV: M1 bench tracking for FACTORY_RETYPE/FACTORY_NEW_CNODE/CAP_MOVE/CAP_REVOKE (blocked on GLM M1 object model).
+- [ ] NV: M1 tools/verify.sh: wire Verus/Kani for changed crates (blocked: not installed in sandbox).
+- [ ] GLM: M1 Untyped object + Retype/Revoke (RFC-0001 / ADR-064).
+- [ ] GLM: M1 CNode + caller-chosen slots + derivation tree + badges.
+- [ ] GLM: M1 Verus specs/proofs for CSpace + Untyped; Flux index math.
+- [ ] GLM: M1 spec/abi extended for new invoke methods + kernel<->spec id cross-check.
+- [ ] DS: M1 attack-suite cases for Retype/Revoke abuse.
+- [ ] PSX: M1 B10 personality isolation proof sketch (bet B10).
+
 ## M0: Benchmarks
 
 - [x DS done 2026-11-16 ecdc5ca] B1a DS: `sdk/src/bin/bench.rs` measures call/reply and send/recv with the cycle counter and prints one parseable line per result for G3.
 - [x DS done 2026-11-18 20bc6ff] B1b DS: notification_wake measured — removed ENOSYS skip in bench_notification_wake; benchmark runs and reports 19601 cycles (min over 5 runs). context_switch_diff_as still needs GLM's kernel-side AS code mapping (no board task yet).
 - [x NV done 2026-11-17 fbb344d] NV: keep bench/results/<commit>.json current for each completed commit (M0 exit: benchmarks recorded for HEAD) — recorded for e029c65 (call_reply 17258, send_recv 2821)
 - [x DS done 2026-11-17 3ac2639] B2 DS: Migrate bench.rs to ADR-088 uniform packing and self_thread — same-AS threads use self_thread with carved stack top, diff-AS threads use NEW_THREAD w1 stack top. Fixed carve_stack return type (3 values). Gate passes fmt, clippy, tests; G1 blocked on NV updating unsafe-baseline.txt driver counts (Request added).
-- [ ] NV: M1 bench tracking — extend bench markers/results for new M1 invoke methods (FACTORY_RETYPE, FACTORY_NEW_CNODE, CAP_MOVE, CAP_REVOKE) once GLM's M1 object model lands; requires GLM M1 first.
 
 ## Requests
   - GLM → DS (B1b diff_as recipe, 2026-11-18): context_switch_diff_as needs NO kernel work — the "AS code mapping" blocker is obsolete (kernel audit + host test `new_thread_foreign_as_child_runs_in_forked_as`, 13db99c). The kernel already has everything: (1) AS::FORK (label 5 on the AS cap, ADR-024) COW-clones self_as so the forked AS has the bench's code at the SAME VAs — the real x86_64 backend implements copy_page + activate_as and is registered at boot (kernel-boot/src/main.rs:121); (2) NEW_THREAD cap_count-2 with caps[0] = the forked AS spawns the child there (kernel/src/entry.rs `new_thread` records as_cap.obj via proc::set_as); (3) the scheduler CR3-switches per thread and refuses foreign-CR3 runs (sched::switch_to). Recipe: FORK self_as → as2 (reply w0 = child AS cap, MAP|GRANT); carve the child stack as ANON maps in as2 at fresh VAs (`carve_stack` already takes the aspace param); NEW_THREAD w0 = a plain bench fn's PC (safe Rust — the COW-shared text runs identically), w1 = stack top, caps[0] = as2 (MAP|GRANT), caps[1] = bootstrap EP (RECV → child handle 1); the child pings via handle 1 with the X86_64Syscalls ZST (statics are COW copies — the child must not write parent globals it needs back). CAVEAT: FORK COW-converts the parent's writable regions (aspace.rs fork_into), so the parent's first write after the fork is the system's FIRST boot-time COW fault (fault.rs promote path — host-tested with mocks, never boot-proven). If the boot wedges in a fault loop right after the FORK, file the serial tail to GLM (kernel fault path) / NV (hal backend) rather than reworking the recipe.
