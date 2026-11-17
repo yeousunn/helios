@@ -169,6 +169,10 @@ pub fn park_result(tid: ThreadId) -> Option<SyscallReturn> {
         if let Ok(mask) = crate::notification::pending(obj) {
             if mask != 0 {
                 let _ = crate::notification::clear(obj, mask);
+                // NOTIFIED completions retire the park like steps 1/4/5:
+                // a stale record would consume a PARKS slot per wake and a
+                // raced timed_out/call_dead flag would poison the next park.
+                syscall::clear_park_entry(tid);
                 return Some(SyscallReturn::ok(
                     Tag::new(ipc::labels::kernel::NOTIFY).with_flags(flags::NOTIFIED),
                     [mask, 0, 0, 0],
@@ -185,6 +189,9 @@ pub fn park_result(tid: ThreadId) -> Option<SyscallReturn> {
         };
         if mask > 0 {
             let _ = crate::notification::clear(n, mask);
+            // Same retirement duty as step 2 (the §3.1 select wake of a
+            // parked recv rides this path every cycle).
+            syscall::clear_park_entry(tid);
             return Some(SyscallReturn::ok(
                 Tag::new(ipc::labels::kernel::NOTIFY).with_flags(flags::NOTIFIED),
                 [mask, 0, 0, 0],
@@ -512,6 +519,7 @@ fn thread_invoke(
     const SUSPEND: u16 = 3;
     const RESUME: u16 = 4;
     const SET_PRIORITY: u16 = 5;
+    const BIND_NOTIFICATION: u16 = 8;
     const BIND_DEATH_NOTIFICATION: u16 = 12;
     const THREAD_CREATE: u16 = 13;
     const SET_ENTRY: u16 = 14;
@@ -552,14 +560,30 @@ fn thread_invoke(
             Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
             Err(_) => SyscallReturn::err(ipc::status::EBADCAP),
         },
+        BIND_NOTIFICATION => {
+            // syscall-abi §3.1 select primitive: caps[0] = Notification or
+            // NULL to clear. A signal on it wakes the target out of a
+            // Recv/Send/Reply park (notification::signal's bound-wake path);
+            // independent of the death notification (label 12). A wrong-type
+            // caps[0] is EBADARG before any state change (bind_fault_ep's
+            // validation shape) — not a silent clear.
+            match bind_notification_cap(pid, &msg, ObjType::Notification) {
+                Ok(bound) => match set_bound_notification(target, bound) {
+                    Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
+                    Err(e) => SyscallReturn::err(e),
+                },
+                Err(e) => SyscallReturn::err(e),
+            }
+        }
         BIND_DEATH_NOTIFICATION => {
-            // caps[0] = Notification or NULL to clear.
+            // ADR-031: caps[0] = Notification or NULL to clear; signalled
+            // with the death payload when the thread exits.
             let bound = msg
                 .descriptor(0)
                 .filter(|cs| cs.handle() != 0)
                 .and_then(|cs| proc::get_cap(pid, cs.handle()).ok())
                 .filter(|c| c.typ == ObjType::Notification);
-            match set_bound_notification(target, bound.map(|c| crate::sched::ObjRef(c.obj.0))) {
+            match set_death_notification(target, bound.map(|c| crate::sched::ObjRef(c.obj.0))) {
                 Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
                 Err(e) => SyscallReturn::err(e),
             }
@@ -768,6 +792,28 @@ fn resume(target: ThreadId) -> Result<(), i32> {
 
 fn set_bound_notification(target: ThreadId, n: Option<crate::sched::ObjRef>) -> Result<(), i32> {
     sched::set_bound_notification(target, n).map_err(|_| ipc::status::EBADCAP)
+}
+
+fn set_death_notification(target: ThreadId, n: Option<crate::sched::ObjRef>) -> Result<(), i32> {
+    sched::set_death_notification(target, n).map_err(|_| ipc::status::EBADCAP)
+}
+
+/// Resolve a bind's caps[0]: absent/NULL → `None` (clear); otherwise the
+/// caller's live cap of exactly `typ` → its object ref. Anything else is
+/// EBADARG before any state changes.
+fn bind_notification_cap(
+    pid: ProcessId,
+    msg: &Message,
+    typ: ObjType,
+) -> Result<Option<crate::sched::ObjRef>, i32> {
+    let Some(cs) = msg.descriptor(0).filter(|cs| cs.handle() != 0) else {
+        return Ok(None);
+    };
+    let cap = proc::get_cap(pid, cs.handle()).map_err(map_proc)?;
+    if cap.typ != typ || !crate::objreg::is_alive(cap.obj) {
+        return Err(ipc::status::EBADARG);
+    }
+    Ok(Some(crate::sched::ObjRef(cap.obj.0)))
 }
 
 /// Thread::BIND_FAULT_EP (label 18, ADR-088): bind or clear the target's
@@ -1186,6 +1232,12 @@ mod tests {
             w,
             nonblock: false,
         }
+    }
+
+    fn msg_for_test(label: u16, w0: u64) -> Message {
+        let mut m = Message::new(label);
+        m.words[0] = w0;
+        m
     }
 
     #[test]
@@ -2230,6 +2282,258 @@ mod tests {
         syscall::sys_exit(target, 0).unwrap();
         let r = thread_invoke_for_test(pid, tc, bind_msg(ep_h, Rights::SEND));
         assert_eq!(r.status, ipc::status::EBADCAP as i64, "dead target");
+
+        crate::proc::reset_for_test();
+    }
+
+    /// Thread::BIND_NOTIFICATION (label 8, syscall-abi §3.1 select
+    /// primitive): bind a live Notification, wake a thread parked in Recv
+    /// by signalling it, clear with NULL, reject a wrong-type caps[0]
+    /// with EBADARG before any state change — and pin the split from
+    /// BIND_DEATH_NOTIFICATION (label 12): one thread carries both, the
+    /// exit fires only the death payload, the wake binding is untouched.
+    #[test]
+    fn bind_notification_wakes_parked_recv_and_is_independent_of_death_binding() {
+        let (pid, _tid, factory) = setup();
+
+        let r_notif = dispatch(args(num::INVOKE, factory, Tag::new(2), [0; 4]));
+        let notif_h = r_notif.w[0] as u32;
+        let notif_obj = proc::get_cap(pid, notif_h).unwrap().obj;
+        let r_ep = dispatch(args(num::INVOKE, factory, Tag::new(1), [0; 4]));
+        let ep_h = r_ep.w[0] as u32;
+        let ep_obj = proc::get_cap(pid, ep_h).unwrap().obj;
+        let r_death = dispatch(args(num::INVOKE, factory, Tag::new(2), [0; 4]));
+        let death_h = r_death.w[0] as u32;
+        let death_obj = proc::get_cap(pid, death_h).unwrap().obj;
+
+        let target = sched::spawn(ObjRef(1), 100).unwrap();
+        let tc = proc::install_cap(
+            pid,
+            Capability {
+                obj: ObjId(target.0),
+                typ: ObjType::Thread,
+                rights: Rights::CONTROL.union(Rights::GRANT),
+            },
+        )
+        .unwrap();
+
+        // Bind the wake notification (label 8) — fail-before: this arm was
+        // the ENOSYS wildcard, so the bench's notification_wake skipped.
+        let bind_msg = |label: u16, cap_h: u32| {
+            let mut b = Message::new(label);
+            b.tag = b.tag.with_caps(1);
+            b.set_descriptor(0, CapSlot::pack(cap_h, Rights::SIGNAL))
+                .unwrap();
+            b
+        };
+        let r = thread_invoke_for_test(pid, tc, bind_msg(8, notif_h));
+        assert_eq!(r.status, ipc::status::OK as i64, "bind wake notification");
+        assert_eq!(
+            sched::get(target).unwrap().bound_notification,
+            Some(crate::sched::ObjRef(notif_obj.0))
+        );
+
+        // The death binding (label 12) is independent — both live at once.
+        let r = thread_invoke_for_test(pid, tc, bind_msg(12, death_h));
+        assert_eq!(r.status, ipc::status::OK as i64, "bind death notification");
+        assert_eq!(
+            sched::get(target).unwrap().death_notification,
+            Some(crate::sched::ObjRef(death_obj.0)),
+            "death binding did not clobber the wake binding"
+        );
+        assert_eq!(
+            sched::get(target).unwrap().bound_notification,
+            Some(crate::sched::ObjRef(notif_obj.0)),
+            "wake binding survived the death bind"
+        );
+
+        // §3.1: a signal on the wake notification pulls the thread out of a
+        // Recv park (it is not blocked on the notification itself).
+        sched::block(
+            target,
+            crate::sched::BlockReason::Recv(crate::sched::ObjRef(ep_obj.0)),
+        )
+        .unwrap();
+        crate::notification::signal(crate::sched::ObjRef(notif_obj.0), 0b110).unwrap();
+        assert_eq!(
+            sched::get(target).unwrap().state,
+            sched::State::Ready,
+            "signal woke the parked thread through the label-8 binding"
+        );
+
+        // Wrong-type caps[0] → EBADARG before any state change (the wake
+        // binding is untouched, not silently cleared).
+        let r = thread_invoke_for_test(pid, tc, bind_msg(8, ep_h));
+        assert_eq!(r.status, ipc::status::EBADARG as i64, "non-Notification");
+        assert_eq!(
+            sched::get(target).unwrap().bound_notification,
+            Some(crate::sched::ObjRef(notif_obj.0))
+        );
+
+        // NULL clears the wake binding only.
+        let c = Message::new(8);
+        let r = thread_invoke_for_test(pid, tc, c);
+        assert_eq!(r.status, ipc::status::OK as i64, "NULL clears");
+        assert_eq!(sched::get(target).unwrap().bound_notification, None);
+        assert_eq!(
+            sched::get(target).unwrap().death_notification,
+            Some(crate::sched::ObjRef(death_obj.0)),
+            "death binding survives the wake-binding clear"
+        );
+
+        // Exit fires the death payload on the death notification only.
+        assert_eq!(syscall::sys_exit(target, 7), Ok(true));
+        let death_mask = crate::notification::pending(crate::sched::ObjRef(death_obj.0)).unwrap();
+        assert_eq!(death_mask & 1, 1, "death event bit");
+        assert_eq!(death_mask >> 32, 7, "exit status in the death payload");
+        let wake_mask = crate::notification::pending(crate::sched::ObjRef(notif_obj.0)).unwrap();
+        assert_eq!(
+            wake_mask, 0b110,
+            "wake word holds only the earlier signal, no death payload"
+        );
+
+        crate::proc::reset_for_test();
+    }
+
+    /// The §3.1 select wake must CANCEL the parked recv — unqueue the
+    /// waiter from the endpoint before waking it. A bare make_ready leaves
+    /// the waiter in the endpoint's 64-slot receiver queue, so every
+    /// subsequent re-park leaks one slot until recv can no longer park at
+    /// all: the bench notification_wake boot wedge (warmup + ~54 measure
+    /// signal/yield iterations in, the waiter hot-spins on failing recvs
+    /// and the launcher starves). Drives the REAL park path
+    /// (sys_recv → endpoint::recv → park_recv + park record) for
+    /// MAX_WAITERS + 6 bind/signal-wake/resume cycles, then proves the
+    /// endpoint still delivers to the parked waiter in FIFO order.
+    #[test]
+    fn bind_notification_wake_cancels_the_parked_recv_queue_entry() {
+        let (pid, sender, factory) = setup();
+
+        let r_ep = dispatch(args(num::INVOKE, factory, Tag::new(1), [0; 4]));
+        let ep_h = r_ep.w[0] as u32;
+        let ep_obj = proc::get_cap(pid, ep_h).unwrap().obj;
+        let r_notif = dispatch(args(num::INVOKE, factory, Tag::new(2), [0; 4]));
+        let notif_h = r_notif.w[0] as u32;
+        let notif_obj = proc::get_cap(pid, notif_h).unwrap().obj;
+
+        let target = sched::spawn(ObjRef(1), 100).unwrap();
+        let tc = proc::install_cap(
+            pid,
+            Capability {
+                obj: ObjId(target.0),
+                typ: ObjType::Thread,
+                rights: Rights::CONTROL.union(Rights::GRANT),
+            },
+        )
+        .unwrap();
+        let mut bind = Message::new(8);
+        bind.tag = bind.tag.with_caps(1);
+        bind.set_descriptor(0, CapSlot::pack(notif_h, Rights::SIGNAL))
+            .unwrap();
+        let r = thread_invoke_for_test(pid, tc, bind);
+        assert_eq!(r.status, ipc::status::OK as i64, "bind wake notification");
+
+        // MAX_WAITERS is 64: cycle past it so a leaked entry per wake
+        // exhausts the queue and fails the park.
+        for cycle in 0..70u32 {
+            assert_eq!(
+                crate::syscall::sys_recv(pid, target, ep_h, false, 0),
+                Ok(None),
+                "cycle {cycle}: park in recv"
+            );
+            assert!(matches!(
+                sched::get(target).unwrap().state,
+                sched::State::Blocked(_)
+            ));
+            crate::notification::signal(ObjRef(notif_obj.0), 0b10).unwrap();
+            assert_eq!(
+                sched::get(target).unwrap().state,
+                sched::State::Ready,
+                "cycle {cycle}: signal woke the parked thread"
+            );
+            let r = crate::syscall::park_result(target).expect("notified resume");
+            assert_eq!(r.status, ipc::status::OK as i64);
+            assert!(r.tag.flags() & flags::NOTIFIED != 0);
+            assert_eq!(r.w[0], 0b10, "mask consumed");
+        }
+
+        // The queue is still sane: a real message reaches the parked
+        // waiter (no zombie entries consuming deliveries).
+        assert_eq!(
+            crate::syscall::sys_recv(pid, target, ep_h, false, 0),
+            Ok(None)
+        );
+        assert_eq!(
+            crate::syscall::sys_send(pid, sender, ep_h, msg_for_test(0x11, 7), false),
+            Ok(ipc::status::OK as i32)
+        );
+        let r = crate::syscall::park_result(target).expect("delivered recv on resume");
+        assert_eq!(r.status, ipc::status::OK as i64);
+        assert_eq!(r.tag.label(), 0x11);
+        assert_eq!(r.w[0], 7);
+
+        crate::proc::reset_for_test();
+    }
+
+    /// Same cancellation discipline for a Send-parked thread: the §3.1
+    /// select wake interrupts the parked send, drops its queued message
+    /// (it was never delivered) and unqueues it — otherwise every
+    /// wake/re-send cycle leaks one of the 64 sender-queue slots until
+    /// send can no longer park.
+    #[test]
+    fn bind_notification_wake_cancels_the_parked_send_queue_entry() {
+        let (pid, filler, factory) = setup();
+
+        let r_ep = dispatch(args(num::INVOKE, factory, Tag::new(1), [0; 4]));
+        let ep_h = r_ep.w[0] as u32;
+        let r_notif = dispatch(args(num::INVOKE, factory, Tag::new(2), [0; 4]));
+        let notif_h = r_notif.w[0] as u32;
+        let notif_obj = proc::get_cap(pid, notif_h).unwrap().obj;
+
+        let target = sched::spawn(ObjRef(1), 100).unwrap();
+        let tc = proc::install_cap(
+            pid,
+            Capability {
+                obj: ObjId(target.0),
+                typ: ObjType::Thread,
+                rights: Rights::CONTROL.union(Rights::GRANT),
+            },
+        )
+        .unwrap();
+        let mut bind = Message::new(8);
+        bind.tag = bind.tag.with_caps(1);
+        bind.set_descriptor(0, CapSlot::pack(notif_h, Rights::SIGNAL))
+            .unwrap();
+        let r = thread_invoke_for_test(pid, tc, bind);
+        assert_eq!(r.status, ipc::status::OK as i64, "bind wake notification");
+
+        // Fill the mailbox so target's sends park with their message queued.
+        assert_eq!(
+            crate::syscall::sys_send(pid, filler, ep_h, msg_for_test(0x21, 1), false),
+            Ok(ipc::status::OK as i32)
+        );
+
+        for cycle in 0..70u32 {
+            assert_eq!(
+                crate::syscall::sys_send(pid, target, ep_h, msg_for_test(0x22, 2), false),
+                Ok(ipc::status::OK as i32),
+                "cycle {cycle}: park in send"
+            );
+            assert!(matches!(
+                sched::get(target).unwrap().state,
+                sched::State::Blocked(_)
+            ));
+            crate::notification::signal(ObjRef(notif_obj.0), 0b100).unwrap();
+            assert_eq!(
+                sched::get(target).unwrap().state,
+                sched::State::Ready,
+                "cycle {cycle}: signal woke the parked sender"
+            );
+            let r = crate::syscall::park_result(target).expect("notified resume");
+            assert_eq!(r.status, ipc::status::OK as i64);
+            assert!(r.tag.flags() & flags::NOTIFIED != 0);
+            assert_eq!(r.w[0], 0b100, "mask consumed");
+        }
 
         crate::proc::reset_for_test();
     }

@@ -312,6 +312,21 @@ pub const THREAD_SET_TLS: InvokeSpec = InvokeSpec {
     description: "Set the target thread's TLS base (FS register on x86_64). 0 clears it.",
 };
 
+/// THREAD_BIND_NOTIFICATION invoke specification
+pub const THREAD_BIND_NOTIFICATION: InvokeSpec = InvokeSpec {
+    obj_type: ObjType::Thread,
+    label: 8,
+    name: "BIND_NOTIFICATION",
+    required_rights: Rights::CONTROL,
+    args: &[],
+    descriptors: &[
+        ("caps[0]", ObjType::Notification, Rights::SIGNAL), // optional, NULL to clear
+    ],
+    errors: &[ErrorCode::OK, ErrorCode::EBADCAP, ErrorCode::ERIGHTS, ErrorCode::EBADARG, ErrorCode::EBADSTATE, ErrorCode::EREVOKED],
+    commutativity: Commutativity::Commutes,
+    description: "Bind the thread's wake notification (syscall-abi §3.1 select primitive): a signal on it wakes the thread out of a Recv/Send/Reply park, which then completes with OK + NOTIFY + FLAG_NOTIFIED and w0 = the consumed mask. Independent of BIND_DEATH_NOTIFICATION (label 12) — a thread can carry both. caps[0] = Notification or NULL to clear.",
+};
+
 /// THREAD_BIND_DEATH_NOTIFICATION invoke specification
 pub const THREAD_BIND_DEATH_NOTIFICATION: InvokeSpec = InvokeSpec {
     obj_type: ObjType::Thread,
@@ -324,7 +339,7 @@ pub const THREAD_BIND_DEATH_NOTIFICATION: InvokeSpec = InvokeSpec {
     ],
     errors: &[ErrorCode::OK, ErrorCode::EBADCAP, ErrorCode::ERIGHTS, ErrorCode::EBADARG, ErrorCode::EBADSTATE, ErrorCode::EREVOKED],
     commutativity: Commutativity::Commutes,
-    description: "Bind a notification to be signalled when the thread exits. caps[0] = Notification or NULL to clear.",
+    description: "Bind a notification to be signalled when the thread exits (ADR-031 death payload: bit 0 = event, bits 32.. = exit status). Independent of BIND_NOTIFICATION (label 8). caps[0] = Notification or NULL to clear.",
 };
 
 /// THREAD_CREATE invoke specification
@@ -705,10 +720,10 @@ pub const ALL_SPECS: &[InvokeSpec] = &[
     THREAD_EXIT,
     THREAD_KILL,
     THREAD_SUSPEND,
+    THREAD_BIND_NOTIFICATION,
     THREAD_RESUME,
     THREAD_SET_PRIORITY,
     THREAD_SET_TLS,
-    THREAD_BIND_DEATH_NOTIFICATION,
     THREAD_CREATE,
     THREAD_SET_ENTRY,
     THREAD_SET_FOREIGN,
@@ -748,16 +763,20 @@ pub const SPEC_BY_TYPE_AND_LABEL: &[((ObjType, u16), &InvokeSpec)] = &[
     ((ObjType::Thread, THREAD_EXIT.label), &THREAD_EXIT),
     ((ObjType::Thread, THREAD_KILL.label), &THREAD_KILL),
     ((ObjType::Thread, THREAD_SUSPEND.label), &THREAD_SUSPEND),
+    (
+        (ObjType::Thread, THREAD_BIND_NOTIFICATION.label),
+        &THREAD_BIND_NOTIFICATION,
+    ),
+    (
+        (ObjType::Thread, THREAD_BIND_DEATH_NOTIFICATION.label),
+        &THREAD_BIND_DEATH_NOTIFICATION,
+    ),
     ((ObjType::Thread, THREAD_RESUME.label), &THREAD_RESUME),
     (
         (ObjType::Thread, THREAD_SET_PRIORITY.label),
         &THREAD_SET_PRIORITY,
     ),
     ((ObjType::Thread, THREAD_SET_TLS.label), &THREAD_SET_TLS),
-    (
-        (ObjType::Thread, THREAD_BIND_DEATH_NOTIFICATION.label),
-        &THREAD_BIND_DEATH_NOTIFICATION,
-    ),
     ((ObjType::Thread, THREAD_CREATE.label), &THREAD_CREATE),
     ((ObjType::Thread, THREAD_SET_ENTRY.label), &THREAD_SET_ENTRY),
     (

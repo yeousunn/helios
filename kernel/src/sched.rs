@@ -51,8 +51,14 @@ pub struct Thread {
     pub process: ObjRef,
     /// Fault endpoint (ADR-007), if any.
     pub fault_ep: Option<ObjRef>,
-    /// Bound notification (syscall-abi §3.1), if any.
+    /// Bound notification (syscall-abi §3.1 select primitive,
+    /// Thread::BIND_NOTIFICATION): a signal on it wakes this thread out of
+    /// a Recv/Send/Reply park, if any.
     pub bound_notification: Option<ObjRef>,
+    /// Death notification (ADR-031, Thread::BIND_DEATH_NOTIFICATION):
+    /// signalled with the death payload when this thread exits, if any.
+    /// Separate from `bound_notification` so one thread can carry both.
+    pub death_notification: Option<ObjRef>,
     /// Userspace entry PC (NEW_THREAD w0, ADR-019 §4). SP is arch-owned.
     pub initial_pc: u64,
     /// Kernel stack top for this thread (allocated at spawn, M3).
@@ -98,6 +104,7 @@ impl Thread {
             process,
             fault_ep: None,
             bound_notification: None,
+            death_notification: None,
             initial_pc: 0,
             kstack_top: 0,
             ksp: 0,
@@ -879,13 +886,24 @@ pub fn set_entry(id: ThreadId, pc: u64) -> SchedResult<()> {
     Ok(())
 }
 
-/// Rebind a thread's bound notification (Thread::BIND_DEATH_NOTIFICATION /
-/// Thread::BIND_NOTIFICATION, syscall-abi §7).
+/// Rebind a thread's wake notification (Thread::BIND_NOTIFICATION,
+/// syscall-abi §3.1/§7): the select primitive — a signal on it wakes the
+/// thread out of a Recv/Send/Reply park.
 pub fn set_bound_notification(id: ThreadId, n: Option<ObjRef>) -> SchedResult<()> {
     let mut guard = SCHED.lock();
     let s = guard.as_mut().ok_or(SchedError::NoSuchThread)?;
     let slot = find_slot(s, id)?;
     s.slots.threads[slot].as_mut().unwrap().bound_notification = n;
+    Ok(())
+}
+
+/// Rebind a thread's death notification (Thread::BIND_DEATH_NOTIFICATION,
+/// ADR-031): signalled with the death payload when the thread exits.
+pub fn set_death_notification(id: ThreadId, n: Option<ObjRef>) -> SchedResult<()> {
+    let mut guard = SCHED.lock();
+    let s = guard.as_mut().ok_or(SchedError::NoSuchThread)?;
+    let slot = find_slot(s, id)?;
+    s.slots.threads[slot].as_mut().unwrap().death_notification = n;
     Ok(())
 }
 
@@ -912,7 +930,7 @@ pub fn exit(id: ThreadId, status: i32) -> SchedResult<bool> {
         if matches!(t.state, State::Exited(_)) {
             return Err(SchedError::NotRunnable);
         }
-        (t.priority, t.bound_notification)
+        (t.priority, t.death_notification)
     };
     // If queued at its priority level, unlink first.
     {
@@ -1400,7 +1418,7 @@ mod tests {
             let mut guard = SCHED.lock();
             let s = guard.as_mut().unwrap();
             let slot = (t.0) as usize;
-            s.slots.threads[slot].as_mut().unwrap().bound_notification = Some(ObjRef(42));
+            s.slots.threads[slot].as_mut().unwrap().death_notification = Some(ObjRef(42));
         }
         assert_eq!(exit(t, 0), Ok(true), "death notification bound");
         assert!(matches!(get(t).unwrap().state, State::Exited(0)));

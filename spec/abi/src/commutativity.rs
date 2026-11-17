@@ -311,11 +311,18 @@ pub mod invoke_commutativity {
         notes: "Only affects the target thread",
     };
 
+    /// THREAD_BIND_NOTIFICATION invoke commutativity (syscall-abi §3.1)
+    pub const THREAD_BIND_NOTIFICATION: CommutativitySpec = CommutativitySpec {
+        class: Commutativity::Commutes,
+        resource_extractor: ResourceExtractor::ObjId,
+        notes: "Only affects the target thread's wake-notification binding",
+    };
+
     /// THREAD_BIND_DEATH_NOTIFICATION invoke commutativity
     pub const THREAD_BIND_DEATH_NOTIFICATION: CommutativitySpec = CommutativitySpec {
         class: Commutativity::Commutes,
         resource_extractor: ResourceExtractor::ObjId,
-        notes: "Only affects the target thread's notification binding",
+        notes: "Only affects the target thread's death-notification binding",
     };
 
     /// THREAD_BIND_FAULT_EP invoke commutativity (ADR-088: Thread label 18)

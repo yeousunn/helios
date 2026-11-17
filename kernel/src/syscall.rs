@@ -716,11 +716,11 @@ pub fn sys_exit(tid: ThreadId, status: i32) -> SysResult<bool> {
         }
     }
     if fired {
-        // Read the bound notification from the (now Exited) record and signal.
+        // Read the death notification from the (now Exited) record and signal.
         // Payload convention (v0, consumed by PS's `WAIT` reaper): bit 0 = the
         // death event, bits 32.. = the raw exit status. OR-ing semantics mean
         // a later signal cannot clear an earlier event; status 0 keeps bit 0.
-        if let Some(n) = sched::get(tid).ok().and_then(|t| t.bound_notification) {
+        if let Some(n) = sched::get(tid).ok().and_then(|t| t.death_notification) {
             let payload = 1 | ((status as u32 as u64) << 32);
             let _ = notification::signal(n, payload);
         }
@@ -1010,7 +1010,7 @@ mod tests {
             s.slots.threads[server.0 as usize]
                 .as_mut()
                 .unwrap()
-                .bound_notification = Some(n);
+                .death_notification = Some(n);
         }
         // Client calls so the server holds a reply target.
         assert_eq!(sys_call(pid, client, ep_h, msg(1, 1)), Ok(0));

@@ -90,8 +90,30 @@ pub fn signal(n: ObjRef, mask: u64) -> Result<(), crate::endpoint::IpcError> {
             break;
         }
         if let Ok(t) = sched::get(tid) {
-            if t.bound_notification == Some(n) {
-                let _ = sched::make_ready(tid);
+            if t.bound_notification != Some(n) {
+                continue;
+            }
+            // The select wake interrupts the parked syscall, so cancel its
+            // endpoint queue entry before waking — the same unqueue-before-
+            // wake discipline as ADR-041's expire path. A bare make_ready
+            // leaves the waiter queued: a later delivery could complete a
+            // recv the wake already cancelled, and every re-park of the
+            // woken thread then leaks one of the 64 waiter slots until
+            // recv can no longer park at all (measured as the bench
+            // notification_wake wedge: warmup + ~54 measure iterations in).
+            match t.state {
+                crate::sched::State::Blocked(crate::sched::BlockReason::Recv(ep))
+                | crate::sched::State::Blocked(crate::sched::BlockReason::Send(ep)) => {
+                    if !crate::endpoint::unqueue_waiter(ep, tid).unwrap_or(false) {
+                        // Not in the queue (cannot happen while Blocked on
+                        // it): wake directly rather than lose the thread.
+                        let _ = sched::make_ready(tid);
+                    }
+                }
+                // Reply parks have no queue to leave.
+                _ => {
+                    let _ = sched::make_ready(tid);
+                }
             }
         }
     }
