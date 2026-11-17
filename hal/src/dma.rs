@@ -46,6 +46,28 @@ impl DmaBuffer {
         Self { virt, phys, len }
     }
 
+    /// Create a DMA buffer over a region granted by a [`crate::Dma`]
+    /// capability (e.g. a `Frame` mapped via `AS::MAP`) or from
+    /// `hal::Dma::alloc_dma`.
+    ///
+    /// The capability system has already validated that `[virt, virt + len)`
+    /// is valid DMA-safe, physically contiguous memory; this safe constructor
+    /// only sanity-checks the arguments before handing a buffer to safe driver
+    /// code. The unsafe [`DmaBuffer::new`] remains for the kernel's
+    /// capability-mapping path (ADR-016).
+    ///
+    /// # Errors
+    ///
+    /// Returns `DmaError::OutOfBounds` if `len` is zero or `virt + len`
+    /// overflows a `usize`.
+    pub fn from_cap(virt: usize, phys: usize, len: usize) -> Result<Self, DmaError> {
+        if len == 0 {
+            return Err(DmaError::OutOfBounds);
+        }
+        virt.checked_add(len).ok_or(DmaError::OutOfBounds)?;
+        Ok(Self { virt, phys, len })
+    }
+
     /// Returns the buffer's virtual address.
     pub fn virt_addr(&self) -> usize {
         self.virt
@@ -368,12 +390,41 @@ mod tests {
     }
 
     #[test]
+    fn from_cap_ok() {
+        let mut buf = [0u8; 16];
+        let base = buf.as_mut_ptr() as usize;
+        let len = buf.len();
+        let dma = DmaBuffer::from_cap(base, base, len).unwrap();
+        assert_eq!(dma.virt_addr(), base);
+        assert_eq!(dma.phys_addr(), base);
+        assert_eq!(dma.len(), len);
+        assert!(!dma.is_empty());
+    }
+
+    #[test]
     fn clear_zeroes_the_buffer() {
         let mut buf = [0xAAu8; 16];
         let base = buf.as_mut_ptr() as usize;
         let mut win = unsafe { DmaBuffer::new(base, base, buf.len()) };
         win.clear();
         assert_eq!(buf, [0u8; 16]);
+    }
+
+    #[test]
+    fn from_cap_rejects_zero_len() {
+        let base = 0x1000;
+        assert!(matches!(
+            DmaBuffer::from_cap(base, base, 0),
+            Err(DmaError::OutOfBounds)
+        ));
+    }
+
+    #[test]
+    fn from_cap_rejects_overflow() {
+        assert!(matches!(
+            DmaBuffer::from_cap(usize::MAX, 0x1000, 1),
+            Err(DmaError::OutOfBounds)
+        ));
     }
 
     #[test]
