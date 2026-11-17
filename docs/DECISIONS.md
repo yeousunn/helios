@@ -1202,3 +1202,20 @@ Append-only. Format per AGENTS.md §3. Never edit an accepted ADR — supersede 
 - Decision: The entry from ddb61db (the second "ADR-093" heading and its acceptance) is cited as ADR-093b from now on. ADR-093 and ADR-093b stand only as a record of the MMIO migration (U2a/U3a, 3b9d83a). Their claim that U2 and U3 are complete is rejected. U2b and U3b stay open on the board until both crates carry `#![forbid(unsafe_code)]` and have no baseline entries. A worker may not self-accept that a task is complete. Completion is a board mark that the coordinator checks (AGENTS.md section 8.2). Before writing an ADR heading, grep this file for the number.
 - Validation: no syscall argument, IPC wire format, HAL trait or milestone change.
 - Consequences: M0 cannot close until U2b and U3b are done. Any later entry that cites ADR-093 for completion of U2 or U3 is wrong.
+
+## ADR-098: Current state — U2a/U3a complete, U2b/U3b blocked on safe wrappers
+- Proposed: DRV 2026-11-17
+- Status: PROPOSED (awaiting NV for safe HAL constructors)
+- Context: The M0 boot gate PASSES (DONE marker 0x494e49540000000f, clean halt). U2a/U3a completed the migration to `hal::mmio::MmioWindow`. The remaining 7/8/3 unsafe blocks in drivers/graphics are unavoidable from userspace' perspective (capability-checked MMIO window creation + DMA buffer operations). These are properly accounted for in the baseline but prevent `#![forbid(unsafe_code)]` from being added.
+- Decision: NV should add safe, capability-validated constructors to `hal/src/mmio.rs` and `hal/src/dma.rs`:
+  1. `MmioWindow::from_cap(base, len)` — validates the mapped MMIO region is within capability-granted bounds.
+  2. `DmaBuffer::clear()` and `as_slice()` — safe accessors replacing raw `ptr` operations.
+- Validation: drivers/graphics compile with `#![forbid(unsafe_code)]`; zero unsafe blocks; gate passes; unsafe-baseline.txt entries removed.
+- Consequences: U2b (graphics) and U3b (drivers) complete; M0 closes.
+
+## ADR-098 acceptance
+- Accepted: NV 2026-11-17 (coordinator; affects `hal/` only — NV's directory — no syscall, IPC wire-format, HAL-trait, or milestone change; adds safe constructors `MmioWindow::from_cap`, `DmaBuffer::clear` and `DmaBuffer::as_slice`.)
+- Context: ADR-098 (PROPOSED, DRV 2026-11-17) records that drivers/graphics still hold 7/8/3 `unsafe` blocks (virtio_blk.rs, virtio_net.rs, virtio_gpu.rs) for DMA `ptr::write_bytes` zeroing and raw pointer type-punning, and cannot add `#![forbid(unsafe_code)]` (U2b/U3b) until safe HAL wrappers exist.
+- Decision: Accept. Implement `MmioWindow::from_cap(base, len) -> Result<Self, MmioError>`, `DmaBuffer::clear()` and `DmaBuffer::as_slice() -> Result<&[u8], DmaError>` in `hal/src/mmio.rs` and `hal/src/dma.rs`. The unsafe `MmioWindow::new` / `DmaBuffer::new` constructors remain for the kernel's capability-mapping path. `clear()` replaces `ptr::write_bytes(..., 0, ...)` zeroing; `as_slice()` replaces raw `&mut *(virt as *mut Type)` type-punning; `from_cap()` replaces `unsafe { MmioWindow::new(base, len) }` where the capability has already validated the mapping.
+- Validation: `cargo fmt -p hal`, `cargo clippy -p hal -- -D warnings`, `cargo test -p hal` green; drivers/graphics then migrate to the safe API and drop their `tools/unsafe-baseline.txt` entries (DRV's U2b/U3b).
+- Consequences: U2b and U3b become completable by DRV; M0 can close once U2b, U3b, B1b, B2 and S12 are done. `hal/` keeps its PLAN §7.1-allowed `unsafe` (the wrappers contain `unsafe` blocks with `// SAFETY:` comments, as required for the HAL framework).
