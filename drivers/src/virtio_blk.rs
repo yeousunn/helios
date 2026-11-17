@@ -124,7 +124,7 @@ impl VirtioBlk {
     /// and has already mapped the region.
     pub fn new(mmio_base: usize, mmio_len: usize) -> Self {
         Self {
-            mmio: unsafe { MmioWindow::new(mmio_base, mmio_len) },
+            mmio: MmioWindow::from_cap(mmio_base, mmio_len).expect("MMIO window validation failed"),
             capacity_sectors: 0,
             queue_vaddr: None,
             queue_paddr: 0,

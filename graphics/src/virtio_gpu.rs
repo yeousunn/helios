@@ -115,7 +115,7 @@ impl VirtioGpu {
     /// region.
     pub fn new(mmio_base: usize, mmio_len: usize) -> Self {
         Self {
-            mmio: unsafe { MmioWindow::new(mmio_base, mmio_len) },
+            mmio: MmioWindow::from_cap(mmio_base, mmio_len).expect("MMIO window validation failed"),
             queue_vaddr: None,
             queue_paddr: 0,
             width: 0,
