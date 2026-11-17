@@ -20,7 +20,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
 ## M0: Gates and tools
 
-- [ ] G1 DS (from DRV, reopened by HUMAN 2026-11-17): HEAD does not build. 56bc2c2 added `#![forbid(unsafe_code)]` to `drivers/src/lib.rs` and `graphics/src/lib.rs` while both crates still hold `unsafe` blocks, so `cargo check -p drivers -p graphics` fails. The earlier note follows. `tools/check-unsafe.sh`: gate was red at 158f482 (baseline 7/6/2 vs actual 8/7/3). Fixed by drivers/graphics using safe `MmioWindow::from_cap` constructor instead of `unsafe { MmioWindow::new(...) }`. check-unsafe OK at 56bc2c2.
+- [x NV done 2026-11-17 4073688] G1 NV (from DRV, reopened by HUMAN 2026-11-17): drivers/graphics migrated to safe `MmioWindow::from_cap` (56bc2c2) and the unsafe baseline corrected to actual usage 6/7/2 (4073688); `cargo check -p drivers -p graphics` passes and `tools/check-unsafe.sh` is OK at HEAD.
 - [x NV done 2026-11-15 309828e] G2 NV: `deny.toml` + `cargo deny check` added to the gate (tools/qemu-test.sh; `cargo deny check` passes). `tools/verify.sh` wired into the gate; `cargo vet` still blocked (cargo-vet not installed in sandbox, reported as non-failing blocker).
 - [x NV done 2026-11-16 662de4d] G3 NV: `tools/bench.sh`: boot a `BENCH=1` image, parse the cycle counts the bench program prints, store them as `bench/results/<commit>.json`, and with `--compare` fail on a regression above 5% against the previous result. `--compare` now stores decimal (valid JSON) and skips metrics with no previous value instead of crashing on a corrupt previous result.
 - [x NV done 2026-11-14 281cd2f] G4 NV: `docs/rfcs/README.md` and `docs/rfcs/0000-template.md` with the RFC sections from PLAN.md 10.2.
