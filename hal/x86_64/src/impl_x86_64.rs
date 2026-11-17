@@ -61,6 +61,15 @@ const PIT_MODE: u16 = 0x43;
 /// PIT base frequency ~1.193182 MHz.
 const PIT_BASE_HZ: u64 = 1_193_182;
 
+/// Usable physical memory regions handed to the kernel's frame allocator.
+///
+/// QEMU `-m 256M` places contiguous RAM from address 0; the kernel image and
+/// boot stack live below 16 MiB, so the allocatable region reported here is
+/// `[16 MiB, 256 MiB)`. M1: this is the backing the root `Untyped` object is
+/// carved from, so every byte of RAM the kernel can hand out must appear here
+/// (the Untyped layer tags each region with a NUMA node and tier).
+pub const PHYS_MEM_REGIONS: [(u64, u64); 1] = [(0x100_0000, 0xF00_0000)];
+
 /// QEMU isa-debug-exit I/O port (x86_64). Writing an exit code here terminates
 /// QEMU with that status.
 const QEMU_EXIT_PORT: u16 = 0x501;
