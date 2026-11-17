@@ -1878,6 +1878,84 @@ mod tests {
         );
     }
 
+    /// A9c / ADR-088: the spec carries FACTORY_RETYPE (Factory label 5,
+    /// RFC-0001's number) with the RFC-0005 §3 corrected packing, and the
+    /// kernel answers ENOSYS for label 5 until M1 lands the Untyped/
+    /// Retype/Revoke object model (the AS_FORK/AS_DESTROY precedent: the
+    /// spec documents the accepted ABI, the kernel rejects it until the
+    /// implementation exists). Factory label 6 stays unassigned —
+    /// NEW_CNODE is RETYPE with target type CNode, never a second name
+    /// for one operation.
+    #[test]
+    fn a9c_retype_spec_carries_adr088_packing_kernel_enosys() {
+        let spec = helios_abi::invoke_spec(helios_abi::ObjType::Factory, 5)
+            .expect("spec/abi lacks FACTORY_RETYPE (Factory label 5)");
+        assert_eq!(spec.name, "RETYPE");
+        assert_eq!(spec.required_rights, helios_abi::Rights::GRANT);
+        // cap_count exactly 1: the single descriptor is the source
+        // Untyped, riding words[3] under the trailing-descriptor overlay.
+        assert_eq!(spec.descriptors.len(), 1, "cap_count exactly 1");
+        let (name, typ, rights) = spec.descriptors[0];
+        assert_eq!(name, "caps[0]");
+        assert_eq!(typ, helios_abi::ObjType::Untyped, "source is the Untyped");
+        assert_eq!(rights, helios_abi::Rights::MAP, "source needs MAP");
+        for arg in ["target_type", "size", "align_order"] {
+            let a = spec
+                .args
+                .iter()
+                .find(|a| a.name == arg)
+                .unwrap_or_else(|| panic!("RETYPE: spec lacks {arg}"));
+            assert_eq!(a.range_error, helios_abi::ErrorCode::EBADARG);
+        }
+        // w0 is a set test (the M1 target set, RFC-0001 §4.1.2), not a
+        // range check — the numeric range is only the outer bound, and 0
+        // (None) is never valid. w2 is 0 or 12..=47; the range max is the
+        // hard order bound.
+        let ty = spec
+            .args
+            .iter()
+            .find(|a| a.name == "target_type")
+            .expect("RETYPE: spec lacks target_type");
+        assert_eq!(ty.range.0, 1, "target type 0 (None) is never valid");
+        let align = spec
+            .args
+            .iter()
+            .find(|a| a.name == "align_order")
+            .expect("RETYPE: spec lacks align_order");
+        assert_eq!(align.range, (0, 47));
+        // RFC-0005 §ABI row 3 error set, + ENOSYS until M1 (AS_FORK
+        // precedent).
+        for code in [
+            helios_abi::ErrorCode::EBADCAP,
+            helios_abi::ErrorCode::ERIGHTS,
+            helios_abi::ErrorCode::EBADARG,
+            helios_abi::ErrorCode::ENOMEM,
+            helios_abi::ErrorCode::ENOSYS,
+        ] {
+            assert!(spec.errors.contains(&code), "RETYPE errors lack {code:?}");
+        }
+        assert_eq!(
+            spec.commutativity,
+            helios_abi::Commutativity::CommutesDisjointRanges,
+            "RFC-0005 §ABI row 3: disjoint Untypeds commute, same-Untyped carving is ordered"
+        );
+        // Factory label 6 stays unassigned (ADR-088: NEW_CNODE is RETYPE
+        // with target type CNode, never a second name).
+        assert!(
+            helios_abi::invoke_spec(helios_abi::ObjType::Factory, 6).is_none(),
+            "Factory label 6 must stay unassigned"
+        );
+        // Kernel side: label 5 is not dispatched yet — the factory reader
+        // answers ENOSYS for it until M1.
+        let (_pid, _tid, factory) = setup();
+        let r = dispatch(args(num::INVOKE, factory, Tag::new(5), [0; 4]));
+        assert_eq!(
+            r.status,
+            ipc::status::ENOSYS as i64,
+            "RETYPE is unimplemented until M1"
+        );
+    }
+
     /// ADR-088 uniform packing (cap_count 2): w0 = entry PC, w1 = stack
     /// top (0 = arch default, else `valid_stack_top`), caps[0] = AS,
     /// caps[1] = bootstrap EP (installed at child handle 1, rights ∩

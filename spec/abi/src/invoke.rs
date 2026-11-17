@@ -132,6 +132,57 @@ pub const FACTORY_NEW_THREAD: InvokeSpec = InvokeSpec {
     description: "Create a new thread in a new process. w0 = entry PC (both packings). cap_count 2 (ADR-088 uniform): w1 = initial user stack top (0 = arch default, ADR-085 validation), caps[0] = AddressSpace, caps[1] = bootstrap endpoint (installed at child handle 1), no fault EP (bind one later with Thread::BIND_FAULT_EP before the first yield — the child cannot run before the parent yields). cap_count 3 (legacy ADR-017): w1..w3 are descriptor bytes (ignored, no validation), caps[0] = AddressSpace, caps[1] = fault endpoint (optional), caps[2] = bootstrap endpoint (optional, installed at child handle 1). Any other cap_count: EBADARG. caps transfer under S8 (rights ∩ requested). Returns thread cap with CONTROL|GRANT.",
 };
 
+/// FACTORY_RETYPE invoke specification
+///
+/// ADR-088 (RFC-0005 §3, correcting RFC-0001/ADR-064's table): retype
+/// carves a new object out of a source Untyped. cap_count must be exactly
+/// 1 — caps[0] is the source Untyped (MAP right required) and rides
+/// words[3] under the trailing-descriptor overlay — with w0 = target
+/// type, w1 = size, w2 = alignment order. RFC-0001's w3 = numa_node is
+/// dropped (the carved object inherits the source's node/tier) and
+/// destination placement goes through CAP_MOVE (first-free install here).
+/// Kernel support lands with M1 (Untyped/Retype/Revoke); until then
+/// INVOKE on a Factory cap with label 5 answers ENOSYS (the AS_FORK/
+/// AS_DESTROY precedent). Factory label 6 stays unassigned — NEW_CNODE
+/// is RETYPE with target type CNode, never a second name for it.
+pub const FACTORY_RETYPE: InvokeSpec = InvokeSpec {
+    obj_type: ObjType::Factory,
+    label: 5,
+    name: "RETYPE",
+    required_rights: Rights::GRANT,
+    args: &[
+        InvokeArg {
+            name: "target_type",
+            range: (1, 63),
+            range_error: ErrorCode::EBADARG,
+            description: "Target object type (ObjType discriminant). Must be in the M1 retype target set — Endpoint, Notification, AddressSpace, Thread, Frame, CNode, Region, SchedContext, Domain, IOSpace, CoreGrant, Port, Ring (RFC-0001 §4.1.2) — a set test, not a range check: 0 (None), 8 (Untyped — a source, never a target), 14 (Reply), 15 (Factory), 6 (Irq) and every other discriminant outside the set are EBADARG.",
+        },
+        InvokeArg {
+            name: "size",
+            range: (1, u64::MAX),
+            range_error: ErrorCode::EBADARG,
+            description: "Carve size in bytes. Fixed-size types must pass exactly their fixed size (no ignore-ambiguity — the kernel↔spec cross-check stays exact); variable-size types (Frame, CNode, Region) accept [type_min, source remaining] (Frame/Region ≥ 4 KiB; CNode capacity ≥ 1 KiB of slots). Type minimums are kernel constants (M1); size 0 is never valid.",
+        },
+        InvokeArg {
+            name: "align_order",
+            range: (0, 47),
+            range_error: ErrorCode::EBADARG,
+            description: "Alignment order (log2). 0 = the type's natural alignment; otherwise 12 ≤ order ≤ 47 (4 KiB .. 128 TiB) AND size % (1 << order) == 0. 1..=11 and > 47 are EBADARG (RFC-0005 §3).",
+        },
+    ],
+    descriptors: &[("caps[0]", ObjType::Untyped, Rights::MAP)],
+    errors: &[
+        ErrorCode::OK,
+        ErrorCode::EBADCAP,
+        ErrorCode::ERIGHTS,
+        ErrorCode::EBADARG,
+        ErrorCode::ENOMEM,
+        ErrorCode::ENOSYS,
+    ],
+    commutativity: Commutativity::CommutesDisjointRanges,
+    description: "Retype: carve a new object from a source Untyped (caps[0], MAP required; cap_count exactly 1, else EBADARG — the THREAD_CREATE precedent, keeping the w-reads unambiguous). w0 = target type (M1 target set), w1 = size, w2 = alignment order (0 = natural, else 12..=47 dividing size). All-or-nothing: the source is reduced only after every validation passes (depleted source = EBADARG; dead/foreign source = EBADCAP). Reply w0 = new cap handle (first-free install; deterministic placement via CAP_MOVE), reply w1 = remaining source size. NUMA node/tier inherited from the source (RFC-0001's w3 dropped). Kernel support lands with M1 — until then ENOSYS (AS_FORK/AS_DESTROY precedent). Retypes on different Untypeds commute; on the same Untyped they conflict (carving is ordered).",
+};
+
 // ============================================================================
 // Thread methods (ObjType::Thread)
 // ============================================================================
@@ -650,6 +701,7 @@ pub const ALL_SPECS: &[InvokeSpec] = &[
     FACTORY_NEW_NOTIFICATION,
     FACTORY_NEW_ADDRESS_SPACE,
     FACTORY_NEW_THREAD,
+    FACTORY_RETYPE,
     THREAD_EXIT,
     THREAD_KILL,
     THREAD_SUSPEND,
@@ -692,6 +744,7 @@ pub const SPEC_BY_TYPE_AND_LABEL: &[((ObjType, u16), &InvokeSpec)] = &[
         (ObjType::Factory, FACTORY_NEW_THREAD.label),
         &FACTORY_NEW_THREAD,
     ),
+    ((ObjType::Factory, FACTORY_RETYPE.label), &FACTORY_RETYPE),
     ((ObjType::Thread, THREAD_EXIT.label), &THREAD_EXIT),
     ((ObjType::Thread, THREAD_KILL.label), &THREAD_KILL),
     ((ObjType::Thread, THREAD_SUSPEND.label), &THREAD_SUSPEND),

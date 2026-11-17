@@ -261,6 +261,13 @@ pub mod invoke_commutativity {
         notes: "Creates independent thread/process. The AddressSpace cap (caps[0]) is read-only for this operation. w1 is descriptor-overlay territory at cap_count 3 and is ignored by the kernel (ADR-086 proposal; RFC-0004's stack top ships on THREAD_CREATE w1 only).",
     };
 
+    /// FACTORY_RETYPE invoke commutativity (ADR-088/RFC-0005 §3)
+    pub const FACTORY_RETYPE: CommutativitySpec = CommutativitySpec {
+        class: Commutativity::CommutesDisjointRanges,
+        resource_extractor: ResourceExtractor::ObjId, // the source Untyped's ObjId (caps[0])
+        notes: "Retypes on different Untypeds commute ([R-COMMUTER]); on the same Untyped they conflict — carving is ordered, the source shrinks in place.",
+    };
+
     // Thread methods
     /// THREAD_EXIT invoke commutativity
     pub const THREAD_EXIT: CommutativitySpec = CommutativitySpec {
@@ -309,6 +316,13 @@ pub mod invoke_commutativity {
         class: Commutativity::Commutes,
         resource_extractor: ResourceExtractor::ObjId,
         notes: "Only affects the target thread's notification binding",
+    };
+
+    /// THREAD_BIND_FAULT_EP invoke commutativity (ADR-088: Thread label 18)
+    pub const THREAD_BIND_FAULT_EP: CommutativitySpec = CommutativitySpec {
+        class: Commutativity::Conflicts,
+        resource_extractor: ResourceExtractor::ObjId,
+        notes: "Rebinds the target thread's fault-routing state (RFC-0005 §ABI row 2); serialized against everything that touches that thread.",
     };
 
     /// THREAD_CREATE invoke commutativity
