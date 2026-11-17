@@ -17,15 +17,3 @@ personality/src/bin/ls.rs 1
 personality/src/bin/posix.rs 1
 personality/src/bin/sh.rs 1
 personality/src/bin/wc.rs 1
-sdk/src/args.rs 7
-sdk/src/bin/bench.rs 2
-sdk/src/bin/child.rs 1
-sdk/src/bin/init.rs 7
-sdk/src/heap.rs 1
-sdk/src/spawn.rs 1
-sdk/src/syscall.rs 2
-sdk/src/window.rs 2
-servers/auth/src/bin/auth.rs 1
-servers/console/src/bin/console.rs 1
-servers/process/src/bin/ps.rs 1
-servers/vfs/src/bin/vfs.rs 1
