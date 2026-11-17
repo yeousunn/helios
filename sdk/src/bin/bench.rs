@@ -429,18 +429,12 @@ fn bench_notification_wake(
     mark(&mut sys, debug_ep, 0xF2, 4); // debug: after spawn_thread_same_as
 
     // Bind notification to the waiter thread (so recv on bootstrap_ep wakes on signal).
-    // Kernel may not implement BIND_NOTIFICATION yet (ENOSYS). Skip benchmark if so.
-    let bind_result = sys.invoke(
+    // BIND_NOTIFICATION (Thread label 8) is now implemented in kernel (ADR-101).
+    sys.invoke(
         waiter_thread,
         &msg_with_cap(methods::thread::BIND_NOTIFICATION, notif, Rights::SIGNAL),
-    );
-    if bind_result.is_err() {
-        // BIND_NOTIFICATION not implemented; skip this benchmark.
-        mark(&mut sys, debug_ep, 0xF2, 0xFF); // debug: BIND_NOTIFICATION unavailable
-        let _ = sys.invoke(waiter_thread, &Message::new(methods::thread::KILL));
-        let _ = sys.cap_revoke(waiter_thread, 1);
-        return Ok(());
-    }
+    )
+    .map_err(err_to_u64)?;
     mark(&mut sys, debug_ep, 0xF2, 5); // debug: after BIND_NOTIFICATION
 
     // Bind death notification.
