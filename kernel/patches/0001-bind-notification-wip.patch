@@ -1,0 +1,375 @@
+diff --git a/kernel/src/entry.rs b/kernel/src/entry.rs
+index 93aa630..e24e890 100644
+--- a/kernel/src/entry.rs
++++ b/kernel/src/entry.rs
+@@ -512,6 +512,7 @@ fn thread_invoke(
+     const SUSPEND: u16 = 3;
+     const RESUME: u16 = 4;
+     const SET_PRIORITY: u16 = 5;
++    const BIND_NOTIFICATION: u16 = 8;
+     const BIND_DEATH_NOTIFICATION: u16 = 12;
+     const THREAD_CREATE: u16 = 13;
+     const SET_ENTRY: u16 = 14;
+@@ -552,14 +553,30 @@ fn thread_invoke(
+             Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
+             Err(_) => SyscallReturn::err(ipc::status::EBADCAP),
+         },
++        BIND_NOTIFICATION => {
++            // syscall-abi §3.1 select primitive: caps[0] = Notification or
++            // NULL to clear. A signal on it wakes the target out of a
++            // Recv/Send/Reply park (notification::signal's bound-wake path);
++            // independent of the death notification (label 12). A wrong-type
++            // caps[0] is EBADARG before any state change (bind_fault_ep's
++            // validation shape) — not a silent clear.
++            match bind_notification_cap(pid, &msg, ObjType::Notification) {
++                Ok(bound) => match set_bound_notification(target, bound) {
++                    Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
++                    Err(e) => SyscallReturn::err(e),
++                },
++                Err(e) => SyscallReturn::err(e),
++            }
++        }
+         BIND_DEATH_NOTIFICATION => {
+-            // caps[0] = Notification or NULL to clear.
++            // ADR-031: caps[0] = Notification or NULL to clear; signalled
++            // with the death payload when the thread exits.
+             let bound = msg
+                 .descriptor(0)
+                 .filter(|cs| cs.handle() != 0)
+                 .and_then(|cs| proc::get_cap(pid, cs.handle()).ok())
+                 .filter(|c| c.typ == ObjType::Notification);
+-            match set_bound_notification(target, bound.map(|c| crate::sched::ObjRef(c.obj.0))) {
++            match set_death_notification(target, bound.map(|c| crate::sched::ObjRef(c.obj.0))) {
+                 Ok(()) => SyscallReturn::ok(msg.tag, [0; 4]),
+                 Err(e) => SyscallReturn::err(e),
+             }
+@@ -770,6 +787,28 @@ fn set_bound_notification(target: ThreadId, n: Option<crate::sched::ObjRef>) ->
+     sched::set_bound_notification(target, n).map_err(|_| ipc::status::EBADCAP)
+ }
+ 
++fn set_death_notification(target: ThreadId, n: Option<crate::sched::ObjRef>) -> Result<(), i32> {
++    sched::set_death_notification(target, n).map_err(|_| ipc::status::EBADCAP)
++}
++
++/// Resolve a bind's caps[0]: absent/NULL → `None` (clear); otherwise the
++/// caller's live cap of exactly `typ` → its object ref. Anything else is
++/// EBADARG before any state changes.
++fn bind_notification_cap(
++    pid: ProcessId,
++    msg: &Message,
++    typ: ObjType,
++) -> Result<Option<crate::sched::ObjRef>, i32> {
++    let Some(cs) = msg.descriptor(0).filter(|cs| cs.handle() != 0) else {
++        return Ok(None);
++    };
++    let cap = proc::get_cap(pid, cs.handle()).map_err(map_proc)?;
++    if cap.typ != typ || !crate::objreg::is_alive(cap.obj) {
++        return Err(ipc::status::EBADARG);
++    }
++    Ok(Some(crate::sched::ObjRef(cap.obj.0)))
++}
++
+ /// Thread::BIND_FAULT_EP (label 18, ADR-088): bind or clear the target's
+ /// fault endpoint — the uniform NEW_THREAD packing (cap_count 2) carries
+ /// no fault EP, so a launcher binds one after creation. ADR-017's
+@@ -2234,6 +2273,115 @@ mod tests {
+         crate::proc::reset_for_test();
+     }
+ 
++    /// Thread::BIND_NOTIFICATION (label 8, syscall-abi §3.1 select
++    /// primitive): bind a live Notification, wake a thread parked in Recv
++    /// by signalling it, clear with NULL, reject a wrong-type caps[0]
++    /// with EBADARG before any state change — and pin the split from
++    /// BIND_DEATH_NOTIFICATION (label 12): one thread carries both, the
++    /// exit fires only the death payload, the wake binding is untouched.
++    #[test]
++    fn bind_notification_wakes_parked_recv_and_is_independent_of_death_binding() {
++        let (pid, _tid, factory) = setup();
++
++        let r_notif = dispatch(args(num::INVOKE, factory, Tag::new(2), [0; 4]));
++        let notif_h = r_notif.w[0] as u32;
++        let notif_obj = proc::get_cap(pid, notif_h).unwrap().obj;
++        let r_ep = dispatch(args(num::INVOKE, factory, Tag::new(1), [0; 4]));
++        let ep_h = r_ep.w[0] as u32;
++        let ep_obj = proc::get_cap(pid, ep_h).unwrap().obj;
++        let r_death = dispatch(args(num::INVOKE, factory, Tag::new(2), [0; 4]));
++        let death_h = r_death.w[0] as u32;
++        let death_obj = proc::get_cap(pid, death_h).unwrap().obj;
++
++        let target = sched::spawn(ObjRef(1), 100).unwrap();
++        let tc = proc::install_cap(
++            pid,
++            Capability {
++                obj: ObjId(target.0),
++                typ: ObjType::Thread,
++                rights: Rights::CONTROL.union(Rights::GRANT),
++            },
++        )
++        .unwrap();
++
++        // Bind the wake notification (label 8) — fail-before: this arm was
++        // the ENOSYS wildcard, so the bench's notification_wake skipped.
++        let bind_msg = |label: u16, cap_h: u32| {
++            let mut b = Message::new(label);
++            b.tag = b.tag.with_caps(1);
++            b.set_descriptor(0, CapSlot::pack(cap_h, Rights::SIGNAL))
++                .unwrap();
++            b
++        };
++        let r = thread_invoke_for_test(pid, tc, bind_msg(8, notif_h));
++        assert_eq!(r.status, ipc::status::OK as i64, "bind wake notification");
++        assert_eq!(
++            sched::get(target).unwrap().bound_notification,
++            Some(crate::sched::ObjRef(notif_obj.0))
++        );
++
++        // The death binding (label 12) is independent — both live at once.
++        let r = thread_invoke_for_test(pid, tc, bind_msg(12, death_h));
++        assert_eq!(r.status, ipc::status::OK as i64, "bind death notification");
++        assert_eq!(
++            sched::get(target).unwrap().death_notification,
++            Some(crate::sched::ObjRef(death_obj.0)),
++            "death binding did not clobber the wake binding"
++        );
++        assert_eq!(
++            sched::get(target).unwrap().bound_notification,
++            Some(crate::sched::ObjRef(notif_obj.0)),
++            "wake binding survived the death bind"
++        );
++
++        // §3.1: a signal on the wake notification pulls the thread out of a
++        // Recv park (it is not blocked on the notification itself).
++        sched::block(
++            target,
++            crate::sched::BlockReason::Recv(crate::sched::ObjRef(ep_obj.0)),
++        )
++        .unwrap();
++        crate::notification::signal(crate::sched::ObjRef(notif_obj.0), 0b110).unwrap();
++        assert_eq!(
++            sched::get(target).unwrap().state,
++            sched::State::Ready,
++            "signal woke the parked thread through the label-8 binding"
++        );
++
++        // Wrong-type caps[0] → EBADARG before any state change (the wake
++        // binding is untouched, not silently cleared).
++        let r = thread_invoke_for_test(pid, tc, bind_msg(8, ep_h));
++        assert_eq!(r.status, ipc::status::EBADARG as i64, "non-Notification");
++        assert_eq!(
++            sched::get(target).unwrap().bound_notification,
++            Some(crate::sched::ObjRef(notif_obj.0))
++        );
++
++        // NULL clears the wake binding only.
++        let c = Message::new(8);
++        let r = thread_invoke_for_test(pid, tc, c);
++        assert_eq!(r.status, ipc::status::OK as i64, "NULL clears");
++        assert_eq!(sched::get(target).unwrap().bound_notification, None);
++        assert_eq!(
++            sched::get(target).unwrap().death_notification,
++            Some(crate::sched::ObjRef(death_obj.0)),
++            "death binding survives the wake-binding clear"
++        );
++
++        // Exit fires the death payload on the death notification only.
++        assert_eq!(syscall::sys_exit(target, 7), Ok(true));
++        let death_mask = crate::notification::pending(crate::sched::ObjRef(death_obj.0)).unwrap();
++        assert_eq!(death_mask & 1, 1, "death event bit");
++        assert_eq!(death_mask >> 32, 7, "exit status in the death payload");
++        let wake_mask = crate::notification::pending(crate::sched::ObjRef(notif_obj.0)).unwrap();
++        assert_eq!(
++            wake_mask, 0b110,
++            "wake word holds only the earlier signal, no death payload"
++        );
++
++        crate::proc::reset_for_test();
++    }
++
+     /// S4: AS::MAP/UNMAP/PROTECT must reject kernel-window, split and null
+     /// ranges with EBADARG — a user PTE must never be installable over the
+     /// shared kernel window (PML4[511]), and a rejected call must allocate
+diff --git a/kernel/src/sched.rs b/kernel/src/sched.rs
+index ad3c20f..63d4426 100644
+--- a/kernel/src/sched.rs
++++ b/kernel/src/sched.rs
+@@ -51,8 +51,14 @@ pub struct Thread {
+     pub process: ObjRef,
+     /// Fault endpoint (ADR-007), if any.
+     pub fault_ep: Option<ObjRef>,
+-    /// Bound notification (syscall-abi §3.1), if any.
++    /// Bound notification (syscall-abi §3.1 select primitive,
++    /// Thread::BIND_NOTIFICATION): a signal on it wakes this thread out of
++    /// a Recv/Send/Reply park, if any.
+     pub bound_notification: Option<ObjRef>,
++    /// Death notification (ADR-031, Thread::BIND_DEATH_NOTIFICATION):
++    /// signalled with the death payload when this thread exits, if any.
++    /// Separate from `bound_notification` so one thread can carry both.
++    pub death_notification: Option<ObjRef>,
+     /// Userspace entry PC (NEW_THREAD w0, ADR-019 §4). SP is arch-owned.
+     pub initial_pc: u64,
+     /// Kernel stack top for this thread (allocated at spawn, M3).
+@@ -98,6 +104,7 @@ impl Thread {
+             process,
+             fault_ep: None,
+             bound_notification: None,
++            death_notification: None,
+             initial_pc: 0,
+             kstack_top: 0,
+             ksp: 0,
+@@ -879,8 +886,9 @@ pub fn set_entry(id: ThreadId, pc: u64) -> SchedResult<()> {
+     Ok(())
+ }
+ 
+-/// Rebind a thread's bound notification (Thread::BIND_DEATH_NOTIFICATION /
+-/// Thread::BIND_NOTIFICATION, syscall-abi §7).
++/// Rebind a thread's wake notification (Thread::BIND_NOTIFICATION,
++/// syscall-abi §3.1/§7): the select primitive — a signal on it wakes the
++/// thread out of a Recv/Send/Reply park.
+ pub fn set_bound_notification(id: ThreadId, n: Option<ObjRef>) -> SchedResult<()> {
+     let mut guard = SCHED.lock();
+     let s = guard.as_mut().ok_or(SchedError::NoSuchThread)?;
+@@ -889,6 +897,16 @@ pub fn set_bound_notification(id: ThreadId, n: Option<ObjRef>) -> SchedResult<()
+     Ok(())
+ }
+ 
++/// Rebind a thread's death notification (Thread::BIND_DEATH_NOTIFICATION,
++/// ADR-031): signalled with the death payload when the thread exits.
++pub fn set_death_notification(id: ThreadId, n: Option<ObjRef>) -> SchedResult<()> {
++    let mut guard = SCHED.lock();
++    let s = guard.as_mut().ok_or(SchedError::NoSuchThread)?;
++    let slot = find_slot(s, id)?;
++    s.slots.threads[slot].as_mut().unwrap().death_notification = n;
++    Ok(())
++}
++
+ /// Rebind a thread's fault endpoint (Thread::BIND_FAULT_EP, ADR-088;
+ /// ADR-007 routing). `None` clears the binding: the next fault takes the
+ /// default path (thread killed, fault.rs §2).
+@@ -912,7 +930,7 @@ pub fn exit(id: ThreadId, status: i32) -> SchedResult<bool> {
+         if matches!(t.state, State::Exited(_)) {
+             return Err(SchedError::NotRunnable);
+         }
+-        (t.priority, t.bound_notification)
++        (t.priority, t.death_notification)
+     };
+     // If queued at its priority level, unlink first.
+     {
+@@ -1400,7 +1418,7 @@ mod tests {
+             let mut guard = SCHED.lock();
+             let s = guard.as_mut().unwrap();
+             let slot = (t.0) as usize;
+-            s.slots.threads[slot].as_mut().unwrap().bound_notification = Some(ObjRef(42));
++            s.slots.threads[slot].as_mut().unwrap().death_notification = Some(ObjRef(42));
+         }
+         assert_eq!(exit(t, 0), Ok(true), "death notification bound");
+         assert!(matches!(get(t).unwrap().state, State::Exited(0)));
+diff --git a/kernel/src/syscall.rs b/kernel/src/syscall.rs
+index a78885f..a02b713 100644
+--- a/kernel/src/syscall.rs
++++ b/kernel/src/syscall.rs
+@@ -716,11 +716,11 @@ pub fn sys_exit(tid: ThreadId, status: i32) -> SysResult<bool> {
+         }
+     }
+     if fired {
+-        // Read the bound notification from the (now Exited) record and signal.
++        // Read the death notification from the (now Exited) record and signal.
+         // Payload convention (v0, consumed by PS's `WAIT` reaper): bit 0 = the
+         // death event, bits 32.. = the raw exit status. OR-ing semantics mean
+         // a later signal cannot clear an earlier event; status 0 keeps bit 0.
+-        if let Some(n) = sched::get(tid).ok().and_then(|t| t.bound_notification) {
++        if let Some(n) = sched::get(tid).ok().and_then(|t| t.death_notification) {
+             let payload = 1 | ((status as u32 as u64) << 32);
+             let _ = notification::signal(n, payload);
+         }
+@@ -1010,7 +1010,7 @@ mod tests {
+             s.slots.threads[server.0 as usize]
+                 .as_mut()
+                 .unwrap()
+-                .bound_notification = Some(n);
++                .death_notification = Some(n);
+         }
+         // Client calls so the server holds a reply target.
+         assert_eq!(sys_call(pid, client, ep_h, msg(1, 1)), Ok(0));
+diff --git a/spec/abi/src/commutativity.rs b/spec/abi/src/commutativity.rs
+index f603895..e14e7b4 100644
+--- a/spec/abi/src/commutativity.rs
++++ b/spec/abi/src/commutativity.rs
+@@ -311,11 +311,18 @@ pub mod invoke_commutativity {
+         notes: "Only affects the target thread",
+     };
+ 
++    /// THREAD_BIND_NOTIFICATION invoke commutativity (syscall-abi §3.1)
++    pub const THREAD_BIND_NOTIFICATION: CommutativitySpec = CommutativitySpec {
++        class: Commutativity::Commutes,
++        resource_extractor: ResourceExtractor::ObjId,
++        notes: "Only affects the target thread's wake-notification binding",
++    };
++
+     /// THREAD_BIND_DEATH_NOTIFICATION invoke commutativity
+     pub const THREAD_BIND_DEATH_NOTIFICATION: CommutativitySpec = CommutativitySpec {
+         class: Commutativity::Commutes,
+         resource_extractor: ResourceExtractor::ObjId,
+-        notes: "Only affects the target thread's notification binding",
++        notes: "Only affects the target thread's death-notification binding",
+     };
+ 
+     /// THREAD_BIND_FAULT_EP invoke commutativity (ADR-088: Thread label 18)
+diff --git a/spec/abi/src/invoke.rs b/spec/abi/src/invoke.rs
+index a579eb7..d64bc6c 100644
+--- a/spec/abi/src/invoke.rs
++++ b/spec/abi/src/invoke.rs
+@@ -312,6 +312,21 @@ pub const THREAD_SET_TLS: InvokeSpec = InvokeSpec {
+     description: "Set the target thread's TLS base (FS register on x86_64). 0 clears it.",
+ };
+ 
++/// THREAD_BIND_NOTIFICATION invoke specification
++pub const THREAD_BIND_NOTIFICATION: InvokeSpec = InvokeSpec {
++    obj_type: ObjType::Thread,
++    label: 8,
++    name: "BIND_NOTIFICATION",
++    required_rights: Rights::CONTROL,
++    args: &[],
++    descriptors: &[
++        ("caps[0]", ObjType::Notification, Rights::SIGNAL), // optional, NULL to clear
++    ],
++    errors: &[ErrorCode::OK, ErrorCode::EBADCAP, ErrorCode::ERIGHTS, ErrorCode::EBADARG, ErrorCode::EBADSTATE, ErrorCode::EREVOKED],
++    commutativity: Commutativity::Commutes,
++    description: "Bind the thread's wake notification (syscall-abi §3.1 select primitive): a signal on it wakes the thread out of a Recv/Send/Reply park, which then completes with OK + NOTIFY + FLAG_NOTIFIED and w0 = the consumed mask. Independent of BIND_DEATH_NOTIFICATION (label 12) — a thread can carry both. caps[0] = Notification or NULL to clear.",
++};
++
+ /// THREAD_BIND_DEATH_NOTIFICATION invoke specification
+ pub const THREAD_BIND_DEATH_NOTIFICATION: InvokeSpec = InvokeSpec {
+     obj_type: ObjType::Thread,
+@@ -324,7 +339,7 @@ pub const THREAD_BIND_DEATH_NOTIFICATION: InvokeSpec = InvokeSpec {
+     ],
+     errors: &[ErrorCode::OK, ErrorCode::EBADCAP, ErrorCode::ERIGHTS, ErrorCode::EBADARG, ErrorCode::EBADSTATE, ErrorCode::EREVOKED],
+     commutativity: Commutativity::Commutes,
+-    description: "Bind a notification to be signalled when the thread exits. caps[0] = Notification or NULL to clear.",
++    description: "Bind a notification to be signalled when the thread exits (ADR-031 death payload: bit 0 = event, bits 32.. = exit status). Independent of BIND_NOTIFICATION (label 8). caps[0] = Notification or NULL to clear.",
+ };
+ 
+ /// THREAD_CREATE invoke specification
+@@ -705,6 +720,8 @@ pub const ALL_SPECS: &[InvokeSpec] = &[
+     THREAD_EXIT,
+     THREAD_KILL,
+     THREAD_SUSPEND,
++    THREAD_BIND_NOTIFICATION,
++    THREAD_BIND_DEATH_NOTIFICATION,
+     THREAD_RESUME,
+     THREAD_SET_PRIORITY,
+     THREAD_SET_TLS,
+@@ -748,6 +765,14 @@ pub const SPEC_BY_TYPE_AND_LABEL: &[((ObjType, u16), &InvokeSpec)] = &[
+     ((ObjType::Thread, THREAD_EXIT.label), &THREAD_EXIT),
+     ((ObjType::Thread, THREAD_KILL.label), &THREAD_KILL),
+     ((ObjType::Thread, THREAD_SUSPEND.label), &THREAD_SUSPEND),
++    (
++        (ObjType::Thread, THREAD_BIND_NOTIFICATION.label),
++        &THREAD_BIND_NOTIFICATION,
++    ),
++    (
++        (ObjType::Thread, THREAD_BIND_DEATH_NOTIFICATION.label),
++        &THREAD_BIND_DEATH_NOTIFICATION,
++    ),
+     ((ObjType::Thread, THREAD_RESUME.label), &THREAD_RESUME),
+     (
+         (ObjType::Thread, THREAD_SET_PRIORITY.label),
