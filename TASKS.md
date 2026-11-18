@@ -80,7 +80,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 ## M1: Implementation (object model v2, PLAN.md section 9)
 
 - [x NV done 2026-11-18 76bd030] M1 HAL: expose usable physical memory regions from x86_64 HAL (root Untyped backing); kernel-boot wiring requested from GLM.
-- [ ] NV: M1 bench tracking for FACTORY_RETYPE/FACTORY_NEW_CNODE/CAP_MOVE/CAP_REVOKE (blocked on GLM M1 object model).
+- [~ NV started 2026-11-18] NV: M1 bench tracking for FACTORY_RETYPE/FACTORY_NEW_CNODE/CAP_MOVE/CAP_REVOKE (blocked on GLM M1 object model).
 - [ ] NV: M1 tools/verify.sh: wire Verus/Kani for changed crates (blocked: not installed in sandbox).
 - [ ] GLM: M1 Untyped object + Retype/Revoke (RFC-0001 / ADR-064).
 - [ ] GLM: M1 CNode + caller-chosen slots + derivation tree + badges.
