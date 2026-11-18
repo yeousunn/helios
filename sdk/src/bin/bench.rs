@@ -619,19 +619,181 @@ fn bench_context_switch_same_as(
 }
 
 /// Benchmark: context switch between threads in different address spaces.
-// TEMPORARILY DISABLED: kernel NEW_THREAD doesn't schedule diff-AS child thread.
-// Request filed to GLM to fix kernel-side scheduling. Returns Ok without measuring.
+/// Uses FORK to create a child AS, then NEW_THREAD to spawn a thread in it.
+/// The child thread receives endpoint capabilities via the bootstrap EP and ping-pongs
+/// with a thread in the parent AS.
 fn bench_context_switch_diff_as(
-    _raw: &mut X86_64Syscalls,
+    raw: &mut X86_64Syscalls,
     debug_ep: Handle,
-    _factory: Handle,
-    _self_as: Handle,
-    _self_thread: Handle,
-    _region: Handle,
+    factory: Handle,
+    self_as: Handle,
+    self_thread: Handle,
+    region: Handle,
 ) -> Result<()> {
-    let mut sys = Syscalls::new(_raw);
-    mark(&mut sys, debug_ep, 0xF1, 0); // debug: skipped
-                                       // TODO: re-enable when kernel fixes NEW_THREAD diff-AS scheduling (GLM Request)
+    let mut sys = Syscalls::new(raw);
+    mark(&mut sys, debug_ep, 0xF4, 1); // debug: context_switch_diff_as start
+
+    // Create endpoints in the parent AS: ep1 (for diff-AS thread), ep2 (for parent-AS thread), done_ep.
+    let ep1 = {
+        let reply = sys
+            .invoke(factory, &Message::new(methods::factory::NEW_ENDPOINT))
+            .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
+        reply.words[0] as Handle
+    };
+    let ep2 = {
+        let reply = sys
+            .invoke(factory, &Message::new(methods::factory::NEW_ENDPOINT))
+            .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
+        reply.words[0] as Handle
+    };
+    let done_ep = {
+        let reply = sys
+            .invoke(factory, &Message::new(methods::factory::NEW_ENDPOINT))
+            .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
+        reply.words[0] as Handle
+    };
+    mark(&mut sys, debug_ep, 0xF4, 2); // debug: after mint_ep
+
+    // Create bootstrap endpoint for the diff-AS thread (in parent AS).
+    let bootstrap_ep = {
+        let reply = sys
+            .invoke(factory, &Message::new(methods::factory::NEW_ENDPOINT))
+            .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
+        reply.words[0] as Handle
+    };
+    mark(&mut sys, debug_ep, 0xF4, 3); // debug: after mint bootstrap_ep
+
+    // FORK self_as -> as2 (child AS). Reply w0 = child AS cap with MAP|GRANT.
+    let fork_msg = Message::new(methods::aspace::FORK);
+    let fork_reply = sys
+        .invoke(self_as, &fork_msg)
+        .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
+    let as2 = fork_reply.words[0] as Handle;
+    if as2 == 0 {
+        return Err(fail_code(STEP_SETUP, 0xEA));
+    }
+    mark(&mut sys, debug_ep, 0xF4, 4); // debug: after FORK
+
+    // Carve a stack for the diff-AS thread in as2.
+    let (stack_top, _frame_handle, _stack_base) = carve_stack(&mut sys, region, as2)?;
+    mark(&mut sys, debug_ep, 0xF4, 5); // debug: after carve_stack
+
+    // NEW_THREAD in as2 with cap_count=2:
+    // caps[0] = as2 (MAP|GRANT), caps[1] = bootstrap_ep (RECV -> child handle 1)
+    let mut new_thread_msg = Message::new(methods::factory::NEW_THREAD);
+    new_thread_msg.tag = new_thread_msg.tag.with_caps(2);
+    new_thread_msg.words[0] = thread_entry_new_thread_diff_as_done as *const () as u64;
+    new_thread_msg.words[1] = stack_top;
+    let _ = new_thread_msg.set_descriptor(0, CapSlot::pack(as2, Rights::MAP.union(Rights::GRANT)));
+    let _ = new_thread_msg.set_descriptor(1, CapSlot::pack(bootstrap_ep, Rights::RECV));
+
+    let nt_reply = sys
+        .invoke(factory, &new_thread_msg)
+        .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
+    let diff_thread = nt_reply.words[0] as Handle;
+    if diff_thread == 0 {
+        return Err(fail_code(STEP_SETUP, 0xEB));
+    }
+    mark(&mut sys, debug_ep, 0xF4, 6); // debug: after NEW_THREAD
+
+    // Spawn parent-AS thread using THREAD_CREATE on self_thread.
+    THREAD_ENTRY_EP.store(ep2, Ordering::SeqCst);
+    THREAD_ENTRY_EP_OTHER.store(done_ep, Ordering::SeqCst);
+    let parent_entry = thread_entry_ping_pong_done as *const () as u64;
+    let (parent_thread, _parent_frame, _parent_stack) =
+        spawn_thread_same_as(&mut sys, self_thread, self_as, region, parent_entry)?;
+    mark(&mut sys, debug_ep, 0xF4, 7); // debug: after spawn parent thread
+
+    // Bind death notifications for cleanup.
+    let death1 = {
+        let reply = sys
+            .invoke(factory, &Message::new(methods::factory::NEW_NOTIFICATION))
+            .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
+        reply.words[0] as Handle
+    };
+    let death2 = {
+        let reply = sys
+            .invoke(factory, &Message::new(methods::factory::NEW_NOTIFICATION))
+            .map_err(|e| fail_code(STEP_SETUP, e as u64))?;
+        reply.words[0] as Handle
+    };
+    mark(&mut sys, debug_ep, 0xF4, 8); // debug: after mint death notifications
+    sys.invoke(
+        diff_thread,
+        &msg_with_cap(
+            methods::thread::BIND_DEATH_NOTIFICATION,
+            death1,
+            Rights::SIGNAL,
+        ),
+    )
+    .map_err(err_to_u64)?;
+    sys.invoke(
+        parent_thread,
+        &msg_with_cap(
+            methods::thread::BIND_DEATH_NOTIFICATION,
+            death2,
+            Rights::SIGNAL,
+        ),
+    )
+    .map_err(err_to_u64)?;
+    mark(&mut sys, debug_ep, 0xF4, 9); // debug: after BIND_DEATH_NOTIFICATION
+
+    // Send endpoint capabilities to the diff-AS thread via bootstrap_ep.
+    // Message carries ep1, ep2, done_ep as descriptors 0, 1, 2.
+    let mut setup_msg = Message::new(0);
+    setup_msg.tag = setup_msg.tag.with_caps(3);
+    let _ = setup_msg.set_descriptor(
+        0,
+        CapSlot::pack(ep1, Rights::SEND.union(Rights::RECV).union(Rights::GRANT)),
+    );
+    let _ = setup_msg.set_descriptor(
+        1,
+        CapSlot::pack(ep2, Rights::SEND.union(Rights::RECV).union(Rights::GRANT)),
+    );
+    let _ = setup_msg.set_descriptor(
+        2,
+        CapSlot::pack(
+            done_ep,
+            Rights::SEND.union(Rights::RECV).union(Rights::GRANT),
+        ),
+    );
+    sys.send(bootstrap_ep, &setup_msg).map_err(err_to_u64)?;
+    mark(&mut sys, debug_ep, 0xF4, 0xA); // debug: after sending capabilities
+
+    // Yield to let both threads start and park on their receive endpoints.
+    sys.yield_now().map_err(err_to_u64)?;
+    sys.yield_now().map_err(err_to_u64)?;
+    mark(&mut sys, debug_ep, 0xF4, 0xB); // debug: after yield
+
+    // Warmup: one full ping-pong (ep1 -> diff_thread -> ep2 -> parent_thread -> done_ep).
+    let m = Message::new(0x1003);
+    sys.send(ep1, &m).map_err(err_to_u64)?;
+    let _ = sys.recv(done_ep).map_err(err_to_u64)?;
+    mark(&mut sys, debug_ep, 0xF4, 0xC); // debug: warmup done
+
+    // Measure: MEASURE_ITERS ping-pongs.
+    let start = rdtsc();
+    for _ in 0..MEASURE_ITERS {
+        sys.send(ep1, &m).map_err(err_to_u64)?;
+        let _ = sys.recv(done_ep).map_err(err_to_u64)?;
+    }
+    let end = rdtsc();
+    mark(&mut sys, debug_ep, 0xF4, 0xD); // debug: measure done
+
+    let cycles_per_iter = (end - start) / MEASURE_ITERS;
+    mark_bench(
+        &mut sys,
+        debug_ep,
+        "context_switch_diff_as",
+        cycles_per_iter,
+    );
+
+    // Cleanup.
+    let _ = sys.invoke(diff_thread, &Message::new(methods::thread::KILL));
+    let _ = sys.cap_revoke_simple(diff_thread, 1);
+    let _ = sys.invoke(parent_thread, &Message::new(methods::thread::KILL));
+    let _ = sys.cap_revoke_simple(parent_thread, 1);
+
     Ok(())
 }
 
@@ -836,14 +998,59 @@ fn thread_entry_new_thread_ping_pong_done() -> ! {
     }
 }
 
-/// Thread entry point for NEW_THREAD children in diff_as benchmark (disabled).
-/// Kept for reference when kernel-side scheduling is fixed.
+/// Thread entry point for NEW_THREAD children in diff_as benchmark.
+/// Receives endpoint capabilities on bootstrap EP (handle 1), then ping-pongs.
+/// Expected message on bootstrap EP: two capability descriptors for ep1 and ep2.
 #[allow(dead_code)]
 fn thread_entry_new_thread_diff_as() -> ! {
     let mut raw = X86_64Syscalls;
     let mut sys = Syscalls::new(&mut raw);
+    // Bootstrap endpoint is at handle 1 (first cap from NEW_THREAD).
+    let bootstrap_ep = 1;
+
+    // First message on bootstrap EP carries ep1 and ep2 capabilities.
+    let first_msg = sys.recv(bootstrap_ep).unwrap_or_else(|_| Message::new(0));
+    let ep1 = first_msg.descriptor(0).map(|d| d.handle()).unwrap_or(0);
+    let ep2 = first_msg.descriptor(1).map(|d| d.handle()).unwrap_or(0);
+
+    if ep1 == 0 || ep2 == 0 {
+        loop {
+            let _ = sys.yield_now();
+        }
+    }
+
+    let ping_msg = Message::new(0);
     loop {
-        let _ = sys.yield_now();
+        let _ = sys.recv(ep1);
+        let _ = sys.send(ep2, &ping_msg);
+    }
+}
+
+/// Thread entry point for NEW_THREAD children in diff_as benchmark with done signal.
+/// Receives endpoint capabilities on bootstrap EP (handle 1), then ping-pongs and signals done.
+/// Expected message on bootstrap EP: three capability descriptors for ep1, ep2, and done_ep.
+#[allow(dead_code)]
+fn thread_entry_new_thread_diff_as_done() -> ! {
+    let mut raw = X86_64Syscalls;
+    let mut sys = Syscalls::new(&mut raw);
+    let bootstrap_ep = 1;
+
+    let first_msg = sys.recv(bootstrap_ep).unwrap_or_else(|_| Message::new(0));
+    let ep1 = first_msg.descriptor(0).map(|d| d.handle()).unwrap_or(0);
+    let ep2 = first_msg.descriptor(1).map(|d| d.handle()).unwrap_or(0);
+    let done_ep = first_msg.descriptor(2).map(|d| d.handle()).unwrap_or(0);
+
+    if ep1 == 0 || ep2 == 0 || done_ep == 0 {
+        loop {
+            let _ = sys.yield_now();
+        }
+    }
+
+    let ping_msg = Message::new(0);
+    loop {
+        let _ = sys.recv(ep1);
+        let _ = sys.send(ep2, &ping_msg);
+        let _ = sys.send(done_ep, &ping_msg);
     }
 }
 
