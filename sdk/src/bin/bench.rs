@@ -51,6 +51,7 @@ type Result<T> = core::result::Result<T, u64>;
 /// Minimal bench configuration.
 const WARMUP_ITERS: u64 = 10;
 const MEASURE_ITERS: u64 = 1000;
+const MEASURE_BATCHES: u64 = 10;
 const BENCH_HEAP_CHUNKS: u64 = 2;
 
 /// Stack size for bench threads (64 KiB = 16 pages).
@@ -337,18 +338,24 @@ fn bench_call_reply(
 
     mark(&mut sys, debug_ep, 0xF0, 5); // debug: call_reply warmup done
 
-    // Measure.
-    let start = rdtsc();
-    for _ in 0..MEASURE_ITERS {
-        let m = Message::new(0x1000);
-        let _ = sys.call(server_ep, &m).map_err(err_to_u64)?;
+    // Measure: run multiple batches, keep the minimum batch average.
+    let mut best_cycles_per_iter = u64::MAX;
+    for _batch in 0..MEASURE_BATCHES {
+        let start = rdtsc();
+        for _ in 0..MEASURE_ITERS {
+            let m = Message::new(0x1000);
+            let _ = sys.call(server_ep, &m).map_err(err_to_u64)?;
+        }
+        let end = rdtsc();
+        let cycles_per_iter = (end - start) / MEASURE_ITERS;
+        if cycles_per_iter < best_cycles_per_iter {
+            best_cycles_per_iter = cycles_per_iter;
+        }
     }
-    let end = rdtsc();
 
     mark(&mut sys, debug_ep, 0xF0, 6); // debug: call_reply measure done
 
-    let cycles_per_iter = (end - start) / MEASURE_ITERS;
-    mark_bench(&mut sys, debug_ep, "call_reply", cycles_per_iter);
+    mark_bench(&mut sys, debug_ep, "call_reply", best_cycles_per_iter);
 
     // Cleanup: kill server thread.
     let _ = sys.invoke(server_thread, &Message::new(methods::thread::KILL));
@@ -375,17 +382,23 @@ fn bench_send_recv(raw: &mut X86_64Syscalls, debug_ep: Handle, factory: Handle) 
         let _ = sys.recv(ep).map_err(err_to_u64)?;
     }
 
-    // Measure send+recv in same thread (lower bound).
-    let start = rdtsc();
-    for _ in 0..MEASURE_ITERS {
-        let m = Message::new(0x1001);
-        sys.send(ep, &m).map_err(err_to_u64)?;
-        let _ = sys.recv(ep).map_err(err_to_u64)?;
+    // Measure: run multiple batches, keep the minimum batch average.
+    let mut best_cycles_per_iter = u64::MAX;
+    for _batch in 0..MEASURE_BATCHES {
+        let start = rdtsc();
+        for _ in 0..MEASURE_ITERS {
+            let m = Message::new(0x1001);
+            sys.send(ep, &m).map_err(err_to_u64)?;
+            let _ = sys.recv(ep).map_err(err_to_u64)?;
+        }
+        let end = rdtsc();
+        let cycles_per_iter = (end - start) / MEASURE_ITERS;
+        if cycles_per_iter < best_cycles_per_iter {
+            best_cycles_per_iter = cycles_per_iter;
+        }
     }
-    let end = rdtsc();
 
-    let cycles_per_iter = (end - start) / MEASURE_ITERS;
-    mark_bench(&mut sys, debug_ep, "send_recv", cycles_per_iter);
+    mark_bench(&mut sys, debug_ep, "send_recv", best_cycles_per_iter);
 
     Ok(())
 }
@@ -469,19 +482,30 @@ fn bench_notification_wake(
     }
     mark(&mut sys, debug_ep, 0xF2, 9); // debug: warmup done
 
-    // Measure signal-to-wake (signal + waiter unblocks).
-    let start = rdtsc();
-    for _ in 0..MEASURE_ITERS {
-        let mut m = Message::new(methods::notification::SIGNAL);
-        m.words[0] = 1;
-        sys.invoke(notif, &m).map_err(err_to_u64)?;
-        sys.yield_now().map_err(err_to_u64)?; // let waiter run and re-block
+    // Measure: run multiple batches, keep the minimum batch average.
+    let mut best_cycles_per_iter = u64::MAX;
+    for _batch in 0..MEASURE_BATCHES {
+        let start = rdtsc();
+        for _ in 0..MEASURE_ITERS {
+            let mut m = Message::new(methods::notification::SIGNAL);
+            m.words[0] = 1;
+            sys.invoke(notif, &m).map_err(err_to_u64)?;
+            sys.yield_now().map_err(err_to_u64)?; // let waiter run and re-block
+        }
+        let end = rdtsc();
+        let cycles_per_iter = (end - start) / MEASURE_ITERS;
+        if cycles_per_iter < best_cycles_per_iter {
+            best_cycles_per_iter = cycles_per_iter;
+        }
     }
-    let end = rdtsc();
     mark(&mut sys, debug_ep, 0xA, 0); // debug: measure done
 
-    let cycles_per_iter = (end - start) / MEASURE_ITERS;
-    mark_bench(&mut sys, debug_ep, "notification_wake", cycles_per_iter);
+    mark_bench(
+        &mut sys,
+        debug_ep,
+        "notification_wake",
+        best_cycles_per_iter,
+    );
 
     // Cleanup.
     let _ = sys.invoke(waiter_thread, &Message::new(methods::thread::KILL));
@@ -592,21 +616,27 @@ fn bench_context_switch_same_as(
     let _ = sys.recv(done_ep).map_err(err_to_u64)?;
     mark(&mut sys, debug_ep, 0xF3, 6); // debug: warmup done
 
-    // Measure: MEASURE_ITERS ping-pongs.
-    let start = rdtsc();
-    for _ in 0..MEASURE_ITERS {
-        sys.send(ep1, &m).map_err(err_to_u64)?;
-        let _ = sys.recv(done_ep).map_err(err_to_u64)?;
+    // Measure: run multiple batches, keep the minimum batch average.
+    let mut best_cycles_per_iter = u64::MAX;
+    for _batch in 0..MEASURE_BATCHES {
+        let start = rdtsc();
+        for _ in 0..MEASURE_ITERS {
+            sys.send(ep1, &m).map_err(err_to_u64)?;
+            let _ = sys.recv(done_ep).map_err(err_to_u64)?;
+        }
+        let end = rdtsc();
+        let cycles_per_iter = (end - start) / MEASURE_ITERS;
+        if cycles_per_iter < best_cycles_per_iter {
+            best_cycles_per_iter = cycles_per_iter;
+        }
     }
-    let end = rdtsc();
     mark(&mut sys, debug_ep, 0xF3, 7); // debug: measure done
 
-    let cycles_per_iter = (end - start) / MEASURE_ITERS;
     mark_bench(
         &mut sys,
         debug_ep,
         "context_switch_same_as",
-        cycles_per_iter,
+        best_cycles_per_iter,
     );
 
     // Cleanup.
@@ -771,21 +801,27 @@ fn bench_context_switch_diff_as(
     let _ = sys.recv(done_ep).map_err(err_to_u64)?;
     mark(&mut sys, debug_ep, 0xF4, 0xC); // debug: warmup done
 
-    // Measure: MEASURE_ITERS ping-pongs.
-    let start = rdtsc();
-    for _ in 0..MEASURE_ITERS {
-        sys.send(ep1, &m).map_err(err_to_u64)?;
-        let _ = sys.recv(done_ep).map_err(err_to_u64)?;
+    // Measure: run multiple batches, keep the minimum batch average.
+    let mut best_cycles_per_iter = u64::MAX;
+    for _batch in 0..MEASURE_BATCHES {
+        let start = rdtsc();
+        for _ in 0..MEASURE_ITERS {
+            sys.send(ep1, &m).map_err(err_to_u64)?;
+            let _ = sys.recv(done_ep).map_err(err_to_u64)?;
+        }
+        let end = rdtsc();
+        let cycles_per_iter = (end - start) / MEASURE_ITERS;
+        if cycles_per_iter < best_cycles_per_iter {
+            best_cycles_per_iter = cycles_per_iter;
+        }
     }
-    let end = rdtsc();
     mark(&mut sys, debug_ep, 0xF4, 0xD); // debug: measure done
 
-    let cycles_per_iter = (end - start) / MEASURE_ITERS;
     mark_bench(
         &mut sys,
         debug_ep,
         "context_switch_diff_as",
-        cycles_per_iter,
+        best_cycles_per_iter,
     );
 
     // Cleanup.
@@ -843,9 +879,35 @@ fn bench_map_unmap_4k(
         sys.invoke(self_as, &um).map_err(err_to_u64)?;
     }
 
-    // Measure MAP: map, unmap (unmap not measured).
-    let start = rdtsc();
-    for _ in 0..MEASURE_ITERS {
+    // Measure MAP: run multiple batches, keep the minimum batch average.
+    let mut best_map_cycles = u64::MAX;
+    for _batch in 0..MEASURE_BATCHES {
+        let start = rdtsc();
+        for _ in 0..MEASURE_ITERS {
+            let mut m = Message::new(methods::aspace::MAP);
+            m.words[0] = MAP_VA;
+            m.words[1] = u64::from(map_flags_val);
+            m.tag = m.tag.with_caps(1);
+            let _ = m.set_descriptor(0, CapSlot::pack(frame, Rights::MAP));
+            sys.invoke(self_as, &m).map_err(err_to_u64)?;
+
+            let mut um = Message::new(methods::aspace::UNMAP);
+            um.words[0] = MAP_VA;
+            um.words[1] = 1;
+            sys.invoke(self_as, &um).map_err(err_to_u64)?;
+        }
+        let end = rdtsc();
+        let map_cycles = (end - start) / MEASURE_ITERS;
+        if map_cycles < best_map_cycles {
+            best_map_cycles = map_cycles;
+        }
+    }
+    mark_bench(&mut sys, debug_ep, "map_4k", best_map_cycles);
+
+    // Measure UNMAP: run multiple batches, keep the minimum batch average.
+    let mut best_unmap_cycles = u64::MAX;
+    for _batch in 0..MEASURE_BATCHES {
+        // Map once for this batch.
         let mut m = Message::new(methods::aspace::MAP);
         m.words[0] = MAP_VA;
         m.words[1] = u64::from(map_flags_val);
@@ -853,41 +915,28 @@ fn bench_map_unmap_4k(
         let _ = m.set_descriptor(0, CapSlot::pack(frame, Rights::MAP));
         sys.invoke(self_as, &m).map_err(err_to_u64)?;
 
-        let mut um = Message::new(methods::aspace::UNMAP);
-        um.words[0] = MAP_VA;
-        um.words[1] = 1;
-        sys.invoke(self_as, &um).map_err(err_to_u64)?;
+        let start = rdtsc();
+        for _ in 0..MEASURE_ITERS {
+            let mut um = Message::new(methods::aspace::UNMAP);
+            um.words[0] = MAP_VA;
+            um.words[1] = 1;
+            sys.invoke(self_as, &um).map_err(err_to_u64)?;
+
+            // Re-map for next iteration (not measured).
+            let mut m = Message::new(methods::aspace::MAP);
+            m.words[0] = MAP_VA;
+            m.words[1] = u64::from(map_flags_val);
+            m.tag = m.tag.with_caps(1);
+            let _ = m.set_descriptor(0, CapSlot::pack(frame, Rights::MAP));
+            sys.invoke(self_as, &m).map_err(err_to_u64)?;
+        }
+        let end = rdtsc();
+        let unmap_cycles = (end - start) / MEASURE_ITERS;
+        if unmap_cycles < best_unmap_cycles {
+            best_unmap_cycles = unmap_cycles;
+        }
     }
-    let end = rdtsc();
-    let map_cycles = (end - start) / MEASURE_ITERS;
-    mark_bench(&mut sys, debug_ep, "map_4k", map_cycles);
-
-    // Measure UNMAP: map once, then unmap in loop (re-map not measured).
-    let mut m = Message::new(methods::aspace::MAP);
-    m.words[0] = MAP_VA;
-    m.words[1] = u64::from(map_flags_val);
-    m.tag = m.tag.with_caps(1);
-    let _ = m.set_descriptor(0, CapSlot::pack(frame, Rights::MAP));
-    sys.invoke(self_as, &m).map_err(err_to_u64)?;
-
-    let start = rdtsc();
-    for _ in 0..MEASURE_ITERS {
-        let mut um = Message::new(methods::aspace::UNMAP);
-        um.words[0] = MAP_VA;
-        um.words[1] = 1;
-        sys.invoke(self_as, &um).map_err(err_to_u64)?;
-
-        // Re-map for next iteration (not measured).
-        let mut m = Message::new(methods::aspace::MAP);
-        m.words[0] = MAP_VA;
-        m.words[1] = u64::from(map_flags_val);
-        m.tag = m.tag.with_caps(1);
-        let _ = m.set_descriptor(0, CapSlot::pack(frame, Rights::MAP));
-        sys.invoke(self_as, &m).map_err(err_to_u64)?;
-    }
-    let end = rdtsc();
-    let unmap_cycles = (end - start) / MEASURE_ITERS;
-    mark_bench(&mut sys, debug_ep, "unmap_4k", unmap_cycles);
+    mark_bench(&mut sys, debug_ep, "unmap_4k", best_unmap_cycles);
 
     // Final cleanup.
     let mut um = Message::new(methods::aspace::UNMAP);
