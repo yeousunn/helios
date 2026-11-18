@@ -956,11 +956,7 @@ fn bench_map_unmap_4k(
 /// Benchmark: FACTORY_RETYPE invoke latency.
 /// Measures the latency of retyping an Untyped capability into a concrete object.
 /// Currently returns ENOSYS until M1 kernel implementation lands (RFC-0001/ADR-064).
-fn bench_factory_retype(
-    raw: &mut X86_64Syscalls,
-    debug_ep: Handle,
-    factory: Handle,
-) -> Result<()> {
+fn bench_factory_retype(raw: &mut X86_64Syscalls, debug_ep: Handle, factory: Handle) -> Result<()> {
     let mut sys = Syscalls::new(raw);
     mark(&mut sys, debug_ep, 0xF5, 1); // debug: factory_retype start
 
