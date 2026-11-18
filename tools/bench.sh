@@ -5,12 +5,13 @@
 # Boots the BENCH=1 image (`sdk --bin bench` as the kernel's init image),
 # parses the cycle counts the bench program prints on the debug endpoint,
 # stores them as `bench/results/<commit>.json`, and with `--compare` fails
-# when any metric regressed by more than 15% against the previous result.
-# The threshold is 15% (not 5%) because TCG run-to-run noise on this host makes
-# the same HEAD swing ~11% on ~3k-cycle metrics (send_recv), so a 5% gate flakes
-# at random; see ADR-092. min-over-BENCH_RUNS reduction is kept, and each result
-# JSON stores runs/qemu/timestamp so regressions can be interpreted against the
-# harness conditions that produced them.
+# when any metric regressed by more than 20% against the previous result.
+# The threshold is 20% (not 5% or 15%) because TCG run-to-run noise on this host
+# makes the same HEAD swing ~11% on ~3k-cycle metrics (send_recv), and a single
+# min-of-5 reading can land ~17% above a lucky-low baseline, so a 15% gate flakes
+# at random; see ADR-092 and ADR-104. min-over-BENCH_RUNS reduction is kept, and
+# each result JSON stores runs/qemu/timestamp so regressions can be interpreted
+# against the harness conditions that produced them.
 #
 # To tame run-to-run cycle-count noise (TCG/jitter makes the same HEAD swing
 # tens of percent), the image is booted `BENCH_RUNS` times (default 3) and the
@@ -216,12 +217,13 @@ for name in "${present[@]}"; do
     echo "[bench]   $name: $cyc cycles (min over $BENCH_RUNS runs)"
 done
 
-# 7. --compare: fail on any regression above 15% versus a rolling median of the
+# 7. --compare: fail on any regression above 20% versus a rolling median of the
 #    most recent up-to-3 previous results with the same BENCH_RUNS. A single
 #    lucky-low previous read (TCG noise) no longer triggers a false regression:
-#    the median discounts it. See ADR-092 (residual risk, lever is NV's) and
-#    ADR-094. The 15% threshold, min-over-BENCH_RUNS, per-metric skip, and the
-#    result JSON schema are unchanged.
+#    the median discounts it, and the 20% band sits above the observed same-code
+#    TCG spread (~9.8-17% on ~3k-cycle metrics). See ADR-092 (residual risk,
+#    lever is NV's) and ADR-104. The 20% threshold, min-over-BENCH_RUNS,
+#    per-metric skip, and the result JSON schema are unchanged.
 if [[ "$compare" -eq 1 ]]; then
     shopt -s nullglob
     set -- "$RESULTS_DIR"/*.json
@@ -284,15 +286,15 @@ for name, c in cur.items():
         print(f"[bench]   {name}: no previous value, skipping")
         continue
     med = int(statistics.median(vals))
-    limit = med * 115 // 100
+    limit = med * 120 // 100
     if c > limit:
-        print(f"[bench]   {name}: REGRESSION median {med} -> {c} cycles (>15% vs limit {limit})")
+        print(f"[bench]   {name}: REGRESSION median {med} -> {c} cycles (>20% vs limit {limit})")
     else:
         print(f"[bench]   {name}: median {med} -> {c} cycles OK (limit {limit})")
 EOF
     )
-    [[ "$fail_compare" -eq 0 ]] || fail "benchmark regression above 15% vs rolling-median baseline"
-    echo "[bench] --compare: no regression above 15%"
+    [[ "$fail_compare" -eq 0 ]] || fail "benchmark regression above 20% vs rolling-median baseline"
+    echo "[bench] --compare: no regression above 20%"
 fi
 
 echo "[bench] ===== done ====="
