@@ -18,6 +18,30 @@ fn eng() -> spin::MutexGuard<'static, Option<Engine>> {
     ENGINE.lock()
 }
 
+/// M1 Retype charge for target Notification (ADR-103 §4): the engine's
+/// per-slot share (one `word` entry + one `used` flag). FACTORY_RETYPE's
+/// w1 must pass exactly this for target Notification (spec/abi: fixed
+/// sizes are kernel constants); the retype tests pin it.
+pub const RETYPE_SLOT_BYTES: u64 = (core::mem::size_of::<Engine>() / MAX_NOTIFICATIONS) as u64;
+
+/// Destroy a notification object (Retype rollback, ADR-103 §3: an install
+/// failure must leave no kernel state behind). Owner-death cleanup keeps
+/// notification slots today — a pre-existing leak tracked in ADR-103's
+/// Consequences.
+pub fn destroy(n: ObjRef) -> Result<(), crate::endpoint::IpcError> {
+    let mut e = eng();
+    let engine = e
+        .as_mut()
+        .ok_or(crate::endpoint::IpcError::NoSuchEndpoint)?;
+    let slot = slot_of(n).ok_or(crate::endpoint::IpcError::NoSuchEndpoint)?;
+    if !engine.used[slot] {
+        return Err(crate::endpoint::IpcError::NoSuchEndpoint);
+    }
+    engine.used[slot] = false;
+    engine.word[slot] = 0;
+    Ok(())
+}
+
 /// Create a notification object; returns its ObjRef.
 pub fn create() -> Result<ObjRef, crate::endpoint::IpcError> {
     let mut e = eng();

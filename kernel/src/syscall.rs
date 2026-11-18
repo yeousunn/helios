@@ -741,6 +741,11 @@ pub fn sys_exit(tid: ThreadId, status: i32) -> SysResult<bool> {
                     crate::kinfo!("ASDESTROY: as={} retired for pid={}", obj.0, pid.0);
                     let _ = crate::aspace::destroy(obj);
                 }
+                // M1 (ADR-103): a dead principal stops paying — free the
+                // Untyped table slot so the id space and accounting reset.
+                ObjType::Untyped => {
+                    crate::untyped::destroy(obj);
+                }
                 _ => {}
             }
         }

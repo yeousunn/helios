@@ -892,6 +892,7 @@ fn factory_invoke(
     const NEW_NOTIFICATION: u16 = 2;
     const NEW_ADDRESS_SPACE: u16 = 3;
     const NEW_THREAD: u16 = 4;
+    const RETYPE: u16 = 5;
 
     let msg = args.message();
     match msg.tag.label() {
@@ -941,7 +942,146 @@ fn factory_invoke(
             }
         }
         NEW_THREAD => new_thread(pid, cap, &msg),
+        RETYPE => retype(pid, cap, &msg),
         _ => SyscallReturn::err(ipc::status::ENOSYS),
+    }
+}
+
+/// Factory::RETYPE (label 5; RFC-0001 §4.1.2 as corrected by ADR-088/
+/// RFC-0005 §3, kernel side per ADR-103): carve a new object out of the
+/// caller's Untyped. cap_count exactly 1; caps[0] = the source Untyped
+/// (MAP required, live, right type); w0 = target type (spec discriminant,
+/// M1 target set), w1 = size (fixed-size types: exactly the kernel
+/// charge), w2 = alignment order (0 = natural, else 12..=47 dividing
+/// size). All-or-nothing: the source is charged only after the object
+/// exists and the new cap is installed — every rejection burns nothing.
+/// M1a1 implements the fixed-size targets (Endpoint, Notification); the
+/// other in-set targets answer ENOSYS with the source untouched (the
+/// AS_FORK precedent; ENOSYS is in the spec's error set). Reply w0 = the
+/// first-free handle, w1 = the remaining source size.
+fn retype(pid: ProcessId, cap: &Capability, msg: &Message) -> SyscallReturn {
+    if !cap.rights.contains(Rights::GRANT) {
+        return SyscallReturn::err(ipc::status::ERIGHTS);
+    }
+    if msg.tag.cap_count() != 1 {
+        return SyscallReturn::err(ipc::status::EBADARG);
+    }
+    let Some(cs) = msg.descriptor(0) else {
+        return SyscallReturn::err(ipc::status::EBADARG);
+    };
+    if cs.handle() == 0 {
+        return SyscallReturn::err(ipc::status::EBADARG);
+    }
+    let src = match proc::get_cap(pid, cs.handle()) {
+        Ok(c) => c,
+        Err(_) => return SyscallReturn::err(ipc::status::EBADCAP),
+    };
+    if src.typ != ObjType::Untyped {
+        // Wrong type = the S8 descriptor convention (EBADARG); dead or
+        // foreign = EBADCAP, per the spec description.
+        return SyscallReturn::err(ipc::status::EBADARG);
+    }
+    if !crate::objreg::is_alive(src.obj) {
+        return SyscallReturn::err(ipc::status::EBADCAP);
+    }
+    if !src.rights.contains(Rights::MAP) {
+        return SyscallReturn::err(ipc::status::ERIGHTS);
+    }
+
+    let (target, size, align) = (msg.words[0], msg.words[1], msg.words[2]);
+    if !crate::untyped::M1_TARGET_SET.contains(&target) {
+        return SyscallReturn::err(ipc::status::EBADARG);
+    }
+    // Fixed-size implemented targets: the charge is the engine slot bytes
+    // (ADR-103 §4). Everything else in the set is ENOSYS until its M1
+    // slice lands.
+    let (typ, charge) = match target {
+        t if t == ObjType::Endpoint as u64 => {
+            (ObjType::Endpoint, crate::endpoint::RETYPE_SLOT_BYTES)
+        }
+        t if t == ObjType::Notification as u64 => (
+            ObjType::Notification,
+            crate::notification::RETYPE_SLOT_BYTES,
+        ),
+        _ => return SyscallReturn::err(ipc::status::ENOSYS),
+    };
+    if size != charge {
+        return SyscallReturn::err(ipc::status::EBADARG);
+    }
+    // 0 = natural alignment; else 12..=47 AND a size multiple. The range
+    // check precedes the shift, so `1u64 << align` cannot overflow.
+    if align != 0 && (!(12..=47).contains(&align) || size % (1u64 << align) != 0) {
+        return SyscallReturn::err(ipc::status::EBADARG);
+    }
+    // Depleted / foreign source: EBADARG / EBADCAP before any state.
+    let Ok(remaining) = crate::untyped::remaining(src.obj) else {
+        return SyscallReturn::err(ipc::status::EBADCAP);
+    };
+    if remaining < charge {
+        return SyscallReturn::err(ipc::status::EBADARG);
+    }
+
+    let created = match typ {
+        ObjType::Endpoint => crate::endpoint::create_endpoint().map(|r| r.0),
+        _ => crate::notification::create().map(|r| r.0),
+    };
+    let Ok(created) = created else {
+        return SyscallReturn::err(ipc::status::ENOMEM);
+    };
+    let rights = match typ {
+        ObjType::Endpoint => Rights::SEND.union(Rights::RECV).union(Rights::GRANT),
+        _ => Rights::SIGNAL.union(Rights::RECV).union(Rights::GRANT),
+    };
+    let new_cap = Capability {
+        obj: ObjId(created),
+        typ,
+        rights,
+    };
+    match proc::install_cap(pid, new_cap) {
+        Ok(h) => {
+            crate::objreg::register(ObjId(created), typ, pid);
+            match crate::untyped::carve(src.obj, charge) {
+                Ok(remaining) => {
+                    crate::kinfo!(
+                        "RETYPE: pid={} typ={:?} obj={:#x} charge={} remaining={}",
+                        pid.0,
+                        typ,
+                        created,
+                        charge,
+                        remaining
+                    );
+                    SyscallReturn::ok(msg.tag, [h as u64, remaining, 0, 0])
+                }
+                // Unreachable on the single v0 core (ADR-103 §6) — roll the
+                // whole call back rather than charge twice.
+                Err(_) => {
+                    rollback_retype(pid, h, new_cap);
+                    SyscallReturn::err(ipc::status::EBADARG)
+                }
+            }
+        }
+        Err(e) => {
+            rollback_retype(pid, u32::MAX, new_cap);
+            SyscallReturn::err(map_proc(e))
+        }
+    }
+}
+
+/// Undo a half-finished Retype: drop the cap (when one was installed),
+/// the objreg entry and the engine slot, so a failure leaves neither
+/// kernel state nor a charge behind (ADR-103 §3 all-or-nothing).
+fn rollback_retype(pid: ProcessId, handle: u32, cap: Capability) {
+    if handle != u32::MAX {
+        let _ = proc::remove_cap(pid, handle);
+    }
+    crate::objreg::unregister(cap.obj);
+    match cap.typ {
+        ObjType::Endpoint => {
+            let _ = crate::endpoint::destroy_endpoint(ObjRef(cap.obj.0));
+        }
+        _ => {
+            let _ = crate::notification::destroy(ObjRef(cap.obj.0));
+        }
     }
 }
 
@@ -1203,6 +1343,7 @@ mod tests {
         crate::objreg::reset_for_test();
         crate::endpoint::reset_engine_for_test();
         crate::notification::reset_for_test();
+        crate::untyped::reset_for_test();
         syscall::reset_reply_for_test();
         *sched::SCHED.lock() = None;
         set_context_backend(&MockCtx);
@@ -1939,7 +2080,7 @@ mod tests {
     /// NEW_CNODE is RETYPE with target type CNode, never a second name
     /// for one operation.
     #[test]
-    fn a9c_retype_spec_carries_adr088_packing_kernel_enosys() {
+    fn a9c_retype_spec_carries_adr088_packing_kernel_dispatches() {
         let spec = helios_abi::invoke_spec(helios_abi::ObjType::Factory, 5)
             .expect("spec/abi lacks FACTORY_RETYPE (Factory label 5)");
         assert_eq!(spec.name, "RETYPE");
@@ -1997,15 +2138,298 @@ mod tests {
             helios_abi::invoke_spec(helios_abi::ObjType::Factory, 6).is_none(),
             "Factory label 6 must stay unassigned"
         );
-        // Kernel side: label 5 is not dispatched yet — the factory reader
-        // answers ENOSYS for it until M1.
+        // Kernel side: label 5 dispatches since M1a1 (ADR-103). With no
+        // descriptor (cap_count 0) the packing rule rejects the call
+        // before anything else: EBADARG, not the old ENOSYS.
         let (_pid, _tid, factory) = setup();
         let r = dispatch(args(num::INVOKE, factory, Tag::new(5), [0; 4]));
         assert_eq!(
             r.status,
-            ipc::status::ENOSYS as i64,
-            "RETYPE is unimplemented until M1"
+            ipc::status::EBADARG as i64,
+            "RETYPE requires cap_count exactly 1"
         );
+    }
+
+    // ---- M1a1: FACTORY_RETYPE (ADR-103) --------------------------------
+
+    /// The spec header says `spec/abi::capability::ObjType` "must match
+    /// kernel's caps::ObjType". The implicit numbering had drifted (Region
+    /// 7 vs 9, Reply 8 vs 14, Factory 0 vs 15); ADR-103 pinned the
+    /// discriminants. This test fails if either enum changes alone.
+    #[test]
+    fn m1a_caps_objtype_discriminants_match_spec() {
+        let pairs = [
+            (ObjType::Endpoint, helios_abi::ObjType::Endpoint, 1),
+            (ObjType::Notification, helios_abi::ObjType::Notification, 2),
+            (ObjType::AddressSpace, helios_abi::ObjType::AddressSpace, 3),
+            (ObjType::Thread, helios_abi::ObjType::Thread, 4),
+            (ObjType::Frame, helios_abi::ObjType::Frame, 5),
+            (ObjType::Irq, helios_abi::ObjType::Irq, 6),
+            (ObjType::CNode, helios_abi::ObjType::CNode, 7),
+            (ObjType::Untyped, helios_abi::ObjType::Untyped, 8),
+            (ObjType::Region, helios_abi::ObjType::Region, 9),
+            (ObjType::SchedContext, helios_abi::ObjType::SchedContext, 10),
+            (ObjType::Domain, helios_abi::ObjType::Domain, 11),
+            (ObjType::IOSpace, helios_abi::ObjType::IOSpace, 12),
+            (ObjType::CoreGrant, helios_abi::ObjType::CoreGrant, 13),
+            (ObjType::Reply, helios_abi::ObjType::Reply, 14),
+            (ObjType::Factory, helios_abi::ObjType::Factory, 15),
+            (ObjType::Port, helios_abi::ObjType::Port, 16),
+            (ObjType::Ring, helios_abi::ObjType::Ring, 17),
+        ];
+        for (k, s, n) in pairs {
+            assert_eq!(k as u64, n, "caps::{k:?} discriminant");
+            assert_eq!(s as u64, n, "spec::{s:?} discriminant");
+        }
+    }
+
+    fn m1a_untyped_cap(pid: ProcessId, base: u64, size: u64) -> u32 {
+        let obj = crate::untyped::create_for_test(base, size, pid);
+        proc::install_cap(
+            pid,
+            Capability {
+                obj,
+                typ: ObjType::Untyped,
+                rights: Rights::MAP.union(Rights::GRANT),
+            },
+        )
+        .unwrap()
+    }
+
+    fn m1a_retype(factory: u32, src: u32, w0: u64, w1: u64, w2: u64) -> SyscallReturn {
+        let mut m = Message::new(5);
+        m.tag = m.tag.with_caps(1);
+        m.words[0] = w0;
+        m.words[1] = w1;
+        m.words[2] = w2;
+        m.set_descriptor(0, CapSlot::pack(src, Rights::MAP))
+            .unwrap();
+        dispatch(args(num::INVOKE, factory, m.tag, m.words))
+    }
+
+    #[test]
+    fn m1a_retype_endpoint_carves_exactly_and_depletes() {
+        let (pid, _tid, factory) = setup();
+        let charge = crate::endpoint::RETYPE_SLOT_BYTES;
+        assert!(charge > 0, "the endpoint charge is the engine slot bytes");
+        let src = m1a_untyped_cap(pid, 0x4000_0000, 3 * charge);
+
+        // First carve: OK, w0 = handle, w1 = remaining.
+        let r = m1a_retype(factory, src, ObjType::Endpoint as u64, charge, 0);
+        assert_eq!(r.status, ipc::status::OK as i64);
+        let h1 = r.w[0] as u32;
+        assert_eq!(r.w[1], 2 * charge, "w1 = remaining source size");
+        let cap = proc::get_cap(pid, h1).unwrap();
+        assert_eq!(cap.typ, ObjType::Endpoint);
+        assert!(
+            cap.rights.contains(Rights::SEND)
+                && cap.rights.contains(Rights::RECV)
+                && cap.rights.contains(Rights::GRANT),
+            "same default rights as NEW_ENDPOINT"
+        );
+        assert!(crate::objreg::is_alive(cap.obj), "registered to the caller");
+
+        // Second carve succeeds; the third takes the source to exactly 0.
+        let r = m1a_retype(factory, src, ObjType::Endpoint as u64, charge, 0);
+        assert_eq!(r.status, ipc::status::OK as i64);
+        assert_eq!(r.w[1], charge);
+        let r = m1a_retype(factory, src, ObjType::Endpoint as u64, charge, 0);
+        assert_eq!(r.status, ipc::status::OK as i64);
+        assert_eq!(r.w[1], 0, "exact depletion reports remaining 0");
+
+        // A depleted source stays registered and answers EBADARG
+        // (ADR-103 §5: the cap is kept until the derivation tree).
+        let r = m1a_retype(factory, src, ObjType::Endpoint as u64, charge, 0);
+        assert_eq!(r.status, ipc::status::EBADARG as i64, "depleted source");
+        assert!(proc::get_cap(pid, src).is_ok(), "source cap is kept");
+        assert!(crate::objreg::is_alive(
+            proc::get_cap(pid, src).unwrap().obj
+        ));
+    }
+
+    #[test]
+    fn m1a_retype_notification_carves_and_depletes() {
+        let (pid, _tid, factory) = setup();
+        let charge = crate::notification::RETYPE_SLOT_BYTES;
+        assert!(charge > 0, "the notification charge is the per-slot share");
+        let src = m1a_untyped_cap(pid, 0x4100_0000, 2 * charge);
+
+        let r = m1a_retype(factory, src, ObjType::Notification as u64, charge, 0);
+        assert_eq!(r.status, ipc::status::OK as i64);
+        let cap = proc::get_cap(pid, r.w[0] as u32).unwrap();
+        assert_eq!(cap.typ, ObjType::Notification);
+        assert_eq!(r.w[1], charge);
+        assert!(
+            cap.rights.contains(Rights::SIGNAL)
+                && cap.rights.contains(Rights::RECV)
+                && cap.rights.contains(Rights::GRANT),
+            "same default rights as NEW_NOTIFICATION"
+        );
+
+        // Deplete exactly, then EBADARG.
+        let r = m1a_retype(factory, src, ObjType::Notification as u64, charge, 0);
+        assert_eq!(r.status, ipc::status::OK as i64);
+        assert_eq!(r.w[1], 0);
+        let r = m1a_retype(factory, src, ObjType::Notification as u64, charge, 0);
+        assert_eq!(r.status, ipc::status::EBADARG as i64);
+    }
+
+    #[test]
+    fn m1a_retype_rejections_burn_nothing() {
+        let (pid, _tid, factory) = setup();
+        let charge = crate::endpoint::RETYPE_SLOT_BYTES;
+        let base = 0x4200_0000;
+        let src = m1a_untyped_cap(pid, base, charge);
+        let src_obj = proc::get_cap(pid, src).unwrap().obj;
+
+        let bad = [
+            // w0 outside the M1 target set: None(0), Irq(6), Untyped(8 —
+            // a source, never a target), Reply(14), Factory(15), Any
+            // (0xFF) and an unknown discriminant.
+            (0u64, charge, 0),
+            (ObjType::Irq as u64, charge, 0),
+            (ObjType::Untyped as u64, charge, 0),
+            (ObjType::Reply as u64, charge, 0),
+            (ObjType::Factory as u64, charge, 0),
+            (0xFF, charge, 0),
+            (64, charge, 0),
+            // w1: 0 and off-by-one from the fixed charge.
+            (ObjType::Endpoint as u64, 0, 0),
+            (ObjType::Endpoint as u64, charge - 1, 0),
+            (ObjType::Endpoint as u64, charge + 1, 0),
+            // w2: sub-page orders 1..=11, over-bound 48, and 12 with a
+            // size that is not a 4 KiB multiple (the endpoint charge
+            // never is).
+            (ObjType::Endpoint as u64, charge, 1),
+            (ObjType::Endpoint as u64, charge, 11),
+            (ObjType::Endpoint as u64, charge, 48),
+            (ObjType::Endpoint as u64, charge, 12),
+        ];
+        for &(w0, w1, w2) in &bad {
+            let r = m1a_retype(factory, src, w0, w1, w2);
+            assert_eq!(
+                r.status,
+                ipc::status::EBADARG as i64,
+                "w0={w0} w1={w1} w2={w2}"
+            );
+        }
+
+        // cap_count 0 and 2 are EBADARG (packing rule).
+        let r = dispatch(args(num::INVOKE, factory, Tag::new(5), [0; 4]));
+        assert_eq!(r.status, ipc::status::EBADARG as i64);
+        let mut m = Message::new(5);
+        m.tag = m.tag.with_caps(2);
+        m.set_descriptor(0, CapSlot::pack(src, Rights::MAP))
+            .unwrap();
+        m.set_descriptor(1, CapSlot::NULL).unwrap();
+        let r = dispatch(args(num::INVOKE, factory, m.tag, m.words));
+        assert_eq!(r.status, ipc::status::EBADARG as i64);
+
+        // NULL descriptor and unknown handle.
+        let mut m = Message::new(5);
+        m.tag = m.tag.with_caps(1);
+        m.set_descriptor(0, CapSlot::NULL).unwrap();
+        let r = dispatch(args(num::INVOKE, factory, m.tag, m.words));
+        assert_eq!(r.status, ipc::status::EBADARG as i64);
+        let r = m1a_retype(factory, 9999, ObjType::Endpoint as u64, charge, 0);
+        assert_eq!(r.status, ipc::status::EBADCAP as i64);
+
+        // Wrong-type source (an Endpoint cap where an Untyped is required).
+        let r = dispatch(args(num::INVOKE, factory, Tag::new(1), [0; 4]));
+        let ep_h = r.w[0] as u32;
+        let r = m1a_retype(factory, ep_h, ObjType::Endpoint as u64, charge, 0);
+        assert_eq!(r.status, ipc::status::EBADARG as i64);
+
+        // Dead source: retire the owner's objects, then EBADCAP.
+        crate::objreg::retire_owner(pid);
+        let r = m1a_retype(factory, src, ObjType::Endpoint as u64, charge, 0);
+        assert_eq!(r.status, ipc::status::EBADCAP as i64, "dead source");
+
+        // Every failure above left the source untouched.
+        let u = crate::untyped::state(src_obj).unwrap();
+        assert_eq!(u.size, charge, "no rejected call charged the source");
+        assert_eq!(u.base, base, "no rejected call advanced the source");
+
+        // Source without MAP (fresh state: retire_owner above killed
+        // everything, so build a second process).
+        let (pid2, _tid2, factory2) = setup();
+        let no_map = proc::install_cap(
+            pid2,
+            Capability {
+                obj: crate::untyped::create_for_test(0x4300_0000, charge, pid2),
+                typ: ObjType::Untyped,
+                rights: Rights::GRANT, // no MAP
+            },
+        )
+        .unwrap();
+        let r = m1a_retype(factory2, no_map, ObjType::Endpoint as u64, charge, 0);
+        assert_eq!(r.status, ipc::status::ERIGHTS as i64, "no MAP on source");
+
+        // Factory cap without GRANT.
+        let no_grant = proc::install_cap(
+            pid2,
+            Capability {
+                obj: ObjId(2),
+                typ: ObjType::Factory,
+                rights: Rights::SEND,
+            },
+        )
+        .unwrap();
+        let src2 = m1a_untyped_cap(pid2, 0x4400_0000, charge);
+        let r = m1a_retype(no_grant, src2, ObjType::Endpoint as u64, charge, 0);
+        assert_eq!(r.status, ipc::status::ERIGHTS as i64, "factory needs GRANT");
+    }
+
+    #[test]
+    fn m1a_retype_unimplemented_targets_enosys() {
+        let (pid, _tid, factory) = setup();
+        let charge = crate::endpoint::RETYPE_SLOT_BYTES;
+        let src = m1a_untyped_cap(pid, 0x4500_0000, 4 * charge);
+        // Every in-set target without an M1a1 implementation answers
+        // ENOSYS (spec errors include it; AS_FORK precedent) and leaves
+        // the source untouched.
+        for &(w0, _name) in &[
+            (helios_abi::ObjType::AddressSpace as u64, "AddressSpace"),
+            (helios_abi::ObjType::Thread as u64, "Thread"),
+            (helios_abi::ObjType::Frame as u64, "Frame"),
+            (helios_abi::ObjType::CNode as u64, "CNode"),
+            (helios_abi::ObjType::Region as u64, "Region"),
+            (helios_abi::ObjType::SchedContext as u64, "SchedContext"),
+            (helios_abi::ObjType::Domain as u64, "Domain"),
+            (helios_abi::ObjType::IOSpace as u64, "IOSpace"),
+            (helios_abi::ObjType::CoreGrant as u64, "CoreGrant"),
+            (helios_abi::ObjType::Port as u64, "Port"),
+            (helios_abi::ObjType::Ring as u64, "Ring"),
+        ] {
+            let r = m1a_retype(factory, src, w0, 4096, 0);
+            assert_eq!(r.status, ipc::status::ENOSYS as i64, "target {w0}");
+        }
+        let u = crate::untyped::state(proc::get_cap(pid, src).unwrap().obj).unwrap();
+        assert_eq!(u.size, 4 * charge, "ENOSYS paths never charged the source");
+    }
+
+    #[test]
+    fn m1a_retype_whole_source_charge_respects_alignment_rules() {
+        let (pid, _tid, factory) = setup();
+        let charge = crate::endpoint::RETYPE_SLOT_BYTES;
+        let src = m1a_untyped_cap(pid, 0x4600_0000, charge);
+        // align 12 with a charge that IS a 4 KiB multiple is accepted —
+        // make the source big enough and round the charge up via a
+        // Notification carve with align 12: the notification charge is 9
+        // bytes, never a multiple, so use the endpoint charge only when
+        // it is a multiple; otherwise assert the rejection (both branches
+        // pin the spec rule against the real constant).
+        let multiple = charge % 4096 == 0;
+        let r = m1a_retype(factory, src, ObjType::Endpoint as u64, charge, 12);
+        if multiple {
+            assert_eq!(r.status, ipc::status::OK as i64);
+        } else {
+            assert_eq!(r.status, ipc::status::EBADARG as i64);
+        }
+        // align 0 (natural) always works.
+        let src2 = m1a_untyped_cap(pid, 0x4700_0000, charge);
+        let r = m1a_retype(factory, src2, ObjType::Endpoint as u64, charge, 0);
+        assert_eq!(r.status, ipc::status::OK as i64);
     }
 
     /// ADR-088 uniform packing (cap_count 2): w0 = entry PC, w1 = stack

@@ -16,19 +16,36 @@ pub use ipc::Rights;
 pub struct ObjId(pub u64);
 
 /// The kind of object a capability grants authority over.
+///
+/// Discriminants are the wire ABI: they MUST match `spec/abi::capability::ObjType`
+/// one-to-one (the spec header says exactly that; ADR-103 pinned the identity
+/// with a kernel↔spec cross-check test after the implicit numbering drifted —
+/// Region 7 vs 9, Reply 8 vs 14, Factory 0 vs 15). `None` (0) and `Any`
+/// (0xFF) exist only on the spec side; this enum lists the concrete types.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u64)]
 pub enum ObjType {
-    Factory,
-    Endpoint,
-    Notification,
-    AddressSpace,
-    Thread,
-    Frame,
-    Irq,
-    Region,
+    Endpoint = 1,
+    Notification = 2,
+    AddressSpace = 3,
+    Thread = 4,
+    Frame = 5,
+    Irq = 6,
+    /// RFC-0001 §4.1.4: a capability table with caller-chosen slots (M1).
+    CNode = 7,
+    /// RFC-0001 §4.1.1: raw memory — the only source of kernel memory (M1).
+    Untyped = 8,
+    Region = 9,
+    SchedContext = 10,
+    Domain = 11,
+    IOSpace = 12,
+    CoreGrant = 13,
     /// ADR-047: one-shot deferred-reply token (kernel-minted via
     /// Thread::DEFER; retired on use). ObjId = (endpoint << 32) | caller_tid.
-    Reply,
+    Reply = 14,
+    Factory = 15,
+    Port = 16,
+    Ring = 17,
 }
 
 /// An unforgeable token granting `rights` over the object `obj`.

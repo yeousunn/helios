@@ -177,6 +177,13 @@ struct Engine {
     endpoints: [Option<Endpoint>; MAX_ENDPOINTS],
 }
 
+/// M1 Retype charge for target Endpoint (ADR-103 §4): the exact kernel
+/// state one engine slot dedicates to a created endpoint (ADR-037 am2
+/// const-staged pool). FACTORY_RETYPE's w1 must pass exactly this for
+/// target Endpoint (spec/abi: fixed sizes are kernel constants); the
+/// retype tests pin it, so it cannot drift silently.
+pub const RETYPE_SLOT_BYTES: u64 = core::mem::size_of::<Option<Endpoint>>() as u64;
+
 /// Global endpoint engine, **const-staged in .bss**: the virgin state
 /// (all slots free) is exactly `Engine { endpoints: [None; _] }`, so the
 /// static is const-initialized and `create_endpoint` never materializes a

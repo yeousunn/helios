@@ -22,6 +22,7 @@ pub mod proc;
 pub mod sched;
 pub mod syscall;
 pub mod time;
+pub mod untyped;
 
 #[cfg(test)]
 extern crate std;
