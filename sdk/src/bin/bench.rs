@@ -50,7 +50,7 @@ type Result<T> = core::result::Result<T, u64>;
 
 /// Minimal bench configuration.
 const WARMUP_ITERS: u64 = 10;
-const MEASURE_ITERS: u64 = 200;
+const MEASURE_ITERS: u64 = 100;
 const MEASURE_BATCHES: u64 = 5;
 const BENCH_HEAP_CHUNKS: u64 = 2;
 
