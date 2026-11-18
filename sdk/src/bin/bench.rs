@@ -128,8 +128,7 @@ fn run(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
     bench_send_recv(raw, debug_ep, factory_cap)?;
     bench_notification_wake(raw, debug_ep, factory_cap, self_as, self_thread, region)?;
     bench_context_switch_same_as(raw, debug_ep, factory_cap, self_as, self_thread, region)?;
-    // bench_context_switch_diff_as skipped: kernel NEW_THREAD diff-AS scheduling bug
-    // (child thread created but never becomes runnable; Request DS→GLM 2026-11-18)
+    bench_context_switch_diff_as(raw, debug_ep, factory_cap, self_as, self_thread, region)?;
     bench_map_unmap_4k(raw, debug_ep, factory_cap, self_as, region)?;
 
     Ok(())
@@ -653,7 +652,6 @@ fn bench_context_switch_same_as(
 /// Uses FORK to create a child AS, then NEW_THREAD to spawn a thread in it.
 /// The child thread receives endpoint capabilities via the bootstrap EP and ping-pongs
 /// with a thread in the parent AS.
-#[allow(dead_code)]
 fn bench_context_switch_diff_as(
     raw: &mut X86_64Syscalls,
     debug_ep: Handle,
