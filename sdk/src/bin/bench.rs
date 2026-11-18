@@ -1027,30 +1027,31 @@ fn thread_entry_new_thread_diff_as() -> ! {
 }
 
 /// Thread entry point for NEW_THREAD children in diff_as benchmark with done signal.
-/// Receives endpoint capabilities on bootstrap EP (handle 1), then ping-pongs and signals done.
+/// Receives endpoint capabilities on bootstrap EP (handle 1), then ping-pongs.
 /// Expected message on bootstrap EP: three capability descriptors for ep1, ep2, and done_ep.
+/// The diff-AS thread only forwards to ep2; the parent-AS thread signals done_ep.
 #[allow(dead_code)]
 fn thread_entry_new_thread_diff_as_done() -> ! {
     let mut raw = X86_64Syscalls;
     let mut sys = Syscalls::new(&mut raw);
     let bootstrap_ep = 1;
-
+    
     let first_msg = sys.recv(bootstrap_ep).unwrap_or_else(|_| Message::new(0));
     let ep1 = first_msg.descriptor(0).map(|d| d.handle()).unwrap_or(0);
     let ep2 = first_msg.descriptor(1).map(|d| d.handle()).unwrap_or(0);
     let done_ep = first_msg.descriptor(2).map(|d| d.handle()).unwrap_or(0);
-
+    
     if ep1 == 0 || ep2 == 0 || done_ep == 0 {
         loop {
             let _ = sys.yield_now();
         }
     }
-
+    
     let ping_msg = Message::new(0);
     loop {
         let _ = sys.recv(ep1);
         let _ = sys.send(ep2, &ping_msg);
-        let _ = sys.send(done_ep, &ping_msg);
+        // Note: do NOT send to done_ep here; parent thread does that.
     }
 }
 
