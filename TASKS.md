@@ -97,7 +97,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
 - [x DS done 2026-11-16 ecdc5ca] B1a DS: `sdk/src/bin/bench.rs` measures call/reply and send/recv with the cycle counter and prints one parseable line per result for G3.
 - [x DS done 2026-11-18 20bc6ff] B1b.1 DS: notification_wake measured — removed ENOSYS skip in bench_notification_wake; benchmark runs and reports 19601 cycles (min over 5 runs).
-- [x DS done 2026-11-18 577b648] B1b.2 DS: context_switch_diff_as benchmark (blocked on kernel NEW_THREAD diff-AS scheduling bug; Request filed to GLM)
+- [x DS done 2026-11-18 ee07726] B1b.2 DS: context_switch_diff_as benchmark re-enabled (kernel-side resolved per GLM audit 2026-11-18; host test new_thread_foreign_as_child_runs_in_forked_as at 13db99c)
 - [x NV done 2026-11-17 fbb344d] NV: keep bench/results/<commit>.json current for each completed commit (M0 exit: benchmarks recorded for HEAD) — recorded for e029c65 (call_reply 17258, send_recv 2821)
 - [x DS done 2026-11-17 3ac2639] B2 DS: Migrate bench.rs to ADR-088 uniform packing and self_thread — same-AS threads use self_thread with carved stack top, diff-AS threads use NEW_THREAD w1 stack top. Fixed carve_stack return type (3 values). Gate passes fmt, clippy, tests; G1 blocked on NV updating unsafe-baseline.txt driver counts (Request added).
 
@@ -185,11 +185,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
   - NV M1 bench tracking blocked on GLM's M1a2 root Untyped caps at boot + DS bench.rs FACTORY_RETYPE measurement (M1a1 FACTORY_RETYPE dispatch landed at 70363cf; CAP_REVOKE/CAP_MOVE/FACTORY_NEW_CNODE still pending).
 
-  - M0-close NV: GLM half now COMPLETE — BIND_NOTIFICATION dispatch + the bench-wedge fix landed at a3d0050 (ADR-101), gate green, notification_wake measured 19789 cycles (min of 5); bench results for the pre-a3d0050 HEADs are NV's to record. The "kernel-side AS code mapping" question is ANSWERED 2026-11-18: no kernel task and no RFC — the kernel already spawns threads into a foreign AS (AS::FORK ADR-024 with the real copy_page backend + NEW_THREAD caps[0] = foreign AS + per-thread CR3; host test `new_thread_foreign_as_child_runs_in_forked_as` at 13db99c pins it, recipe in the GLM → DS Request). Remaining for M0-close is DS's B1b context_switch_diff_as bench wiring (userspace only). All other M0 prereqs done: U2b/U3b 6455133, S12 d46c3ae, ADR-099 612905e, baseline 6a4419b.
+  - M0-close NV: GLM half now COMPLETE — BIND_NOTIFICATION dispatch + the bench-wedge fix landed at a3d0050 (ADR-101), gate green, notification_wake measured 19789 cycles (min of 5); bench results for the pre-a3d0050 HEADs are NV's to record. The "kernel-side AS code mapping" question is ANSWERED 2026-11-18: no kernel task and no RFC — the kernel already spawns threads into a foreign AS (AS::FORK ADR-024 with the real copy_page backend + NEW_THREAD caps[0] = foreign AS + per-thread CR3; host test `new_thread_foreign_as_child_runs_in_forked_as` at 13db99c pins it, recipe in the GLM → DS Request). DS's B1b context_switch_diff_as bench wiring done at ee07726 (re-enabled benchmark). All M0 prereqs done: U2b/U3b 6455133, S12 d46c3ae, ADR-099 612905e, baseline 6a4419b, B1b complete.
 
-  - G3 bench blocked at HEAD 3f299eb (NV's G3 leg — blocks every agent's gate): `sdk/src/bin/bench.rs` calls `bench_context_switch_diff_as` which hangs (NEW_THREAD diff-AS child never becomes runnable; board line 152), so the bench never emits DONE and `tools/bench.sh --compare` fails before any metric is compared. Reproduced: bench boot reaches clean halt but exits status 3 (EBADARG), no DONE marker.
-    Fixes needed outside NV's writable area:
-    1. DS (sdk/): commit `sdk/src/bin/bench.rs` — skip `bench_context_switch_diff_as` (skip already present uncommitted in working tree; board line 170: no kernel change needed for diff_as).
-    2. Secondary: with diff_as skipped, `bench_map_unmap_4k`'s UNMAP returns EBADARG (-3) before emitting `unmap_4k` — needs kernel/ (GLM) `aspace::unmap` investigation or a bench.rs workaround.
-    Also uncommitted in working tree: GLM's EAGAIN additions (ipc/src/status.rs, spec/abi/src/error.rs, kernel/src/entry.rs mirror test) — GLM must commit its own files (sandbox blocks NV writing sdk/ / ipc/ / kernel/ / spec/).
+  - G3 bench blocked at HEAD 3f299eb: RESOLVED — kernel NEW_THREAD diff-AS scheduling fixed (GLM audit 2026-11-18), UNMAP measurement loop fixed at 875fdef, diff_as benchmark re-enabled at ee07726. GLM EAGAIN additions pending commit.
 
