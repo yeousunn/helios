@@ -86,11 +86,12 @@ pub fn run<R: RawSyscalls>(sys: &mut Syscalls<R>, pkg: &BootstrapPackage) -> i32
         case_bind_fault_ep_no_control(sys, pkg),
         case_bind_fault_ep_non_endpoint(sys, pkg),
         case_bind_fault_ep_dead_target(sys, pkg),
-        // M1 / RFC-0001 / RFC-0005: Retype/Revoke/CAP_MOVE abuse
-        // Temporarily disabled until kernel implements M1 (GLM M1a1 in progress).
-        // case_retype_capcount_invalid(sys, pkg),
-        // case_retype_invalid_type(sys, pkg),
-        // case_retype_wrong_source_type(sys, pkg),
+        // M1 / RFC-0001 / RFC-0005: FACTORY_RETYPE abuse (M1a1 complete, ADR-103)
+        case_retype_capcount_invalid(sys, pkg),
+        case_retype_invalid_type(sys, pkg),
+        case_retype_wrong_source_type(sys, pkg),
+        // M1 CAP_REVOKE/CAP_MOVE abuse — disabled until GLM implements M1 CAP_REVOKE
+        // extension (max_steps/resume_token) and CAP_MOVE (RFC-0001 / ADR-064).
         // case_cap_move_oob_slot(sys, pkg),
         // case_cap_move_unknown_flags(sys, pkg),
         // case_cap_move_no_grant_src(sys, pkg),
@@ -569,7 +570,6 @@ fn case_bind_fault_ep_dead_target<R: RawSyscalls>(
 
 /// `FACTORY_RETYPE` with `cap_count != 1` must be rejected with EBADARG.
 /// RFC-0005: RETYPE requires exactly cap_count = 1. Case 18.
-#[allow(dead_code)]
 fn case_retype_capcount_invalid<R: RawSyscalls>(
     sys: &mut Syscalls<R>,
     pkg: &BootstrapPackage,
@@ -597,7 +597,6 @@ fn case_retype_capcount_invalid<R: RawSyscalls>(
 
 /// `FACTORY_RETYPE` with an invalid target type must be rejected with EBADARG.
 /// Case 19.
-#[allow(dead_code)]
 fn case_retype_invalid_type<R: RawSyscalls>(sys: &mut Syscalls<R>, pkg: &BootstrapPackage) -> bool {
     let factory = pkg.optional[4].expect("factory cap missing");
     let mut m = Message::new(crate::methods::factory::RETYPE);
@@ -612,7 +611,6 @@ fn case_retype_invalid_type<R: RawSyscalls>(sys: &mut Syscalls<R>, pkg: &Bootstr
 
 /// `FACTORY_RETYPE` with a non-Untyped source cap must be rejected (EBADCAP/EBADARG).
 /// Case 20.
-#[allow(dead_code)]
 fn case_retype_wrong_source_type<R: RawSyscalls>(
     sys: &mut Syscalls<R>,
     pkg: &BootstrapPackage,
@@ -629,7 +627,7 @@ fn case_retype_wrong_source_type<R: RawSyscalls>(
 }
 
 /// `CAP_MOVE` with an out-of-bounds destination slot must be rejected with EBADARG.
-/// Case 21.
+/// Case 21. DISABLED: CAP_MOVE not implemented in kernel yet.
 #[allow(dead_code)]
 fn case_cap_move_oob_slot<R: RawSyscalls>(sys: &mut Syscalls<R>, pkg: &BootstrapPackage) -> bool {
     let factory = pkg.optional[4].expect("factory cap missing");
@@ -644,7 +642,7 @@ fn case_cap_move_oob_slot<R: RawSyscalls>(sys: &mut Syscalls<R>, pkg: &Bootstrap
 }
 
 /// `CAP_MOVE` with unknown flag bits must be rejected with EBADARG.
-/// Case 22.
+/// Case 22. DISABLED: CAP_MOVE not implemented in kernel yet.
 #[allow(dead_code)]
 fn case_cap_move_unknown_flags<R: RawSyscalls>(
     sys: &mut Syscalls<R>,
@@ -661,7 +659,7 @@ fn case_cap_move_unknown_flags<R: RawSyscalls>(
 }
 
 /// `CAP_MOVE` without GRANT on the source cap must be rejected with ERIGHTS.
-/// Case 23.
+/// Case 23. DISABLED: CAP_MOVE not implemented in kernel yet.
 #[allow(dead_code)]
 fn case_cap_move_no_grant_src<R: RawSyscalls>(
     sys: &mut Syscalls<R>,
@@ -685,7 +683,7 @@ fn case_cap_move_no_grant_src<R: RawSyscalls>(
 }
 
 /// `CAP_REVOKE` with an invalid mode must be rejected with EBADARG.
-/// Case 24.
+/// Case 24. DISABLED: CAP_REVOKE M1 extension (max_steps/resume_token) not implemented in kernel yet.
 #[allow(dead_code)]
 fn case_revoke_invalid_mode<R: RawSyscalls>(sys: &mut Syscalls<R>, pkg: &BootstrapPackage) -> bool {
     // Mode must be 0 (REVOKE_DERIVED) or 1 (DELETE)
@@ -693,7 +691,7 @@ fn case_revoke_invalid_mode<R: RawSyscalls>(sys: &mut Syscalls<R>, pkg: &Bootstr
 }
 
 /// `CAP_REVOKE` with invalid max_steps (0 or > 4096) must be rejected with EBADARG.
-/// Case 25.
+/// Case 25. DISABLED: CAP_REVOKE M1 extension (max_steps/resume_token) not implemented in kernel yet.
 #[allow(dead_code)]
 fn case_revoke_invalid_max_steps<R: RawSyscalls>(
     sys: &mut Syscalls<R>,
@@ -712,7 +710,7 @@ fn case_revoke_invalid_max_steps<R: RawSyscalls>(
 
 /// `CAP_REVOKE` with an invalid resume_token (not held by this process) must
 /// be rejected with EBADARG.
-/// Case 26.
+/// Case 26. DISABLED: CAP_REVOKE M1 extension (max_steps/resume_token) not implemented in kernel yet.
 #[allow(dead_code)]
 fn case_revoke_invalid_resume_token<R: RawSyscalls>(
     sys: &mut Syscalls<R>,
@@ -811,8 +809,15 @@ mod tests {
             statuses.push(OK); // KILL
             statuses.push(OK); // NEW_ENDPOINT
             statuses.push(EBADARG); // BIND_FFAULT_EP on dead target
-                                    // M1 cases (Retype/Revoke/CAP_MOVE) temporarily disabled until kernel implements M1.
-                                    // See run() outcomes array for the list of disabled cases.
+                                    // M1 cases (FACTORY_RETYPE) - GLM M1a1 complete (ADR-103)
+                                    // Case 24: case_retype_capcount_invalid (2 invokes: cap_count=0, cap_count=2) -> EBADARG x2
+            statuses.push(EBADARG);
+            statuses.push(EBADARG);
+            // Case 25: case_retype_invalid_type (1 invoke) -> EBADARG
+            statuses.push(EBADARG);
+            // Case 26: case_retype_wrong_source_type (1 invoke) -> EBADARG
+            statuses.push(EBADARG);
+            // M1 CAP_REVOKE/CAP_MOVE cases disabled until kernel implements them.
 
             MockKernel { statuses, i: 0 }
         }
@@ -836,8 +841,6 @@ mod tests {
             } else {
                 ipc::status::OK
             };
-            // Debug: print index and status
-            // println!("MockKernel raw: i={}, status={}", self.i, status);
             self.i += 1;
             // words[0] = 1: the scratch-thread handle case 3 receives.
             SysReply {
