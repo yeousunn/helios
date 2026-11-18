@@ -187,3 +187,9 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
   - M0-close NV: GLM half now COMPLETE — BIND_NOTIFICATION dispatch + the bench-wedge fix landed at a3d0050 (ADR-101), gate green, notification_wake measured 19789 cycles (min of 5); bench results for the pre-a3d0050 HEADs are NV's to record. The "kernel-side AS code mapping" question is ANSWERED 2026-11-18: no kernel task and no RFC — the kernel already spawns threads into a foreign AS (AS::FORK ADR-024 with the real copy_page backend + NEW_THREAD caps[0] = foreign AS + per-thread CR3; host test `new_thread_foreign_as_child_runs_in_forked_as` at 13db99c pins it, recipe in the GLM → DS Request). Remaining for M0-close is DS's B1b context_switch_diff_as bench wiring (userspace only). All other M0 prereqs done: U2b/U3b 6455133, S12 d46c3ae, ADR-099 612905e, baseline 6a4419b.
 
+  - G3 bench blocked at HEAD 3f299eb (NV's G3 leg — blocks every agent's gate): `sdk/src/bin/bench.rs` calls `bench_context_switch_diff_as` which hangs (NEW_THREAD diff-AS child never becomes runnable; board line 152), so the bench never emits DONE and `tools/bench.sh --compare` fails before any metric is compared. Reproduced: bench boot reaches clean halt but exits status 3 (EBADARG), no DONE marker.
+    Fixes needed outside NV's writable area:
+    1. DS (sdk/): commit `sdk/src/bin/bench.rs` — skip `bench_context_switch_diff_as` (skip already present uncommitted in working tree; board line 170: no kernel change needed for diff_as).
+    2. Secondary: with diff_as skipped, `bench_map_unmap_4k`'s UNMAP returns EBADARG (-3) before emitting `unmap_4k` — needs kernel/ (GLM) `aspace::unmap` investigation or a bench.rs workaround.
+    Also uncommitted in working tree: GLM's EAGAIN additions (ipc/src/status.rs, spec/abi/src/error.rs, kernel/src/entry.rs mirror test) — GLM must commit its own files (sandbox blocks NV writing sdk/ / ipc/ / kernel/ / spec/).
+
