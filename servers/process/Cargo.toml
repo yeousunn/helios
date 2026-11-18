@@ -12,6 +12,7 @@ user = []
 name = "ps"
 path = "src/bin/ps.rs"
 required-features = ["user"]
+test = false
 
 [dependencies]
 ipc = { path = "../../ipc" }

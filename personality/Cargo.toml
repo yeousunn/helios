@@ -12,41 +12,49 @@ user = []
 name = "posix"
 path = "src/bin/posix.rs"
 required-features = ["user"]
+test = false
 
 [[bin]]
 name = "sh"
 path = "src/bin/sh.rs"
 required-features = ["user"]
+test = false
 
 [[bin]]
 name = "cat"
 path = "src/bin/cat.rs"
 required-features = ["user"]
+test = false
 
 [[bin]]
 name = "login"
 path = "src/bin/login.rs"
 required-features = ["user"]
+test = false
 
 [[bin]]
 name = "ls"
 path = "src/bin/ls.rs"
 required-features = ["user"]
+test = false
 
 [[bin]]
 name = "echo"
 path = "src/bin/echo.rs"
 required-features = ["user"]
+test = false
 
 [[bin]]
 name = "wc"
 path = "src/bin/wc.rs"
 required-features = ["user"]
+test = false
 
 [[bin]]
 name = "linrun"
 path = "src/bin/linrun.rs"
 required-features = ["user"]
+test = false
 
 [dependencies]
 ipc = { path = "../ipc" }

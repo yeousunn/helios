@@ -12,16 +12,19 @@ user = []
 name = "init"
 path = "src/bin/init.rs"
 required-features = ["user"]
+test = false
 
 [[bin]]
 name = "child"
 path = "src/bin/child.rs"
 required-features = ["user"]
+test = false
 
 [[bin]]
 name = "bench"
 path = "src/bin/bench.rs"
 required-features = ["user"]
+test = false
 
 [dependencies]
 ipc = { path = "../ipc" }

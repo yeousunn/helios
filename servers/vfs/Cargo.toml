@@ -12,6 +12,7 @@ user = []
 name = "vfs"
 path = "src/bin/vfs.rs"
 required-features = ["user"]
+test = false
 
 [dependencies]
 ipc = { path = "../../ipc" }

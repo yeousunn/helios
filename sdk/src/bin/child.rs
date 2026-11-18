@@ -164,6 +164,7 @@ fn child_main(argc: u64, argv_va: u64, _envp_va: u64) -> ! {
     Syscalls::new(&mut raw).exit(smoke_status)
 }
 
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     Syscalls::new(&mut X86_64Syscalls).exit(0x0BAD_0001)

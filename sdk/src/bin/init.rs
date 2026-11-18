@@ -1243,6 +1243,7 @@ fn mark(raw: &mut X86_64Syscalls, debug_ep: u32, step: u64, value: u64) {
     let _ = sys.send(debug_ep, &m);
 }
 
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     exit_with(FAIL | 0x0BAD_0000)

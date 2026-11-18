@@ -12,6 +12,7 @@ user = []
 name = "auth"
 path = "src/bin/auth.rs"
 required-features = ["user"]
+test = false
 
 [dependencies]
 ipc = { path = "../../ipc" }
