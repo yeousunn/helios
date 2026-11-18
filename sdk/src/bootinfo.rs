@@ -21,6 +21,9 @@
 //! v1.1 (ADR-089): self_thread handle at o28 (formerly reserved), regions still at o32
 //! o 28: u32 self_thread handle (0 = none) - launcher own Thread cap for THREAD_CREATE
 //! o 32: region_count * { u32 handle; u32 reserved; u64 base; u64 len }
+//!
+//! v2 (M1a2, future): root_untyped handle(s) added per RFC-0001/ADR-064.
+//! Exact layout TBD per GLM's M1a2 implementation.
 //! ```
 #![forbid(unsafe_code)]
 
@@ -64,6 +67,9 @@ pub struct BootInfo {
     /// Launcher's own Thread cap handle (ADR-089; 0 = none). Allows the
     /// launcher to invoke THREAD_CREATE on itself for same-AS sibling threads.
     pub self_thread: Option<u32>,
+    /// Root Untyped capability handle (M1a2, RFC-0001/ADR-064).
+    /// `None` until kernel provides it (GLM M1a2).
+    pub root_untyped: Option<u32>,
     pub regions: [Option<BootRegion>; MAX_REGIONS],
     pub region_count: u32,
 }
@@ -129,6 +135,7 @@ impl BootInfo {
             self_as: (self_as != 0).then_some(self_as),
             console_in,
             self_thread,
+            root_untyped: None,
             regions,
             region_count,
         })
@@ -185,6 +192,7 @@ mod tests {
             self_as: Some(9),
             console_in: Some(7),
             self_thread: Some(13),
+            root_untyped: None,
             regions,
             region_count: 2,
         }

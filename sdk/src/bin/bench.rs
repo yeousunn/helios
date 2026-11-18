@@ -14,6 +14,7 @@
 //!   BENCH context_switch_diff_as <cycles>
 //!   BENCH map_4k <cycles>
 //!   BENCH unmap_4k <cycles>
+//!   BENCH factory_retype <cycles>
 
 #![no_std]
 #![no_main]
@@ -130,6 +131,7 @@ fn run(raw: &mut X86_64Syscalls, info: &BootInfo) -> Result<()> {
     bench_context_switch_same_as(raw, debug_ep, factory_cap, self_as, self_thread, region)?;
     bench_context_switch_diff_as(raw, debug_ep, factory_cap, self_as, self_thread, region)?;
     bench_map_unmap_4k(raw, debug_ep, factory_cap, self_as, region)?;
+    bench_factory_retype(raw, debug_ep, factory_cap)?;
 
     Ok(())
 }
@@ -947,6 +949,53 @@ fn bench_map_unmap_4k(
     um.words[0] = MAP_VA;
     um.words[1] = 1;
     sys.invoke(self_as, &um).map_err(err_to_u64)?;
+
+    Ok(())
+}
+
+/// Benchmark: FACTORY_RETYPE invoke latency.
+/// Measures the latency of retyping an Untyped capability into a concrete object.
+/// Currently returns ENOSYS until M1 kernel implementation lands (RFC-0001/ADR-064).
+fn bench_factory_retype(
+    raw: &mut X86_64Syscalls,
+    debug_ep: Handle,
+    factory: Handle,
+) -> Result<()> {
+    let mut sys = Syscalls::new(raw);
+    mark(&mut sys, debug_ep, 0xF5, 1); // debug: factory_retype start
+
+    // Need an Untyped capability to retype. For now, we use the factory cap itself
+    // as a placeholder (wrong type) to measure the ENOSYS path latency.
+    // Once M1 lands, this will use a real Untyped cap from the bootinfo.
+    // FACTORY_RETYPE: label 5, cap_count=1 (caps[0] = Untyped with MAP)
+    // w0 = target_type (1 = Endpoint), w1 = size, w2 = align_order
+    let mut m = Message::new(methods::factory::RETYPE);
+    m.tag = m.tag.with_caps(1);
+    m.words[0] = 1; // ObjType::Endpoint
+    m.words[1] = 0; // size (fixed-size type)
+    m.words[2] = 0; // align_order (0 = natural)
+    let _ = m.set_descriptor(0, CapSlot::pack(factory, Rights::MAP)); // placeholder
+
+    // Warmup.
+    for _ in 0..WARMUP_ITERS {
+        let _ = sys.invoke(factory, &m);
+    }
+
+    // Measure: run multiple batches, keep the minimum batch average.
+    let mut best_cycles_per_iter = u64::MAX;
+    for _batch in 0..MEASURE_BATCHES {
+        let start = rdtsc();
+        for _ in 0..MEASURE_ITERS {
+            let _ = sys.invoke(factory, &m);
+        }
+        let end = rdtsc();
+        let cycles_per_iter = (end - start) / MEASURE_ITERS;
+        if cycles_per_iter < best_cycles_per_iter {
+            best_cycles_per_iter = cycles_per_iter;
+        }
+    }
+
+    mark_bench(&mut sys, debug_ep, "factory_retype", best_cycles_per_iter);
 
     Ok(())
 }
