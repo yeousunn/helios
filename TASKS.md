@@ -97,7 +97,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
 - [x DS done 2026-11-16 ecdc5ca] B1a DS: `sdk/src/bin/bench.rs` measures call/reply and send/recv with the cycle counter and prints one parseable line per result for G3.
 - [x DS done 2026-11-18 20bc6ff] B1b.1 DS: notification_wake measured — removed ENOSYS skip in bench_notification_wake; benchmark runs and reports 19601 cycles (min over 5 runs).
-- [ ] B1b.2 DS: context_switch_diff_as benchmark (blocked on kernel NEW_THREAD diff-AS scheduling bug; Request filed to GLM)
+- [~ DS started 2026-11-18] B1b.2 DS: context_switch_diff_as benchmark (blocked on kernel NEW_THREAD diff-AS scheduling bug; Request filed to GLM)
 - [x NV done 2026-11-17 fbb344d] NV: keep bench/results/<commit>.json current for each completed commit (M0 exit: benchmarks recorded for HEAD) — recorded for e029c65 (call_reply 17258, send_recv 2821)
 - [x DS done 2026-11-17 3ac2639] B2 DS: Migrate bench.rs to ADR-088 uniform packing and self_thread — same-AS threads use self_thread with carved stack top, diff-AS threads use NEW_THREAD w1 stack top. Fixed carve_stack return type (3 values). Gate passes fmt, clippy, tests; G1 blocked on NV updating unsafe-baseline.txt driver counts (Request added).
 
