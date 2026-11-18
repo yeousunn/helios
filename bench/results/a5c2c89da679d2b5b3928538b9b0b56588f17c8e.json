@@ -1,0 +1,17 @@
+{
+  "commit": "a5c2c89da679d2b5b3928538b9b0b56588f17c8e",
+  "bin": "sdk --bin bench",
+  "target": "x86_64-unknown-none",
+  "runs": 5,
+  "timestamp": "2026-11-18T04:36:39Z",
+  "qemu": "accel=tcg cpu=max m=256M",
+  "cycles": {
+    "call_reply": 20160,
+    "send_recv": 3420,
+    "notification_wake": 21000,
+    "context_switch_same_as": 34720,
+    "context_switch_diff_as": 35080,
+    "map_4k": 70800,
+    "unmap_4k": 70260
+  }
+}
