@@ -86,7 +86,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 - [ ] GLM: M1 CNode + caller-chosen slots + derivation tree + badges.
 - [ ] GLM: M1 Verus specs/proofs for CSpace + Untyped; Flux index math.
 - [ ] GLM: M1 spec/abi extended for new invoke methods + kernel<->spec id cross-check.
-- [~ DS started 2026-11-18] M1 attack-suite cases for Retype/Revoke abuse (kernel M1 not implemented; cases written in sdk/src/attack.rs but disabled until GLM completes M1a1).
+- [x DS done 2026-11-18 e6752a3] M1 attack-suite: enable FACTORY_RETYPE abuse cases (M1a1 complete per ADR-103); CAP_REVOKE/CAP_MOVE cases remain disabled until GLM implements M1 extensions.
 - [ ] PSX: M1 B10 personality isolation proof sketch (bet B10).
 
 ## M1: Object model (kernel; ADR-064 = RFC-0001 as corrected by ADR-088/RFC-0005)
