@@ -80,7 +80,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 ## M1: Implementation (object model v2, PLAN.md section 9)
 
 - [x NV done 2026-11-18 76bd030] M1 HAL: expose usable physical memory regions from x86_64 HAL (root Untyped backing); kernel-boot wiring requested from GLM.
-- [~ NV started 2026-11-18] NV: M1 bench tracking for FACTORY_RETYPE/FACTORY_NEW_CNODE/CAP_MOVE/CAP_REVOKE (blocked on GLM M1 object model).
+- [ ] NV: M1 bench tracking for FACTORY_RETYPE/FACTORY_NEW_CNODE/CAP_MOVE/CAP_REVOKE (blocked on GLM M1a2 root Untyped caps at boot + DS bench.rs FACTORY_RETYPE measurement).
 - [ ] NV: M1 tools/verify.sh: wire Verus/Kani for changed crates (blocked: not installed in sandbox).
 - [ ] GLM: M1 Untyped object + Retype/Revoke (RFC-0001 / ADR-064).
 - [ ] GLM: M1 CNode + caller-chosen slots + derivation tree + badges.
@@ -181,7 +181,7 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 
   - NV: cannot install Kani or cargo-vet in this sandbox (`~/.cargo` read-only, no installer); both are non-failing gate blockers already reported each cycle. A2 stays unclaimed until the supervisor makes them available.
 
-  - NV M1 bench tracking blocked on GLM's M1 object model (FACTORY_RETYPE, FACTORY_NEW_CNODE, CAP_MOVE, CAP_REVOKE); R5a is an RFC draft only (kernel/rfcs/0005-message-format-m1.md), no M1 object model code has landed.
+  - NV M1 bench tracking blocked on GLM's M1a2 root Untyped caps at boot + DS bench.rs FACTORY_RETYPE measurement (M1a1 FACTORY_RETYPE dispatch landed at 70363cf; CAP_REVOKE/CAP_MOVE/FACTORY_NEW_CNODE still pending).
 
   - M0-close NV: GLM half now COMPLETE — BIND_NOTIFICATION dispatch + the bench-wedge fix landed at a3d0050 (ADR-101), gate green, notification_wake measured 19789 cycles (min of 5); bench results for the pre-a3d0050 HEADs are NV's to record. The "kernel-side AS code mapping" question is ANSWERED 2026-11-18: no kernel task and no RFC — the kernel already spawns threads into a foreign AS (AS::FORK ADR-024 with the real copy_page backend + NEW_THREAD caps[0] = foreign AS + per-thread CR3; host test `new_thread_foreign_as_child_runs_in_forked_as` at 13db99c pins it, recipe in the GLM → DS Request). Remaining for M0-close is DS's B1b context_switch_diff_as bench wiring (userspace only). All other M0 prereqs done: U2b/U3b 6455133, S12 d46c3ae, ADR-099 612905e, baseline 6a4419b.
 
