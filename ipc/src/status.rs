@@ -26,6 +26,10 @@ pub const ENOTDIR: i32 = -18;
 pub const ENOTEMPTY: i32 = -19;
 pub const EMFILE: i32 = -20;
 pub const EACCES: i32 = -21;
+/// Resource temporarily unavailable — retry with the resume token (M1
+/// CAP_REVOKE extension, RFC-0005 §ABI / ADR-088: a bounded revoke with more
+/// work remaining returns EAGAIN and the token rides in reply w0).
+pub const EAGAIN: i32 = -22;
 
 /// Human-readable name for diagnostics (kernel logging / tests).
 pub const fn name(code: i32) -> &'static str {
@@ -52,6 +56,7 @@ pub const fn name(code: i32) -> &'static str {
         ENOTEMPTY => "ENOTEMPTY",
         EMFILE => "EMFILE",
         EACCES => "EACCES",
+        EAGAIN => "EAGAIN",
         _ => "UNKNOWN",
     }
 }
@@ -78,6 +83,7 @@ mod tests {
             EBADSTATE,
             ETOOBIG,
             ENOSYS,
+            EAGAIN,
         ] {
             assert_ne!(name(code), "UNKNOWN", "{code} missing a name");
         }

@@ -52,6 +52,10 @@ pub enum ErrorCode {
     EMFILE = -20,
     /// Permission denied
     EACCES = -21,
+    /// Resource temporarily unavailable — retry with the resume token
+    /// (M1 CAP_REVOKE extension, RFC-0005 §ABI / ADR-088: a bounded revoke
+    /// that has more work returns EAGAIN with the token in reply w0)
+    EAGAIN = -22,
 }
 
 impl ErrorCode {
@@ -79,6 +83,7 @@ impl ErrorCode {
         ErrorCode::ENOTEMPTY,
         ErrorCode::EMFILE,
         ErrorCode::EACCES,
+        ErrorCode::EAGAIN,
     ];
 
     /// Get the numeric value

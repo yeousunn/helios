@@ -2892,7 +2892,6 @@ mod tests {
 
         let r_ep = dispatch(args(num::INVOKE, factory, Tag::new(1), [0; 4]));
         let ep_h = r_ep.w[0] as u32;
-        let ep_obj = proc::get_cap(pid, ep_h).unwrap().obj;
         let r_notif = dispatch(args(num::INVOKE, factory, Tag::new(2), [0; 4]));
         let notif_h = r_notif.w[0] as u32;
         let notif_obj = proc::get_cap(pid, notif_h).unwrap().obj;
@@ -3943,9 +3942,13 @@ mod tests {
         assert_eq!(ErrorCode::ENOTEMPTY.value(), ipc::status::ENOTEMPTY);
         assert_eq!(ErrorCode::EMFILE.value(), ipc::status::EMFILE);
         assert_eq!(ErrorCode::EACCES.value(), ipc::status::EACCES);
+        // RFC-0005 §ABI / ADR-088 CAP_REVOKE extension: bounded revoke with
+        // remaining work answers EAGAIN (DS's 2026-11-18 Request; the sdk
+        // cap_revoke wrapper and M1 attack cases branch on it).
+        assert_eq!(ErrorCode::EAGAIN.value(), ipc::status::EAGAIN);
         assert_eq!(
             ErrorCode::ALL.len(),
-            22,
+            23,
             "every ipc status code is mirrored"
         );
     }
