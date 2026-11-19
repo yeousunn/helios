@@ -82,7 +82,10 @@ Claim format: `[ ]` then `[~ TAG started YYYY-MM-DD]` then `[x TAG done YYYY-MM-
 - [x NV done 2026-11-18 76bd030] M1 HAL: expose usable physical memory regions from x86_64 HAL (root Untyped backing); kernel-boot wiring requested from GLM.
 - [ ] NV: M1 bench tracking for FACTORY_RETYPE/FACTORY_NEW_CNODE/CAP_MOVE/CAP_REVOKE (blocked on GLM M1a2 root Untyped caps at boot + DS bench.rs FACTORY_RETYPE measurement).
 - [ ] NV: M1 tools/verify.sh: wire Verus/Kani for changed crates (blocked: not installed in sandbox).
-- [ ] GLM: M1 Untyped object + Retype/Revoke (RFC-0001 / ADR-064).
+- [~ GLM started 2026-11-19] M1 Untyped object + Retype/Revoke (RFC-0001 / ADR-064): M1a1 landed (Untyped object + FACTORY_RETYPE fixed targets, 70363cf/ADR-103). Split:
+  - [~ GLM started 2026-11-19] M1a2 GLM: root Untyped caps at boot — spec/abi::entry section first (ADR-073), BootInfo carries the launcher's Untyped handles, RETYPE works from them end-to-end; kernel-boot frame::init sourced from hal PHYS_MEM_REGIONS (NV request).
+  - [ ] M1a3 GLM: CAP_REVOKE dispatch (bounded/resumable, EAGAIN + resume token, RFC-0005/ADR-088; unblocks DS sdk/attack).
+  - [ ] M1a4 GLM: CAP_MOVE + FACTORY_NEW_CNODE dispatch.
 - [ ] GLM: M1 CNode + caller-chosen slots + derivation tree + badges.
 - [ ] GLM: M1 Verus specs/proofs for CSpace + Untyped; Flux index math.
 - [ ] GLM: M1 spec/abi extended for new invoke methods + kernel<->spec id cross-check.
