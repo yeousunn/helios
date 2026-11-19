@@ -42,10 +42,23 @@
 //! o 24: u32 console_in handle (0 = none; v1 only, ADR-043)
 //! o 28: u32 self_thread handle (0 = none; ADR-089; formerly reserved)
 //! o 32: region_count × { u32 handle; u32 reserved; u64 base; u64 len }
+//! o 32 + region_count·24: u32 untyped_count; u32 reserved; then
+//!                         untyped_count × { u32 handle; u32 reserved;
+//!                         u64 base; u64 len }   (M1a2, root Untyped)
 //! ```
 //!
 //! v0 readers (24-byte header, regions at 24) are rejected by the version
 //! check on the userspace side; the kernel only writes v1.
+//!
+//! The root-Untyped section (M1a2, RFC-0001 §4.1.1) is an append-only
+//! extension of the v1 block, exactly like the region records it follows:
+//! the v1 header words were exhausted (o20/24/28 are all assigned), and a
+//! version bump would reject every committed v1 parser (ENOSYS) and break
+//! the shared boot until every reader migrated — the ADR-089 lesson ran the
+//! other way. Readers that stop after the region records are unaffected
+//! (trailing bytes are ignored); readers that want the handles compute the
+//! section offset from the declared region_count via
+//! [`off_untyped_section`].
 
 /// BootInfo magic: "HELI", little-endian.
 pub const BOOTINFO_MAGIC: u32 = 0x4845_4C49;
@@ -82,6 +95,25 @@ pub const MAX_REGIONS: usize = 8;
 pub const REGION_LEN: usize = 24;
 /// Upper bound a parser may read: v1 header plus all regions.
 pub const BOOTINFO_MAX_LEN: usize = HEADER_LEN_V1 + MAX_REGIONS * REGION_LEN;
+/// Maximum root Untyped handles the kernel grants; more are truncated.
+pub const MAX_UNTYPED: usize = MAX_REGIONS;
+/// One root-Untyped record: u32 handle, u32 reserved, u64 base, u64 len —
+/// the same record shape as a region record.
+pub const UNTYPED_RECORD_LEN: usize = REGION_LEN;
+/// Root-Untyped section header: u32 untyped_count + u32 reserved.
+pub const UNTYPED_SECTION_HEADER: usize = 8;
+/// Upper bound a parser may read when it also wants the root-Untyped
+/// section: the v1 block plus the section header plus all records.
+pub const BOOTINFO_MAX_LEN_V2: usize =
+    BOOTINFO_MAX_LEN + UNTYPED_SECTION_HEADER + MAX_UNTYPED * UNTYPED_RECORD_LEN;
+
+/// Offset of the root-Untyped section in a block that declares
+/// `region_count` region records: immediately after those records.
+/// The returned offset plus [`UNTYPED_SECTION_HEADER`] is 8-aligned, so
+/// the records' u64 fields need no padding at any region_count.
+pub const fn off_untyped_section(region_count: usize) -> usize {
+    HEADER_LEN_V1 + region_count * REGION_LEN
+}
 
 /// ADR-009 bootstrap package: fixed prefix caps
 /// (aspace, thread, region, 4 session notifications, ps service endpoint).
@@ -169,6 +201,77 @@ mod tests {
         // A v0 region start (24) would collide with the v1 console_in word:
         // that is exactly why v0 and v1 blocks cannot share a parser path
         // without the version check.
+    }
+
+    /// M1a2: the root-Untyped section sits immediately after the region
+    /// records, carries its own count, and reuses the region record shape.
+    #[test]
+    fn root_untyped_section_layout_matches_a_written_block() {
+        let region_count = 2usize;
+        let untypeds: [(u32, u64, u64); 2] = [
+            (21, 0x100_0000, 0xF00_0000),
+            (22, 0x1_0000_0000, 0x4000_0000),
+        ];
+        let untyped_count = untypeds.len();
+
+        let mut block = [0u8; BOOTINFO_MAX_LEN_V2];
+        let mut put = |off: usize, v: u64, n: usize| {
+            for i in 0..n {
+                block[off + i] = ((v >> (i * 8)) & 0xFF) as u8;
+            }
+        };
+        put(OFF_MAGIC, BOOTINFO_MAGIC as u64, 4);
+        put(OFF_VERSION, BOOTINFO_VERSION_V1 as u64, 4);
+        put(OFF_REGION_COUNT, region_count as u64, 4);
+        let sec = off_untyped_section(region_count);
+        put(sec, untyped_count as u64, 4);
+        for (i, &(handle, base, len)) in untypeds.iter().enumerate() {
+            let off = sec + UNTYPED_SECTION_HEADER + i * UNTYPED_RECORD_LEN;
+            put(off, handle as u64, 4);
+            put(off + 8, base, 8);
+            put(off + 16, len, 8);
+        }
+
+        let rd32 = |off: usize| u32::from_le_bytes(block[off..off + 4].try_into().unwrap());
+        let rd64 = |off: usize| u64::from_le_bytes(block[off..off + 8].try_into().unwrap());
+        assert_eq!(rd32(sec), untyped_count as u32);
+        // The section offset after the declared regions; the u64 fields are
+        // 8-aligned for every region_count (24-record + 8-byte header).
+        assert_eq!(sec, HEADER_LEN_V1 + region_count * REGION_LEN);
+        assert_eq!((sec + UNTYPED_SECTION_HEADER) % 8, 0);
+        assert_eq!(rd64(sec + UNTYPED_SECTION_HEADER + 8), 0x100_0000);
+        let rec1 = sec + UNTYPED_SECTION_HEADER + UNTYPED_RECORD_LEN;
+        assert_eq!(rd32(rec1), 22);
+        assert_eq!(rd64(rec1 + 16), 0x4000_0000);
+    }
+
+    /// M1a2 arithmetic: the section bound extends (never shrinks) the v1
+    /// parser bound, the record shape matches the regions', and the bound
+    /// covers count + header + a full MAX_UNTYPED record set.
+    #[test]
+    fn root_untyped_constants_are_consistent() {
+        assert_eq!(UNTYPED_RECORD_LEN, REGION_LEN, "same record shape");
+        assert_eq!(UNTYPED_RECORD_LEN, 4 + 4 + 8 + 8);
+        assert!(BOOTINFO_MAX_LEN_V2 > BOOTINFO_MAX_LEN);
+        assert_eq!(
+            BOOTINFO_MAX_LEN_V2,
+            BOOTINFO_MAX_LEN + UNTYPED_SECTION_HEADER + MAX_UNTYPED * UNTYPED_RECORD_LEN
+        );
+        // Section offset is monotone in region_count and lands right after
+        // the last region record.
+        for n in 0..=MAX_REGIONS {
+            assert_eq!(off_untyped_section(n), HEADER_LEN_V1 + n * REGION_LEN);
+            if n > 0 {
+                assert!(off_untyped_section(n) > off_untyped_section(n - 1));
+            }
+        }
+        // A maximal block never exceeds the extended bound.
+        assert!(
+            off_untyped_section(MAX_REGIONS)
+                + UNTYPED_SECTION_HEADER
+                + MAX_UNTYPED * UNTYPED_RECORD_LEN
+                <= BOOTINFO_MAX_LEN_V2
+        );
     }
 
     /// ADR-009 package arithmetic: the 8-cap fixed prefix, five defined tail

@@ -83,10 +83,11 @@ unsafe impl core::alloc::GlobalAlloc for NoAlloc {
 #[global_allocator]
 static NO_ALLOC: NoAlloc = NoAlloc;
 
-/// Physical region handed to the frame allocator + init Region caps
-/// (16 MiB..256 MiB; the kernel image and boot stack live below 16 MiB).
-const FRAME_REGION_BASE: u64 = 0x100_0000;
-const FRAME_REGION_LEN: u64 = 0xF00_0000;
+/// Physical region handed to the frame allocator + init Region/Untyped
+/// caps, sourced from the HAL's platform description (NV's M1 wiring
+/// request; same 16 MiB..256 MiB values the hard-coded constants carried —
+/// the kernel image and boot stack live below 16 MiB).
+const FRAME_REGION: (u64, u64) = hal_x86_64::PHYS_MEM_REGIONS[0];
 
 /// Rust entry, called from `boot.S` after long mode is up. Never returns.
 #[no_mangle]
@@ -133,11 +134,9 @@ pub extern "C" fn kernel_main() -> ! {
     kernel::sched::init().expect("sched::init");
     hal_x86_64::uart_writer("boot: 3 backends\n");
 
-    let region = kernel::frame::Region::new(
-        kernel::frame::PhysAddr::new(FRAME_REGION_BASE),
-        FRAME_REGION_LEN,
-    )
-    .expect("invalid frame region");
+    let region =
+        kernel::frame::Region::new(kernel::frame::PhysAddr::new(FRAME_REGION.0), FRAME_REGION.1)
+            .expect("invalid frame region");
     kernel::frame::init(&[region]).expect("frame::init");
     // ADR-035: reserve any part of the kernel image + boot stack that falls
     // inside the frame region (the boot stack is at ~5 MiB today, BELOW the
@@ -149,15 +148,13 @@ pub extern "C" fn kernel_main() -> ! {
             static stack_top: u8;
         }
         let boot_stack_top = core::ptr::addr_of!(stack_top) as u64;
-        if boot_stack_top > FRAME_REGION_BASE {
-            let reserved_len = boot_stack_top - FRAME_REGION_BASE;
-            match kernel::frame::reserve(
-                kernel::frame::PhysAddr::new(FRAME_REGION_BASE),
-                reserved_len,
-            ) {
+        if boot_stack_top > FRAME_REGION.0 {
+            let reserved_len = boot_stack_top - FRAME_REGION.0;
+            match kernel::frame::reserve(kernel::frame::PhysAddr::new(FRAME_REGION.0), reserved_len)
+            {
                 Ok(()) => kernel::kinfo!(
                     "frame::reserve kernel image [0x{:x}..{:#x})",
-                    FRAME_REGION_BASE,
+                    FRAME_REGION.0,
                     boot_stack_top
                 ),
                 Err(e) => kernel::kwarn!("frame::reserve: {}", e),
@@ -167,8 +164,8 @@ pub extern "C" fn kernel_main() -> ! {
     hal_x86_64::uart_writer("boot: 4 frames\n");
 
     let regions = [kernel::init::BootRegion {
-        base: kernel::frame::PhysAddr::new(FRAME_REGION_BASE),
-        len: FRAME_REGION_LEN,
+        base: kernel::frame::PhysAddr::new(FRAME_REGION.0),
+        len: FRAME_REGION.1,
     }];
     let launch = kernel::init::start(&regions).expect("kernel::init::start");
 

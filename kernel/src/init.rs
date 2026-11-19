@@ -42,12 +42,20 @@ pub struct BootInfoV0 {
     /// (the formerly-reserved u32), so the launcher can invoke THREAD_CREATE
     /// on itself (same-AS sibling threads, RFC-0004/ADR-085 stack tops).
     pub self_thread: u32,
+    /// M1a2 (RFC-0001 §4.1.1): root Untyped (handle, base, len) triples in
+    /// grant order, serialized after the region records per the
+    /// `spec/abi::entry` appended section (count u32 + reserved u32 +
+    /// records). One per boot region; the launcher's Retype source.
+    pub root_untyped: [(u32, u64, u64); MAX_BOOT_UNTYPED],
+    pub untyped_count: u32,
     /// (handle, base, len) triples, in grant order.
     pub regions: [(u32, u64, u64); MAX_BOOT_REGIONS],
     pub region_count: u32,
 }
 
 pub const MAX_BOOT_REGIONS: usize = helios_abi::entry::MAX_REGIONS;
+/// M1a2: one root Untyped per boot region, bounded by the spec section.
+pub const MAX_BOOT_UNTYPED: usize = helios_abi::entry::MAX_UNTYPED;
 
 /// Serialize BootInfo into `buf` (little-endian). The byte layout is
 /// normative in `spec/abi::entry` (ADR-073); every offset here is taken
@@ -56,14 +64,18 @@ pub const MAX_BOOT_REGIONS: usize = helios_abi::entry::MAX_REGIONS;
 /// u32 magic; u32 version(1); u32 debug_ep; u32 factory;
 /// u32 region_count; u32 self_as;
 /// u32 console_in; u32 self_thread (ADR-089, formerly reserved);
-/// then region_count × { u32 handle; u32 reserved; u64 base; u64 len }
+/// then region_count × { u32 handle; u32 reserved; u64 base; u64 len };
+/// then the M1a2 root-Untyped section (u32 untyped_count; u32 reserved;
+/// untyped_count × { u32 handle; u32 reserved; u64 base; u64 len })
 /// ```
 /// Returns the number of bytes written. Regions beyond `MAX_BOOT_REGIONS`
-/// are dropped (truncated to region_count).
+/// and Untypeds beyond `MAX_BOOT_UNTYPED` are dropped (truncated counts).
 pub fn write_bootinfo(buf: &mut [u8], info: &BootInfoV0) -> usize {
     use helios_abi::entry as spec;
     let count = (info.region_count as usize).min(MAX_BOOT_REGIONS);
-    let need = spec::HEADER_LEN_V1 + count * spec::REGION_LEN;
+    let ucount = (info.untyped_count as usize).min(MAX_BOOT_UNTYPED);
+    let untyped_off = spec::off_untyped_section(count);
+    let need = untyped_off + spec::UNTYPED_SECTION_HEADER + ucount * spec::UNTYPED_RECORD_LEN;
     if buf.len() < need {
         return 0;
     }
@@ -82,6 +94,17 @@ pub fn write_bootinfo(buf: &mut [u8], info: &BootInfoV0) -> usize {
     w(spec::OFF_SELF_THREAD, info.self_thread as u64, 4);
     for (i, &(handle, base, len)) in info.regions[..count].iter().enumerate() {
         let off = spec::HEADER_LEN_V1 + i * spec::REGION_LEN;
+        w(off, handle as u64, 4);
+        w(off + 4, 0, 4);
+        w(off + 8, base, 8);
+        w(off + 16, len, 8);
+    }
+    // M1a2 root-Untyped section (RFC-0001 §4.1.1): appended after the
+    // regions, v1 readers ignore the trailing bytes.
+    w(untyped_off, ucount as u64, 4);
+    w(untyped_off + 4, 0, 4);
+    for (i, &(handle, base, len)) in info.root_untyped[..ucount].iter().enumerate() {
+        let off = untyped_off + spec::UNTYPED_SECTION_HEADER + i * spec::UNTYPED_RECORD_LEN;
         w(off, handle as u64, 4);
         w(off + 4, 0, 4);
         w(off + 8, base, 8);
@@ -144,6 +167,8 @@ pub fn start(regions: &[BootRegion]) -> Result<InitLaunch, &'static str> {
         self_as: 0,
         console_in: 0,
         self_thread: 0,
+        root_untyped: [(0, 0, 0); MAX_BOOT_UNTYPED],
+        untyped_count: 0,
         regions: [(0, 0, 0); MAX_BOOT_REGIONS],
         region_count: regions.len() as u32,
     };
@@ -162,6 +187,29 @@ pub fn start(regions: &[BootRegion]) -> Result<InitLaunch, &'static str> {
         .map_err(|_| "cannot grant Region")?;
         info.regions[i] = (handle, r.base.as_u64(), r.len);
         REGIONS.lock().add(region_id, r.base.as_u64(), r.len);
+    }
+
+    // M1a2 (RFC-0001 §4.1.1 / ADR-103): one root Untyped object per boot
+    // region, granted to the launcher (MAP | GRANT — MAP because RETYPE
+    // requires it on the source, GRANT because the launcher delegates
+    // memory authority like its Region caps). The v0 Region caps above stay
+    // until init migrates off the Region model (ADR-103 §7); the two grant
+    // the same physical range and the double-accounting is reconciled
+    // there. The Untyped table slot frees on owner death (objreg cleanup).
+    for (i, r) in regions.iter().enumerate().take(MAX_BOOT_UNTYPED) {
+        let obj = crate::untyped::create(r.base.as_u64(), r.len, 0, 0, pid)
+            .map_err(|_| "cannot create root Untyped")?;
+        let handle = proc::install_cap(
+            pid,
+            Capability {
+                obj,
+                typ: ObjType::Untyped,
+                rights: Rights::MAP.union(Rights::GRANT),
+            },
+        )
+        .map_err(|_| "cannot grant root Untyped")?;
+        info.root_untyped[i] = (handle, r.base.as_u64(), r.len);
+        info.untyped_count += 1;
     }
 
     // Console input (ADR-038): reserved recv-only cap (obj 0xD2) — the
@@ -393,6 +441,8 @@ mod tests {
     fn setup() {
         crate::aspace::set_backend_factory(&BootFactory);
         proc::reset_for_test();
+        crate::objreg::reset_for_test();
+        crate::untyped::reset_for_test();
         crate::endpoint::reset_engine_for_test();
         crate::notification::reset_for_test();
         syscall::reset_reply_for_test();
@@ -424,11 +474,19 @@ mod tests {
             self_as: 9,
             console_in: 7,
             self_thread: 13,
+            root_untyped: [(21, 0x100000, 0x40000); MAX_BOOT_UNTYPED],
+            untyped_count: 1,
             regions,
             region_count: 2,
         };
         let n = write_bootinfo(&mut buf, &info);
-        assert_eq!(n, spec::HEADER_LEN_V1 + 2 * spec::REGION_LEN);
+        assert_eq!(
+            n,
+            spec::HEADER_LEN_V1
+                + 2 * spec::REGION_LEN
+                + spec::UNTYPED_SECTION_HEADER
+                + spec::UNTYPED_RECORD_LEN
+        );
         let rd32 = |o: usize| -> u32 { u32::from_le_bytes(buf[o..o + 4].try_into().unwrap()) };
         assert_eq!(rd32(spec::OFF_MAGIC), BOOTINFO_MAGIC);
         assert_eq!(rd32(spec::OFF_MAGIC), spec::BOOTINFO_MAGIC);
@@ -448,6 +506,15 @@ mod tests {
             13,
             "self_thread at offset 28 (ADR-089, formerly reserved)"
         );
+        // M1a2 root-Untyped section after the region records.
+        let sec = spec::off_untyped_section(2);
+        assert_eq!(rd32(sec), 1, "untyped_count");
+        let rec0 = sec + spec::UNTYPED_SECTION_HEADER;
+        assert_eq!(rd32(rec0), 21, "first root-Untyped handle");
+        let ubase = u64::from_le_bytes(buf[rec0 + 8..rec0 + 16].try_into().unwrap());
+        let ulen = u64::from_le_bytes(buf[rec0 + 16..rec0 + 24].try_into().unwrap());
+        assert_eq!(ubase, 0x100000);
+        assert_eq!(ulen, 0x40000);
         // Region records start at the v1 header length; base/len are u64
         // fields at +8/+16 inside the record.
         let rec0 = spec::HEADER_LEN_V1;
@@ -468,18 +535,20 @@ mod tests {
     #[test]
     fn bootinfo_block_matches_entry_spec() {
         use helios_abi::entry as spec;
-        let mut buf = [0u8; helios_abi::entry::BOOTINFO_MAX_LEN];
+        let mut buf = [0u8; helios_abi::entry::BOOTINFO_MAX_LEN_V2];
         let info = BootInfoV0 {
             debug_ep: 2,
             factory: 3,
             self_as: 9,
             console_in: 7,
             self_thread: 13,
+            root_untyped: [(4, 0x100000, 0x40000); MAX_BOOT_UNTYPED],
+            untyped_count: MAX_BOOT_UNTYPED as u32,
             regions: [(4, 0x100000, 0x40000); MAX_BOOT_REGIONS],
             region_count: MAX_BOOT_REGIONS as u32,
         };
         let n = write_bootinfo(&mut buf, &info);
-        assert_eq!(n, spec::BOOTINFO_MAX_LEN);
+        assert_eq!(n, spec::BOOTINFO_MAX_LEN_V2);
         let rd32 = |o: usize| -> u32 { u32::from_le_bytes(buf[o..o + 4].try_into().unwrap()) };
         assert_eq!(rd32(spec::OFF_MAGIC), spec::BOOTINFO_MAGIC);
         assert_eq!(rd32(spec::OFF_VERSION), spec::BOOTINFO_VERSION_V1);
@@ -500,6 +569,8 @@ mod tests {
             self_as: 0,
             console_in: 0,
             self_thread: 0,
+            root_untyped: [(0, 0, 0); MAX_BOOT_UNTYPED],
+            untyped_count: 0,
             regions: [(0, 0, 0); MAX_BOOT_REGIONS],
             region_count: 0,
         };
@@ -627,5 +698,76 @@ mod tests {
         for addr in carved {
             let _ = frame::free(PhysAddr::new(addr));
         }
+    }
+
+    /// M1a2 (RFC-0001 §4.1.1): `start` grants the launcher one root Untyped
+    /// per boot region, serialized into the BootInfo's appended section, and
+    /// the launcher can drive a real FACTORY_RETYPE from that handle — the
+    /// path NV's bench tracking and DS's bench measurement build on.
+    #[test]
+    fn bootinfo_root_untyped_grant_and_retype_end_to_end() {
+        use crate::entry::{self, SyscallArgs};
+        use ipc::CapSlot;
+        use std::boxed::Box;
+
+        struct LaunchCtx(ProcessId);
+        impl crate::entry::CurrentContext for LaunchCtx {
+            fn pid(&self) -> ProcessId {
+                self.0
+            }
+            fn tid(&self) -> crate::sched::ThreadId {
+                crate::sched::ThreadId(1)
+            }
+        }
+
+        setup();
+        let len: u64 = 0x40000;
+        let launch = start(&[BootRegion {
+            base: PhysAddr::new(0x10_0000),
+            len,
+        }])
+        .unwrap();
+        let ctx: &'static LaunchCtx = Box::leak(Box::new(LaunchCtx(launch.pid)));
+        entry::set_current_context(ctx);
+        assert_eq!(launch.bootinfo.untyped_count, 1);
+        let (h_ut, base, ulen) = launch.bootinfo.root_untyped[0];
+        assert_eq!((base, ulen), (0x10_0000, len));
+
+        // The granted cap: Untyped with MAP (RETYPE's source requirement)
+        // and GRANT (delegable like the Region caps).
+        let cap = proc::get_cap(launch.pid, h_ut).unwrap();
+        assert_eq!(cap.typ, ObjType::Untyped);
+        assert_eq!(cap.rights, Rights::MAP.union(Rights::GRANT));
+        assert!(crate::objreg::is_alive(cap.obj));
+        assert_eq!(crate::untyped::remaining(cap.obj).unwrap(), len);
+
+        // FACTORY_RETYPE (label 5) from the root Untyped through the
+        // factory cap, on the real dispatch path: carves an Endpoint and
+        // reports the remainder.
+        let charge = crate::endpoint::RETYPE_SLOT_BYTES;
+        assert!(charge > 0);
+        let mut m = Message::new(5);
+        m.tag = m.tag.with_caps(1);
+        m.words[0] = ObjType::Endpoint as u64;
+        m.words[1] = charge;
+        m.words[2] = 0;
+        m.set_descriptor(0, CapSlot::pack(h_ut, Rights::MAP))
+            .unwrap();
+        let r = entry::dispatch(SyscallArgs {
+            num: entry::num::INVOKE,
+            cap: launch.bootinfo.factory as u64,
+            tag: m.tag,
+            w: m.words,
+            nonblock: false,
+        });
+        assert_eq!(
+            r.status,
+            ipc::status::OK as i64,
+            "RETYPE from the boot-granted root Untyped"
+        );
+        let ep = proc::get_cap(launch.pid, r.w[0] as u32).unwrap();
+        assert_eq!(ep.typ, ObjType::Endpoint);
+        assert_eq!(r.w[1], len - charge, "w1 = remaining source size");
+        assert_eq!(crate::untyped::remaining(cap.obj).unwrap(), len - charge);
     }
 }
